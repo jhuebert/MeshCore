@@ -538,7 +538,7 @@ static bool parseIvNum(const char* s, bool snr_mode, uint16_t* out) {
   } else {
     char* end;
     long v = strtol(s, &end, 10);
-    if (end == s || *end != 0 || v < 0 || v > 65535) return false;
+    if (end == s || *end != 0 || v < 0 || v > 32767) return false;   // endpoints are compared as int16
     *out = (uint16_t)v;
   }
   return true;
