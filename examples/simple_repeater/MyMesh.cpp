@@ -432,6 +432,7 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
+  if (filter.checkPacket(packet, millis()) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -456,6 +457,17 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
     }
   }
   return true;
+}
+
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
+  return filter.searchChannelsByHash(hash, channels, max_matches);
+}
+
+void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  if (filter.checkContent(packet, type, channel, data, len) == FILTER_ACT_DROP) {
+    MESH_DEBUG_PRINTLN("filter: dropping group packet by content rule");
+    packet->markDoNotRetransmit();
+  }
 }
 
 const char *MyMesh::getLogDateTime() {
@@ -947,6 +959,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
+  filter.begin(fs);
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -1280,6 +1293,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
+  } else if (memcmp(command, "filter", 6) == 0 && (command[6] == ' ' || command[6] == 0)) {
+    const char* sub = command + 6;
+    while (*sub == ' ') sub++;
+    filterCLI(filter, sub, reply);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1323,6 +1340,9 @@ void MyMesh::loop() {
     acl.save(_fs);
     dirty_contacts_expiry = 0;
   }
+
+  // lazy dirty-flag save for the packet filter config
+  filter.loop(_fs);
 
   // update uptime
   uint32_t now = millis();
