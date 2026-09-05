@@ -40,7 +40,7 @@ static int filterDecodeBase64(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_B64  "izOH6cXN6mrJ5e26oRXNcg=="
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     2
+#define FILTER_CFG_VERSION     3   // v3: chan_mask widened to 16 bits (v1/v2 configs discarded)
 #define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
 #define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
@@ -168,8 +168,8 @@ void FilterRules::delChannel(int idx) {
   // remap rule masks so they keep pointing at the same channels
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
-    uint8_t lo = r->chan_mask & ((1 << idx) - 1);
-    uint8_t hi = (uint8_t)(r->chan_mask >> (idx + 1)) << idx;
+    uint16_t lo = r->chan_mask & (uint16_t)((1 << idx) - 1);
+    uint16_t hi = (uint16_t)(r->chan_mask >> (idx + 1)) << idx;
     r->chan_mask = lo | hi;
   }
   dirty = true; dirty_since = millis();
