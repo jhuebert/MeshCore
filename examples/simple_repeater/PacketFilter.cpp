@@ -163,6 +163,14 @@ void FilterRules::delChannel(int idx) {
   memmove(&channels[idx], &channels[idx + 1], (num_channels - idx - 1) * sizeof(FilterChannel));
   memset(&channels[num_channels - 1], 0, sizeof(FilterChannel));
   num_channels--;
+  // channels above idx shift down one slot: drop the deleted channel's bit and
+  // remap rule masks so they keep pointing at the same channels
+  for (int i = 0; i < num_rules; i++) {
+    FilterRule* r = &rules[i];
+    uint8_t lo = r->chan_mask & ((1 << idx) - 1);
+    uint8_t hi = (uint8_t)(r->chan_mask >> (idx + 1)) << idx;
+    r->chan_mask = lo | hi;
+  }
   dirty = true; dirty_since = millis();
 }
 
