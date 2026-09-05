@@ -47,7 +47,6 @@ FilterRules::FilterRules() {
   enabled = true;
   dirty = false;
   dirty_since = 0;
-  _fs = NULL;
 }
 
 void FilterRules::begin(FILESYSTEM* fs) {
@@ -71,7 +70,7 @@ void FilterRules::loop(FILESYSTEM* fs) {
 void FilterRules::setEnabled(bool on) {
   if (enabled != on) {
     enabled = on;
-    dirty = true; dirty_since = millis();
+    markDirty();
   }
 }
 
@@ -89,7 +88,7 @@ FilterRule* FilterRules::addRule() {
   memset(r, 0, sizeof(FilterRule));
   r->enabled = true;
   r->action = FILTER_ACT_DROP;
-  dirty = true; dirty_since = millis();
+  markDirty();
   return r;
 }
 
@@ -98,13 +97,13 @@ void FilterRules::delRule(int idx) {
   memmove(&rules[idx], &rules[idx + 1], (num_rules - idx - 1) * sizeof(FilterRule));
   memset(&rules[num_rules - 1], 0, sizeof(FilterRule));
   num_rules--;
-  dirty = true; dirty_since = millis();
+  markDirty();
 }
 
 void FilterRules::clearRules() {
   memset(rules, 0, sizeof(rules));
   num_rules = 0;
-  dirty = true; dirty_since = millis();
+  markDirty();
 }
 
 // ---------------------------------------------------------------- channel store
@@ -141,7 +140,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   mesh::Utils::sha256(&ch->hash, sizeof(ch->hash), ch->secret, ch->secret_len);
   StrHelper::strzcpy(ch->name, name, FILTER_CHAN_NAME_LEN);
   num_channels++;
-  dirty = true; dirty_since = millis();
+  markDirty();
   return ch;
 }
 
@@ -158,7 +157,7 @@ void FilterRules::delChannel(int idx) {
     uint16_t hi = (uint16_t)(r->chan_mask >> (idx + 1)) << idx;
     r->chan_mask = lo | hi;
   }
-  dirty = true; dirty_since = millis();
+  markDirty();
 }
 
 int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches) {
@@ -168,7 +167,6 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
     if (channels[i].name[0] == 0) continue;   // null-key guard (same as BaseChatMesh)
     if (channels[i].hash == hash[0]) {
       dest[n].hash[0] = channels[i].hash;
-      memset(dest[n].secret, 0, sizeof(dest[n].secret));
       memcpy(dest[n].secret, channels[i].secret, sizeof(dest[n].secret));
       n++;
     }
@@ -180,7 +178,7 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
 
 void FilterRules::setAdvertRatelimit(uint16_t hours) {
   ratelimit_hours = hours;
-  dirty = true; dirty_since = millis();
+  markDirty();
 }
 
 void FilterRules::clearAdvertCache() {
@@ -427,7 +425,6 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // guards against layout drift.
 
 void FilterRules::load(FILESYSTEM* fs) {
-  _fs = fs;
   num_rules = 0;
   num_channels = 0;
   enabled = true;
