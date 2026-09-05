@@ -44,7 +44,7 @@ jobs:
         run: |
           git remote add upstream https://github.com/meshcore-dev/MeshCore.git
           git fetch upstream dev
-          git checkout dev
+          git checkout -B dev origin/dev
           if ! git merge --ff-only upstream/dev; then
             echo "fork/dev has diverged from upstream/dev; refusing to force-push." >&2
             exit 1
