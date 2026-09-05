@@ -40,7 +40,8 @@ static int filterDecodeBase64(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_B64  "izOH6cXN6mrJ5e26oRXNcg=="
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     1
+#define FILTER_CFG_VERSION     2
+#define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
 #define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
@@ -426,10 +427,12 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 }
 
 // ---------------------------------------------------------------- persistence
-// Binary format (version 1): header + raw rule structs + raw channel structs.
-// All struct members are fixed-size arrays/scalars (no pointers) and structs
-// are memset(0) before use, so a raw write/read is deterministic on a given
-// platform; the version byte guards against layout drift.
+// Binary format (version 2): header + config-only rule records + raw channel
+// structs. Rule records are the FilterRule struct up to (excluding) `hits` —
+// stats are memory-only and never touch the file. All struct members are
+// fixed-size arrays/scalars (no pointers) and structs are memset(0) before use,
+// so a raw write/read is deterministic on a given platform; the version byte
+// guards against layout drift.
 
 void FilterRules::load(FILESYSTEM* fs) {
   _fs = fs;
@@ -452,7 +455,7 @@ void FilterRules::load(FILESYSTEM* fs) {
       if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
-          ok = (file.read((uint8_t*)&rules[i], sizeof(FilterRule)) == sizeof(FilterRule));
+          ok = (file.read((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
         }
         for (int i = 0; ok && i < nc; i++) {
           ok = (file.read((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
@@ -491,7 +494,7 @@ void FilterRules::save(FILESYSTEM* fs) {
     bool ok = (file.write(hdr, 5) == 5);
     ok = ok && (file.write((uint8_t*)&ratelimit_hours, 2) == 2);
     for (int i = 0; ok && i < num_rules; i++) {
-      ok = (file.write((uint8_t*)&rules[i], sizeof(FilterRule)) == sizeof(FilterRule));
+      ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
     }
     for (int i = 0; ok && i < num_channels; i++) {
       ok = (file.write((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));

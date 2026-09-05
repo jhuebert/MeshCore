@@ -73,7 +73,7 @@ Each rule holds:
 | `chanhash` | Single 1-byte on-air channel hash |
 | `sender` | Regex over the message sender (`"<sender>:"`), GRP_TXT only |
 | `text` | Regex over the message text, GRP_TXT only |
-| `hits` | Lifetime match counter (survives in config, reset by `filter clear` … see §6) |
+| `hits` | Match counter (RAM-only, never written to the config file) |
 
 **Interval syntax** (used by `hops`, `len`, `snr`):
 
@@ -152,10 +152,11 @@ reachable through you.
 ## 5. Persistence
 
 All rules, channels, the enabled flag, and the ratelimit window are saved to
-`/filter_cfg` on the repeater's filesystem (binary format, version-guarded). Saves
-are lazy: 3 seconds after the last configuration change, so bursts of CLI commands
-produce a single write. Everything survives reboot; the advert cache does not (by
-design — it is RAM-only monotonic-clock state).
+`/filter_cfg` on the repeater's filesystem (binary format, version-guarded) —
+**the file holds configuration only**. Stats are not part of the file format: rule
+records on disk end at the `hits` field, so counters and the advert cache exist
+only in RAM and reset on reboot. Saves are lazy: 3 seconds after the last
+configuration change, so bursts of CLI commands produce a single write.
 
 ---
 
@@ -236,8 +237,8 @@ Invalid input is rejected with `Err - ...` and no half-added rule is left behind
 ### Hit counters
 
 `filter stats` shows `hits` per rule plus the limiter and regex-abort counters.
-Counters are lifetime values; they are only reset by `filter clear` (which clears
-the rules themselves) or a config wipe. Use `logonly` rules as long-term probes to
+All counters are RAM-only: they start at zero after every reboot, and `filter
+clear` resets them with the rules. Use `logonly` rules as long-term probes to
 measure what a `drop` *would* remove before enforcing it.
 
 ---
@@ -373,7 +374,8 @@ port is only needed for initial flashing and emergencies.
   after a restart — a deliberate fail-open).
 - Regex evaluations are step-budgeted and fail open (see §2); watch the `aborted`
   counter if you use heavy patterns like `.*.*.*`.
-- All counters (`hits`, `limiter`, `aborted`) are lifetime values; they reset on
-  config wipe, not on reboot.
+- All counters (`hits`, `limiter`, `aborted`) and the advert cache are memory-only:
+  they reset on reboot (the config file does not store them) or on config wipe,
+  and the cache can also be emptied via `filter ratelimit clear`.
 - Reply strings are capped at 160 bytes (remote CLI buffer); `filter list` shows a
   short digest per rule and `filter get <idx>` the full detail.
