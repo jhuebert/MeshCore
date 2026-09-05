@@ -40,7 +40,8 @@ static int filterDecodeBase64(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_B64  "izOH6cXN6mrJ5e26oRXNcg=="
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     3   // v3: chan_mask widened to 16 bits (v1/v2 configs discarded)
+#define FILTER_CFG_VERSION     3   // v3: chan_mask 16-bit + 1-byte channel hash
+                                   // (v1/v2 configs discarded on upgrade)
 #define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
 #define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
@@ -152,7 +153,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_base64)
     ch->secret_len = len;
   }
 
-  mesh::Utils::sha256(ch->hash, sizeof(ch->hash), ch->secret, ch->secret_len);
+  mesh::Utils::sha256(&ch->hash, sizeof(ch->hash), ch->secret, ch->secret_len);
   StrHelper::strzcpy(ch->name, name, FILTER_CHAN_NAME_LEN);
   num_channels++;
   dirty = true; dirty_since = millis();
@@ -180,8 +181,8 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
   int n = 0;
   for (int i = 0; i < num_channels && n < max_matches; i++) {
     if (channels[i].name[0] == 0) continue;   // null-key guard (same as BaseChatMesh)
-    if (channels[i].hash[0] == hash[0]) {
-      memcpy(dest[n].hash, channels[i].hash, sizeof(dest[n].hash));
+    if (channels[i].hash == hash[0]) {
+      dest[n].hash[0] = channels[i].hash;
       memset(dest[n].secret, 0, sizeof(dest[n].secret));
       memcpy(dest[n].secret, channels[i].secret, sizeof(dest[n].secret));
       n++;
@@ -808,7 +809,7 @@ static void cliChanList(FilterRules& filter, char* reply) {
   for (int i = 0; i < filter.getNumChannels(); i++) {
     auto ch = filter.getChannel(i);
     radd(&out, &remain, "%s%d:%s k%u h%02X%s", i ? " " : "", i, ch->name,
-         ch->secret_len, ch->hash[0], ch->secret_len == 16 && ch->name[0] == '#' ? " d" : "");
+         ch->secret_len, ch->hash, ch->secret_len == 16 && ch->name[0] == '#' ? " d" : "");
   }
 }
 
@@ -825,7 +826,7 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   }
   auto ch = filter.addChannel(name, psk);
   if (ch == NULL) { strcpy(reply, "Err - bad psk or store full"); return; }
-  sprintf(reply, "OK - chan %s h=%02X%s", ch->name, ch->hash[0],
+  sprintf(reply, "OK - chan %s h=%02X%s", ch->name, ch->hash,
           psk == NULL ? " (derived)" : "");
 }
 

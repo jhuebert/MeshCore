@@ -62,7 +62,8 @@ struct FilterChannel {                  // keyed channel store
   char     name[FILTER_CHAN_NAME_LEN]; // e.g. "Public", "#test" (hash channels keep their '#')
   uint8_t  secret[32];                 // zero-padded PSK (16 or 32 bytes used)
   uint8_t  secret_len;                 // 16 or 32
-  uint8_t  hash[32];                   // sha256(secret); hash[0] is the on-air byte
+  uint8_t  hash;                       // sha256(secret)[0]: the 1-byte on-air
+                                       // channel hash (core PATH_HASH_SIZE)
 };
 
 struct Interval {
@@ -96,7 +97,9 @@ struct FilterRule {
 };
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
-  uint8_t  pub_key_prefix[6]; // first 6 bytes of the advert's pubkey
+  uint8_t  pub_key_prefix[4]; // first 4 bytes of the advert's pubkey (collision
+                              // odds ~0.001% per 256 distinct nodes; worst case
+                              // is one falsely suppressed advert per window)
   uint32_t first_seen_millis; // by this repeater's own monotonic clock
 };
 
