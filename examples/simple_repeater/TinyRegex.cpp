@@ -348,7 +348,7 @@ static int matchone(regex_t p, char c)
     case NOT_ALPHA:      return !matchalphanum(c);
     case WHITESPACE:     return  matchwhitespace(c);
     case NOT_WHITESPACE: return !matchwhitespace(c);
-    default:             return  (p.u.ch == c);
+    default:             return  (p.u.ch == (unsigned char)c);  /* byte compare: c may be signed, u.ch is not (multi-byte UTF-8, e.g. emoji) */
   }
 }
 

@@ -93,6 +93,12 @@ under a step budget; if the budget is exhausted the match **fails open** (the
 packet is forwarded) and the `aborted` counter is incremented — a pathological
 pattern can never wedge the repeater, worst case is one spam message repeated.
 
+Patterns and subjects are matched **byte-wise** on the raw UTF-8 payload: a
+literal emoji or other non-ASCII character in a pattern matches that exact
+character (e.g. `sender=^John😀$`), but `.` and character classes cover single
+bytes, not whole characters — one emoji is 4 bytes, so `J.hn` will not match
+`J😀hn` (use `J....hn` or a literal).
+
 **Capacity defaults** (build-time tunables in `examples/simple_repeater/PacketFilterConfig.h`):
 
 | Constant | Default | Notes |
