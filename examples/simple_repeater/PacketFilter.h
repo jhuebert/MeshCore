@@ -118,14 +118,12 @@ class FilterRules {
   bool enabled;
   bool dirty;                 // needs save
   unsigned long dirty_since;
-  FILESYSTEM* _fs;
 
 public:
   FilterRules();
 
   void begin(FILESYSTEM* fs);      // load persisted config, pre-provision Public channel
   void loop(FILESYSTEM* fs);       // lazy dirty-flag save (same pattern as ClientACL)
-  bool isDirty() const { return dirty; }
 
   bool isEnabled() const { return enabled; }
   void setEnabled(bool on);
