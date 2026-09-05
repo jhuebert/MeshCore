@@ -103,8 +103,8 @@ bytes, not whole characters — one emoji is 4 bytes, so `J.hn` will not match
 
 | Constant | Default | Notes |
 |---|---|---|
-| `FILTER_MAX_RULES` | 16 | ~119 B per rule slot |
-| `FILTER_MAX_CHANNELS` | 8 | `chan` bitmask is one byte wide |
+| `FILTER_MAX_RULES` | 16 | ~128 B per rule slot |
+| `FILTER_MAX_CHANNELS` | 16 | `chan` bitmask is 16 bits (one bit per channel) |
 | `FILTER_CHAN_NAME_LEN` | 16 | channel name storage (NUL incl.) |
 | `FILTER_ADVERT_CACHE_SIZE` | 256 | advert rate-limiter cache |
 | `FILTER_SENDER_PATTERN_LEN` | 24 | sender regex length (NUL incl.) |

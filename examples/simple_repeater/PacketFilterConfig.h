@@ -5,8 +5,8 @@
 // build_flags (e.g. in platformio.local.ini: -DFILTER_MAX_RULES=32) or by
 // editing the defaults below.
 //
-// NOTE: FilterRule::chan_mask is one byte wide; if FILTER_MAX_CHANNELS is
-// raised above 8, widen chan_mask accordingly (see PacketFilter.h).
+// NOTE: FilterRule::chan_mask is 16 bits wide; if FILTER_MAX_CHANNELS is
+// raised above 16, widen chan_mask accordingly (see PacketFilter.h).
 
 #ifndef _PACKET_FILTER_CONFIG_H
 #define _PACKET_FILTER_CONFIG_H
@@ -16,7 +16,7 @@
 #endif
 
 #ifndef FILTER_MAX_CHANNELS
-  #define FILTER_MAX_CHANNELS 8        // keyed channel store entries
+  #define FILTER_MAX_CHANNELS 16       // keyed channel store entries
 #endif
 
 #ifndef FILTER_CHAN_NAME_LEN

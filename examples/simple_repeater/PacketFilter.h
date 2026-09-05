@@ -54,8 +54,8 @@
 #define FILTER_IV_HI_ANY  0x08   // hi unbounded (*)
 // flags == 0 -> predicate unset (wildcard)
 
-#if FILTER_MAX_CHANNELS > 8
-  #error "FILTER_MAX_CHANNELS > 8 needs a wider FilterRule::chan_mask"
+#if FILTER_MAX_CHANNELS > 16
+  #error "FILTER_MAX_CHANNELS > 16 needs a wider FilterRule::chan_mask"
 #endif
 
 struct FilterChannel {                  // keyed channel store
@@ -85,7 +85,7 @@ struct FilterRule {
     uint8_t pos;          // FILTER_PATH_* ; anchor position
   } path;
   uint8_t  hash_size_mask; // bit0..3 = path hash size 1..4; 0 = any
-  uint8_t  chan_mask;      // keyed channels by stored name; bitmask over the
+  uint16_t chan_mask;      // keyed channels by stored name; bitmask over the
                            // FILTER_MAX_CHANNELS store; 0 = unset (deferred to
                            // onGroupDataRecv, identity proven by MAC decrypt)
   uint8_t  chan_hash;      // 1-byte air hash (chanhash=XX); valid only w/ flag
