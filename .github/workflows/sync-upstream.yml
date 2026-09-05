@@ -1,0 +1,120 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build firmware even if upstream is unchanged
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: filter-sync
+  cancel-in-progress: false
+
+jobs:
+
+  sync:
+    name: Merge upstream dev into repeater-filter
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      conflict: ${{ steps.merge.outputs.conflict }}
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward fork dev to upstream dev
+        id: sync-dev
+        run: |
+          git remote add upstream https://github.com/meshcore-dev/MeshCore.git
+          git fetch upstream dev
+          git checkout dev
+          if ! git merge --ff-only upstream/dev; then
+            echo "fork/dev has diverged from upstream/dev; refusing to force-push." >&2
+            exit 1
+          fi
+          git push origin dev
+
+      - name: Merge fork dev into repeater-filter
+        id: merge
+        run: |
+          git checkout repeater-filter
+          BEFORE=$(git rev-parse HEAD)
+          if ! git merge origin/dev --no-edit; then
+            git diff --name-only --diff-filter=U > conflicted-files.txt
+            git merge --abort
+            echo "merged=false" >> $GITHUB_OUTPUT
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ "$(git rev-parse HEAD)" = "$BEFORE" ]; then
+            echo "Already up to date with dev"
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git push origin repeater-filter
+          echo "merged=true" >> $GITHUB_OUTPUT
+
+      - name: Open merge-conflict issue
+        if: steps.merge.outputs.conflict == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '[filter-sync-conflict]';
+            const files = fs.readFileSync('conflicted-files.txt', 'utf8').trim() || '(none listed)';
+            const body = [
+              marker,
+              'Automatic merge of `dev` into `repeater-filter` failed with conflicts.',
+              '',
+              '**Conflicted files:**',
+              '',
+              ...files.split('\n').map((f) => '- ' + f),
+              '',
+              'Resolve the conflicts locally, push the merge, then close this issue.',
+            ].join('\n');
+            const res = await github.rest.search.issuesAndPullRequests({
+              q: 'repo:' + context.repo.owner + '/' + context.repo.repo + ' is:issue is:open "' + marker + '" in:body',
+            });
+            if (res.data.total_count > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: res.data.items[0].number,
+                title: 'Upstream merge conflict in repeater-filter',
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Upstream merge conflict in repeater-filter',
+                body,
+              });
+            }
+
+      - name: Fail on merge conflict
+        if: steps.merge.outputs.conflict == 'true'
+        run: exit 1
+
+  build:
+    name: Build firmware
+    needs: sync
+    if: needs.sync.outputs.merged == 'true' || inputs.force_build == true
+    uses: ./.github/workflows/filter-build.yml
