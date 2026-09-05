@@ -97,9 +97,10 @@ struct FilterRule {
 };
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
-  uint8_t  pub_key_prefix[4]; // first 4 bytes of the advert's pubkey (collision
-                              // odds ~0.001% per 256 distinct nodes; worst case
-                              // is one falsely suppressed advert per window)
+  uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
+                              // advertRatelimitDrop); collision odds ~0.001%
+                              // per 256 distinct nodes, vanity-robust; worst
+                              // case is one falsely suppressed advert/window
   uint32_t first_seen_millis; // by this repeater's own monotonic clock
 };
 

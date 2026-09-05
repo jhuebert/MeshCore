@@ -209,7 +209,13 @@ void FilterRules::clearAdvertCache() {
 // advert exactly once, so each origin is recorded exactly once per window.
 bool FilterRules::advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_millis) {
   uint32_t window_ms = (uint32_t)ratelimit_hours * 3600UL * 1000UL;
-  const uint8_t* prefix = pkt->payload;   // origin pubkey = payload[0..31]
+  // cache key: 4 bytes sampled from the origin pubkey (payload[0..31]) at fixed
+  // offsets clear of the vanity zones at both ends — prefix/suffix grinding
+  // leaves the middle bytes uniformly random, so two vanity keys collide with
+  // plain random-chance odds instead of deterministically
+  static const uint8_t KEY_OFFSETS[4] = { 8, 14, 20, 26 };
+  uint8_t prefix[4];
+  for (int i = 0; i < 4; i++) prefix[i] = pkt->payload[KEY_OFFSETS[i]];
 
   int total = advert_cache_count < FILTER_ADVERT_CACHE_SIZE ? advert_cache_count
                                                            : FILTER_ADVERT_CACHE_SIZE;

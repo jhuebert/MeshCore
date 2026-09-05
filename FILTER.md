@@ -139,10 +139,12 @@ Independent of the rule list, flood-route adverts can be rate-limited **per
 originating node**: *each node's advert is forwarded at most once every N hours.*
 
 - `filter ratelimit advert <hours>` sets the window (0 = off, max 720 h ≈ 30 days).
-- The repeater keeps a 256-entry ring cache of origin pubkey prefixes (first 4
-  bytes; two distinct nodes colliding on a prefix is a ~0.001% chance per 256
-  nodes, worst case one advert falsely suppressed until the window expires) with
-  first-seen timestamps (RAM only — cleared on reboot).
+- The repeater keeps a 256-entry ring cache of 4-byte keys sampled from the
+  origin pubkey at fixed middle offsets (`{8,14,20,26}` — clear of the
+  prefix/suffix vanity zones, so grinded vanity keys collide with plain
+  random-chance odds, ~0.001% per 256 distinct nodes; worst case is one advert
+  falsely suppressed until the window expires) with first-seen timestamps (RAM
+  only — cleared on reboot).
 - A repeated advert from a known origin inside the window is silently dropped and
   counted in `limiter`. After the window expires the origin is re-admitted and the
   window restarts.
