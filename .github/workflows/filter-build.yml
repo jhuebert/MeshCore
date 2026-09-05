@@ -1,0 +1,188 @@
+name: Filter Firmware Build
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: Comma- or newline-separated build targets (defaults to the FIRMWARE_TARGETS repo variable)
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: Branch to build
+        required: false
+        type: string
+        default: repeater-filter
+      create_release:
+        description: Attach the built firmware to a release
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: Comma- or newline-separated build targets (defaults to the FIRMWARE_TARGETS repo variable)
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: Branch to build
+        required: false
+        type: string
+        default: repeater-filter
+      create_release:
+        description: Attach the built firmware to a release
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: filter-firmware-build
+  cancel-in-progress: false
+
+jobs:
+
+  version:
+    name: Derive version and release tag
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_version: ${{ steps.version.outputs.upstream_version }}
+      build_id: ${{ steps.version.outputs.build_id }}
+      short_sha: ${{ steps.version.outputs.short_sha }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      firmware_version: ${{ steps.version.outputs.firmware_version }}
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Derive Version
+        id: version
+        run: |
+          # upstream version from the last companion tag reachable from the build
+          # ref, e.g. companion-v1.17.1-62-g65aa1138 -> v1.17.1-62
+          DESC=$(git describe --tags --match 'companion-v*' HEAD || true)
+          if [ -n "$DESC" ]; then
+            UPSTREAM_VERSION="${DESC#companion-}"
+            UPSTREAM_VERSION="${UPSTREAM_VERSION%-g*}"
+          else
+            UPSTREAM_VERSION="untagged"
+          fi
+
+          BUILD_ID=$(date -u +%Y%m%d-%H%M)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          RELEASE_TAG="filter-${UPSTREAM_VERSION}-${BUILD_ID}-${SHORT_SHA}"
+          FIRMWARE_VERSION="${UPSTREAM_VERSION}-filter-${BUILD_ID}"
+
+          echo "upstream_version=$UPSTREAM_VERSION" >> $GITHUB_OUTPUT
+          echo "build_id=$BUILD_ID" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "firmware_version=$FIRMWARE_VERSION" >> $GITHUB_OUTPUT
+
+  validate-targets:
+    name: Validate build targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.validate.outputs.targets }}
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Validate Build Targets
+        id: validate
+        env:
+          TARGETS_INPUT: ${{ inputs.targets }}
+        run: |
+          # resolve targets: explicit input, else FIRMWARE_TARGETS repo variable
+          TARGETS="${TARGETS_INPUT:-${{ vars.FIRMWARE_TARGETS }}}"
+          if [ -z "$TARGETS" ]; then
+            echo "No targets: set the FIRMWARE_TARGETS repo variable or pass the 'targets' input" >&2
+            exit 1
+          fi
+
+          # known targets come from platformio.ini via build.sh
+          sh build.sh list > /tmp/known-targets.txt
+
+          # fail hard on unknown names instead of silently skipping them
+          for target in $(echo "$TARGETS" | tr ' ,' '\n'); do
+            [ -z "$target" ] && continue
+            if ! grep -qx "$target" /tmp/known-targets.txt; then
+              echo "Unknown build target: '$target'" >&2
+              exit 1
+            fi
+          done
+
+          # convert targets separated by comma/newline into a json array string
+          JSON_ARRAY=$(echo "$TARGETS" | tr ' ,' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          echo "targets=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [version, validate-targets]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.validate-targets.outputs.targets) }}
+      fail-fast: false
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Build Environment
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Build Firmware
+        env:
+          FIRMWARE_VERSION: ${{ needs.version.outputs.firmware_version }}
+        run: /usr/bin/env bash build.sh build-firmware ${{ matrix.target }}
+
+      - name: Upload Workflow Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: "firmware-${{ matrix.target }}"
+          path: out
+
+  release:
+    name: Create Release
+    needs: [version, validate-targets, build]
+    if: inputs.create_release
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+          path: out
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.release_tag }}
+          name: "Filter Firmware ${{ needs.version.outputs.upstream_version }} (filter @ ${{ needs.version.outputs.short_sha }}, ${{ needs.version.outputs.build_id }} UTC)"
+          body: |
+            Built from `${{ inputs.branch }}` @ ${{ needs.version.outputs.short_sha }}.
+
+            Upstream base: ${{ needs.version.outputs.upstream_version }} (meshcore-dev/MeshCore `dev`).
+            Build: ${{ needs.version.outputs.build_id }} UTC.
+
+            Targets: ${{ join(fromJSON(needs.validate-targets.outputs.targets), ', ') }}
+          files: out/*
+          commitish: ${{ inputs.branch }}
