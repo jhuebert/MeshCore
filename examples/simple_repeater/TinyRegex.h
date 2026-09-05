@@ -11,6 +11,8 @@
  *     against catastrophic backtracking on attacker-controlled input;
  *   - re_budget_exhausted() reports whether the last match aborted;
  *   - renamed re.h/re.c to TinyRegex.h/TinyRegex.cpp.
+ *   - fixed matchone() to compare the pattern char as unsigned char, so
+ *     literal bytes >= 0x80 (multi-byte UTF-8, e.g. emoji) can match.
  *
  * Supports:
  * ---------
