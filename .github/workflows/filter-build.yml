@@ -185,4 +185,4 @@ jobs:
 
             Targets: ${{ join(fromJSON(needs.validate-targets.outputs.targets), ', ') }}
           files: out/*
-          commitish: ${{ inputs.branch }}
+          target_commitish: ${{ inputs.branch }}
