@@ -141,9 +141,9 @@ public:
   int getNumChannels() const { return num_channels; }
   FilterChannel* getChannel(int idx) { return &channels[idx]; }
   FilterChannel* findChannel(const char* name);
-  // addChannel: psk_base64 required for non-'#' names; NULL/empty for '#name'
+  // addChannel: psk_hex required for non-'#' names; NULL/empty for '#name'
   // derives secret = sha256(name)[0..15] per the companion protocol.
-  FilterChannel* addChannel(const char* name, const char* psk_base64);
+  FilterChannel* addChannel(const char* name, const char* psk_hex);
   void delChannel(int idx);
 
   // match packet-level predicates (type/route/hops/len/snr/chanhash/path/hashsize)

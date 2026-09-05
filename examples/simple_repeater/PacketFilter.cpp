@@ -4,41 +4,26 @@
 #include "PacketFilter.h"
 #include <helpers/TxtDataHelpers.h>
 
-// Minimal base64 decoder for PSK entry (16/32-byte keys). Fork-owned: the
-// densaugeo/base64 lib is not in the repeater envs' lib_deps.
-static int filterDecodeBase64(const char* in, size_t in_len, uint8_t* out) {
-  uint8_t quad[4];
-  int nq = 0, out_len = 0;
-  for (size_t i = 0; i < in_len; i++) {
-    char c = in[i];
-    if (c == '=' || c == '\r' || c == '\n') continue;
-    int v;
-    if (c >= 'A' && c <= 'Z') v = c - 'A';
-    else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
-    else if (c >= '0' && c <= '9') v = c - '0' + 52;
-    else if (c == '+') v = 62;
-    else if (c == '/') v = 63;
-    else return 0;
-    quad[nq++] = (uint8_t)v;
-    if (nq == 4) {
-      out[out_len++] = (quad[0] << 2) | (quad[1] >> 4);
-      out[out_len++] = (quad[1] << 4) | (quad[2] >> 2);
-      out[out_len++] = (quad[2] << 6) | quad[3];
-      nq = 0;
-    }
+static int hexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
+static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
+  if ((in_len & 1) != 0) return 0;
+  for (size_t i = 0; i < in_len; i += 2) {
+    int hi = hexVal(in[i]), lo = hexVal(in[i + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
   }
-  if (nq == 2) { out[out_len++] = (quad[0] << 2) | (quad[1] >> 4); }
-  else if (nq == 3) {
-    out[out_len++] = (quad[0] << 2) | (quad[1] >> 4);
-    out[out_len++] = (quad[1] << 4) | (quad[2] >> 2);
-  } else if (nq != 0) {
-    return 0;
-  }
-  return out_len;
+  return in_len / 2;
 }
 
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
-#define FILTER_PUBLIC_PSK_B64  "izOH6cXN6mrJ5e26oRXNcg=="
+#define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
 #define FILTER_CFG_VERSION     3   // v3: chan_mask 16-bit + 1-byte channel hash
                                    // (v1/v2 configs discarded on upgrade)
@@ -71,7 +56,7 @@ void FilterRules::begin(FILESYSTEM* fs) {
 
   // pre-provision the well-known Public channel on a fresh node
   if (fresh && findChannel("Public") == NULL) {
-    addChannel("Public", FILTER_PUBLIC_PSK_B64);
+    addChannel("Public", FILTER_PUBLIC_PSK_HEX);
   }
 }
 
@@ -131,7 +116,7 @@ FilterChannel* FilterRules::findChannel(const char* name) {
   return NULL;
 }
 
-FilterChannel* FilterRules::addChannel(const char* name, const char* psk_base64) {
+FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   if (num_channels >= FILTER_MAX_CHANNELS) return NULL;
   if (name[0] == 0 || strlen(name) >= FILTER_CHAN_NAME_LEN) return NULL;
   if (findChannel(name) != NULL) return NULL;   // already in the store
@@ -139,7 +124,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_base64)
   FilterChannel* ch = &channels[num_channels];
   memset(ch, 0, sizeof(FilterChannel));
 
-  if (psk_base64 == NULL || psk_base64[0] == 0) {
+  if (psk_hex == NULL || psk_hex[0] == 0) {
     if (name[0] != '#') return NULL;   // psk required for non-hash channels
     // hashtag channels are public-by-construction: secret = sha256(name)[0..15]
     // (per the companion protocol; see plan §2.11)
@@ -148,7 +133,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_base64)
     memcpy(ch->secret, digest, 16);
     ch->secret_len = 16;
   } else {
-    int len = filterDecodeBase64(psk_base64, strlen(psk_base64), ch->secret);
+    int len = filterDecodeHex(psk_hex, strlen(psk_hex), ch->secret);
     if (len != 16 && len != 32) return NULL;
     ch->secret_len = len;
   }
@@ -523,13 +508,6 @@ static char* nextToken(char** p) {
   return t;
 }
 
-static int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
 // bounded reply append (CLI reply buffer is 160 bytes)
 static void radd(char** out, int* remain, const char* fmt, ...) {
   if (*remain <= 0) return;
@@ -823,7 +801,7 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   char* p = params;
   char* name = nextToken(&p);
   char* psk = nextToken(&p);
-  if (name == NULL) { strcpy(reply, "Err - usage: filter chan add <name> [<psk-b64>]"); return; }
+  if (name == NULL) { strcpy(reply, "Err - usage: filter chan add <name> [<psk-hex>]"); return; }
   if (strlen(name) >= FILTER_CHAN_NAME_LEN) { strcpy(reply, "Err - name too long"); return; }
   if (filter.findChannel(name) != NULL) { strcpy(reply, "Err - channel exists"); return; }
   if ((psk == NULL || psk[0] == 0) && name[0] != '#') {
