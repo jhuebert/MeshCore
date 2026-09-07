@@ -464,14 +464,15 @@ void FilterRules::load(FILESYSTEM* fs) {
 #endif
   if (file) {
     uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
+    uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
     if (file.read(hdr, 1) == 1 &&
-        (hdr[0] == FILTER_CFG_VERSION || hdr[0] == FILTER_CFG_VERSION - 1) &&
+        ((ver = hdr[0]) == FILTER_CFG_VERSION || ver == FILTER_CFG_VERSION - 1) &&
         file.read(hdr, 4) == 4) {
       enabled = hdr[0] != 0;
       uint8_t nr = hdr[1] < FILTER_MAX_RULES ? hdr[1] : FILTER_MAX_RULES;
       uint8_t nc = hdr[2] < FILTER_MAX_CHANNELS ? hdr[2] : FILTER_MAX_CHANNELS;
-      size_t rule_bytes = (hdr[0] == FILTER_CFG_VERSION) ? FILTER_RULE_PERSIST_BYTES
-                                                         : FILTER_RULE_V3_PERSIST_BYTES;
+      size_t rule_bytes = (ver == FILTER_CFG_VERSION) ? FILTER_RULE_PERSIST_BYTES
+                                                      : FILTER_RULE_V3_PERSIST_BYTES;
       if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
@@ -606,7 +607,9 @@ static bool parseInterval(const char* tok, Interval& iv, bool snr_mode) {
     if ((flags & FILTER_IV_LO_ANY) && (flags & FILTER_IV_HI_ANY)) {
       return true;   // (*,*) = "any": leave predicate unset
     }
-    iv.flags = flags;
+    // both-exclusive (a,b) encodes to flags==0, which reads back as unset:
+    // keep the predicate marked set via the sentinel bit
+    iv.flags = flags ? flags : FILTER_IV_SET;
     return true;
   }
 
