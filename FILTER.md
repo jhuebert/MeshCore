@@ -23,8 +23,8 @@ match. The guiding model:
 
 ### How rules are evaluated
 
-- **Packet-level rules** (type, route, hops, len, snr, path, hsize, chanhash)
-  are decided before the packet is forwarded.
+- **Packet-level rules** (type, route, region, hops, len, snr, path, hsize,
+  chanhash) are decided before the packet is forwarded.
 - **Content rules** (keyed `chan`, `sender`, `text`) are deferred: they are
   decided only after the group payload is decrypted and verified.
 
@@ -61,9 +61,18 @@ Each rule holds:
 | `hsize` | Path hash size (1–4 bytes) used by the packet |
 | `chan` | Keyed channel match (identity proven by decryption) |
 | `chanhash` | Single 1-byte on-air channel hash |
+| `region` | Comma list of flood regions (or `unscoped`); direct traffic never matches |
 | `sender` | Regex over the message sender (`"<sender>:"`), group text only |
 | `text` | Regex over the message text, group text only |
 | `hits` | Match counter (see §6) |
+
+**Region identity.** Scoped flood packets arrive with a transport code that the
+repeater matches against its region table (`region def ...`); plain flood packets
+with no scope are **unscoped**. The `region` predicate is decided at packet time,
+*before* decryption. Region names are resolved (and stored in canonical form)
+when the rule is added, so a rule keeps working if the region table is rebuilt —
+as long as the region is recreated under the same name. Direct-routed packets
+have no region at all and therefore never match a `region=` predicate.
 
 **Interval syntax** (used by `hops`, `len`, `snr`):
 
@@ -98,6 +107,7 @@ characters — one emoji is 4 bytes, so `J.hn` will not match `J😀hn` (use
 | Sender regex length | 24 chars |
 | Text regex length | 48 chars |
 | Path hashes per rule | 4 |
+| Region list length | 32 chars |
 | Advert rate-limiter cache | 256 origins |
 
 ---
@@ -202,6 +212,7 @@ Space-separated `key=value` tokens. Multiple values inside one key use commas
 | `hsize` | `1..4` (comma-combine) | Path hash size the packet carries |
 | `chan` | channel name(s) | Keyed store match, decryption-proven; `#` names auto-add |
 | `chanhash` | 2 hex chars | Bare 1-byte on-air channel hash (no decryption proof) |
+| `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (`unscoped` = plain flood with no scope); direct traffic never matches |
 | `sender` | regex | Sender name in `"<sender>: <text>"` (group text only) |
 | `text` | regex | Message text (group text only) |
 | `action` | `drop` \| `logonly` | Default `drop` |
@@ -331,6 +342,26 @@ filter del 3
 
 Disabled vs deleted: `filter disable 2` keeps the rule for later
 (`filter enable 2`), useful for A/B testing a predicate.
+
+### 8.8 Keeping out-of-region traffic off a channel
+
+Not all flood regions are appropriate for all channels. To forbid unscoped
+(plain, scope-less) flood traffic on a hashtag channel:
+
+```text
+filter add chan=#zperA region=unscoped action=drop
+```
+
+Or drop traffic scoped to several regions everywhere, on any channel:
+
+```text
+filter add region=Foo,Bar action=drop
+```
+
+Region names resolve by prefix at add time (like `region allow`), so
+`region=fo` stores the canonical name `Foo`. A combined rule shares one `hits`
+counter — for per-region usage stats, add one `logonly` rule per region
+instead. Direct-routed packets have no region and are never affected.
 
 ---
 
