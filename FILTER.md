@@ -276,10 +276,10 @@ decrypted payload, scoped to the channels where it's a problem:
 ```text
 filter chan add #local
 filter chan add #weather
-filter add chan=#local,#weather sender=^OBot$ action=drop
+filter add chan=#local,#weather sender=^BotName$ action=drop
 
 # substring match instead of exact:
-filter add chan=#local,#weather sender=Mule action=drop
+filter add chan=#local,#weather sender=BotName action=drop
 ```
 
 ### 8.4 Shadow mode before enforcement
