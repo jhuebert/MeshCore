@@ -53,7 +53,11 @@
 #define FILTER_IV_HI_INC  0x02   // hi endpoint inclusive
 #define FILTER_IV_LO_ANY  0x04   // lo unbounded (*)
 #define FILTER_IV_HI_ANY  0x08   // hi unbounded (*)
-// flags == 0 -> predicate unset (wildcard)
+// flags == 0 -> predicate unset (wildcard). A both-exclusive interval
+// "(a,b)" would otherwise encode as 0 and read back as a wildcard, so
+// parseInterval() stores FILTER_IV_SET alone for that case (endpoint logic
+// is unchanged: absent LO_INC/HI_INC still means exclusive).
+#define FILTER_IV_SET     0x10   // predicate is set (both endpoints exclusive)
 
 #if FILTER_MAX_CHANNELS > 16
   #error "FILTER_MAX_CHANNELS > 16 needs a wider FilterRule::chan_mask"
