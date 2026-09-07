@@ -25,9 +25,16 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     3   // v3: chan_mask 16-bit + 1-byte channel hash
-                                   // (v1/v2 configs discarded on upgrade)
+#define FILTER_CFG_VERSION     4   // v4: region= predicate list on rules
+                                   // (a v3 rule record is a byte-prefix of a v4
+                                   // record; v1/v2 configs discarded on upgrade)
 #define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
+// v3 record size: v3 ended each rule record at its offsetof(hits) — the config
+// bytes plus the tail padding that preceded the (then-next) uint32_t. With v4
+// only appending `regions` after `text`, that equals regions' offset rounded
+// up to uint32_t alignment.
+#define FILTER_RULE_V3_PERSIST_BYTES  ((offsetof(FilterRule, regions) + (alignof(uint32_t) - 1)) \
+                                       & ~(alignof(uint32_t) - 1))
 #define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
@@ -278,13 +285,33 @@ static bool ruleIsDeferred(const FilterRule* r) {
   return false;
 }
 
+// exact match of `name` against one comma token of `list`
+static bool regionListContains(const char* list, const char* name) {
+  size_t nlen = strlen(name);
+  while (*list) {
+    const char* comma = strchr(list, ',');
+    size_t tlen = comma ? (size_t)(comma - list) : strlen(list);
+    if (tlen == nlen && memcmp(list, name, tlen) == 0) return true;
+    if (!comma) break;
+    list = comma + 1;
+  }
+  return false;
+}
+
 // Evaluate the packet-level predicates of one rule (shared by both phases).
-static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint8_t payload_type) {
+static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint8_t payload_type,
+                              const RegionEntry* region) {
   if (r->type_mask != 0 && !(r->type_mask & (1 << payload_type))) return false;
 
   if (r->route_mask != 0) {
     uint8_t bit = pkt->isRouteFlood() ? FILTER_ROUTE_FLOOD : FILTER_ROUTE_DIRECT;
     if (!(r->route_mask & bit)) return false;
+  }
+
+  if (r->regions[0]) {               // region= predicate: comma list of canonical names
+    if (region == NULL) return false;   // direct-routed (or unknown code): no region at all
+    const char* want = region->isWildcard() ? "unscoped" : region->name;
+    if (!regionListContains(r->regions, want)) return false;
   }
 
   if (r->hops.flags != 0) {          // hop count is meaningful for flood path only
@@ -309,7 +336,7 @@ static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint
   return true;
 }
 
-uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis) {
+uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region) {
   if (!enabled) return FILTER_ACT_ALLOW;
 
   uint8_t payload_type = pkt->getPayloadType();
@@ -317,7 +344,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis) {
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
-    if (ruleMatchesPacket(r, pkt, payload_type)) {
+    if (ruleMatchesPacket(r, pkt, payload_type, region)) {
       r->hits++;
       action = r->action;
       break;   // first match wins
@@ -394,7 +421,7 @@ bool FilterRules::regexMatches(const char* pattern, const char* subject) {
 }
 
 uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
-                                  const uint8_t* data, size_t len) {
+                                  const uint8_t* data, size_t len, const RegionEntry* region) {
   if (!enabled) return FILTER_ACT_ALLOW;
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return FILTER_ACT_ALLOW;
 
@@ -406,7 +433,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled || !ruleIsDeferred(r)) continue;
-    if (!ruleMatchesPacket(r, pkt, type)) continue;
+    if (!ruleMatchesPacket(r, pkt, type, region)) continue;
     if ((r->chan_flags & FILTER_CHANFLG_MASK_SET) && !channelMatchesStore(r, channel)) continue;
     if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
@@ -437,14 +464,23 @@ void FilterRules::load(FILESYSTEM* fs) {
 #endif
   if (file) {
     uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
-    if (file.read(hdr, 1) == 1 && hdr[0] == FILTER_CFG_VERSION && file.read(hdr, 4) == 4) {
+    if (file.read(hdr, 1) == 1 &&
+        (hdr[0] == FILTER_CFG_VERSION || hdr[0] == FILTER_CFG_VERSION - 1) &&
+        file.read(hdr, 4) == 4) {
       enabled = hdr[0] != 0;
       uint8_t nr = hdr[1] < FILTER_MAX_RULES ? hdr[1] : FILTER_MAX_RULES;
       uint8_t nc = hdr[2] < FILTER_MAX_CHANNELS ? hdr[2] : FILTER_MAX_CHANNELS;
+      size_t rule_bytes = (hdr[0] == FILTER_CFG_VERSION) ? FILTER_RULE_PERSIST_BYTES
+                                                         : FILTER_RULE_V3_PERSIST_BYTES;
       if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
-          ok = (file.read((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
+          ok = (file.read((uint8_t*)&rules[i], rule_bytes) == rule_bytes);
+          if (ok && rule_bytes < FILTER_RULE_PERSIST_BYTES) {
+            // v3 record: the read drags the old record's trailing padding bytes
+            // into regions[0..1], so zero the whole regions field (predicate unset)
+            memset(rules[i].regions, 0, sizeof(rules[i].regions));
+          }
         }
         for (int i = 0; ok && i < nc; i++) {
           ok = (file.read((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
@@ -656,8 +692,8 @@ static bool setPattern(char* dest, size_t dest_sz, const char* pattern) {
   return re_compile(pattern) != 0;                 // validate syntax at add time
 }
 
-static bool addRuleParam(FilterRules& filter, FilterRule* r, const char* key, const char* val,
-                         char* reply) {
+static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
+                         const char* key, const char* val, char* reply) {
   if (strcmp(key, "chan") == 0) {
     char names[80];
     if (strlen(val) >= sizeof(names)) { strcpy(reply, "Err - chan list too long"); return false; }
@@ -724,6 +760,32 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, const char* key, co
       strcpy(reply, "Err - bad path spec");
       return false;
     }
+    return true;
+  }
+  if (strcmp(key, "region") == 0) {
+    char vals[80];
+    if (strlen(val) >= sizeof(vals)) { strcpy(reply, "Err - region list too long"); return false; }
+    strcpy(vals, val);
+    char list[FILTER_REGION_LIST_LEN];
+    list[0] = 0;
+    char* vp = vals;
+    char* t;
+    while ((t = strsep(&vp, ",")) != NULL) {
+      if (t[0] == 0) { strcpy(reply, "Err - empty region name"); return false; }
+      const char* canon;
+      if (strcmp(t, "unscoped") == 0 || strcmp(t, "*") == 0) {
+        canon = "unscoped";   // keyword wins, even if a region were named "unscoped"
+      } else {
+        RegionEntry* reg = regions->findByNamePrefix(t);
+        if (reg == NULL) { sprintf(reply, "Err - unknown region '%s'", t); return false; }
+        canon = reg->name;
+      }
+      size_t used = strlen(list);
+      if (used + strlen(canon) + 2 > sizeof(list)) { strcpy(reply, "Err - region list too long"); return false; }
+      if (used) list[used++] = ',';
+      strcpy(&list[used], canon);
+    }
+    strcpy(r->regions, list);
     return true;
   }
   if (strcmp(key, "hsize") == 0) {
@@ -821,7 +883,7 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
   sprintf(reply, "OK - chan %s deleted", name);
 }
 
-static void cliAdd(FilterRules& filter, char* params, char* reply) {
+static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
   FilterRule* r = filter.addRule();
   if (r == NULL) { strcpy(reply, "Err - rule list full"); return; }
   int idx = filter.getNumRules() - 1;
@@ -836,7 +898,7 @@ static void cliAdd(FilterRules& filter, char* params, char* reply) {
       return;
     }
     *eq = 0;
-    if (!addRuleParam(filter, r, tok, eq + 1, reply)) {
+    if (!addRuleParam(filter, r, regions, tok, eq + 1, reply)) {
       filter.delRule(idx);   // roll back the half-added rule
       return;
     }
@@ -900,6 +962,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
     }
   }
   if (r->chan_flags & FILTER_CHANFLG_HASH_SET) radd(&out, &remain, " chanhash=%02X", r->chan_hash);
+  if (r->regions[0]) radd(&out, &remain, " region=%s", r->regions);
   if (r->sender[0]) radd(&out, &remain, " sender=%s", r->sender);
   if (r->text[0]) radd(&out, &remain, " text=%s", r->text);
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
@@ -923,7 +986,7 @@ static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
   return true;
 }
 
-void filterCLI(FilterRules& filter, const char* command, char* reply) {
+void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions) {
   char buf[MAX_PACKET_PAYLOAD + 1];
   StrHelper::strzcpy(buf, command, sizeof(buf));
   char* p = buf;
@@ -949,7 +1012,7 @@ void filterCLI(FilterRules& filter, const char* command, char* reply) {
       strcpy(reply, "Err - usage: chan list|add <name> [<psk>]|del <name>");
     }
   } else if (strcmp(cmd, "add") == 0) {
-    cliAdd(filter, p, reply);
+    cliAdd(filter, regions, p, reply);
   } else if (strcmp(cmd, "list") == 0) {
     cliList(filter, reply);
   } else if (strcmp(cmd, "get") == 0) {

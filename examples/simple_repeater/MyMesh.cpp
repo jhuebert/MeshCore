@@ -432,7 +432,7 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
-  if (filter.checkPacket(packet, millis()) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
+  if (filter.checkPacket(packet, millis(), recv_pkt_region) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -464,7 +464,7 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
 }
 
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
-  if (filter.checkContent(packet, type, channel, data, len) == FILTER_ACT_DROP) {
+  if (filter.checkContent(packet, type, channel, data, len, recv_pkt_region) == FILTER_ACT_DROP) {
     MESH_DEBUG_PRINTLN("filter: dropping group packet by content rule");
     packet->markDoNotRetransmit();
   }
@@ -1295,7 +1295,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   } else if (memcmp(command, "filter", 6) == 0 && (command[6] == ' ' || command[6] == 0)) {
     const char* sub = command + 6;
     while (*sub == ' ') sub++;
-    filterCLI(filter, sub, reply);
+    filterCLI(filter, sub, reply, &region_map);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }

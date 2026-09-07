@@ -12,7 +12,7 @@
 #define _PACKET_FILTER_CONFIG_H
 
 #ifndef FILTER_MAX_RULES
-  #define FILTER_MAX_RULES 16          // rule slots (~119 B each, incl. patterns)
+  #define FILTER_MAX_RULES 16          // rule slots (~151 B each, incl. patterns)
 #endif
 
 #ifndef FILTER_MAX_CHANNELS
@@ -33,6 +33,10 @@
 
 #ifndef FILTER_TEXT_PATTERN_LEN
   #define FILTER_TEXT_PATTERN_LEN 48   // text regex storage length (NUL incl.)
+#endif
+
+#ifndef FILTER_REGION_LIST_LEN
+  #define FILTER_REGION_LIST_LEN 32    // region= comma list storage length (NUL incl.)
 #endif
 
 #ifndef FILTER_PATH_HASH_SLOTS

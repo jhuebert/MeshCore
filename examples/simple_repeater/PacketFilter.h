@@ -21,6 +21,7 @@
 #include <Arduino.h>
 #include <Mesh.h>
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
+#include <helpers/RegionMap.h>       // RegionEntry (region= predicate)
 #include "PacketFilterConfig.h"
 #include "TinyRegex.h"
 
@@ -93,6 +94,8 @@ struct FilterRule {
   uint8_t  chan_flags;     // FILTER_CHANFLG_* bits
   char     sender[FILTER_SENDER_PATTERN_LEN];  // regex over "<sender>:"; empty = wildcard
   char     text[FILTER_TEXT_PATTERN_LEN];      // regex over message text;   empty = wildcard
+  char     regions[FILTER_REGION_LIST_LEN];    // comma list of canonical region names
+                                           // and/or "unscoped"; empty = wildcard
   uint32_t hits;           // match counter (logonly telemetry + validation)
 };
 
@@ -144,14 +147,16 @@ public:
   FilterChannel* addChannel(const char* name, const char* psk_hex);
   void delChannel(int idx);
 
-  // match packet-level predicates (type/route/hops/len/snr/chanhash/path/hashsize)
-  // and apply the advert rate limiter. Returns FILTER_ACT_*.
-  uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis);
+  // match packet-level predicates (type/route/region/hops/len/snr/chanhash/path/
+  // hashsize) and apply the advert rate limiter. `region` is the region the
+  // packet arrived in (NULL = direct-routed or unknown transport code).
+  // Returns FILTER_ACT_*.
+  uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region);
 
   // evaluate content rules on a decrypted group payload (chan keyed, sender, text);
   // caller drops the packet if this returns FILTER_ACT_DROP.
   uint8_t checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
-                       const uint8_t* data, size_t len);
+                       const uint8_t* data, size_t len, const RegionEntry* region);
 
   // supply keyed-channel candidates for core's group decryption
   int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
@@ -178,7 +183,8 @@ private:
 };
 
 // CLI command handler: invoke with the command after "filter" (prefix removed).
+// `regions` resolves region names for the region= predicate.
 // Replies must fit the 160-byte CLI reply buffer.
-void filterCLI(FilterRules& filter, const char* command, char* reply);
+void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions);
 
 #endif // _PACKET_FILTER_H
