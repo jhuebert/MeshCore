@@ -432,6 +432,7 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
+  if (!battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
   if (filter.checkPacket(packet, millis(), recv_pkt_region) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
@@ -960,6 +961,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
   filter.begin(fs);
+  battGate.begin(fs);
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -1297,6 +1299,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 6;
     while (*sub == ' ') sub++;
     filterCLI(filter, sub, reply, &region_map);
+  } else if (memcmp(command, "battery", 7) == 0 && (command[7] == ' ' || command[7] == 0)) {
+    const char* sub = command + 7;
+    while (*sub == ' ') sub++;
+    batteryCLI(battGate, board, sub, reply);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1343,6 +1349,9 @@ void MyMesh::loop() {
 
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
+
+  // battery gate: periodic voltage sample + lazy config save
+  battGate.loop(_fs, board);
 
   // update uptime
   uint32_t now = millis();
