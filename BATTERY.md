@@ -77,28 +77,3 @@ batt 3250mV; gate on; SUSPENDED; suspend <3300mV; resume >=3500mV; drops 42
 > battery off
 OK - battery gate off
 ```
-
-## 5. Testing
-
-Native unit tests (no hardware needed):
-
-```
-pio test -e native_battery_gate
-```
-
-### On-air verification playbook
-
-Requires no battery control — only remote CLI access to the repeater (e.g. via
-a companion node). Once the physical repeater is reachable again:
-
-1. `battery` — sanity-check the mV reading against the node's telemetry.
-2. `battery 9999` — the gate suspends after two consecutive samples
-   (~30–60 s); confirm `battery` reports `SUSPENDED`, flood forwards stop, and
-   the drop counter climbs while traffic is offered.
-3. `battery 1` — the gate resumes on the next sample cycle (thresholds now far
-   below the live voltage); confirm `forwarding` and normal relaying.
-4. `battery off` — restore normal operation.
-
-Not covered by the native tests (hardware checks): the
-`allowPacketForward()` hook itself, real ADC accuracy/sag behaviour, and
-on-air timing.
