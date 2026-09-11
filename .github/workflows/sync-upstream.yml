@@ -22,11 +22,8 @@ concurrency:
 jobs:
 
   sync:
-    name: Merge upstream dev into repeater-filter
+    name: Sync upstream and filter branches
     runs-on: ubuntu-latest
-    outputs:
-      merged: ${{ steps.merge.outputs.merged }}
-      conflict: ${{ steps.merge.outputs.conflict }}
     steps:
 
       - name: Clone Repo
@@ -50,6 +47,17 @@ jobs:
             exit 1
           fi
           git push origin dev
+
+      - name: Fast-forward fork main to upstream main
+        id: sync-main
+        run: |
+          git fetch upstream main
+          git checkout -B main origin/main
+          if ! git merge --ff-only upstream/main; then
+            echo "fork/main has diverged from upstream/main; refusing to force-push." >&2
+            exit 1
+          fi
+          git push origin main
 
       - name: Merge fork dev into repeater-filter
         id: merge
@@ -109,12 +117,85 @@ jobs:
               });
             }
 
+      - name: Maintain repeater-filter-stable
+        id: stable
+        run: |
+          git checkout repeater-filter-stable || git checkout -b repeater-filter-stable origin/main
+          # carry the upstream release branch (merge commit when main moved;
+          # repeater-filter-stable always diverges from main by the filter picks)
+          if ! git merge origin/main --no-edit; then
+            git diff --name-only --diff-filter=U > stable-conflicted-files.txt
+            git merge --abort
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # cherry-pick filter commits not yet on stable (git cherry matches by
+          # patch-id, so already-picked commits are skipped); oldest first
+          PICKS=$(git cherry HEAD repeater-filter origin/dev | grep '^+' | cut -d' ' -f2 | tac)
+          for c in $PICKS; do
+            if ! git cherry-pick "$c"; then
+              git diff --name-only --diff-filter=U > stable-conflicted-files.txt || true
+              git cherry-pick --abort
+              echo "conflict=true" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
+          git push origin repeater-filter-stable
+
+      - name: Open stable-sync conflict issue
+        if: steps.stable.outputs.conflict == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '[filter-sync-conflict-stable]';
+            const files = fs.readFileSync('stable-conflicted-files.txt', 'utf8').trim() || '(none listed)';
+            const body = [
+              marker,
+              'Automatic update of `repeater-filter-stable` (merge of `main` and/or cherry-picks from `repeater-filter`) failed with conflicts.',
+              '',
+              '**Conflicted files:**',
+              '',
+              ...files.split('\n').map((f) => '- ' + f),
+              '',
+              'Resolve the conflicts locally, push the branch, then close this issue.',
+            ].join('\n');
+            const res = await github.rest.search.issuesAndPullRequests({
+              q: 'repo:' + context.repo.owner + '/' + context.repo.repo + ' is:issue is:open "' + marker + '" in:body',
+            });
+            if (res.data.total_count > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: res.data.items[0].number,
+                title: 'Upstream sync conflict in repeater-filter-stable',
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Upstream sync conflict in repeater-filter-stable',
+                body,
+              });
+            }
+
       - name: Fail on merge conflict
         if: steps.merge.outputs.conflict == 'true'
         run: exit 1
 
   build:
-    name: Build firmware
+    name: Build firmware (${{ matrix.channel }})
     needs: sync
-    if: needs.sync.outputs.merged == 'true' || inputs.force_build == true
+    strategy:
+      matrix:
+        include:
+          - channel: dev
+            branch: repeater-filter
+          - channel: stable
+            branch: repeater-filter-stable
     uses: ./.github/workflows/filter-build.yml
+    with:
+      channel: ${{ matrix.channel }}
+      branch: ${{ matrix.branch }}
+      force_build: ${{ inputs.force_build }}
