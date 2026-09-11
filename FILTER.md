@@ -4,6 +4,9 @@ A remote-configurable packet filter for the `simple_repeater` firmware. Rules ca
 added, inspected, and removed over the repeater CLI (locally via serial, or remotely
 over the mesh by an authenticated admin) — no rebuild or physical access required.
 
+> Maintained on the [jhuebert fork](https://github.com/jhuebert/MeshCore) — prebuilt
+> firmware is on the fork's Releases page (`filter-v*` tags).
+
 ---
 
 ## 1. Overview
