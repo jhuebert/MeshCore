@@ -1,6 +1,7 @@
 // BatteryGate.cpp — see BatteryGate.h for the design overview.
 
 #include "BatteryGate.h"
+#include "CliUtil.h"
 
 #define BATT_CFG_FILE            "/batt_cfg"
 #define BATT_CFG_VERSION         1
@@ -140,30 +141,6 @@ void BatteryGate::save(FILESYSTEM* fs) {
 }
 
 // ---------------------------------------------------------------- CLI
-
-static char* nextToken(char** p) {
-  char* s = *p;
-  while (*s == ' ') s++;
-  if (*s == 0) { *p = s; return NULL; }
-  char* t = s;
-  while (*s && *s != ' ') s++;
-  if (*s) { *s = 0; s++; }
-  *p = s;
-  return t;
-}
-
-// bounded reply append (CLI reply buffer is 160 bytes)
-static void radd(char** out, int* remain, const char* fmt, ...) {
-  if (*remain <= 0) return;
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(*out, *remain, fmt, ap);
-  va_end(ap);
-  if (n < 0) { *remain = 0; return; }
-  if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
-  *out += n;
-  *remain -= n;
-}
 
 static bool parseMilliVolts(const char* tok, bool* numeric, uint16_t* out) {
   *numeric = false;

@@ -128,6 +128,16 @@ Content rules match against a store of named channels and their keys:
 - Deleting a channel keeps existing rules working (their references are
   updated; the deleted channel simply no longer matches).
 
+**The store is not the rule list.** Rules reference store entries by index and
+never own them: deleting a rule (or `filter clear`) leaves auto-added channels
+in place, so a `#name` channel created by the shorthand can outlive the rule
+that created it. That is usually harmless — a stored channel is also offered
+for decryption while the filter is on — but the store holds a hard maximum of
+16 entries no matter how few rules use them. When it is full, new `chan=#...`
+references are rejected with `Err - chan store full` until you free a slot with
+`filter chan del <name>`; candidates can be found by comparing `filter chan
+list` against the `chan=` lines of `filter get <idx>`.
+
 While the filter is enabled, group payloads on any stored channel are offered
 for decryption — so a keyed channel rule doubles as an implicit "decrypt this
 channel" registration, letting content rules fire on channels the repeater
@@ -202,7 +212,11 @@ All commands begin with `filter`. Replies are short (the remote CLI reply buffer
 ### `filter add` predicate keys
 
 Space-separated `key=value` tokens. Multiple values inside one key use commas
-(`type=advert,txt`, `chan=#a,#b`, `hsize=1,2`).
+(`type=advert,txt`, `chan=#a,#b`, `hsize=1,2`). Values containing spaces must be
+wrapped in double quotes: `text="^RX in place"` (alternatively, `\s` matches a
+literal space: `text="^RX\sin\splace"`). Quote characters are stripped by the
+CLI tokenizer, so a pattern cannot contain a literal `"` (an odd number of
+quotes is rejected) — work around one with `.` if a message text ever includes it.
 
 | Key | Values | Matches |
 |---|---|---|
@@ -242,6 +256,9 @@ filter add type=advert path=^A1B2C3 action=drop
 
 # Drop group text on Public whose text looks like a flood of test beacons
 filter add chan=Public text=^BEACON action=drop
+
+# Drop an auto-reply bot's beacon: sender AND text must both match
+filter add chan=#test sender=^SpamBot text="^RX in place" action=drop
 
 # Damp Direct-of-motion chatter: only very long payloads on flood routes
 filter add route=flood len=[180,*] action=drop
@@ -294,6 +311,9 @@ filter add chan=#local,#weather sender=^BotName$ action=drop
 
 # substring match instead of exact:
 filter add chan=#local,#weather sender=BotName action=drop
+
+# predicates combine (AND): match the sender AND the message text
+filter add chan=#local sender=^BotName$ text="^RX in place" action=drop
 ```
 
 ### 8.4 Shadow mode before enforcement
