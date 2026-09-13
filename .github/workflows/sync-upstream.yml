@@ -63,19 +63,25 @@ jobs:
         id: merge
         run: |
           git checkout repeater-filter
-          BEFORE=$(git rev-parse HEAD)
-          if ! git merge origin/dev --no-edit; then
+          # --no-commit so the fork-owned README can be restored before the
+          # merge commit is created
+          git merge origin/dev --no-commit --no-ff || true
+          # README.md is fork-owned: force it back to this branch's version no
+          # matter what the merge did (clean take of upstream changes or conflict)
+          git checkout HEAD -- README.md
+          if [ ! -f .git/MERGE_HEAD ]; then
+            echo "Already up to date with dev"
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
             git diff --name-only --diff-filter=U > conflicted-files.txt
             git merge --abort
             echo "merged=false" >> $GITHUB_OUTPUT
             echo "conflict=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-          if [ "$(git rev-parse HEAD)" = "$BEFORE" ]; then
-            echo "Already up to date with dev"
-            echo "merged=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          git commit --no-edit
           git push origin repeater-filter
           echo "merged=true" >> $GITHUB_OUTPUT
 
@@ -123,16 +129,31 @@ jobs:
           git checkout repeater-filter-stable || git checkout -b repeater-filter-stable origin/main
           # carry the upstream release branch (merge commit when main moved;
           # repeater-filter-stable always diverges from main by the filter picks)
-          if ! git merge origin/main --no-edit; then
-            git diff --name-only --diff-filter=U > stable-conflicted-files.txt
-            git merge --abort
-            echo "conflict=true" >> $GITHUB_OUTPUT
-            exit 0
+          # --no-commit so the fork-owned README can be resolved before the
+          # merge commit is created
+          git merge origin/main --no-commit --no-ff || true
+          if [ -f .git/MERGE_HEAD ] && [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            # README.md is fork-owned; resolve it as the repeater-filter version
+            # so it can never block the merge. Abort only for other files.
+            git checkout repeater-filter -- README.md
+            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+              git diff --name-only --diff-filter=U > stable-conflicted-files.txt
+              git merge --abort
+              echo "conflict=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          if [ -f .git/MERGE_HEAD ]; then
+            git commit --no-edit
           fi
           # cherry-pick filter commits not yet on stable (git cherry matches by
           # patch-id, so already-picked commits are skipped); oldest first
-          PICKS=$(git cherry HEAD repeater-filter origin/dev | grep '^+' | cut -d' ' -f2 | tac)
+          PICKS=$(git cherry HEAD repeater-filter origin/dev | grep '^+' | cut -d' ' -f2)
           for c in $PICKS; do
+            # skip fork-owned-README-only commits; the README is synced below
+            if [ -z "$(git show --pretty=format: --name-only "$c" | grep -v '^README.md$')" ]; then
+              continue
+            fi
             if ! git cherry-pick "$c"; then
               git diff --name-only --diff-filter=U > stable-conflicted-files.txt || true
               git cherry-pick --abort
@@ -140,6 +161,11 @@ jobs:
               break
             fi
           done
+          # keep the fork-owned README in step with repeater-filter
+          git checkout repeater-filter -- README.md
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: sync fork README"
+          fi
           git push origin repeater-filter-stable
 
       - name: Open stable-sync conflict issue
