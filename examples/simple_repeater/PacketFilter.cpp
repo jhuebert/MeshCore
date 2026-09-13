@@ -2,6 +2,7 @@
 // See PacketFilter.h for the rule model.
 
 #include "PacketFilter.h"
+#include "CliUtil.h"
 #include <helpers/TxtDataHelpers.h>
 
 static int hexVal(char c) {
@@ -531,30 +532,6 @@ void FilterRules::save(FILESYSTEM* fs) {
 
 // ---------------------------------------------------------------- CLI
 
-static char* nextToken(char** p) {
-  char* s = *p;
-  while (*s == ' ') s++;
-  if (*s == 0) { *p = s; return NULL; }
-  char* t = s;
-  while (*s && *s != ' ') s++;
-  if (*s) { *s = 0; s++; }
-  *p = s;
-  return t;
-}
-
-// bounded reply append (CLI reply buffer is 160 bytes)
-static void radd(char** out, int* remain, const char* fmt, ...) {
-  if (*remain <= 0) return;
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(*out, *remain, fmt, ap);
-  va_end(ap);
-  if (n < 0) { *remain = 0; return; }
-  if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
-  *out += n;
-  *remain -= n;
-}
-
 // interval value: hops/len = unsigned decimal; snr = signed dB (snapped to the
 // quarter-dB grid, stored as quarter-dB int)
 static bool parseIvNum(const char* s, bool snr_mode, uint16_t* out) {
@@ -704,12 +681,19 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     char* np = names;
     char* nm;
     while ((nm = strsep(&np, ",")) != NULL) {
-      if (nm[0] == 0) { strcpy(reply, "Err - empty chan name"); return false; }
+      if (nm[0] == 0 || (nm[0] == '#' && nm[1] == 0)) { strcpy(reply, "Err - empty chan name"); return false; }
       FilterChannel* ch = filter.findChannel(nm);
       if (ch == NULL && nm[0] == '#') {
         ch = filter.addChannel(nm, NULL);   // auto-provision '#' names with derived PSK
       }
-      if (ch == NULL) { sprintf(reply, "Err - unknown chan '%s'", nm); return false; }
+      if (ch == NULL) {
+        if (nm[0] == '#' && filter.getNumChannels() >= FILTER_MAX_CHANNELS) {
+          strcpy(reply, "Err - chan store full");
+        } else {
+          sprintf(reply, "Err - unknown chan '%s'", nm);
+        }
+        return false;
+      }
       int idx = ch - filter.getChannel(0);
       r->chan_mask |= (1 << idx);
       r->chan_flags |= FILTER_CHANFLG_MASK_SET;
@@ -805,6 +789,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return true;
   }
   if (strcmp(key, "sender") == 0) {
+    if (val[0] == 0) { strcpy(reply, "Err - empty regex"); return false; }   // matches everything
     if (!setPattern(r->sender, FILTER_SENDER_PATTERN_LEN, val)) {
       strcpy(reply, "Err - bad/long sender regex");
       return false;
@@ -812,6 +797,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return true;
   }
   if (strcmp(key, "text") == 0) {
+    if (val[0] == 0) { strcpy(reply, "Err - empty regex"); return false; }   // matches everything
     if (!setPattern(r->text, FILTER_TEXT_PATTERN_LEN, val)) {
       strcpy(reply, "Err - bad/long text regex");
       return false;
@@ -865,6 +851,7 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   char* psk = nextToken(&p);
   if (name == NULL) { strcpy(reply, "Err - usage: filter chan add <name> [<psk-hex>]"); return; }
   if (strlen(name) >= FILTER_CHAN_NAME_LEN) { strcpy(reply, "Err - name too long"); return; }
+  if (name[0] == '#' && name[1] == 0) { strcpy(reply, "Err - empty chan name"); return; }
   if (filter.findChannel(name) != NULL) { strcpy(reply, "Err - channel exists"); return; }
   if ((psk == NULL || psk[0] == 0) && name[0] != '#') {
     strcpy(reply, "Err - psk required for non-# names");
@@ -887,6 +874,11 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
 }
 
 static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
+  // an odd quote count would silently swallow the tokens that follow
+  int quotes = 0;
+  for (const char* s = params; *s; s++) if (*s == '"') quotes++;
+  if (quotes & 1) { strcpy(reply, "Err - unbalanced quotes"); return; }
+
   FilterRule* r = filter.addRule();
   if (r == NULL) { strcpy(reply, "Err - rule list full"); return; }
   int idx = filter.getNumRules() - 1;
@@ -966,8 +958,14 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   }
   if (r->chan_flags & FILTER_CHANFLG_HASH_SET) radd(&out, &remain, " chanhash=%02X", r->chan_hash);
   if (r->regions[0]) radd(&out, &remain, " region=%s", r->regions);
-  if (r->sender[0]) radd(&out, &remain, " sender=%s", r->sender);
-  if (r->text[0]) radd(&out, &remain, " text=%s", r->text);
+  if (r->sender[0]) {
+    if (strchr(r->sender, ' ')) radd(&out, &remain, " sender=\"%s\"", r->sender);
+    else radd(&out, &remain, " sender=%s", r->sender);
+  }
+  if (r->text[0]) {
+    if (strchr(r->text, ' ')) radd(&out, &remain, " text=\"%s\"", r->text);
+    else radd(&out, &remain, " text=%s", r->text);
+  }
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
 }
 
@@ -983,7 +981,7 @@ static void cliStats(FilterRules& filter, char* reply) {
 }
 
 static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
-  if (arg == NULL || arg[0] == 0) { strcpy(reply, "Err - rule index required"); return false; }
+  if (arg == NULL || arg[0] < '0' || arg[0] > '9') { strcpy(reply, "Err - rule index required"); return false; }
   idx = atoi(arg);
   if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return false; }
   return true;
@@ -1043,7 +1041,7 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
     }
   } else if (strcmp(cmd, "clear") == 0) {
     filter.clearRules();
-    strcpy(reply, "OK - rules cleared");
+    strcpy(reply, "OK - rules cleared (chans kept)");
   } else if (strcmp(cmd, "ratelimit") == 0) {
     char* sub = nextToken(&p);
     if (sub == NULL) {

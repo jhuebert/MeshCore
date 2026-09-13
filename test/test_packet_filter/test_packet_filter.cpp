@@ -1151,6 +1151,37 @@ TEST_F(FilterTest, AddSenderAndTextPatterns) {
   EXPECT_STREQ(filter.getRule(0)->text, "^BEACON");
 }
 
+TEST_F(FilterTest, AddQuotedTextWithSpaces) {
+  expectOk(filter, "add text=\"^RX in place\"");
+  EXPECT_STREQ(filter.getRule(0)->text, "^RX in place");
+  auto payload = makeGroupText("Alice", "RX in place now");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, payload.len);
+  auto chan = channelFromStore(filter, 0);
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
+                                payload.len, nullptr),
+            FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, SenderAndTextPredicatesCombine) {
+  expectOk(filter, "add sender=^SpamBot text=\"^RX in place\"");
+  auto chan = channelFromStore(filter, 0);
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto hit = makeGroupText("SpamBot", "RX in place");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, hit.data,
+                                hit.len, nullptr),
+            FILTER_ACT_DROP);
+  auto wrongSender = makeGroupText("OtherGuy", "RX in place");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, wrongSender.data,
+                                wrongSender.len, nullptr),
+            FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, GetQuotesValuesContainingSpaces) {
+  expectOk(filter, "add sender=^SpamBot text=\"^RX in place\"");
+  EXPECT_NE(cli(filter, "get 0").find("sender=^SpamBot text=\"^RX in place\""),
+            std::string::npos);
+}
+
 TEST_F(FilterTest, AddLogOnlyAction) {
   expectOk(filter, "add sender=x action=logonly");
   EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_LOG_ONLY);
@@ -1177,6 +1208,11 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     { "add region=Nowhere", "Err - unknown region" },
     { "add action=ban", "Err - action must be drop|logonly" },
     { "add sender=[a", "Err - bad/long sender regex" },  // compile check rejects
+    { "add text=[a", "Err - bad/long text regex" },      // compile check rejects
+    { "add text=", "Err - empty regex" },                // empty regex matches everything
+    { "add sender=", "Err - empty regex" },
+    { "add chan=#", "Err - empty chan name" },           // bare '#' = empty hashtag
+    { "add text=\"unterminated", "Err - unbalanced quotes" },
   };
   for (auto& c : cases) {
     EXPECT_EQ(cli(filter, c.cmd).find(c.err_fragment), 0) << c.cmd;
@@ -1194,6 +1230,19 @@ TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
 TEST_F(FilterTest, AddRejectsWhenFull) {
   for (int i = 0; i < FILTER_MAX_RULES; i++) filter.addRule();
   EXPECT_EQ(cli(filter, "add type=advert"), "Err - rule list full");
+}
+
+TEST_F(FilterTest, RuleIdxRejectsNonNumeric) {
+  expectOk(filter, "add type=advert");
+  EXPECT_EQ(cli(filter, "get abc").substr(0, 5), "Err -");   // atoi() would silently pick rule 0
+  EXPECT_EQ(cli(filter, "disable abc").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "enable 1x").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getRule(0)->enabled, true);   // untouched by the rejects
+}
+
+TEST_F(FilterTest, ChanAddRejectsBareHash) {
+  EXPECT_EQ(cli(filter, "chan add #"), "Err - empty chan name");
+  EXPECT_EQ(cli(filter, "chan add"), "Err - usage: filter chan add <name> [<psk-hex>]");
 }
 
 // ---------------------------------------------------------------- rule bookkeeping
@@ -1215,7 +1264,7 @@ TEST_F(FilterTest, GetEnableDisableDelClear) {
   EXPECT_EQ(cli(filter, "del 0"), "OK - rule 0 deleted");
   EXPECT_EQ(filter.getNumRules(), 1);
 
-  EXPECT_EQ(cli(filter, "clear"), "OK - rules cleared");
+  EXPECT_EQ(cli(filter, "clear"), "OK - rules cleared (chans kept)");
   EXPECT_EQ(filter.getNumRules(), 0);
 }
 
@@ -1264,6 +1313,15 @@ TEST_F(FilterTest, ChanStoreFull) {
     ASSERT_EQ(cli(filter, ("chan add #full" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
   }
   EXPECT_EQ(cli(filter, "chan add #onemore"), "Err - bad psk or store full");
+}
+
+TEST_F(FilterTest, AddChanAutoProvisionStoreFull) {
+  // Public + 15 more fills the 16-slot store; auto-provision must report the
+  // real reason, not "unknown chan"
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    ASSERT_EQ(cli(filter, ("chan add #full" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
+  }
+  EXPECT_EQ(cli(filter, "add chan=#overflow"), "Err - chan store full");
 }
 
 TEST_F(FilterTest, ChanDelRemapsRuleMasks) {
