@@ -17,6 +17,11 @@ on decrypted payloads — channel identity and sender/text patterns. Rules are
 managed over the repeater CLI, locally via serial or **remotely over the mesh**
 by an authenticated admin. No rebuild, no physical access.
 
+Independently of the rules, flood-route adverts can be rate-limited per
+originating node: each node's advert is forwarded at most once per window
+(up to 30 days), taming advert storms on busy channels while every node
+stays discoverable.
+
 → Full guide, including the complete predicate reference and CLI commands:
 **[FILTER.md](./FILTER.md)**
 
@@ -36,8 +41,11 @@ fork is for operators who want policy and resilience at the node:
 
 - **Shared / community nodes** — mute noisy senders or channels that eat your
   airtime, without asking anyone to change their setup.
-- **Regional gating** — keep a repeater from carrying traffic that belongs
-  to another region.
+- **OpenHop-style policy, nothing extra to run** — the rule engine is modelled
+  after the policy filters in [OpenHop](https://github.com/openhop-dev) and
+  lives entirely in the repeater firmware, so you get about the same
+  functionality with just the node itself — no computer, companion app, or
+  other hardware needed.
 - **Solar / off-grid sites** — the node goes quiet *while it can still answer
   you*, instead of disappearing dark, and wakes itself when there's sun again.
 
