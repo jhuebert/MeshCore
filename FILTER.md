@@ -60,7 +60,7 @@ Each rule holds:
 | `hops` | Flood path length (number of path hashes); direct traffic never matches |
 | `len` | Payload length in bytes |
 | `snr` | Received SNR in dB (signed, quarter-dB resolution) |
-| `path` | Sliding-window match of 1–4 adjacent repeater pubkey-hash prefixes in the flood path |
+| `path` | Sliding-window match of 1–4 adjacent repeater pubkey-hash prefixes in the flood path (`^`/`$` anchor first/last entry; both anchors = whole path) |
 | `hsize` | Path hash size (1–4 bytes) used by the packet |
 | `chan` | Keyed channel match (identity proven by decryption) |
 | `chanhash` | Single 1-byte on-air channel hash |
@@ -225,7 +225,7 @@ quotes is rejected) — work around one with `.` if a message text ever includes
 | `hops` | interval | Flood hop count (see interval syntax, §2) |
 | `len` | interval | Payload length, bytes |
 | `snr` | interval, signed dB | Packet SNR (e.g. `snr=[-100,-5]`, `snr=-2.25`) |
-| `path` | `[^]HEX>HEX>…[$]` | Adjacent flood-path hash prefixes; `^` anchors first, `$` anchors last; 2–8 hex chars per entry, up to 4 entries |
+| `path` | `[^]HEX>HEX>…[$]` | Adjacent flood-path hash prefixes; `^` anchors first, `$` anchors last, both together require the chain to span the whole path (e.g. `path=^10$` = 1-hop only); 2–8 hex chars per entry, up to 4 entries |
 | `hsize` | `1..4` (comma-combine) | Path hash size the packet carries |
 | `chan` | channel name(s) | Keyed store match, decryption-proven; `#` names auto-add |
 | `chanhash` | 2 hex chars | Bare 1-byte on-air channel hash (no decryption proof) |
@@ -420,7 +420,9 @@ port is only needed for initial flashing and emergencies.
   with these predicates never fires on binary group data.
 - `chanhash` is a convenience for key-less cases; prefer keyed `chan` matching.
 - Regex evaluations are step-budgeted and fail open (see §2); watch the `aborted`
-  counter if you use heavy patterns like `.*.*.*`.
+  counter if you use heavy patterns like `.*.*.*`. Patterns are also rejected at
+  add time if they exceed the engine's 30-symbol compile budget or their storage
+  length (sender 24 / text 48 chars) — a too-long regex never silently truncates.
 - All counters (`hits`, `limiter`, `aborted`) and the advert cache are memory-only:
   they reset on reboot, and the cache can also be emptied via `filter ratelimit clear`.
 - Reply strings are capped at 160 bytes (remote CLI buffer); `filter list` shows a

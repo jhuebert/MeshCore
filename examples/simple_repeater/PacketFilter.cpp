@@ -266,6 +266,9 @@ static bool pathMatches(const FilterRule* r, const mesh::Packet* pkt) {
   switch (r->path.pos) {
     case FILTER_PATH_FIRST: start_min = 0; start_max = 0; break;
     case FILTER_PATH_LAST:  start_min = n - r->path.count; start_max = start_min; break;
+    case FILTER_PATH_FIRST | FILTER_PATH_LAST:   // ^A$ / ^A>B$: whole path only
+      if (n != r->path.count) return false;
+      break;   // start_min == start_max == 0
     default: break;   // FILTER_PATH_ANY: every window position
   }
   for (int w = start_min; w <= start_max; w++) {
@@ -625,6 +628,8 @@ static bool parseHexHash(const char* s, uint8_t* out, uint8_t* out_len) {
 }
 
 // path=^HEX>HEX>...>HEX$  (up to FILTER_PATH_HASH_SLOTS adjacent hashes)
+// '^' anchors the first entry, '$' the last; both together mean the rule's
+// chain must span the whole path (e.g. path=^10$ matches 1-hop paths only)
 static bool parsePath(const char* tok, FilterRule* r) {
   r->path.count = 0;
   r->path.pos = FILTER_PATH_ANY;
@@ -636,7 +641,7 @@ static bool parsePath(const char* tok, FilterRule* r) {
   if (tlen == 0 || tlen >= sizeof(buf)) return false;
   memcpy(buf, s, tlen + 1);
   if (buf[tlen - 1] == '$') {
-    r->path.pos = FILTER_PATH_LAST;
+    r->path.pos |= FILTER_PATH_LAST;
     buf[tlen - 1] = 0;
   }
 
@@ -935,12 +940,12 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (r->len.flags) { formatInterval(r->len, ivs, sizeof(ivs), false); radd(&out, &remain, " len=%s", ivs); }
   if (r->snr.flags) { formatInterval(r->snr, ivs, sizeof(ivs), true); radd(&out, &remain, " snr=%s", ivs); }
   if (r->path.count) {
-    radd(&out, &remain, " path=%s", r->path.pos == FILTER_PATH_FIRST ? "^" : "");
+    radd(&out, &remain, " path=%s", (r->path.pos & FILTER_PATH_FIRST) ? "^" : "");
     for (int e = 0; e < r->path.count; e++) {
       radd(&out, &remain, "%s", e ? ">" : "");
       for (int b = 0; b < r->path.len[e]; b++) radd(&out, &remain, "%02X", r->path.bytes[e][b]);
     }
-    radd(&out, &remain, "%s", r->path.pos == FILTER_PATH_LAST ? "$" : "");
+    radd(&out, &remain, "%s", (r->path.pos & FILTER_PATH_LAST) ? "$" : "");
   }
   if (r->hash_size_mask) {
     radd(&out, &remain, " hsize=");
@@ -982,8 +987,10 @@ static void cliStats(FilterRules& filter, char* reply) {
 
 static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
   if (arg == NULL || arg[0] < '0' || arg[0] > '9') { strcpy(reply, "Err - rule index required"); return false; }
-  idx = atoi(arg);
-  if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return false; }
+  char* end;
+  long v = strtol(arg, &end, 10);   // full token must be consumed ("0x10" is not an index)
+  if (*end != 0 || v < 0 || v >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return false; }
+  idx = (int)v;
   return true;
 }
 
