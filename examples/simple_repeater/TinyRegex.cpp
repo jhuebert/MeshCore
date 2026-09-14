@@ -163,7 +163,11 @@ re_t re_compile(const char* pattern)
             } break;
           }
         }
-        /* '\\' as last char in pattern -> invalid regular expression. */
+        else
+        {
+          /* '\\' as last char in pattern -> invalid regular expression. */
+          return 0;
+        }
       } break;
 
       /* Character class: */
@@ -234,6 +238,12 @@ re_t re_compile(const char* pattern)
 
     i += 1;
     j += 1;
+  }
+  if (pattern[i] != '\0')
+  {
+    /* pattern exceeds MAX_REGEXP_OBJECTS symbols -> reject rather than
+       silently compiling a truncated pattern (which would over/under-match) */
+    return 0;
   }
   /* 'UNUSED' is a sentinel used to indicate end-of-pattern */
   re_compiled[j].type = UNUSED;
