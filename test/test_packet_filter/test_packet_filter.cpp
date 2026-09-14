@@ -5,6 +5,22 @@
 //
 // Sections: TinyRegex, packet-level matching, content rules, advert rate
 // limiter, management/persistence, and the filter CLI.
+//
+// Coverage map (2026-09-13 host-native gap analysis; on-air semantics mirrored
+// from the Phase-4 raw-packet suites):
+//   hops exact/range/exclusive/unbounded/direct  -> HopsExactAndRange,
+//       HopsExclusiveBounds, HopsUnboundedBelowAndAbove, HopsIgnoredForDirectTraffic
+//   path anchors/chains/windows/clamping/0-hop   -> Path* tests
+//   region lists + unscoped + exact-name         -> Region* tests
+//   type/route/hsize/len/snr                     -> Type/Route/Hsize/Len/Snr* tests
+//   content rules + keyed channels               -> content-rules section
+//   limiter windows/cache/origin keys            -> advert rate limiter section
+//   persistence roundtrip/upgrade/truncation     -> management/persistence section
+//   CLI quoting/errors/capacity                  -> filter CLI surface section
+//   regex budget/anchors/classes                 -> TinyRegex* tests
+//   hook order (battery gate -> checkPacket -> disable_fwd, MyMesh.cpp
+//       allowPacketForward; checkContent in onGroupDataRecv) is a MyMesh
+//       wiring property, asserted by code review of the hook lines, not here
 
 #include <gtest/gtest.h>
 
@@ -146,6 +162,37 @@ TEST(TinyRegexCompile, ValidPatternsCompile) {
   EXPECT_TRUE(re_compile("[a-zA-Z0-9_]+") != nullptr);
 }
 
+TEST(TinyRegexCompile, TrailingBackslashRejected) {
+  // regression: a trailing '\' used to fall through compile into stale static
+  // state and return a wild pointer (global-buffer-overflow, found by fuzzing)
+  EXPECT_TRUE(re_compile("abc\\") == nullptr);
+  EXPECT_EQ(match("abc\\", "abc"), -1);
+}
+
+TEST(TinyRegexCompile, OverlongPatternRejectedNotTruncated) {
+  // the engine holds MAX_REGEXP_OBJECTS (30) symbols; longer patterns must
+  // fail to compile, never silently match a truncated pattern
+  std::string fits(29, 'a');
+  EXPECT_TRUE(re_compile(fits.c_str()) != nullptr);
+  std::string too_long(30, 'a');
+  EXPECT_TRUE(re_compile(too_long.c_str()) == nullptr);
+  EXPECT_EQ(match(too_long.c_str(), too_long.c_str()), -1);
+}
+
+TEST(TinyRegexClasses, UnterminatedClassRejected) {
+  // missing ']': the end-of-pattern sentinel check rejects the pattern at
+  // compile time (no memory-unsafe class match at runtime)
+  EXPECT_TRUE(re_compile("[ab") == nullptr);
+  EXPECT_EQ(match("[ab", "xaZb"), -1);
+}
+
+TEST(TinyRegexClasses, EdgeClasses) {
+  EXPECT_TRUE(re_compile("[]") != nullptr);   // empty class compiles...
+  EXPECT_EQ(match("[]", "abc"), -1);          // ...but matches nothing
+  EXPECT_EQ(match("[-a]+", "--aa"), 0);       // leading '-' is a literal
+  EXPECT_EQ(match("[a-]+", "a-a"), 0);        // trailing '-' is a literal
+}
+
 // ============================================================
 // UNIT TESTS: packet-level rule matching (checkPacket)
 // ============================================================
@@ -239,6 +286,30 @@ TEST_F(FilterTest, TransportFloodCountsAsFlood) {
   EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
 }
 
+// The core calls allowPacketForward() for every relayed flood, plus direct
+// TRACE/MULTIPART/ACK relays — so the filter sees payload types beyond
+// advert/txt/data. type_mask only distinguishes advert/txt/data; every other
+// type falls through to the generic predicates (hops/len/snr/...).
+// Hook order in MyMesh::allowPacketForward(): battery gate -> checkPacket() ->
+// disable_fwd, so with `set repeat off` packets still reach the filter and a
+// DROP pre-empts the repeat check.
+TEST_F(FilterTest, GenericPredicatesCoverNonAdvertTypes) {
+  expectOk(filter, "add hops=[2,*]");
+  auto ack = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ACK, 10, 1, 3);
+  EXPECT_EQ(filter.checkPacket(&ack, 0, nullptr), FILTER_ACT_DROP);
+  auto trace = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_TRACE, 10, 1, 3);
+  EXPECT_EQ(filter.checkPacket(&trace, 0, nullptr), FILTER_ACT_DROP);
+  auto raw = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_RAW_CUSTOM, 10, 1, 3);
+  EXPECT_EQ(filter.checkPacket(&raw, 0, nullptr), FILTER_ACT_DROP);
+
+  // a type=advert rule does not hit non-advert payloads (0-hop so the hops
+  // rule stays out of the way)
+  expectOk(filter, "add type=advert");
+  auto ack2 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ACK, 10, 1, 0);
+  EXPECT_EQ(filter.checkPacket(&ack2, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+}
+
 // ---------------------------------------------------------------- hops=
 
 TEST_F(FilterTest, HopsExactAndRange) {
@@ -297,6 +368,21 @@ TEST_F(FilterTest, LenInterval) {
   EXPECT_EQ(filter.checkPacket(&short_pkt, 0, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.checkPacket(&edge, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.checkPacket(&long_pkt, 0, nullptr), FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, LenBoundaries) {
+  // payload_len as measured on the wire: 0..MAX_PACKET_PAYLOAD (184)
+  expectOk(filter, "add len=[0,3]");
+  expectOk(filter, "add len=184");
+  for (uint16_t l = 0; l <= 4; l++) {
+    auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, l);
+    EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr),
+              l <= 3 ? FILTER_ACT_DROP : FILTER_ACT_ALLOW) << "len " << l;
+  }
+  auto max_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, MAX_PACKET_PAYLOAD);
+  EXPECT_EQ(filter.checkPacket(&max_pkt, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 4u);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
 }
 
 // ---------------------------------------------------------------- snr=
@@ -405,6 +491,47 @@ TEST_F(FilterTest, PathNotMatchedOnDirectTraffic) {
   EXPECT_EQ(filter.checkPacket(&direct, 0, nullptr), FILTER_ACT_ALLOW);
 }
 
+TEST_F(FilterTest, PathChainOutOfOrderNoMatch) {
+  // 20>30 must appear as adjacent, in-order entries: 10 30 20 40 does not match
+  expectOk(filter, "add path=20>30");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 4);
+  pkt.path[1] = 0x30;
+  pkt.path[2] = 0x20;
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, PathPrefixCompareWithHashSize2) {
+  // hsz=2 packets carry 2-byte entries (10 11 / 20 21); rule entries are
+  // prefix-compared with min(rule_len, packet hsz) bytes
+  expectOk(filter, "add path=10");   // 1-byte prefix of entry 0
+  auto hit = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 2, 2);
+  EXPECT_EQ(filter.checkPacket(&hit, 0, nullptr), FILTER_ACT_DROP);
+
+  // 2-byte compare: rule bytes 20 11 must not match entry 20 21 — a 1-byte
+  // compare on the rule's first byte would falsely drop here
+  expectOk(filter, "add path=2011");
+  auto miss = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 2, 2);
+  miss.path[0] = 0x20; miss.path[1] = 0x21;   // entries 20 21 / 30 31: no rule matches
+  miss.path[2] = 0x30; miss.path[3] = 0x31;
+  EXPECT_EQ(filter.checkPacket(&miss, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, PathBothAnchorsMatchWholePath) {
+  // ^A$ (or ^A>B$): the window must be exactly the whole path — first entry
+  // AND last entry anchored. A 1-hop path is the only match for a 1-entry rule.
+  expectOk(filter, "add path=^10$");
+  auto one = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 1);
+  auto two = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&one, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&two, 0, nullptr), FILTER_ACT_ALLOW);
+
+  expectOk(filter, "add path=^10>20$");
+  auto exact = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  auto longer = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 3);
+  EXPECT_EQ(filter.checkPacket(&exact, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&longer, 0, nullptr), FILTER_ACT_ALLOW);   // 10 20 30: prefix, not whole
+}
+
 // ---------------------------------------------------------------- region=
 
 TEST_F(FilterTest, RegionPredicate) {
@@ -434,6 +561,15 @@ TEST_F(FilterTest, RegionExactNameMatchOnly) {
   RegionEntry ne{ 3, 1, 0, "TestNorthEast" };
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT);
   EXPECT_EQ(filter.checkPacket(&pkt, 0, &ne), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, RegionPredicateIgnoresTransportFloodWithoutRegion) {
+  // MyMesh passes recv_pkt_region = NULL for flood packets whose transport
+  // codes match no configured region: no named region predicate may fire
+  // (only an explicit "unscoped" list entry matches, see RegionListAndUnscoped)
+  expectOk(filter, "add region=TestNorth");
+  auto pkt = makePacket(ROUTE_TYPE_TRANSPORT_FLOOD, PAYLOAD_TYPE_GRP_TXT);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
 }
 
 // ---------------------------------------------------------------- deferral
@@ -790,6 +926,22 @@ TEST_F(FilterTest, ClearEmptiesCacheButNotCounters) {
   EXPECT_EQ(filter.checkPacket(&pkt2, 3000, nullptr), FILTER_ACT_ALLOW);
 }
 
+TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
+  // `ratelimit clear` clears the RAM origin cache (reboot does too) but never
+  // the sticky drop/abort counters (only `filter stats` reset does)
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 7, 7, 7, 7 };
+  auto pkt = makeAdvert(key);
+  filter.checkPacket(&pkt, 1000, nullptr);
+  pkt.transport_codes[0] = 1;
+  filter.checkPacket(&pkt, 2000, nullptr);
+  ASSERT_EQ(filter.getLimiterDrops(), 1u);
+
+  ASSERT_EQ(cli(filter, "ratelimit clear"), "OK - advert cache cleared");
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);   // sticky
+}
+
 TEST_F(FilterTest, RatelimitZeroIsOff) {
   uint8_t key[4] = { 3, 1, 4, 1 };
   auto pkt = makeAdvert(key);
@@ -890,23 +1042,40 @@ TEST_F(FilterTest, SaveLoadRoundtripPreservesConfig) {
   FilterRules restored;
   restored.begin(&fs);   // existing config: no fresh provisioning
 
-  ASSERT_EQ(restored.getNumRules(), 1);
-  FilterRule* r = restored.getRule(0);
-  EXPECT_TRUE(r->enabled);
-  EXPECT_EQ(r->action, FILTER_ACT_LOG_ONLY);
-  EXPECT_EQ(r->type_mask, FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA);
-  // '[' + ']' set both INC bits; HI_INC is redundant beside HI_ANY but harmless
-  EXPECT_EQ(r->hops.flags, FILTER_IV_LO_INC | FILTER_IV_HI_INC | FILTER_IV_HI_ANY);
-  EXPECT_EQ(r->hops.lo, 2);
-  EXPECT_EQ(r->chan_mask & (1 << 1), (uint16_t)(1 << 1));   // #chan32 is store idx 1
-  EXPECT_STREQ(r->regions, "TestNorth,unscoped");
-  EXPECT_STREQ(r->sender, "^X");
-  EXPECT_STREQ(r->text, "^y");
-
-  ASSERT_EQ(restored.getNumChannels(), 2);   // Public + #chan32
-  EXPECT_EQ(restored.getChannel(1)->secret_len, 32);
   EXPECT_EQ(restored.getAdvertRatelimit(), 5);
   EXPECT_TRUE(restored.isEnabled());
+}
+
+TEST_F(FilterTest, SaveLoadRoundtripPreservesPathAndIntervals) {
+  ASSERT_EQ(cli(filter, "add path=^A1B2>CC$ hsize=1,2 len=[10,20] chanhash=AA snr=[-3,0.5]"),
+            "OK - rule 0 added");
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_EQ(r->path.count, 2);
+  EXPECT_EQ(r->path.pos, FILTER_PATH_FIRST | FILTER_PATH_LAST);
+  EXPECT_EQ(r->path.len[0], 2);
+  EXPECT_EQ(r->path.bytes[0][0], 0xA1);
+  EXPECT_EQ(r->path.bytes[0][1], 0xB2);
+  EXPECT_EQ(r->path.len[1], 1);
+  EXPECT_EQ(r->path.bytes[1][0], 0xCC);
+  EXPECT_EQ(r->hash_size_mask, 0x03);
+  EXPECT_EQ(r->len.lo, 10);
+  EXPECT_EQ(r->len.hi, 20);
+  EXPECT_EQ(r->chan_flags, FILTER_CHANFLG_HASH_SET);
+  EXPECT_EQ(r->chan_hash, 0xAA);
+  EXPECT_EQ(r->snr.lo, (uint16_t)(int16_t)-12);
+  EXPECT_EQ(r->snr.hi, 2);
+
+  // behaviourally: the restored rule still matches the same packet shape
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 15, 2, 2);
+  pkt.path[0] = 0xA1; pkt.path[1] = 0xB2;   // ^A1B2 whole-path anchor
+  pkt.path[2] = 0xCC;                       // >CC$ last entry (1-byte prefix vs hsz=2)
+  pkt.payload[0] = 0xAA;
+  EXPECT_EQ(restored.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, StatsAreNeverPersisted) {
@@ -1005,6 +1174,33 @@ TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
   FilterRules restored;
   restored.begin(&fs);
   EXPECT_EQ(restored.getNumRules(), 0);   // nothing half-loaded
+}
+
+TEST_F(FilterTest, TruncatedConfigAllOrNothingAtEveryLength) {
+  // fuzz-lite: cut the saved blob at every byte offset; the loader must never
+  // half-load (rules/channels appear only when the whole file reads cleanly)
+  filter.setAdvertRatelimit(5);
+  ASSERT_EQ(cli(filter, "add type=advert hops=[1,2] path=10>20"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "chan add #x aabbccddeeff00112233445566778899").substr(0, 3), "OK ");
+  filter.save(&fs);
+  auto full = fs.files[CFG_FILE];
+  ASSERT_GT(full.size(), (size_t)8);
+
+  for (size_t len = 0; len < full.size(); len++) {
+    NativeFS cut;
+    cut.files[CFG_FILE] = std::vector<uint8_t>(full.begin(), full.begin() + len);
+    FilterRules restored;
+    restored.begin(&cut);   // must not crash or half-load
+    EXPECT_EQ(restored.getNumRules(), 0) << "truncated at " << len;
+    EXPECT_EQ(restored.getNumChannels(), 0) << "truncated at " << len;
+  }
+
+  // the full blob still loads intact
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getNumChannels(), 2);   // Public + #x
+  EXPECT_EQ(restored.getAdvertRatelimit(), 5);
 }
 
 // ---------------------------------------------------------------- lazy save
@@ -1110,12 +1306,18 @@ TEST_F(FilterTest, AddPathPredicate) {
   expectOk(filter, "add path=^A1B2>CC$");
   FilterRule* r = filter.getRule(0);
   EXPECT_EQ(r->path.count, 2);
-  EXPECT_EQ(r->path.pos, FILTER_PATH_LAST);   // '$' anchor
+  EXPECT_EQ(r->path.pos, FILTER_PATH_FIRST | FILTER_PATH_LAST);   // both anchors
   EXPECT_EQ(r->path.len[0], 2);
   EXPECT_EQ(r->path.bytes[0][0], 0xA1);
   EXPECT_EQ(r->path.bytes[0][1], 0xB2);
   EXPECT_EQ(r->path.len[1], 1);
   EXPECT_EQ(r->path.bytes[1][0], 0xCC);
+
+  // single anchors stay as before
+  expectOk(filter, "add path=BB$");
+  EXPECT_EQ(filter.getRule(1)->path.pos, FILTER_PATH_LAST);
+  expectOk(filter, "add path=^CC");
+  EXPECT_EQ(filter.getRule(2)->path.pos, FILTER_PATH_FIRST);
 }
 
 TEST_F(FilterTest, AddHsizePredicate) {
@@ -1227,6 +1429,24 @@ TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
   EXPECT_EQ(filter.getNumRules(), 0);
 }
 
+TEST_F(FilterTest, AddPathRejectsEmptySegments) {
+  // parseHexHash needs >= 2 hex chars, so empty chain segments must fail
+  EXPECT_EQ(cli(filter, "add path=10>"), "Err - bad path spec");
+  EXPECT_EQ(cli(filter, "add path=>10"), "Err - bad path spec");
+  EXPECT_EQ(cli(filter, "add path=10>>20"), "Err - bad path spec");
+  EXPECT_EQ(filter.getNumRules(), 0);
+}
+
+TEST_F(FilterTest, LongCommandIsTruncatedSafely) {
+  // the remote-CLI layer caps commands at 160 B; filterCLI() itself must also
+  // be safe with longer input (bounded copy -> clean regex-length rejection)
+  std::string cmd = "add text=" + std::string(300, 'a');
+  std::string reply = cli(filter, cmd.c_str());
+  EXPECT_EQ(reply.substr(0, 5), "Err -");
+  EXPECT_LE(reply.size(), (size_t)MAX_PACKET_PAYLOAD);
+  EXPECT_EQ(filter.getNumRules(), 0);
+}
+
 TEST_F(FilterTest, AddRejectsWhenFull) {
   for (int i = 0; i < FILTER_MAX_RULES; i++) filter.addRule();
   EXPECT_EQ(cli(filter, "add type=advert"), "Err - rule list full");
@@ -1238,6 +1458,16 @@ TEST_F(FilterTest, RuleIdxRejectsNonNumeric) {
   EXPECT_EQ(cli(filter, "disable abc").substr(0, 5), "Err -");
   EXPECT_EQ(cli(filter, "enable 1x").substr(0, 5), "Err -");
   EXPECT_EQ(filter.getRule(0)->enabled, true);   // untouched by the rejects
+}
+
+TEST_F(FilterTest, RuleIdxRejectsNegativeHexAndHuge) {
+  expectOk(filter, "add type=advert");
+  EXPECT_EQ(cli(filter, "get -1").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "del -1").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "get 0x10").substr(0, 5), "Err -");   // must not atoi() down to rule 0
+  EXPECT_EQ(cli(filter, "get 99999").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "disable 99999999999999").substr(0, 5), "Err -");   // overflows int
+  EXPECT_EQ(cli(filter, "get 0").find("r0 "), 0);   // genuine rule 0 still reachable
 }
 
 TEST_F(FilterTest, ChanAddRejectsBareHash) {
