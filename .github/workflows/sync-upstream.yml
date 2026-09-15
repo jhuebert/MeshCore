@@ -24,6 +24,8 @@ jobs:
   sync:
     name: Sync upstream and filter branches
     runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.gate.outputs.changed }}
     steps:
 
       - name: Clone Repo
@@ -126,6 +128,7 @@ jobs:
       - name: Maintain repeater-filter-stable
         id: stable
         run: |
+          STABLE_BEFORE=$(git rev-parse refs/remotes/origin/repeater-filter-stable 2>/dev/null || echo none)
           git checkout repeater-filter-stable || git checkout -b repeater-filter-stable origin/main
           # carry the upstream release branch (merge commit when main moved;
           # repeater-filter-stable always diverges from main by the filter picks)
@@ -167,6 +170,10 @@ jobs:
             git commit -m "docs: sync fork README"
           fi
           git push origin repeater-filter-stable
+          STABLE_AFTER=$(git ls-remote origin refs/heads/repeater-filter-stable | cut -f1)
+          if [ "$STABLE_BEFORE" != "$STABLE_AFTER" ]; then
+            echo "pushed=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Open stable-sync conflict issue
         if: steps.stable.outputs.conflict == 'true'
@@ -210,9 +217,21 @@ jobs:
         if: steps.merge.outputs.conflict == 'true'
         run: exit 1
 
+      - name: Set build gate
+        id: gate
+        if: always()
+        run: |
+          if [ "${{ steps.merge.outputs.merged }}" = "true" ] \
+             || [ "${{ steps.stable.outputs.pushed }}" = "true" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
   build:
     name: Build firmware (${{ matrix.channel }})
     needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.force_build == true
     strategy:
       matrix:
         include:
