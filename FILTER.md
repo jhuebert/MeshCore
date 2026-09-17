@@ -8,14 +8,14 @@ access to the repeater is required.
 > Maintained on the [jhuebert fork](https://github.com/jhuebert/MeshCore) — prebuilt
 > firmware is on the fork's Releases page (`filter-v*` tags).
 
-**Quick navigation:** [Quick start](#2-quick-start) ·
-[Common setups](#8-common-setups) ·
-[Command reference](#7-command-reference) ·
-[Writing sender/text patterns](#13-writing-sendertext-patterns)
+**Quick navigation:** [Quick start](#quick-start) ·
+[Common setups](#common-setups) ·
+[Command reference](#command-reference) ·
+[Writing sender/text patterns](#writing-sender-text-patterns)
 
 ---
 
-## 1. What it does
+## What it does
 
 The filter looks at every packet that reaches the repeater and decides whether
 to **forward** it or **drop** it.
@@ -30,7 +30,7 @@ to **forward** it or **drop** it.
 
 Everything is saved on the repeater and survives reboots.
 
-## 2. Quick start
+## Quick start
 
 Silence one noisy channel, keeping everything else:
 
@@ -44,7 +44,7 @@ That's it. Rules default to **drop**, and `filter on` switches the whole filter
 on. To undo: `filter del 0` (use the index the repeater printed when you added
 the rule) or `filter clear` to remove all rules.
 
-## 3. How rules work
+## How rules work
 
 ### One rule = conditions ANDed together
 
@@ -92,7 +92,7 @@ filter add chan=#test text=^BEACON
   telemetry. Add `type=` when you want to narrow it.
 - Invalid input is rejected with `Err - ...`; no half-added rule is left behind.
 
-## 4. What you can match on
+## What you can match on
 
 Each `filter add` takes one or more of these `key=value` conditions, separated
 by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
@@ -104,14 +104,14 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `hops` | interval | Flood hop count (direct packets never match) |
 | `len` | interval | Payload size in bytes |
 | `snr` | interval, dB | Received signal strength at your repeater |
-| `path` | `[^]HEX>HEX>…[$]` | Repeater IDs on the flood path (see §9) |
+| `path` | `[^]HEX>HEX>…[$]` | Repeater IDs on the flood path (see [path examples](#path)) |
 | `hsize` | `1..4` (comma-combine) | Path ID size used by the packet |
-| `chan` | channel name(s) | Keyed channel — proven by decryption (see §5) |
-| `chanhash` | 2 hex digits | On-air channel tag, no key needed (see §9) |
+| `chan` | channel name(s) | Keyed channel — proven by decryption (see [Channels](#channels-senders-and-message-text)) |
+| `chanhash` | 2 hex digits | On-air channel tag, no key needed (see [chanhash examples](#chanhash)) |
 | `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (direct packets never match) |
 | `sender` | pattern | Sender name in group text, e.g. `SpamBot` from `SpamBot: hello` |
 | `text` | pattern | Message text in group text |
-| `action` | `drop` (default) or `logonly` | What to do on a match (see §10) |
+| `action` | `drop` (default) or `logonly` | What to do on a match (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)) |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
 message is decrypted. Everything else is checked before forwarding and works on
@@ -132,7 +132,7 @@ Examples: `hops=[2,*]` = at least 2 hops · `len=[*,80]` = at most 80 bytes ·
 `snr=[*,-8.5]` = signal of −8.5 dB or weaker. Fractional SNR values use
 quarter-dB steps: `.00`, `.25`, `.50`, `.75`.
 
-## 5. Channels, senders, and message text
+## Channels, senders, and message text
 
 ### Channels
 
@@ -165,9 +165,10 @@ Group-text messages look like `SenderName: message text` after decryption.
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
   field unless you anchor it. `sender=SpamBot` also matches `MySpamBot2`;
   `sender=^SpamBot$` matches exactly `SpamBot` and nothing else. See
-  §13 for the full pattern language.
+  [Writing sender/text patterns](#writing-sender-text-patterns) for the full
+  pattern language.
 
-## 6. Cutting advert noise (rate limiter)
+## Cutting advert noise (rate limiter)
 
 Independent of the rules, you can rate-limit flood adverts per originating
 node: *each node's advert is forwarded at most once every N hours.*
@@ -182,16 +183,16 @@ Use this on a well-connected repeater to stop re-flooding everyone's periodic
 adverts while still passing each node's advert once per window so it stays
 reachable through you. The window can be 0 (off) to 720 hours; 0 turns it off.
 
-## 7. Command reference
+## Command reference
 
 All commands begin with `filter`. They work identically over serial and remote
-admin (see §11).
+admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 | Command | Effect |
 |---|---|
 | `filter` | Status: on/off, rule and channel counts, ratelimit, counters |
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
-| `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see §4) |
+| `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
 | `filter list` | One-line summary of every rule |
 | `filter get <idx>` | Full detail of one rule, including its hit count |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
@@ -214,7 +215,7 @@ Notes:
   deletions.
 - Counters (`filter stats`) reset to zero on reboot; the rules themselves do not.
 
-## 8. Common setups
+## Common setups
 
 These are ready-to-use recipes. Lines starting with `#` are comments — don't
 send them to the repeater.
@@ -256,7 +257,8 @@ filter add chan=#local sender=^BotName$ text="^RX in place"
 
 ### Cutting advert noise
 
-See §6 — the one-liner is `filter ratelimit advert 48`.
+See [Cutting advert noise](#cutting-advert-noise-rate-limiter) — the one-liner
+is `filter ratelimit advert 48`.
 
 ### Isolating one upstream repeater
 
@@ -275,7 +277,7 @@ immediate neighbour. To match the *most recent* relay instead, use
 `path=A1B2C3$`. IDs can be written with 2, 4, 6, or 8 hex digits per entry;
 chain up to four with `>`, and use `^`/`$` to anchor the first/last entry.
 
-### Keeping out-of-region traffic off a channel
+### Keeping unwanted regions off a channel
 
 Flood packets can carry a region scope. To forbid plain, scope-less flood
 traffic on a channel:
@@ -284,10 +286,11 @@ traffic on a channel:
 filter add chan=#mychan region=unscoped
 ```
 
-Or drop traffic from specific regions on any channel:
+To exclude a specific region from a channel — here, dropping `#mychan` traffic
+that arrived via region `Foo` while every other region still passes:
 
 ```text
-filter add region=Foo,Bar
+filter add chan=#mychan region=Foo
 ```
 
 Region names must already exist on the repeater (`region def ...`). Direct
@@ -302,11 +305,11 @@ filter disable 2     # keep rule 2 but skip it
 filter enable 2      # put it back
 ```
 
-## 9. Examples for every condition
+## Examples for every condition
 
 Complete, independent commands. Anything not specified is unrestricted. Rules
 default to dropping — add `action=logonly` if you want to just count matches
-first (see §10).
+first (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)).
 
 ### `type`
 
@@ -462,7 +465,7 @@ Match the message only. For `SpamBot: BEACON 123`, the text is `BEACON 123`.
 
 The last pattern matches `ID:123` and `ID: 042`, but not `ID:12` or `ID:1234`.
 
-## 10. Trying a rule before enforcing it (shadow mode)
+## Trying a rule before enforcing it (shadow mode)
 
 Not sure a rule is right? Add it with `action=logonly`: matching packets are
 **counted but still forwarded**. Watch the counters, then enforce.
@@ -479,11 +482,11 @@ filter add chan=#test
 Two things to remember:
 
 - `logonly` rules count hits but don't drop anything, and they don't stop the
-  rate limiter (§6) from acting.
+  [rate limiter](#cutting-advert-noise-rate-limiter) from acting.
 - Don't leave an overlapping `logonly` rule in place after adding the real
   drop rule — the earlier rule matches first and the drop never fires.
 
-## 11. Managing the repeater remotely
+## Managing the repeater remotely
 
 Everything above works over the mesh. From a companion device that has the
 repeater as a contact:
@@ -503,7 +506,7 @@ await mc.commands.send_cmd(rep, "filter stats", dst_type=2)
 This is the normal management path for a repeater on a tower — the serial port
 is only needed for initial flashing and emergencies.
 
-## 12. Limits and good-to-knows
+## Limits and good-to-knows
 
 | Limit | Value |
 |---|---|
@@ -523,7 +526,7 @@ is only needed for initial flashing and emergencies.
   `filter stats` grows if a pattern gives up mid-match; simplify it if you see
   that.
 
-## 13. Writing sender/text patterns
+## Writing sender/text patterns
 
 `sender=` and `text=` use a small pattern language (**TinyRegex**) built into
 the firmware. It is *not* JavaScript, Python, or PCRE regex — patterns copied
@@ -663,7 +666,7 @@ always confirm what the repeater actually stored with `filter get <idx>`.
 
 - Literal text with emoji or accented letters works: `sender=^John😀$` is fine.
 - Internally each emoji counts as several characters, so `.` won't match a
-  whole emoji and emoji length eats into the pattern-length limits (§12).
+  whole emoji and emoji length eats into the [pattern-length limits](#limits-and-good-to-knows).
   Exact literal matches are safest for non-ASCII names.
 - There is no case-insensitive option. Use explicit choices like `[Bb]` — and
   note that accented letters can't be handled that way; match them literally.
@@ -687,6 +690,6 @@ filter stats
 | Matches too broadly | Add `^`/`$` anchors; escape literal dots; remember `sender=Bot` matches `MyBot2` |
 | Combined rule matches nothing | Every condition must be true — test each one alone; check `route=`/case |
 | Pattern from an online tester misbehaves | Remove `/slashes/`, flags, groups, OR, `{counts}`, `\b` — see the table above |
-| "Bad/long regex" error | Pattern too long (§12 limits) or broken syntax; shorten or simplify |
+| "Bad/long regex" error | Pattern too long (see [Limits](#limits-and-good-to-knows)) or broken syntax; shorten or simplify |
 | `aborted` counter grows | Pattern too complex — simplify it |
 | Drop rule never fires | An earlier overlapping rule (often `logonly`) is matching first |
