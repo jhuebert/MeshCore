@@ -41,8 +41,9 @@ filter stats          # watch hits climb as #memes traffic arrives
 ```
 
 That's it. Rules default to **drop**, and `filter on` switches the whole filter
-on. To undo: `filter del 0` (use the index the repeater printed when you added
-the rule) or `filter clear` to remove all rules.
+on. To undo: `filter del 0` — rules are numbered **starting at 0**, so the
+first rule is rule 0 (the repeater prints the number when it adds a rule) —
+or `filter clear` to remove all rules.
 
 ## How rules work
 
@@ -163,10 +164,16 @@ Group-text messages look like `SenderName: message text` after decryption.
 - These conditions only apply to group text. They never match adverts or
   binary group data.
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
-  field unless you anchor it. `sender=SpamBot` also matches `MySpamBot2`;
-  `sender=^SpamBot$` matches exactly `SpamBot` and nothing else. See
-  [Writing sender/text patterns](#writing-sender-text-patterns) for the full
-  pattern language.
+  field unless you anchor it. The three most common shapes, at a glance:
+
+  | You want | Pattern | For `SpamBot: hello` |
+  |---|---|---|
+  | Name *contains* `SpamBot` | `sender=SpamBot` | Matches; also matches `MySpamBot2` |
+  | Name *starts with* `SpamBot` | `sender=^SpamBot` | Matches; also matches `SpamBot2` |
+  | Name is *exactly* `SpamBot` | `sender=^SpamBot$` | Matches; not `SpamBot2`, not `spambot` |
+
+  See [Writing sender/text patterns](#writing-sender-text-patterns) for the
+  full pattern language.
 
 ## Cutting advert noise (rate limiter)
 
@@ -190,10 +197,10 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 | Command | Effect |
 |---|---|
-| `filter` | Status: on/off, rule and channel counts, ratelimit, counters |
+| `filter` | Status line, e.g. `on; rules 1/16; chans 2/16; ratelimit advert 0h; cache 0/256; limiter 0; aborted 0` — filter on/off, rules used out of 16, channels stored out of 16, advert rate-limit window and cache fill, limiter and regex-abort counters |
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
-| `filter list` | One-line summary of every rule |
+| `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — filter on/off, rules used out of 16, then the rule's short code |
 | `filter get <idx>` | Full detail of one rule, including its hit count |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
@@ -209,10 +216,15 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 Notes:
 
+- **Commands that take a rule number want the rule's index**, not the short
+  code shown by `filter list`. Indexes count from **0**: the first rule added
+  is rule 0, the second rule 1, and so on. The repeater prints the index when
+  you add a rule (`OK - rule 0 added`). So `filter get 0` is correct;
+  `filter get 0eDBE9` is not — the code is for display only.
+- Deleting a rule shifts later rules down: delete rule 1 of 3 and the old
+  rules 2 and 3 become 1 and 2. Re-check `filter list` after deletions.
 - The repeater replies with short lines; `filter get <idx>` gives the most
   detail about a rule.
-- Deleting a rule shifts later indexes down — re-check `filter list` after
-  deletions.
 - Counters (`filter stats`) reset to zero on reboot; the rules themselves do not.
 
 ## Common setups
