@@ -200,7 +200,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter` | Status line, e.g. `on; rules 1/16; chans 2/16; ratelimit advert 0h; cache 0/256; limiter 0; aborted 0` — filter on/off, rules used out of 16, channels stored out of 16, advert rate-limit window and cache fill, limiter and regex-abort counters |
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
-| `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — filter on/off, rules used out of 16, then the rule's short code |
+| `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
 | `filter get <idx>` | Full detail of one rule, including its hit count |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
@@ -216,11 +216,26 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 Notes:
 
-- **Commands that take a rule number want the rule's index**, not the short
-  code shown by `filter list`. Indexes count from **0**: the first rule added
+- **Reading `filter list` output.** The line starts with the filter state and
+  rule count (`on 1/16` = on, 1 rule of max 16), followed by one token per
+  rule. Each token packs four facts:
+
+  ```text
+  0eDBE9
+  │││└─ 3 hex digits: digest of the rule's content (changes whenever
+  │││     any part of the rule changes; identical rules always match)
+  ││└─── D = drop, L = logonly
+  │└──── e = enabled, d = disabled
+  └────── rule index (0-based position)
+  ```
+
+  The digest is handy as a change indicator: if a rule's digest is the same
+  before and after a reboot or re-add, its stored content is unchanged.
+- **Commands that take a rule number want the rule's index**, not the whole
+  `filter list` token. Indexes count from **0**: the first rule added
   is rule 0, the second rule 1, and so on. The repeater prints the index when
   you add a rule (`OK - rule 0 added`). So `filter get 0` is correct;
-  `filter get 0eDBE9` is not — the code is for display only.
+  `filter get 0eDBE9` is not — the token is for display only.
 - Deleting a rule shifts later rules down: delete rule 1 of 3 and the old
   rules 2 and 3 become 1 and 2. Re-check `filter list` after deletions.
 - The repeater replies with short lines; `filter get <idx>` gives the most
