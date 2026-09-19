@@ -234,18 +234,18 @@ TEST_F(FilterTest, DisabledRuleIgnored) {
 
 // ---------------------------------------------------------------- actions
 
-TEST_F(FilterTest, LogOnlyActionCountsButForwards) {
-  expectOk(filter, "add type=advert action=logonly");
+TEST_F(FilterTest, ForwardActionCountsButForwards) {
+  expectOk(filter, "add type=advert action=forward");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
-  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_LOG_ONLY);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
 }
 
 TEST_F(FilterTest, FirstMatchWins) {
-  expectOk(filter, "add type=advert action=logonly");
+  expectOk(filter, "add type=advert action=forward");
   expectOk(filter, "add type=advert action=drop");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
-  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_LOG_ONLY);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getRule(1)->hits, 0u);
 }
@@ -734,15 +734,15 @@ TEST_F(FilterTest, NonGroupPayloadTypesBypassContentRules) {
             FILTER_ACT_ALLOW);
 }
 
-TEST_F(FilterTest, ContentFirstMatchWinsAndLogOnlyCounts) {
-  expectOk(filter, "add sender=^Alice action=logonly");
+TEST_F(FilterTest, ContentFirstMatchWinsAndForwardCounts) {
+  expectOk(filter, "add sender=^Alice action=forward");
   expectOk(filter, "add sender=^Alice action=drop");
   auto payload = makeGroupText("Alice", "hi");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, payload.len);
   auto chan = channelFromStore(filter, 0);
   EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
                                 payload.len, nullptr),
-            FILTER_ACT_LOG_ONLY);
+            FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getRule(1)->hits, 0u);
 }
@@ -965,13 +965,13 @@ TEST_F(FilterTest, OnlyFloodAdvertsAreLimited) {
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // non-advert types not recorded
 }
 
-TEST_F(FilterTest, LogOnlyAdvertStillHitsLimiter) {
-  // the limiter runs even when a logonly rule matched (only a DROP pre-empts)
-  expectOk(filter, "add type=advert action=logonly");
+TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
+  // the limiter runs even when a forward rule matched (only a DROP pre-empts)
+  expectOk(filter, "add type=advert action=forward");
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0x0A, 0x0B, 0x0C, 0x0D };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_LOG_ONLY);
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
   pkt.transport_codes[0] = 5;
   EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
@@ -1035,7 +1035,7 @@ TEST_F(FilterTest, ClearRulesKeepsChannels) {
 TEST_F(FilterTest, SaveLoadRoundtripPreservesConfig) {
   filter.setAdvertRatelimit(5);
   ASSERT_EQ(cli(filter, "chan add #chan32 aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899").substr(0, 3), "OK ");
-  ASSERT_EQ(cli(filter, "add chan=#chan32 hops=[2,*] type=txt,data region=TestNorth,unscoped action=logonly sender=^X text=^y"),
+  ASSERT_EQ(cli(filter, "add chan=#chan32 hops=[2,*] type=txt,data region=TestNorth,unscoped action=forward sender=^X text=^y"),
             "OK - rule 0 added");
   filter.save(&fs);
 
@@ -1256,7 +1256,7 @@ TEST_F(FilterTest, OnOffTogglesAndKeepsConfig) {
 
 TEST_F(FilterTest, UnknownSubcommandPrintsUsage) {
   EXPECT_EQ(cli(filter, "bogus"),
-            "Err - usage: on|off|add|list|get|enable|disable|del|clear|chan|ratelimit|stats");
+            "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats");
 }
 
 // ---------------------------------------------------------------- filter add: valid parsing
@@ -1384,9 +1384,10 @@ TEST_F(FilterTest, GetQuotesValuesContainingSpaces) {
             std::string::npos);
 }
 
-TEST_F(FilterTest, AddLogOnlyAction) {
-  expectOk(filter, "add sender=x action=logonly");
-  EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_LOG_ONLY);
+TEST_F(FilterTest, AddForwardAction) {
+  expectOk(filter, "add sender=x action=forward");
+  EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->action, 2);   // byte value is the old logonly: configs load identically
 }
 
 // ---------------------------------------------------------------- filter add: rejection + rollback
@@ -1408,7 +1409,8 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     { "add chanhash=ABCD", "Err - chanhash must be 2 hex chars" },
     { "add chan=nosuchchan", "Err - unknown chan" },   // non-# names must exist
     { "add region=Nowhere", "Err - unknown region" },
-    { "add action=ban", "Err - action must be drop|logonly" },
+    { "add action=ban", "Err - action must be drop|forward" },
+    { "add action=logonly", "Err - action must be drop|forward" },   // renamed keyword
     { "add sender=[a", "Err - bad/long sender regex" },  // compile check rejects
     { "add text=[a", "Err - bad/long text regex" },      // compile check rejects
     { "add text=", "Err - empty regex" },                // empty regex matches everything
@@ -1619,6 +1621,439 @@ TEST_F(FilterTest, ResetStatsClearsCounters) {
   filter.resetStats();
   EXPECT_EQ(filter.getRule(0)->hits, 0u);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
+}
+
+// ============================================================
+// UNIT TESTS: forward verdict + single-pass evaluation + filter move
+// ============================================================
+
+// Native tests for the terminal `forward` action (allowlist-within-a-
+// denylist), the single-pass whole-rule evaluation it relies on, the
+// checkContent() -> checkPacket() verdict stash, and `filter move`.
+
+#include <gtest/gtest.h>
+
+#include "FilterTestHelpers.h"
+
+// index of a named channel in the store (-1 if absent)
+static int storeIdx(FilterRules& filter, const char* name) {
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (strcmp(filter.getChannel(i)->name, name) == 0) return i;
+  }
+  return -1;
+}
+
+// run checkContent() on a decrypted "<sender>: <text>" group-text packet
+// delivered on channel `chan_name` (packet written into `pkt` so its address
+// stays stable for the verdict-stash tests)
+static uint8_t contentCheck(FilterRules& filter, mesh::Packet& pkt, const char* chan_name,
+                            const char* sender, const char* text) {
+  auto payload = makeGroupText(sender, text);
+  pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, payload.len);
+  int ci = storeIdx(filter, chan_name);
+  EXPECT_GE(ci, 0) << chan_name;
+  auto chan = channelFromStore(filter, ci);
+  return filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data, payload.len, nullptr);
+}
+
+// ---------------------------------------------------------------- single-pass semantics
+
+TEST_F(FilterTest, ForwardTerminalBeforeDrop) {
+  // the allowlist idiom: Alice on #foo passes, everyone else is dropped
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  expectOk(filter, "add chan=#foo");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);   // terminal: later rules not consulted
+
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Bob", "hi"), FILTER_ACT_DROP);   // rule 0 fails
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+TEST_F(FilterTest, DropBeforeForwardDropsEvenAlice) {
+  // reversed order: the drop matches first and the forward is never reached
+  expectOk(filter, "add chan=#foo");
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+}
+
+TEST_F(FilterTest, ForwardShieldsPacketLevelRules) {
+  // a forward verdict is terminal — the old two-pass model would have let the
+  // packet-time chanhash scan drop the very packet rule 0 forwarded
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  expectOk(filter, "add chanhash=FF");   // packet-level drop that also matches
+  mesh::Packet pkt;
+  ASSERT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  pkt.payload[0] = 0xFF;   // on-air channel tag: rule 1 matches this packet too
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);   // stash consumed
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+}
+
+TEST_F(FilterTest, PacketRuleBeforeContentRulePreempts) {
+  // a packet-level rule listed first is terminal at content time for a
+  // decrypted group packet — the content rule behind it is not evaluated
+  expectOk(filter, "add type=txt");                        // packet-level drop
+  expectOk(filter, "add sender=^Alice action=forward");    // never reached
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+}
+
+TEST_F(FilterTest, FirstMatchWinsMixedList) {
+  // interleaved packet-level and content rules: exactly one hit per packet
+  // across both scan entry points
+  expectOk(filter, "add type=advert");                  // packet-level, no match
+  expectOk(filter, "add sender=^Alice action=forward"); // content
+  expectOk(filter, "add type=txt");                     // packet-level drop, shadowed
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+  EXPECT_EQ(filter.getRule(2)->hits, 0u);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);   // no rescan
+}
+
+TEST_F(FilterTest, ProbeBeforeDropCountsWhatDropWouldCatch) {
+  // shadow-mode idiom: a forward probe immediately before the drop counts
+  // exactly what the drop would catch, while the packet still passes
+  expectOk(filter, "add chan=#foo action=forward");   // probe
+  expectOk(filter, "add chan=#foo");                  // the drop it shadows
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Bob", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+
+  // flip the probe to an enforcing rule: same traffic now drops
+  ASSERT_EQ(cli(filter, "del 0"), "OK - rule 0 deleted");
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Bob", "hi"), FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, TrailingCatchAllProbeCountsOnlyUnmatched) {
+  // a catch-all forward rule at the END of the list only sees packets no
+  // earlier rule matched, so it tallies surviving traffic
+  expectOk(filter, "add chan=#memes");                 // drop
+  expectOk(filter, "add type=txt action=forward");     // catch-all probe, last
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#memes", "Bob", "hi"), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);   // drop short-circuits the probe
+
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);   // untouched
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);   // probe tallies the survivor
+}
+
+TEST_F(FilterTest, DisabledForwardRuleSkipped) {
+  // disabling the forward exception restores the channel drop for everyone
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  expectOk(filter, "add chan=#foo");
+  ASSERT_EQ(cli(filter, "disable 0"), "OK - rule 0 disabled");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, DisabledFilterForwardMoot) {
+  // filter off: everything is allowed and no verdict is stashed — once the
+  // filter is back on, the same packet is scanned normally
+  ASSERT_EQ(cli(filter, "off"), "OK - filter off");
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  expectOk(filter, "add type=txt");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_ALLOW);
+  ASSERT_EQ(cli(filter, "on"), "OK - filter on");
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);   // rule 1 scanned
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+// ---------------------------------------------------------------- packet classes
+
+TEST_F(FilterTest, PacketOnlyForwardOnAdvertAndDirect) {
+  // packet-level forward rules decide on traffic checkContent never sees
+  expectOk(filter, "add type=advert route=flood action=forward");
+  expectOk(filter, "add route=direct action=forward");
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&adv, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  auto direct = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_TXT_MSG, 10);
+  EXPECT_EQ(filter.checkPacket(&direct, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+TEST_F(FilterTest, UndecryptedGroupPacketSkipsContentRules) {
+  // group traffic that never decrypts only ever sees the packet-level scan
+  expectOk(filter, "add chan=#neverseen");            // content rule (deferred)
+  expectOk(filter, "add type=txt action=forward");    // packet-level
+  expectOk(filter, "add type=advert");                // packet-level drop
+  auto txt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);   // no checkContent ran
+  EXPECT_EQ(filter.checkPacket(&txt, 0, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);   // content rule untouched
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(2)->hits, 1u);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+}
+
+TEST_F(FilterTest, GrpDataForwardRuleHonoursChanIgnoresSenderText) {
+  // GRP_DATA has no parseable sender: the sender predicate can't match, so
+  // the rule is skipped even though the channel matches
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  mesh::Packet pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_DATA, 20);
+  uint8_t raw[] = { 0, 0, 0, 0, 'x' };   // not even parsed for data
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_DATA,
+                                channelFromStore(filter, storeIdx(filter, "#foo")),
+                                raw, sizeof(raw), nullptr),
+            FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+}
+
+TEST_F(FilterTest, LimiterStillAppliesAfterForward) {
+  // forward short-circuits the rule list only — never the advert rate limiter
+  expectOk(filter, "add type=advert action=forward");
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x21, 0x22, 0x23, 0x24 };
+  auto pkt = makeAdvert(key);
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  pkt.transport_codes[0] = 7;
+  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
+  EXPECT_EQ(filter.getRule(0)->hits, 2u);   // one scan per received advert (single pass)
+}
+
+TEST_F(FilterTest, LimiterUnaffectedByForwardOnGroupPackets) {
+  // group traffic never touches the advert rate limiter (payload-type guard)
+  expectOk(filter, "add type=txt action=forward");
+  filter.setAdvertRatelimit(48);
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);   // stash consumed
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+}
+
+// ---------------------------------------------------------------- verdict stash handoff
+
+TEST_F(FilterTest, StashConsumedOnceNoDoubleHits) {
+  // a packet-level rule matching a decrypted group packet is counted once at
+  // content time; checkPacket() serves the stashed verdict without rescanning
+  expectOk(filter, "add type=txt");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+}
+
+TEST_F(FilterTest, StashCarriesAllowVerdict) {
+  // even an allow verdict is stashed: no surprise packet-level drop later
+  expectOk(filter, "add type=advert");   // matches nothing here
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "Public", "Alice", "hi"), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);   // not rescanned
+}
+
+TEST_F(FilterTest, DropVerdictStashLingers) {
+  // a content drop makes core mark the packet DoNotRetransmit, so checkPacket
+  // is never called for it; the next, different packet must clear the stale
+  // stash by pointer mismatch and be scanned normally
+  expectOk(filter, "add sender=^Alice");   // content drop
+  expectOk(filter, "add type=advert");     // packet-level drop for the next pkt
+  mesh::Packet a;
+  EXPECT_EQ(contentCheck(filter, a, "Public", "Alice", "hi"), FILTER_ACT_DROP);
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_DROP);   // scanned
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+TEST_F(FilterTest, StashStaleByPointerAndAge) {
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");   // content rule
+  expectOk(filter, "add chanhash=AA");                               // packet-level drop
+  mesh::Packet a, b;
+
+  // different pointer: stash cleared, normal scan (rule 1 matches)
+  ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  b = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  b.payload[0] = 0xAA;
+  EXPECT_EQ(filter.checkPacket(&b, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+
+  // same buffer, clock exactly at the age guard: stash still consumed
+  ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  a.payload[0] = 0xAA;
+  EXPECT_EQ(filter.checkPacket(&a, 500, nullptr), FILTER_ACT_FORWARD);   // 500 ms guard
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+
+  // same buffer re-used by the pool, clock just past the guard: stale, scan
+  ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  a.payload[0] = 0xAA;
+  EXPECT_EQ(filter.checkPacket(&a, 501, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(1)->hits, 2u);
+}
+
+TEST_F(FilterTest, StashClearedOnNewSequence) {
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");   // rule 0
+  expectOk(filter, "add chan=#foo");                                 // rule 1 (drop)
+  mesh::Packet a, b;
+
+  // forward-then-drop: b's drop stash replaces a's forward stash; a is never
+  // handed to checkPacket (dropped packets aren't relayed), and b's verdict
+  // is the one served
+  ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  ASSERT_EQ(contentCheck(filter, b, "#foo", "Bob", "hi"), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&b, 0, nullptr), FILTER_ACT_DROP);
+
+  // drop-then-forward: the lingering drop stash is overwritten before it can
+  // mis-serve the next packet
+  ASSERT_EQ(contentCheck(filter, a, "#foo", "Bob", "hi"), FILTER_ACT_DROP);
+  ASSERT_EQ(contentCheck(filter, b, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.checkPacket(&b, 0, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getRule(0)->hits, 2u);   // Alice matched twice
+  EXPECT_EQ(filter.getRule(1)->hits, 2u);   // Bob matched twice
+}
+
+// ---------------------------------------------------------------- rename (logonly -> forward)
+
+TEST_F(FilterTest, LogonlyKeywordRejected) {
+  EXPECT_EQ(cli(filter, "add sender=x action=logonly"), "Err - action must be drop|forward");
+  EXPECT_EQ(filter.getNumRules(), 0);   // rolled back, no half rule
+}
+
+TEST_F(FilterTest, LegacyByteLoadsAsForward) {
+  // action byte 2 on disk (written by pre-rename firmware as logonly) loads,
+  // evaluates, and displays as forward — the value was reused, not remapped
+  ASSERT_EQ(cli(filter, "add sender=^Alice action=forward"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(fs.files[CFG_FILE][8], 2);   // the record's action byte carries value 2
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->action, 2);
+  auto payload = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, payload.len);
+  EXPECT_EQ(restored.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(restored, 0),
+                                  payload.data, payload.len, nullptr),
+            FILTER_ACT_FORWARD);
+  EXPECT_EQ(cli(restored, "get 0").find("r0 en forward"), 0);
+
+  // digest identical to the same rule added via the new CLI
+  NativeFS fs2;
+  FilterRules fresh;
+  fresh.begin(&fs2);
+  expectOk(fresh, "add sender=^Alice action=forward");
+  fresh.save(&fs2);
+  FilterRules freshRestored;
+  freshRestored.begin(&fs2);
+  EXPECT_EQ(cli(restored, "list"), cli(freshRestored, "list"));
+}
+
+TEST_F(FilterTest, ListAndGetShowForward) {
+  expectOk(filter, "add sender=^Alice action=forward");
+  std::string list = cli(filter, "list");
+  EXPECT_EQ(list.find("on 1/16: 0eF"), 0);   // F = forward, no L anymore
+  EXPECT_EQ(cli(filter, "get 0").find("r0 en forward"), 0);
+}
+
+// ---------------------------------------------------------------- filter move
+
+TEST_F(FilterTest, MoveForwardAndBackward) {
+  expectOk(filter, "add hops=11");
+  expectOk(filter, "add hops=22");
+  expectOk(filter, "add hops=33");
+  ASSERT_EQ(cli(filter, "move 0 2"), "OK - rule 0 moved to 2");   // rule ends up AT index 2
+  EXPECT_LE(strlen("OK - rule 15 moved to 15"), (size_t)160);   // remote-CLI reply discipline
+  EXPECT_EQ(filter.getRule(0)->hops.lo, 22);
+  EXPECT_EQ(filter.getRule(1)->hops.lo, 33);
+  EXPECT_EQ(filter.getRule(2)->hops.lo, 11);
+  ASSERT_EQ(cli(filter, "move 2 0"), "OK - rule 2 moved to 0");
+  EXPECT_EQ(filter.getRule(0)->hops.lo, 11);
+  EXPECT_EQ(filter.getRule(1)->hops.lo, 22);
+  EXPECT_EQ(filter.getRule(2)->hops.lo, 33);
+}
+
+TEST_F(FilterTest, MoveRejects) {
+  EXPECT_EQ(cli(filter, "move 0 1"), "Err - no such rule");   // empty list
+  expectOk(filter, "add hops=1");
+  EXPECT_EQ(cli(filter, "move 0 0"), "Err - no such rule");   // no-op rejected
+  EXPECT_EQ(cli(filter, "move 0 1"), "Err - no such rule");
+  EXPECT_EQ(cli(filter, "move 1 0"), "Err - no such rule");
+  EXPECT_EQ(cli(filter, "move -1 0").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "move 0 -1").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "move 0x1 0").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "move 0 99999").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "move 99999999999999 0").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "move").substr(0, 5), "Err -");       // missing args
+  EXPECT_EQ(cli(filter, "move 0").substr(0, 5), "Err -");     // missing target
+  EXPECT_EQ(filter.getRule(0)->hops.lo, 1);   // untouched by the rejects
+  EXPECT_EQ(filter.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, MoveCarriesHits) {
+  expectOk(filter, "add type=advert");
+  expectOk(filter, "add type=txt");
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
+  filter.checkPacket(&adv, 0, nullptr);
+  ASSERT_EQ(filter.getRule(0)->hits, 1u);
+  ASSERT_EQ(cli(filter, "move 0 1"), "OK - rule 0 moved to 1");
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);   // hits travel with the rule, not the slot
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  filter.resetStats();
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  EXPECT_EQ(filter.getRule(1)->hits, 0u);
+}
+
+TEST_F(FilterTest, MovePersistsOrder) {
+  expectOk(filter, "add hops=11");
+  expectOk(filter, "add hops=22");
+  filter.getRule(1)->hits = 42;   // hits are RAM-only
+  ASSERT_EQ(cli(filter, "move 1 0"), "OK - rule 1 moved to 0");
+  filter.save(&fs);
+  EXPECT_EQ(fs.files[CFG_FILE][0], 4);   // config version byte unchanged
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 2);
+  EXPECT_EQ(restored.getRule(0)->hops.lo, 22);
+  EXPECT_EQ(restored.getRule(1)->hops.lo, 11);
+  EXPECT_EQ(restored.getRule(0)->hits, 0u);   // still never persisted
+}
+
+TEST_F(FilterTest, MoveLeavesChanMasksAlone) {
+  // masks index the channel store, not rule slots: remap + move compose
+  expectOk(filter, "chan add #a");
+  expectOk(filter, "chan add #b");
+  expectOk(filter, "chan add #c");
+  ASSERT_EQ(cli(filter, "add chan=#a,#b,#c"), "OK - rule 0 added");   // mask 0x0E
+  ASSERT_EQ(cli(filter, "add chan=#b"), "OK - rule 1 added");         // mask 0x04
+  ASSERT_EQ(cli(filter, "chan del #a"), "OK - chan #a deleted");      // remap: #b=1, #c=2
+  ASSERT_EQ(cli(filter, "move 0 1"), "OK - rule 0 moved to 1");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 0x02);   // #b (was rule 1)
+  EXPECT_EQ(filter.getRule(1)->chan_mask, 0x06);   // #b,#c (was rule 0)
+  int b_idx = storeIdx(filter, "#b");
+  ASSERT_GE(b_idx, 0);
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, b_idx),
+                                nullptr, 0, nullptr),
+            FILTER_ACT_DROP);   // still matches the same named channel
+}
+
+TEST_F(FilterTest, MoveChangesVerdicts) {
+  // moving the forward exception behind the channel drop flips a previously
+  // protected packet to dropped (end-to-end semantic check)
+  expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
+  expectOk(filter, "add chan=#foo");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
+  ASSERT_EQ(cli(filter, "move 0 1"), "OK - rule 0 moved to 1");   // drop now first
+  EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_DROP);
 }
 
 int main(int argc, char **argv) {
