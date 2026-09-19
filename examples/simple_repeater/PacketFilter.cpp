@@ -37,8 +37,6 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 #define FILTER_RULE_V3_PERSIST_BYTES  ((offsetof(FilterRule, regions) + (alignof(uint32_t) - 1)) \
                                        & ~(alignof(uint32_t) - 1))
 #define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
-#define FILTER_STASH_MAX_AGE_MS 500          // content-verdict stash age guard
-                                             // (buffers are pool-reused)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
 // ---------------------------------------------------------------- initialization
@@ -360,10 +358,13 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
 
   // a verdict stashed by checkContent() for this exact packet is final:
   // return it without rescanning (no double-counted hits, no reordering).
-  // Stale stash (different buffer, or the pool re-used it) is cleared and a
-  // normal packet-level scan runs.
+  // Stale stash (different buffer, or the pool re-used it with new content,
+  // caught by the content-hash tag) is cleared and a normal packet-level scan
+  // runs.
   if (content_verdict.pkt == pkt) {
-    if (now_millis - content_verdict.t <= FILTER_STASH_MAX_AGE_MS) {
+    uint8_t hash[MAX_HASH_SIZE];
+    pkt->calculatePacketHash(hash);
+    if (memcmp(hash, content_verdict.hash, MAX_HASH_SIZE) == 0) {
       content_verdict.pkt = NULL;   // consume once
       return content_verdict.verdict;
     }
@@ -479,9 +480,10 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 
   // stash the verdict (allow included) for checkPacket(); a drop verdict
   // lingers (core marks the packet DoNotRetransmit and never calls
-  // checkPacket for it) until the next packet clears it by pointer mismatch
+  // checkPacket for it) until the next packet clears it by pointer or
+  // content-hash mismatch
   content_verdict.pkt = pkt;
-  content_verdict.t = millis();
+  pkt->calculatePacketHash(content_verdict.hash);
   content_verdict.verdict = verdict;
   return verdict;
 }

@@ -13,7 +13,7 @@
 // predicates alike — is evaluated once in checkContent() (called from
 // onGroupDataRecv(); keyed channel identity is proven by successful MAC
 // verification) and the verdict is handed to checkPacket() via a
-// pointer+age-tagged stash. For every other packet (adverts, trace, direct,
+// pointer+content-hash-tagged stash. For every other packet (adverts, trace, direct,
 // group that fails to decrypt) checkPacket() runs the packet-level predicates
 // only: content predicates (keyed channel / sender / text) can only match
 // decryption-proven traffic, so rules carrying them are skipped.
@@ -130,7 +130,7 @@ class FilterRules {
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
   struct {                    // verdict stashed by checkContent() for the packet
     const mesh::Packet* pkt;  // currently being relayed; consumed by checkPacket()
-    unsigned long t;          // pointer + age tag guards against pool reuse
+    uint8_t hash[MAX_HASH_SIZE];  // pointer + content hash guard against pool reuse
     uint8_t verdict;          // FILTER_ACT_* (allow included)
   } content_verdict;
   bool enabled;
@@ -163,8 +163,8 @@ public:
   FilterChannel* addChannel(const char* name, const char* psk_hex);
   void delChannel(int idx);
 
-  // For a packet whose verdict was stashed by checkContent() (same buffer,
-  // within the age guard): return that verdict without rescanning. Otherwise
+  // For a packet whose verdict was stashed by checkContent() (same buffer and
+  // content hash): return that verdict without rescanning. Otherwise
   // match packet-level predicates (type/route/region/hops/len/snr/chanhash/
   // path/hashsize; content rules are skipped) and apply the advert rate
   // limiter — it runs unless the verdict is DROP, so it still applies after a
