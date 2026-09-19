@@ -1685,10 +1685,11 @@ TEST_F(FilterTest, ForwardShieldsPacketLevelRules) {
   // a forward verdict is terminal — the old two-pass model would have let the
   // packet-time chanhash scan drop the very packet rule 0 forwarded
   expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");
-  expectOk(filter, "add chanhash=FF");   // packet-level drop that also matches
+  expectOk(filter, "add type=txt");   // packet-level drop that also matches
   mesh::Packet pkt;
   ASSERT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
-  pkt.payload[0] = 0xFF;   // on-air channel tag: rule 1 matches this packet too
+  // (payload left byte-identical, as in the real relay flow: the stash is
+  // keyed by pointer + content hash, so mutated bytes would forfeit it)
   EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_FORWARD);   // stash consumed
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getRule(1)->hits, 0u);
@@ -1872,7 +1873,7 @@ TEST_F(FilterTest, DropVerdictStashLingers) {
   EXPECT_EQ(filter.getRule(1)->hits, 1u);
 }
 
-TEST_F(FilterTest, StashStaleByPointerAndAge) {
+TEST_F(FilterTest, StashStaleByPointerAndHash) {
   expectOk(filter, "add chan=#foo sender=^Alice$ action=forward");   // content rule
   expectOk(filter, "add chanhash=AA");                               // packet-level drop
   mesh::Packet a, b;
@@ -1885,16 +1886,15 @@ TEST_F(FilterTest, StashStaleByPointerAndAge) {
   EXPECT_EQ(filter.checkPacket(&b, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getRule(1)->hits, 1u);
 
-  // same buffer, clock exactly at the age guard: stash still consumed
+  // same buffer, same bytes (the real relay flow): stash consumed at any age
   ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
-  a.payload[0] = 0xAA;
-  EXPECT_EQ(filter.checkPacket(&a, 500, nullptr), FILTER_ACT_FORWARD);   // 500 ms guard
+  EXPECT_EQ(filter.checkPacket(&a, 0, nullptr), FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(1)->hits, 1u);
 
-  // same buffer re-used by the pool, clock just past the guard: stale, scan
+  // same buffer re-used by the pool with different content: stale, scan
   ASSERT_EQ(contentCheck(filter, a, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
   a.payload[0] = 0xAA;
-  EXPECT_EQ(filter.checkPacket(&a, 501, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&a, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getRule(1)->hits, 2u);
 }
 
