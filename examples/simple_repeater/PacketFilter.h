@@ -3,15 +3,20 @@
 // (PacketFilter.h/.cpp, PacketFilterConfig.h, TinyRegex.h/.cpp) plus minimal
 // hook lines in MyMesh.h/MyMesh.cpp. No changes to MeshCore core sources.
 //
-// A rule is a conjunction of optional predicates; a packet is DROPPED if any
-// enabled rule whose predicates all match is hit (first match wins).
-// Unspecified predicate = wildcard. Actions: drop (enforce) and logonly
-// (shadow mode: count hits, still forward).
+// A rule is a conjunction of optional predicates; the enabled rules are
+// evaluated in listed order and the first one whose predicates all match
+// decides the packet's verdict (first match wins). Unspecified predicate =
+// wildcard. Actions: drop (enforce) and forward (terminal: stop the list,
+// count the hit, let the packet through).
 //
-// Rules with content predicates (keyed channel / sender / text) are evaluated
-// in onGroupDataRecv() on the decrypted group payload — keyed channel identity
-// is proven by successful MAC verification. All other predicates are evaluated
-// packet-level in allowPacketForward().
+// For a decrypted group packet the whole rule list — packet-level and content
+// predicates alike — is evaluated once in checkContent() (called from
+// onGroupDataRecv(); keyed channel identity is proven by successful MAC
+// verification) and the verdict is handed to checkPacket() via a
+// pointer+content-hash-tagged stash. For every other packet (adverts, trace, direct,
+// group that fails to decrypt) checkPacket() runs the packet-level predicates
+// only: content predicates (keyed channel / sender / text) can only match
+// decryption-proven traffic, so rules carrying them are skipped.
 //
 // CLI: "filter ..." commands, handled by filterCLI() (see PacketFilter.cpp).
 
@@ -28,7 +33,8 @@
 // actions
 #define FILTER_ACT_ALLOW     0
 #define FILTER_ACT_DROP      1
-#define FILTER_ACT_LOG_ONLY  2
+#define FILTER_ACT_FORWARD   2   // value 2 = the old logonly byte; configs
+                                 // load identically across the rename
 
 // payload-type mask bits (indexed by mesh::Packet payload type, 4 bits)
 #define FILTER_TYPE_ADVERT  (1 << PAYLOAD_TYPE_ADVERT)
@@ -78,7 +84,7 @@ struct Interval {
 
 struct FilterRule {
   bool     enabled;
-  uint8_t  action;        // FILTER_ACT_DROP | FILTER_ACT_LOG_ONLY
+  uint8_t  action;        // FILTER_ACT_DROP | FILTER_ACT_FORWARD
   uint8_t  type_mask;     // bits by payload type (see FILTER_TYPE_*); 0 = any
   uint8_t  route_mask;    // FILTER_ROUTE_* bits; 0 = any
   Interval hops;          // flood path length (getPathHashCount)
@@ -100,7 +106,7 @@ struct FilterRule {
   char     text[FILTER_TEXT_PATTERN_LEN];      // regex over message text;   empty = wildcard
   char     regions[FILTER_REGION_LIST_LEN];    // comma list of canonical region names
                                            // and/or "unscoped"; empty = wildcard
-  uint32_t hits;           // match counter (logonly telemetry + validation)
+  uint32_t hits;           // match counter (forward/drop telemetry + validation)
 };
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
@@ -122,6 +128,11 @@ class FilterRules {
   uint16_t ratelimit_hours;   // per-node advert repeat window; 0 = off
   uint32_t limiter_drops;     // adverts dropped by the rate limiter
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
+  struct {                    // verdict stashed by checkContent() for the packet
+    const mesh::Packet* pkt;  // currently being relayed; consumed by checkPacket()
+    uint8_t hash[MAX_HASH_SIZE];  // pointer + content hash guard against pool reuse
+    uint8_t verdict;          // FILTER_ACT_* (allow included)
+  } content_verdict;
   bool enabled;
   bool dirty;                 // needs save
   unsigned long dirty_since;
@@ -140,6 +151,7 @@ public:
   FilterRule* getRule(int idx) { return &rules[idx]; }
   FilterRule* addRule();           // returns NULL if full
   void delRule(int idx);
+  void moveRule(int from, int to); // rule ends up AT index `to`; hits travel with it
   void clearRules();
 
   // keyed channel store
@@ -151,14 +163,20 @@ public:
   FilterChannel* addChannel(const char* name, const char* psk_hex);
   void delChannel(int idx);
 
-  // match packet-level predicates (type/route/region/hops/len/snr/chanhash/path/
-  // hashsize) and apply the advert rate limiter. `region` is the region the
-  // packet arrived in (NULL = direct-routed or unknown transport code).
-  // Returns FILTER_ACT_*.
+  // For a packet whose verdict was stashed by checkContent() (same buffer and
+  // content hash): return that verdict without rescanning. Otherwise
+  // match packet-level predicates (type/route/region/hops/len/snr/chanhash/
+  // path/hashsize; content rules are skipped) and apply the advert rate
+  // limiter — it runs unless the verdict is DROP, so it still applies after a
+  // forward verdict. `region` is the region the packet arrived in (NULL =
+  // direct-routed or unknown transport code). Returns FILTER_ACT_*.
   uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region);
 
-  // evaluate content rules on a decrypted group payload (chan keyed, sender, text);
-  // caller drops the packet if this returns FILTER_ACT_DROP.
+  // Single-pass evaluation of the ENTIRE rule list on a decrypted group
+  // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
+  // sender / text), in listed order; first enabled match decides (first match
+  // wins) and its verdict — allow, forward or drop — is stashed for
+  // checkPacket(). Caller drops the packet if this returns FILTER_ACT_DROP.
   uint8_t checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
                        const uint8_t* data, size_t len, const RegionEntry* region);
 

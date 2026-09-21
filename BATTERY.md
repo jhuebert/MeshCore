@@ -7,7 +7,7 @@ physical access, or manual intervention required.
 
 ---
 
-## 1. Purpose
+## Purpose
 
 A repeater otherwise repeats until the battery dies, leaving the node dark with
 no warning. The battery gate flips that failure mode: repeating stops while
@@ -16,7 +16,7 @@ and status responses are originated by the node itself, never forwarded, and
 the node's own adverts continue. An admin can log in over the mesh at any time,
 check the voltage, and adjust or disable the gate.
 
-## 2. Behaviour
+## Behaviour
 
 - **Sampling:** the battery is measured every 30 s (first sample immediately
   after boot, so the gate is correct right away).
@@ -44,14 +44,14 @@ and group content alike. Everything the node originates on its own behalf
 - **CLI access**: unaffected — replies are originated, not forwarded. You can
   always log in and look.
 
-## 3. Persistence
+## Persistence
 
 Thresholds (and the enabled flag) persist in **`/batt_cfg`**. The suspended
 flag itself is **never persisted** — it is recomputed from the live voltage on
 every boot, so a reboot mid-suspend can never leave the repeater off after the
 battery recovers.
 
-## 4. CLI reference
+## CLI reference
 
 | Command | Effect |
 |---|---|

@@ -52,6 +52,7 @@ FilterRules::FilterRules() {
   ratelimit_hours = 0;
   limiter_drops = 0;
   budget_aborts = 0;
+  content_verdict.pkt = NULL;
   enabled = true;
   dirty = false;
   dirty_since = 0;
@@ -111,6 +112,18 @@ void FilterRules::delRule(int idx) {
 void FilterRules::clearRules() {
   memset(rules, 0, sizeof(rules));
   num_rules = 0;
+  markDirty();
+}
+
+void FilterRules::moveRule(int from, int to) {
+  if (from < 0 || from >= num_rules || to < 0 || to >= num_rules || from == to) return;
+  FilterRule tmp = rules[from];
+  if (from < to) {
+    memmove(&rules[from], &rules[from + 1], (to - from) * sizeof(FilterRule));
+  } else {
+    memmove(&rules[to + 1], &rules[to], (from - to) * sizeof(FilterRule));
+  }
+  rules[to] = tmp;   // hits travel with the rule
   markDirty();
 }
 
@@ -343,6 +356,21 @@ static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint
 uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region) {
   if (!enabled) return FILTER_ACT_ALLOW;
 
+  // a verdict stashed by checkContent() for this exact packet is final:
+  // return it without rescanning (no double-counted hits, no reordering).
+  // Stale stash (different buffer, or the pool re-used it with new content,
+  // caught by the content-hash tag) is cleared and a normal packet-level scan
+  // runs.
+  if (content_verdict.pkt == pkt) {
+    uint8_t hash[MAX_HASH_SIZE];
+    pkt->calculatePacketHash(hash);
+    if (memcmp(hash, content_verdict.hash, MAX_HASH_SIZE) == 0) {
+      content_verdict.pkt = NULL;   // consume once
+      return content_verdict.verdict;
+    }
+    content_verdict.pkt = NULL;
+  }
+
   uint8_t payload_type = pkt->getPayloadType();
   uint8_t action = FILTER_ACT_ALLOW;
   for (int i = 0; i < num_rules; i++) {
@@ -356,7 +384,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   }
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
-  // limiter runs unless the rule list already dropped; logonly adverts too
+  // limiter runs unless the rule list already dropped; forward adverts too
   if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() &&
       ratelimit_hours > 0 && advertRatelimitDrop(pkt, now_millis)) {
     return FILTER_ACT_DROP;
@@ -429,22 +457,35 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   if (!enabled) return FILTER_ACT_ALLOW;
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return FILTER_ACT_ALLOW;
 
+  // single pass over the WHOLE rule list in listed order: packet-level
+  // predicates and content predicates alike — every predicate is computable
+  // here, and first enabled match is terminal
   char sender[64];
   char text[MAX_PACKET_PAYLOAD + 1];
   bool parsed = (type == PAYLOAD_TYPE_GRP_TXT);
   if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text));
 
+  uint8_t verdict = FILTER_ACT_ALLOW;
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
-    if (!r->enabled || !ruleIsDeferred(r)) continue;
+    if (!r->enabled) continue;
     if (!ruleMatchesPacket(r, pkt, type, region)) continue;
     if ((r->chan_flags & FILTER_CHANFLG_MASK_SET) && !channelMatchesStore(r, channel)) continue;
     if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
     r->hits++;
-    return r->action;   // first match wins
+    verdict = r->action;
+    break;   // first match wins
   }
-  return FILTER_ACT_ALLOW;
+
+  // stash the verdict (allow included) for checkPacket(); a drop verdict
+  // lingers (core marks the packet DoNotRetransmit and never calls
+  // checkPacket for it) until the next packet clears it by pointer or
+  // content-hash mismatch
+  content_verdict.pkt = pkt;
+  pkt->calculatePacketHash(content_verdict.hash);
+  content_verdict.verdict = verdict;
+  return verdict;
 }
 
 // ---------------------------------------------------------------- persistence
@@ -811,8 +852,8 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "action") == 0) {
     if (strcmp(val, "drop") == 0) r->action = FILTER_ACT_DROP;
-    else if (strcmp(val, "logonly") == 0) r->action = FILTER_ACT_LOG_ONLY;
-    else { strcpy(reply, "Err - action must be drop|logonly"); return false; }
+    else if (strcmp(val, "forward") == 0) r->action = FILTER_ACT_FORWARD;
+    else { strcpy(reply, "Err - action must be drop|forward"); return false; }
     return true;
   }
   sprintf(reply, "Err - unknown param '%s'", key);
@@ -914,7 +955,7 @@ static void cliList(FilterRules& filter, char* reply) {
   for (int i = 0; i < filter.getNumRules(); i++) {
     auto r = filter.getRule(i);
     radd(&out, &remain, " %d%c%c%03X", i, r->enabled ? 'e' : 'd',
-         r->action == FILTER_ACT_DROP ? 'D' : 'L', ruleDigest(r) & 0xFFF);
+         r->action == FILTER_ACT_DROP ? 'D' : 'F', ruleDigest(r) & 0xFFF);
   }
 }
 
@@ -924,7 +965,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   char* out = reply;
   int remain = MAX_PACKET_PAYLOAD;
   radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
-       r->action == FILTER_ACT_DROP ? "drop" : "logonly");
+       r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
   if (r->type_mask) {
     radd(&out, &remain, " type=");
@@ -1040,6 +1081,17 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
       filter.markDirty();
       sprintf(reply, "OK - rule %d disabled", idx);
     }
+  } else if (strcmp(cmd, "move") == 0) {
+    int from, to;
+    if (cliRuleIdx(filter, nextToken(&p), from, reply) &&
+        cliRuleIdx(filter, nextToken(&p), to, reply)) {
+      if (from == to) {
+        strcpy(reply, "Err - move: source and target are the same rule");   // no-op move is rejected
+      } else {
+        filter.moveRule(from, to);
+        sprintf(reply, "OK - rule %d moved to %d", from, to);
+      }
+    }
   } else if (strcmp(cmd, "del") == 0) {
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
@@ -1072,6 +1124,6 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
   } else if (strcmp(cmd, "stats") == 0) {
     cliStats(filter, reply);
   } else {
-    strcpy(reply, "Err - usage: on|off|add|list|get|enable|disable|del|clear|chan|ratelimit|stats");
+    strcpy(reply, "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats");
   }
 }

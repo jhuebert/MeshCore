@@ -85,8 +85,8 @@ filter add chan=#test text=^BEACON
   that one condition: `chan=#local,#weather`, `type=txt,data`. Only `type`,
   `chan`, `hsize`, and `region` support this. `sender=Alice,Bob` searches for
   the literal text `Alice,Bob` — it is not a list.
-- The **first matching rule wins**. Once a rule acts, later rules are not
-  consulted for that packet.
+- Rules are evaluated **top to bottom**: the first enabled rule whose conditions all match decides the packet's fate, and later rules are not consulted. A rule with `action=forward` is terminal too — it counts the hit and forwards the packet, skipping the rest of the list.
+- Decryption-dependent conditions (keyed `chan=`, `sender=`, `text=`) can only match traffic the repeater actually decrypts. A rule carrying any of them is skipped for packets that never decrypt (adverts, wrong or missing keys), so a later packet-level rule still decides those.
 - Name each condition once per rule. Repeating a key (e.g. a second `text=`)
   replaces the earlier value rather than adding another condition.
 - A rule without `type=` applies to **all** packet types, including adverts and
@@ -112,7 +112,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (direct packets never match) |
 | `sender` | pattern | Sender name in group text, e.g. `SpamBot` from `SpamBot: hello` |
 | `text` | pattern | Message text in group text |
-| `action` | `drop` (default) or `logonly` | What to do on a match (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)) |
+| `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read and behave as `forward` — the stored value is unchanged, only the keyword and display moved |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
 message is decrypted. Everything else is checked before forwarding and works on
@@ -203,6 +203,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
 | `filter get <idx>` | Full detail of one rule, including its hit count |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
+| `filter move <from> <to>` | Move a rule so it ends up **at** index `<to>` (the rules in between shift; hit counters travel with the rule) |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
 | `filter clear` | Delete all rules (channels and ratelimit are kept) |
 | `filter chan` / `filter chan list` | List the stored channels |
@@ -224,7 +225,7 @@ Notes:
   0eDBE9
   │││└─ 3 hex digits: digest of the rule's content (changes whenever
   │││     any part of the rule changes; identical rules always match)
-  ││└─── D = drop, L = logonly
+  ││└─── D = drop, F = forward
   │└──── e = enabled, d = disabled
   └────── rule index (0-based position)
   ```
@@ -323,6 +324,28 @@ filter add chan=#mychan region=Foo
 Region names must already exist on the repeater (`region def ...`). Direct
 packets have no region and are never affected.
 
+### Allowlist within a channel (let one sender through)
+
+Drop everything on `#foo` **except** messages from Alice. Put the exception
+rule above the catch-all drop — rules are tried top to bottom, so Alice's
+messages match the exception first and the drop is never consulted for them:
+
+```text
+filter add chan=#foo sender=^Alice$ action=forward   # rule 0: Alice passes
+filter add chan=#foo                                 # rule 1: everyone else is dropped
+```
+
+Added the exception after the drop? Reorder without retyping it —
+`filter move <from> <to>` moves a rule so it ends up **at** the target index:
+
+```text
+filter list                    # the drop (rule 0) sits above Alice's rule (rule 1)
+filter move 1 0                # Alice's rule ends up at index 0, above the drop
+```
+
+To preview how much the drop would remove before enforcing it, see
+[shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode).
+
 ### Turning a rule off temporarily
 
 Disable rather than delete, so you can re-enable it later:
@@ -335,7 +358,7 @@ filter enable 2      # put it back
 ## Examples for every condition
 
 Complete, independent commands. Anything not specified is unrestricted. Rules
-default to dropping — add `action=logonly` if you want to just count matches
+default to dropping — add `action=forward` if you want to just count matches
 first (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)).
 
 ### `type`
@@ -494,11 +517,21 @@ The last pattern matches `ID:123` and `ID: 042`, but not `ID:12` or `ID:1234`.
 
 ## Trying a rule before enforcing it (shadow mode)
 
-Not sure a rule is right? Add it with `action=logonly`: matching packets are
-**counted but still forwarded**. Watch the counters, then enforce.
+Not sure a rule is right? Add it with `action=forward`: matching packets are
+**counted but still forwarded**. Watch the counters, then enforce. Where the
+probe sits matters:
+
+- **Preview a drop:** put the `forward` probe immediately **before** the drop
+  rule it shadows — it counts exactly what the drop would catch and, meanwhile,
+  forwards (first match wins, so the drop never runs while the probe is
+  active). When satisfied, flip the probe's action to `drop` (or delete it).
+- **Log what passes:** put a catch-all `forward` rule at the **end** of the
+  list — it only sees packets no earlier rule matched, so it tallies surviving
+  traffic without short-circuiting anything (e.g. `filter add type=txt
+  action=forward` as the last rule).
 
 ```text
-filter add chan=#test action=logonly
+filter add chan=#test action=forward
 # ...later, check:
 filter stats           # hit counter grows; packets still forwarded
 # when satisfied, replace it with an enforcing rule:
@@ -508,10 +541,11 @@ filter add chan=#test
 
 Two things to remember:
 
-- `logonly` rules count hits but don't drop anything, and they don't stop the
+- `forward` rules count hits but don't drop anything, and they don't stop the
   [rate limiter](#cutting-advert-noise-rate-limiter) from acting.
-- Don't leave an overlapping `logonly` rule in place after adding the real
-  drop rule — the earlier rule matches first and the drop never fires.
+- Don't leave an overlapping `forward` probe in place after adding the real
+  drop rule: a misplaced early probe silently disarms later drop rules, since
+  the earlier rule matches first and the drop never fires.
 
 ## Managing the repeater remotely
 
@@ -552,6 +586,20 @@ is only needed for initial flashing and emergencies.
   patterns like `^BEACON` over long wildcard chains. The `aborted` counter in
   `filter stats` grows if a pattern gives up mid-match; simplify it if you see
   that.
+- Rules are evaluated **top to bottom, first match wins** over the whole list —
+  packet-level and content conditions live in the same ordered list. Older
+  fork firmware ran content rules in a separate second pass; with interleaved
+  configs the observable differences are: a matching `forward` or content rule
+  now shields later drop rules, and a packet-level rule listed before a
+  content rule now decides first for decrypted group text/data. The rule order
+  in `filter list` is now honored exactly as listed.
+- `forward` rules on decrypted group traffic count their hit at the moment the
+  message is read (one scan instead of two). Counters are RAM-only and reset
+  on reboot, so this self-heals.
+- Configs are compatible in both directions: the stored action value did not
+  change with the `logonly` → `forward` rename, so firmware that still says
+  `logonly` reads `forward` rules and behaves identically (count, then
+  forward).
 
 ## Writing sender/text patterns
 
@@ -703,7 +751,7 @@ always confirm what the repeater actually stored with `filter get <idx>`.
 Work up from one narrow rule and confirm each piece before combining:
 
 ```text
-filter add chan=#test sender=^Bot[0-9]+$ text=^BEACON action=logonly
+filter add chan=#test sender=^Bot[0-9]+$ text=^BEACON action=forward
 filter on
 filter list
 filter get 0
@@ -719,4 +767,4 @@ filter stats
 | Pattern from an online tester misbehaves | Remove `/slashes/`, flags, groups, OR, `{counts}`, `\b` — see the table above |
 | "Bad/long regex" error | Pattern too long (see [Limits](#limits-and-good-to-knows)) or broken syntax; shorten or simplify |
 | `aborted` counter grows | Pattern too complex — simplify it |
-| Drop rule never fires | An earlier overlapping rule (often `logonly`) is matching first |
+| Drop rule never fires | An earlier overlapping rule (often a `forward` probe) is matching first |
