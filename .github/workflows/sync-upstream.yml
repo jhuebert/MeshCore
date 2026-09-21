@@ -243,4 +243,4 @@ jobs:
     with:
       channel: ${{ matrix.channel }}
       branch: ${{ matrix.branch }}
-      force_build: ${{ inputs.force_build }}
+      force_build: ${{ inputs.force_build == true }}
