@@ -1373,6 +1373,109 @@ TEST_F(FilterTest, ProbContentPathRollsOnce) {
 }
 
 // ============================================================
+// UNIT TESTS: saved-airtime telemetry (air)
+// ============================================================
+
+// Native tests for the airtime counter: DROP decisions bill the caller-
+// supplied estimated time-on-air, forward/allow verdicts and limiter passes
+// do not, and the counters are RAM-only.
+
+#include <gtest/gtest.h>
+
+#include "FilterTestHelpers.h"
+
+static const uint8_t AIR_KEY[4] = { 0x55, 0x66, 0x77, 0x88 };
+static constexpr uint32_t EST_AIR = 337;   // a plausible advert airtime, ms
+
+TEST_F(FilterTest, AirSavedBillsRuleDrops) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, EST_AIR);
+
+  mesh::Packet adv2 = makeAdvert(AIR_KEY);
+  adv2.payload[0] = 0x99;   // distinct packet, still matches the rule
+  ASSERT_EQ(filter.checkPacket(&adv2, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), 2 * EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 2 * EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedBillsContentDrops) {
+  expectOk(filter, "chan add #t");
+  expectOk(filter, "add chan=#t");
+  int ch_idx = -1;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (strcmp(filter.getChannel(i)->name, "#t") == 0) { ch_idx = i; break; }
+  }
+  ASSERT_GE(ch_idx, 0);
+
+  mesh::Packet pkt;
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, ch_idx),
+                                nullptr, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, EST_AIR);
+  // the stashed drop is consumed by checkPacket without billing again
+  ASSERT_EQ(filter.checkPacket(&pkt, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedNotBilledForForwardAllowLimiterPass) {
+  expectOk(filter, "add type=advert action=forward");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+
+  filter.clearRules();
+  mesh::Packet pass = makeAdvert(AIR_KEY);   // no rule: allow, no limiter (off)
+  ASSERT_EQ(filter.checkPacket(&pass, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+
+  // limiter drop: first sighting passes unbilled, the repeat within the
+  // window is dropped and billed (no rule attribution)
+  expectOk(filter, "ratelimit advert 1");
+  mesh::Packet first = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  mesh::Packet again = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+
+  // once the window expires the same origin passes unbilled
+  mesh::Packet expired = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&expired, 3600000, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedRamOnly) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  ASSERT_EQ(filter.getAirSavedMs(), EST_AIR);
+
+  filter.resetStats();
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+
+  filter.save(&fs);   // reboot-sim: reload never restores stats
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getAirSavedMs(), 0u);
+  EXPECT_EQ(restored.getRule(0)->air_ms, 0u);
+}
+
+TEST_F(FilterTest, AirSavedShownInCli) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  filter.checkPacket(&adv, 0, nullptr, EST_AIR);
+  EXPECT_NE(cli(filter, "stats").find("; air:337"), std::string::npos);
+  EXPECT_NE(cli(filter, "get 0").find(" air=337"), std::string::npos);
+}
+
+// ============================================================
 // UNIT TESTS: filter CLI surface
 // ============================================================
 
