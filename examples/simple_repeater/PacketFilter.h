@@ -106,6 +106,10 @@ struct FilterRule {
   char     text[FILTER_TEXT_PATTERN_LEN];      // regex over message text;   empty = wildcard
   char     regions[FILTER_REGION_LIST_LEN];    // comma list of canonical region names
                                            // and/or "unscoped"; empty = wildcard
+  uint8_t  prob;           // match probability %; 0 = unset = always (100 %).
+                           // Lands in the tail padding after regions, so the
+                           // persisted record size is unchanged (v4 configs read
+                           // back with prob == 0)
   uint32_t hits;           // match counter (forward/drop telemetry + validation)
 };
 

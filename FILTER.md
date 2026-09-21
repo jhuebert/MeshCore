@@ -112,6 +112,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (direct packets never match) |
 | `sender` | pattern | Sender name in group text, e.g. `SpamBot` from `SpamBot: hello` |
 | `text` | pattern | Message text in group text |
+| `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
 | `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read and behave as `forward` — the stored value is unchanged, only the keyword and display moved |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
@@ -514,6 +515,37 @@ Match the message only. For `SpamBot: BEACON 123`, the text is `BEACON 123`.
 | `filter add chan=#test text=^ID:\s*\d\d\d$` | `#test` AND `ID:` + optional space + exactly three digits |
 
 The last pattern matches `ID:123` and `ID: 042`, but not `ID:12` or `ID:1234`.
+
+### `prob`
+
+A rule with `prob=N` decides only about N% of the packets its conditions all
+match. On a "failed roll" the rule steps aside and evaluation continues with
+the next rule, exactly as if the conditions had not matched — when every
+matching rule fails its roll, the packet passes. This is *dosing*: apply
+pressure without a hard cutoff.
+
+- Omit `prob=` for the default: 100% (always decides).
+- It works on both actions: a `drop` rule with `prob=75` drops 3 of 4 matching
+  packets; a `forward` probe with `prob=75` terminates the list on 3 of 4.
+- A later static rule acts as the fallback for the packets a dosed rule
+  lets through — e.g. a `prob=80` drop followed by an unconditional rule
+  expresses "80% pressure, guaranteed floor".
+- The roll is **deterministic per packet**: the same packet always gets the
+  same verdict from the same rule, so counters are stable and repeatable.
+  A retransmitted copy is a new packet and rolls again.
+- `prob=0` is rejected — a 0% rule is a disabled rule; use
+  `filter disable <idx>` instead.
+
+| Command | Effect |
+|---|---|
+| `filter add chan=#chat sender="^Bot" prob=50` | Halve the bot's delivered traffic on `#chat` without cutting its owner off |
+| `filter add hsize=1 prob=75` | Degrade ambiguous 1-byte-hash relaying to 25% pass-through, nudging nodes to upgrade |
+| `filter add chan=#auction prob=70` | Shed 70% of a busy event channel's load; users see degradation, not silence |
+| `filter add type=advert action=forward prob=10` | Shadow-mode *sampling*: count a representative 10% of adverts without enforcing anything |
+
+Note: `hits` counts **decisions**, not condition matches — a packet the rule
+matched but then passed on a failed roll is not counted (and not shown in
+`filter get`).
 
 ## Trying a rule before enforcing it (shadow mode)
 
