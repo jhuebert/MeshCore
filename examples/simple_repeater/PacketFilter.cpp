@@ -1086,7 +1086,7 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
     if (cliRuleIdx(filter, nextToken(&p), from, reply) &&
         cliRuleIdx(filter, nextToken(&p), to, reply)) {
       if (from == to) {
-        strcpy(reply, "Err - no such rule");   // no-op move is rejected
+        strcpy(reply, "Err - move: source and target are the same rule");   // no-op move is rejected
       } else {
         filter.moveRule(from, to);
         sprintf(reply, "OK - rule %d moved to %d", from, to);
