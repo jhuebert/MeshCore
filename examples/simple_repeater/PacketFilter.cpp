@@ -54,6 +54,7 @@ FilterRules::FilterRules() {
   ratelimit_hours = 0;
   limiter_drops = 0;
   budget_aborts = 0;
+  air_saved_ms = 0;
   content_verdict.pkt = NULL;
   enabled = true;
   dirty = false;
@@ -88,7 +89,8 @@ void FilterRules::setEnabled(bool on) {
 void FilterRules::resetStats() {
   limiter_drops = 0;
   budget_aborts = 0;
-  for (int i = 0; i < num_rules; i++) rules[i].hits = 0;
+  air_saved_ms = 0;
+  for (int i = 0; i < num_rules; i++) { rules[i].hits = 0; rules[i].air_ms = 0; }
 }
 
 // ---------------------------------------------------------------- rule management
@@ -380,7 +382,8 @@ static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint
   return true;
 }
 
-uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region) {
+uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region,
+                                 uint32_t est_air_ms) {
   if (!enabled) return FILTER_ACT_ALLOW;
 
   // a verdict stashed by checkContent() for this exact packet is final:
@@ -406,6 +409,10 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
     if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
     if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
     r->hits++;
+    if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
+      r->air_ms += est_air_ms;
+      air_saved_ms += est_air_ms;
+    }
     action = r->action;
     break;   // first match wins
   }
@@ -414,6 +421,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   // limiter runs unless the rule list already dropped; forward adverts too
   if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() &&
       ratelimit_hours > 0 && advertRatelimitDrop(pkt, now_millis)) {
+    air_saved_ms += est_air_ms;   // a limiter drop saves the same airtime
     return FILTER_ACT_DROP;
   }
 
@@ -480,7 +488,8 @@ bool FilterRules::regexMatches(const char* pattern, const char* subject) {
 }
 
 uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
-                                  const uint8_t* data, size_t len, const RegionEntry* region) {
+                                  const uint8_t* data, size_t len, const RegionEntry* region,
+                                  uint32_t est_air_ms) {
   if (!enabled) return FILTER_ACT_ALLOW;
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return FILTER_ACT_ALLOW;
 
@@ -502,6 +511,10 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
     if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
     r->hits++;
+    if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
+      r->air_ms += est_air_ms;
+      air_saved_ms += est_air_ms;
+    }
     verdict = r->action;
     break;   // first match wins
   }
@@ -1046,6 +1059,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   }
   if (r->prob) radd(&out, &remain, " prob=%u", r->prob);
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
+  radd(&out, &remain, " air=%lu", (unsigned long)r->air_ms);
 }
 
 static void cliStats(FilterRules& filter, char* reply) {
@@ -1057,6 +1071,7 @@ static void cliStats(FilterRules& filter, char* reply) {
   }
   radd(&out, &remain, "; limiter:%lu aborted:%lu", (unsigned long)filter.getLimiterDrops(),
        (unsigned long)filter.getBudgetAborts());
+  radd(&out, &remain, "; air:%lu", (unsigned long)filter.getAirSavedMs());
 }
 
 static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {

@@ -202,7 +202,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
 | `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
-| `filter get <idx>` | Full detail of one rule, including its hit count |
+| `filter get <idx>` | Full detail of one rule, including its hit count and saved-airtime stat |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter move <from> <to>` | Move a rule so it ends up **at** index `<to>` (the rules in between shift; hit counters travel with the rule) |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
@@ -213,7 +213,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
 | `filter ratelimit advert <hours>` | Set the window (0–720 h; 0 = off) |
 | `filter ratelimit clear` | Empty the advert cache |
-| `filter stats` | Hit counters per rule |
+| `filter stats` | Per-rule hit counters, limiter/abort counters, and total saved airtime (see below) |
 | anything else | Usage line listing the commands |
 
 Notes:
@@ -578,6 +578,20 @@ Two things to remember:
 - Don't leave an overlapping `forward` probe in place after adding the real
   drop rule: a misplaced early probe silently disarms later drop rules, since
   the earlier rule matches first and the drop never fires.
+
+The probe's worth is also visible in **RF terms**: `filter stats` ends with
+`air:<ms>` — the estimated time-on-air the packets dropped so far would
+have consumed on retransmit (rule drops and rate-limiter drops; the same
+estimate the repeater itself bills airtime with). `filter get <idx>` shows the
+per-rule share as `air=<ms>`. A shadow `forward` probe's `hits` therefore
+come with an estimate of the airtime an enforcing rule would save, which is
+usually the number that matters on a shared channel:
+
+```text
+filter stats           # e.g. ... limiter:118 aborted:0; air:214500
+```
+
+All airtime counters are RAM-only and reset on reboot, like every counter.
 
 ## Managing the repeater remotely
 
