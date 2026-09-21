@@ -106,8 +106,25 @@ struct FilterRule {
   char     text[FILTER_TEXT_PATTERN_LEN];      // regex over message text;   empty = wildcard
   char     regions[FILTER_REGION_LIST_LEN];    // comma list of canonical region names
                                            // and/or "unscoped"; empty = wildcard
+  uint8_t  prob;           // match probability %; 0 = unset = always (100 %).
+                           // Lands in the tail padding after regions, so the
+                           // persisted record size is unchanged (v4 configs read
+                           // back with prob == 0)
   uint32_t hits;           // match counter (forward/drop telemetry + validation)
+  uint32_t air_ms;         // estimated on-air time (ms) billed by this rule's
+                           // DROP decisions; RAM-only stat, after `hits` so it
+                           // is never persisted (persist ends at offsetof(hits))
 };
+
+// `prob` must fit in the tail padding between `regions` and `hits` so the
+// persisted record (the struct up to offsetof(hits)) keeps the v4 record
+// size — a v4 config is then a byte-identical prefix of a v5 one. A build-time
+// override of FILTER_REGION_LIST_LEN that removes that padding would shift
+// `hits` and silently corrupt v4 config upgrades; refuse to build.
+static_assert(offsetof(FilterRule, hits) ==
+                  ((offsetof(FilterRule, regions) + FILTER_REGION_LIST_LEN +
+                    alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1)),
+              "FilterRule::prob must fit in the tail padding after regions");
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
   uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
@@ -128,6 +145,8 @@ class FilterRules {
   uint16_t ratelimit_hours;   // per-node advert repeat window; 0 = off
   uint32_t limiter_drops;     // adverts dropped by the rate limiter
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
+  uint32_t air_saved_ms;      // estimated TX airtime (ms) not spent relaying
+                              // dropped packets (rule + limiter drops); RAM-only
   struct {                    // verdict stashed by checkContent() for the packet
     const mesh::Packet* pkt;  // currently being relayed; consumed by checkPacket()
     uint8_t hash[MAX_HASH_SIZE];  // pointer + content hash guard against pool reuse
@@ -169,16 +188,21 @@ public:
   // path/hashsize; content rules are skipped) and apply the advert rate
   // limiter — it runs unless the verdict is DROP, so it still applies after a
   // forward verdict. `region` is the region the packet arrived in (NULL =
-  // direct-routed or unknown transport code). Returns FILTER_ACT_*.
-  uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region);
+  // direct-routed or unknown transport code). `est_air_ms` is the estimated
+  // time-on-air of retransmitting the packet (ms), billed to airtime telemetry
+  // on DROP decisions (0 = unknown: nothing billed). Returns FILTER_ACT_*.
+  uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region,
+                      uint32_t est_air_ms = 0);
 
   // Single-pass evaluation of the ENTIRE rule list on a decrypted group
   // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
   // sender / text), in listed order; first enabled match decides (first match
   // wins) and its verdict — allow, forward or drop — is stashed for
   // checkPacket(). Caller drops the packet if this returns FILTER_ACT_DROP.
+  // `est_air_ms`: see checkPacket().
   uint8_t checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
-                       const uint8_t* data, size_t len, const RegionEntry* region);
+                       const uint8_t* data, size_t len, const RegionEntry* region,
+                       uint32_t est_air_ms = 0);
 
   // supply keyed-channel candidates for core's group decryption
   int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
@@ -191,6 +215,7 @@ public:
   void markDirty() { dirty = true; dirty_since = millis(); }
   uint32_t getLimiterDrops() const { return limiter_drops; }
   uint32_t getBudgetAborts() const { return budget_aborts; }
+  uint32_t getAirSavedMs() const { return air_saved_ms; }   // airtime not relayed (drops)
   void resetStats();
 
   // persistence

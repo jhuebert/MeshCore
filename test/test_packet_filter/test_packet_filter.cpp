@@ -988,13 +988,15 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 
 #include "FilterTestHelpers.h"
 
-// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v4 record is
-// the struct up to `hits`; the v3 record is the same struct with no `regions`
-// field, padded to uint32_t alignment; the lazy-save delay is 3000 ms)
+// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v5 record is
+// the struct up to `hits` (the prob byte slots into the former tail padding,
+// so the v4 record is byte-identical in size); the v3 record is the same
+// struct with no `regions` field, padded to uint32_t alignment; the lazy-save
+// delay is 3000 ms)
 static constexpr size_t V4_RULE_BYTES = offsetof(FilterRule, hits);
 static constexpr size_t V3_RULE_BYTES =
     (offsetof(FilterRule, regions) + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
-static constexpr uint8_t CFG_VERSION = 4;
+static constexpr uint8_t CFG_VERSION = 5;
 static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static const char* CFG_FILE = "/filter_cfg";
 
@@ -1226,6 +1228,251 @@ TEST_F(FilterTest, LoopSavesOnceWhenClean) {
   g_mock_millis = CFG_SAVE_DELAY_MS * 2;
   filter.loop(&fs);          // not dirty: no save
   EXPECT_EQ(fs.files[CFG_FILE], saved);
+}
+
+// ============================================================
+// UNIT TESTS: match probability (prob=)
+// ============================================================
+
+// Native tests for the per-rule match probability: parse validation, the
+// deterministic content-derived roll (same packet -> same verdict, no global
+// RNG), fall-through on a failed roll, and the one-roll-per-decision stash
+// contract on the content path.
+
+#include <gtest/gtest.h>
+
+#include <string>
+
+#include "FilterTestHelpers.h"
+
+static const uint8_t PROB_KEY[4] = { 0x11, 0x22, 0x33, 0x44 };
+
+// distinct packets: same shape, varying first payload byte (the packet hash
+// covers the payload, so each i rolls independently)
+static mesh::Packet probAdvert(int i) {
+  mesh::Packet p = makeAdvert(PROB_KEY);
+  p.payload[0] = (uint8_t)i;   // not one of the advert-limiter key offsets
+  return p;
+}
+
+TEST_F(FilterTest, ProbParseRejectsInvalid) {
+  EXPECT_EQ(cli(filter, "add prob=0").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "add prob=101").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "add prob=abc").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "add prob=").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "add prob=5x").substr(0, 5), "Err -");   // full token required
+  EXPECT_EQ(filter.getNumRules(), 0);   // no half-added rules
+}
+
+TEST_F(FilterTest, ProbShownInGetAndChangesDigest) {
+  expectOk(filter, "add type=advert");
+  expectOk(filter, "add type=advert prob=50");
+  EXPECT_EQ(cli(filter, "get 0").find(" prob="), std::string::npos);
+  EXPECT_NE(cli(filter, "get 1").find(" prob=50"), std::string::npos);
+
+  // digest covers the record through hits, so prob is part of it
+  std::string list = cli(filter, "list");
+  size_t colon = list.find(':');
+  size_t sp1 = list.find(' ', colon + 1), sp2 = list.find(' ', sp1 + 1);
+  ASSERT_NE(sp1, std::string::npos);
+  if (sp2 == std::string::npos) sp2 = list.size();
+  std::string tok0 = list.substr(sp1 + 1, sp2 - sp1 - 1);
+  std::string tok1 = list.substr(sp2 + 1);
+  ASSERT_EQ(tok0.size(), 6u);
+  ASSERT_EQ(tok1.size(), 6u);
+  EXPECT_NE(tok0, tok1);
+}
+
+TEST_F(FilterTest, ProbPersistsRoundtrip) {
+  expectOk(filter, "add type=advert prob=75");
+  filter.save(&fs);
+  std::string digest_before = cli(filter, "list");
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->prob, 75);
+  std::string digest_after = cli(restored, "list");
+  EXPECT_EQ(digest_after, digest_before);   // padding canary: byte-identical record
+}
+
+TEST_F(FilterTest, V4ConfigLoadsProbUnset) {
+  expectOk(filter, "add type=advert prob=50");
+  filter.save(&fs);
+  auto& blob = fs.files[CFG_FILE];
+  blob[0] = 4;   // downgrade the header: a v4 record has no prob field
+  blob[7 + offsetof(FilterRule, prob)] = 0xFF;   // old padding byte, not guaranteed
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->prob, 0);   // unset = always (100 %)
+  EXPECT_EQ(restored.getRule(0)->hits, 0u);  // stats never persisted
+}
+
+TEST_F(FilterTest, ProbAlwaysDecides) {
+  expectOk(filter, "add type=advert prob=100");
+  for (int i = 0; i < 10; i++) {
+    mesh::Packet adv = probAdvert(i);
+    EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_DROP);
+  }
+  EXPECT_EQ(filter.getRule(0)->hits, 10u);
+}
+
+TEST_F(FilterTest, ProbRollStablePerPacket) {
+  // no global RNG: the same packet always gets the same verdict from the
+  // same rule, even across repeated scans (stash re-scan idempotence)
+  expectOk(filter, "add type=advert action=forward prob=50");
+  for (int i = 0; i < 50; i++) {
+    mesh::Packet adv = probAdvert(i);
+    uint8_t v1 = filter.checkPacket(&adv, 0, nullptr);
+    uint8_t v2 = filter.checkPacket(&adv, 0, nullptr);
+    EXPECT_EQ(v1, v2) << "packet " << i;
+  }
+}
+
+TEST_F(FilterTest, ProbRollDistribution) {
+  expectOk(filter, "add type=advert prob=50");
+  int drops = 0;
+  for (int i = 0; i < 200; i++) {
+    mesh::Packet adv = probAdvert(i);
+    if (filter.checkPacket(&adv, 0, nullptr) == FILTER_ACT_DROP) drops++;
+  }
+  EXPECT_GE(drops, 80);   // ~100 expected; wide bounds keep the test deterministic
+  EXPECT_LE(drops, 120);
+  EXPECT_EQ(filter.getRule(0)->hits, (uint32_t)drops);   // hits count decisions
+}
+
+TEST_F(FilterTest, ProbFailFallsThroughToLaterRule) {
+  expectOk(filter, "add type=advert prob=1");   // almost never decides
+  expectOk(filter, "add type=advert");          // unconditional fallback drop
+  for (int i = 0; i < 200; i++) {
+    mesh::Packet adv = probAdvert(i);
+    EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_DROP);   // either way
+  }
+  EXPECT_LE(filter.getRule(0)->hits, 20u);    // dosed rule decides rarely
+  EXPECT_GE(filter.getRule(1)->hits, 180u);   // fallback decides the rest
+}
+
+TEST_F(FilterTest, ProbContentPathRollsOnce) {
+  expectOk(filter, "chan add #t");
+  expectOk(filter, "add chan=#t prob=50");
+  int b_idx = -1;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (strcmp(filter.getChannel(i)->name, "#t") == 0) { b_idx = i; break; }
+  }
+  ASSERT_GE(b_idx, 0);
+
+  mesh::Packet pkt;
+  uint8_t v = filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, b_idx),
+                                  nullptr, 0, nullptr);
+  // the stashed verdict is final: checkPacket consumes it without re-rolling
+  // or double-counting, whatever the roll said
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), v);
+  EXPECT_LE(filter.getRule(0)->hits, 1u);
+}
+
+// ============================================================
+// UNIT TESTS: saved-airtime telemetry (air)
+// ============================================================
+
+// Native tests for the airtime counter: DROP decisions bill the caller-
+// supplied estimated time-on-air, forward/allow verdicts and limiter passes
+// do not, and the counters are RAM-only.
+
+#include <gtest/gtest.h>
+
+#include "FilterTestHelpers.h"
+
+static const uint8_t AIR_KEY[4] = { 0x55, 0x66, 0x77, 0x88 };
+static constexpr uint32_t EST_AIR = 337;   // a plausible advert airtime, ms
+
+TEST_F(FilterTest, AirSavedBillsRuleDrops) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, EST_AIR);
+
+  mesh::Packet adv2 = makeAdvert(AIR_KEY);
+  adv2.payload[0] = 0x99;   // distinct packet, still matches the rule
+  ASSERT_EQ(filter.checkPacket(&adv2, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), 2 * EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 2 * EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedBillsContentDrops) {
+  expectOk(filter, "chan add #t");
+  expectOk(filter, "add chan=#t");
+  int ch_idx = -1;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (strcmp(filter.getChannel(i)->name, "#t") == 0) { ch_idx = i; break; }
+  }
+  ASSERT_GE(ch_idx, 0);
+
+  mesh::Packet pkt;
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, ch_idx),
+                                nullptr, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+  EXPECT_EQ(filter.getRule(0)->air_ms, EST_AIR);
+  // the stashed drop is consumed by checkPacket without billing again
+  ASSERT_EQ(filter.checkPacket(&pkt, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedNotBilledForForwardAllowLimiterPass) {
+  expectOk(filter, "add type=advert action=forward");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+
+  filter.clearRules();
+  mesh::Packet pass = makeAdvert(AIR_KEY);   // no rule: allow, no limiter (off)
+  ASSERT_EQ(filter.checkPacket(&pass, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+
+  // limiter drop: first sighting passes unbilled, the repeat within the
+  // window is dropped and billed (no rule attribution)
+  expectOk(filter, "ratelimit advert 1");
+  mesh::Packet first = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  mesh::Packet again = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+
+  // once the window expires the same origin passes unbilled
+  mesh::Packet expired = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&expired, 3600000, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
+}
+
+TEST_F(FilterTest, AirSavedRamOnly) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  ASSERT_EQ(filter.checkPacket(&adv, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  ASSERT_EQ(filter.getAirSavedMs(), EST_AIR);
+
+  filter.resetStats();
+  EXPECT_EQ(filter.getAirSavedMs(), 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+
+  filter.save(&fs);   // reboot-sim: reload never restores stats
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getAirSavedMs(), 0u);
+  EXPECT_EQ(restored.getRule(0)->air_ms, 0u);
+}
+
+TEST_F(FilterTest, AirSavedShownInCli) {
+  expectOk(filter, "add type=advert");
+  mesh::Packet adv = makeAdvert(AIR_KEY);
+  filter.checkPacket(&adv, 0, nullptr, EST_AIR);
+  EXPECT_NE(cli(filter, "stats").find("; air:337"), std::string::npos);
+  EXPECT_NE(cli(filter, "get 0").find(" air=337"), std::string::npos);
 }
 
 // ============================================================
@@ -2016,7 +2263,7 @@ TEST_F(FilterTest, MovePersistsOrder) {
   filter.getRule(1)->hits = 42;   // hits are RAM-only
   ASSERT_EQ(cli(filter, "move 1 0"), "OK - rule 1 moved to 0");
   filter.save(&fs);
-  EXPECT_EQ(fs.files[CFG_FILE][0], 4);   // config version byte unchanged
+  EXPECT_EQ(fs.files[CFG_FILE][0], CFG_VERSION);   // config version byte unchanged
 
   FilterRules restored;
   restored.begin(&fs);

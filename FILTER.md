@@ -112,6 +112,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (direct packets never match) |
 | `sender` | pattern | Sender name in group text, e.g. `SpamBot` from `SpamBot: hello` |
 | `text` | pattern | Message text in group text |
+| `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
 | `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read and behave as `forward` — the stored value is unchanged, only the keyword and display moved |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
@@ -201,7 +202,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
 | `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
-| `filter get <idx>` | Full detail of one rule, including its hit count |
+| `filter get <idx>` | Full detail of one rule, including its hit count and saved-airtime stat |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter move <from> <to>` | Move a rule so it ends up **at** index `<to>` (the rules in between shift; hit counters travel with the rule) |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
@@ -212,7 +213,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
 | `filter ratelimit advert <hours>` | Set the window (0–720 h; 0 = off) |
 | `filter ratelimit clear` | Empty the advert cache |
-| `filter stats` | Hit counters per rule |
+| `filter stats` | Per-rule hit counters, limiter/abort counters, and total saved airtime (see below) |
 | anything else | Usage line listing the commands |
 
 Notes:
@@ -515,6 +516,37 @@ Match the message only. For `SpamBot: BEACON 123`, the text is `BEACON 123`.
 
 The last pattern matches `ID:123` and `ID: 042`, but not `ID:12` or `ID:1234`.
 
+### `prob`
+
+A rule with `prob=N` decides only about N% of the packets its conditions all
+match. On a "failed roll" the rule steps aside and evaluation continues with
+the next rule, exactly as if the conditions had not matched — when every
+matching rule fails its roll, the packet passes. This is *dosing*: apply
+pressure without a hard cutoff.
+
+- Omit `prob=` for the default: 100% (always decides).
+- It works on both actions: a `drop` rule with `prob=75` drops 3 of 4 matching
+  packets; a `forward` probe with `prob=75` terminates the list on 3 of 4.
+- A later static rule acts as the fallback for the packets a dosed rule
+  lets through — e.g. a `prob=80` drop followed by an unconditional rule
+  expresses "80% pressure, guaranteed floor".
+- The roll is **deterministic per packet**: the same packet always gets the
+  same verdict from the same rule, so counters are stable and repeatable.
+  A retransmitted copy is a new packet and rolls again.
+- `prob=0` is rejected — a 0% rule is a disabled rule; use
+  `filter disable <idx>` instead.
+
+| Command | Effect |
+|---|---|
+| `filter add chan=#chat sender="^Bot" prob=50` | Halve the bot's delivered traffic on `#chat` without cutting its owner off |
+| `filter add hsize=1 prob=75` | Degrade ambiguous 1-byte-hash relaying to 25% pass-through, nudging nodes to upgrade |
+| `filter add chan=#auction prob=70` | Shed 70% of a busy event channel's load; users see degradation, not silence |
+| `filter add type=advert action=forward prob=10` | Shadow-mode *sampling*: count a representative 10% of adverts without enforcing anything |
+
+Note: `hits` counts **decisions**, not condition matches — a packet the rule
+matched but then passed on a failed roll is not counted (and not shown in
+`filter get`).
+
 ## Trying a rule before enforcing it (shadow mode)
 
 Not sure a rule is right? Add it with `action=forward`: matching packets are
@@ -546,6 +578,21 @@ Two things to remember:
 - Don't leave an overlapping `forward` probe in place after adding the real
   drop rule: a misplaced early probe silently disarms later drop rules, since
   the earlier rule matches first and the drop never fires.
+
+The probe's worth is also visible in **RF terms**: `filter stats` ends with
+`air:<ms>` — the estimated time-on-air the packets dropped so far would
+have consumed on retransmit (rule drops and rate-limiter drops; the same
+estimate the repeater itself bills airtime with). `filter get <idx>` shows the
+per-rule share as `air=<ms>`. A shadow `forward` probe itself bills nothing
+(`air=0`, since its packets are still relayed) — flip it to `drop` and those
+same hits start accumulating the estimate, which is usually the number that
+matters on a shared channel:
+
+```text
+filter stats           # e.g. ... limiter:118 aborted:0; air:214500
+```
+
+All airtime counters are RAM-only and reset on reboot, like every counter.
 
 ## Managing the repeater remotely
 
@@ -600,6 +647,13 @@ is only needed for initial flashing and emergencies.
   change with the `logonly` → `forward` rename, so firmware that still says
   `logonly` reads `forward` rules and behaves identically (count, then
   forward).
+- **Never lock out your own admin.** Rules are first-match-wins, so a broad
+  early drop rule can silence remote admin login from your app (login replies
+  ride the flood path). Before enabling any catch-all drop rule, add a
+  higher-priority `forward` rule that admits your own traffic — e.g.
+  `filter add 0 chan=<admin channel> action=forward`, or keep rule 0 as an
+  `sender=<your name> action=forward`. Test it from the app while you still
+  have serial access.
 
 ## Writing sender/text patterns
 
