@@ -26,9 +26,11 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     4   // v4: region= predicate list on rules
-                                   // (a v3 rule record is a byte-prefix of a v4
-                                   // record; v1/v2 configs discarded on upgrade)
+#define FILTER_CFG_VERSION     5   // v5: prob= match probability on rules (stored
+                                   // in the tail padding after regions, so the
+                                   // record size is unchanged); a v4 record is a
+                                   // byte-identical prefix whose prob byte reads 0
+                                   // (= always); v1/v2 configs discarded on upgrade
 #define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
 // v3 record size: v3 ended each rule record at its offsetof(hits) — the config
 // bytes plus the tail padding that preceded the (then-next) uint32_t. With v4
@@ -250,6 +252,31 @@ bool FilterRules::advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_mill
   return false;
 }
 
+// FNV-1a over the rule's predicate fields (a short display digest for `filter list`)
+static uint32_t ruleDigest(const FilterRule* r) {
+  uint32_t h = 2166136261u;
+  const uint8_t* p = (const uint8_t*)&r->action;
+  const uint8_t* end = (const uint8_t*)&r->hits;
+  for (; p < end; p++) {
+    h ^= *p;
+    h *= 16777619u;
+  }
+  return h;
+}
+
+// Deterministic per (packet, rule) match-probability roll: FNV-1a over the
+// packet hash salted with the rule digest. rand() is never seeded anywhere, so
+// it would replay the same sequence every boot; this roll is idempotent under
+// the stash re-scan (same packet -> same verdict) and exact-testable.
+static bool probDecides(const FilterRule* r, const mesh::Packet* pkt) {
+  if (r->prob == 0 || r->prob >= 100) return true;   // unset = always (100 %)
+  uint8_t h[MAX_HASH_SIZE];
+  pkt->calculatePacketHash(h);   // same hash the stash guard uses
+  uint32_t x = ruleDigest(r) ^ 2166136261u;   // per-rule salt
+  for (int i = 0; i < MAX_HASH_SIZE; i++) { x ^= h[i]; x *= 16777619u; }
+  return (x % 100) < r->prob;
+}
+
 // ---------------------------------------------------------------- matching
 
 static bool intervalMatches(const Interval& iv, int32_t v) {
@@ -376,11 +403,11 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
-    if (ruleMatchesPacket(r, pkt, payload_type, region)) {
-      r->hits++;
-      action = r->action;
-      break;   // first match wins
-    }
+    if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
+    if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
+    r->hits++;
+    action = r->action;
+    break;   // first match wins
   }
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
@@ -473,6 +500,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((r->chan_flags & FILTER_CHANFLG_MASK_SET) && !channelMatchesStore(r, channel)) continue;
     if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
+    if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
     r->hits++;
     verdict = r->action;
     break;   // first match wins
@@ -497,6 +525,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // guards against layout drift.
 
 void FilterRules::load(FILESYSTEM* fs) {
+  memset(rules, 0, sizeof(rules));   // unpersisted tail bytes (padding, stats) stay deterministic
   num_rules = 0;
   num_channels = 0;
   enabled = true;
@@ -511,17 +540,22 @@ void FilterRules::load(FILESYSTEM* fs) {
     uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
     uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
     if (file.read(hdr, 1) == 1 &&
-        ((ver = hdr[0]) == FILTER_CFG_VERSION || ver == FILTER_CFG_VERSION - 1) &&
+        (ver = hdr[0], ver == FILTER_CFG_VERSION || ver == FILTER_CFG_VERSION - 1 ||
+         ver == FILTER_CFG_VERSION - 2) &&
         file.read(hdr, 4) == 4) {
       enabled = hdr[0] != 0;
       uint8_t nr = hdr[1] < FILTER_MAX_RULES ? hdr[1] : FILTER_MAX_RULES;
       uint8_t nc = hdr[2] < FILTER_MAX_CHANNELS ? hdr[2] : FILTER_MAX_CHANNELS;
-      size_t rule_bytes = (ver == FILTER_CFG_VERSION) ? FILTER_RULE_PERSIST_BYTES
-                                                      : FILTER_RULE_V3_PERSIST_BYTES;
+      size_t rule_bytes = (ver >= FILTER_CFG_VERSION - 1) ? FILTER_RULE_PERSIST_BYTES
+                                                         : FILTER_RULE_V3_PERSIST_BYTES;
       if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
           ok = (file.read((uint8_t*)&rules[i], rule_bytes) == rule_bytes);
+          if (ok && ver < FILTER_CFG_VERSION) {
+            // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
+            rules[i].prob = 0;
+          }
           if (ok && rule_bytes < FILTER_RULE_PERSIST_BYTES) {
             // v3 record: the read drags the old record's trailing padding bytes
             // into regions[0..1], so zero the whole regions field (predicate unset)
@@ -698,18 +732,6 @@ static bool parsePath(const char* tok, FilterRule* r) {
   return true;
 }
 
-// FNV-1a over the rule's predicate fields (a short display digest for `filter list`)
-static uint32_t ruleDigest(const FilterRule* r) {
-  uint32_t h = 2166136261u;
-  const uint8_t* p = (const uint8_t*)&r->action;
-  const uint8_t* end = (const uint8_t*)&r->hits;
-  for (; p < end; p++) {
-    h ^= *p;
-    h *= 16777619u;
-  }
-  return h;
-}
-
 // ---------------------------------------------------------------- filter add
 
 static bool setPattern(char* dest, size_t dest_sz, const char* pattern) {
@@ -854,6 +876,16 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     if (strcmp(val, "drop") == 0) r->action = FILTER_ACT_DROP;
     else if (strcmp(val, "forward") == 0) r->action = FILTER_ACT_FORWARD;
     else { strcpy(reply, "Err - action must be drop|forward"); return false; }
+    return true;
+  }
+  if (strcmp(key, "prob") == 0) {
+    char* end;
+    long v = strtol(val, &end, 10);
+    if (end == val || *end != 0 || v < 1 || v > 100) {
+      strcpy(reply, "Err - prob must be 1..100 (omit for 100%)");
+      return false;
+    }
+    r->prob = (uint8_t)v;
     return true;
   }
   sprintf(reply, "Err - unknown param '%s'", key);
@@ -1012,6 +1044,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
     if (strchr(r->text, ' ')) radd(&out, &remain, " text=\"%s\"", r->text);
     else radd(&out, &remain, " text=%s", r->text);
   }
+  if (r->prob) radd(&out, &remain, " prob=%u", r->prob);
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
 }
 
