@@ -583,9 +583,10 @@ The probe's worth is also visible in **RF terms**: `filter stats` ends with
 `air:<ms>` — the estimated time-on-air the packets dropped so far would
 have consumed on retransmit (rule drops and rate-limiter drops; the same
 estimate the repeater itself bills airtime with). `filter get <idx>` shows the
-per-rule share as `air=<ms>`. A shadow `forward` probe's `hits` therefore
-come with an estimate of the airtime an enforcing rule would save, which is
-usually the number that matters on a shared channel:
+per-rule share as `air=<ms>`. A shadow `forward` probe itself bills nothing
+(`air=0`, since its packets are still relayed) — flip it to `drop` and those
+same hits start accumulating the estimate, which is usually the number that
+matters on a shared channel:
 
 ```text
 filter stats           # e.g. ... limiter:118 aborted:0; air:214500

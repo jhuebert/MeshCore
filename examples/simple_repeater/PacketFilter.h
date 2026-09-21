@@ -116,6 +116,16 @@ struct FilterRule {
                            // is never persisted (persist ends at offsetof(hits))
 };
 
+// `prob` must fit in the tail padding between `regions` and `hits` so the
+// persisted record (the struct up to offsetof(hits)) keeps the v4 record
+// size — a v4 config is then a byte-identical prefix of a v5 one. A build-time
+// override of FILTER_REGION_LIST_LEN that removes that padding would shift
+// `hits` and silently corrupt v4 config upgrades; refuse to build.
+static_assert(offsetof(FilterRule, hits) ==
+                  ((offsetof(FilterRule, regions) + FILTER_REGION_LIST_LEN +
+                    alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1)),
+              "FilterRule::prob must fit in the tail padding after regions");
+
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
   uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
                               // advertRatelimitDrop); collision odds ~0.001%
