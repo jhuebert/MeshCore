@@ -1982,7 +1982,7 @@ TEST_F(FilterTest, MoveForwardAndBackward) {
 TEST_F(FilterTest, MoveRejects) {
   EXPECT_EQ(cli(filter, "move 0 1"), "Err - no such rule");   // empty list
   expectOk(filter, "add hops=1");
-  EXPECT_EQ(cli(filter, "move 0 0"), "Err - no such rule");   // no-op rejected
+  EXPECT_EQ(cli(filter, "move 0 0"), "Err - move: source and target are the same rule");   // no-op rejected
   EXPECT_EQ(cli(filter, "move 0 1"), "Err - no such rule");
   EXPECT_EQ(cli(filter, "move 1 0"), "Err - no such rule");
   EXPECT_EQ(cli(filter, "move -1 0").substr(0, 5), "Err -");
