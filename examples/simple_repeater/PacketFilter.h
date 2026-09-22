@@ -6,8 +6,10 @@
 // A rule is a conjunction of optional predicates; the enabled rules are
 // evaluated in listed order and the first one whose predicates all match
 // decides the packet's verdict (first match wins). Unspecified predicate =
-// wildcard. Actions: drop (enforce) and forward (terminal: stop the list,
-// count the hit, let the packet through).
+// wildcard. On top of the predicates, prob= and throttle= are match gates: a
+// rule whose predicates match still only decides a packet its gates admit
+// (see probDecides/throttleDecides). Actions: drop (enforce) and forward
+// (terminal: stop the list, count the hit, let the packet through).
 //
 // For a decrypted group packet the whole rule list — packet-level and content
 // predicates alike — is evaluated once in checkContent() (called from
@@ -110,21 +112,35 @@ struct FilterRule {
                            // Lands in the tail padding after regions, so the
                            // persisted record size is unchanged (v4 configs read
                            // back with prob == 0)
+  uint16_t throttle;       // rate gate: the rule decides only matches over one
+                           // per N seconds (1..65535 s); 0 = unset = no limit.
+                           // v6 record growth: the v4/v5 record ends exactly at
+                           // offsetof(throttle) (byte-identical prefix)
+  // the 2 bytes before hits are RESERVED tail padding (like prob's old v4
+  // padding): written raw and not format-guaranteed in v6 files, so a future
+  // field placed there must be forced to 0 when read from a v6-or-older record
   uint32_t hits;           // match counter (forward/drop telemetry + validation)
   uint32_t air_ms;         // estimated on-air time (ms) billed by this rule's
                            // DROP decisions; RAM-only stat, after `hits` so it
                            // is never persisted (persist ends at offsetof(hits))
+  // RAM-only throttle state — never persisted (persist ends at offsetof(hits));
+  // travels with the rule on move/del, like hits
+  uint32_t throttle_last_ms; // millis() stamp of the last within-budget pass
+  uint32_t throttle_pass;    // within-budget passes (slipped past the rule)
+  bool     throttle_seen;    // a pass has been stamped (first match = free pass)
 };
 
-// `prob` must fit in the tail padding between `regions` and `hits` so the
-// persisted record (the struct up to offsetof(hits)) keeps the v4 record
-// size — a v4 config is then a byte-identical prefix of a v5 one. A build-time
-// override of FILTER_REGION_LIST_LEN that removes that padding would shift
-// `hits` and silently corrupt v4 config upgrades; refuse to build.
-static_assert(offsetof(FilterRule, hits) ==
+// v4/v5 records must stay byte-identical prefixes of a v6 record: throttle
+// starts exactly where the old record ended (offsetof(hits) under v5 layout),
+// and the 2 bytes before hits are reserved tail padding (throttle is u16). A
+// build-time override of FILTER_REGION_LIST_LEN that breaks either invariant
+// would silently corrupt config upgrades; refuse to build.
+static_assert(offsetof(FilterRule, throttle) ==
                   ((offsetof(FilterRule, regions) + FILTER_REGION_LIST_LEN +
                     alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1)),
-              "FilterRule::prob must fit in the tail padding after regions");
+              "FilterRule::throttle must start where the v4/v5 record ended");
+static_assert(offsetof(FilterRule, hits) == offsetof(FilterRule, throttle) + 4,
+              "u16 throttle + 2 reserved bytes must fill the gap before hits");
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
   uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
