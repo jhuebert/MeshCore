@@ -113,6 +113,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `sender` | pattern | Sender name in group text, e.g. `SpamBot` from `SpamBot: hello` |
 | `text` | pattern | Message text in group text |
 | `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
+| `throttle` | seconds, `1..65535` | Rate gate: the rule decides only the matches that exceed one per N seconds; one per N seconds slips past (see [throttle examples](#throttle)) |
 | `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read and behave as `forward` — the stored value is unchanged, only the keyword and display moved |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
@@ -202,7 +203,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
 | `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
-| `filter get <idx>` | Full detail of one rule, including its hit count and saved-airtime stat |
+| `filter get <idx>` | Full detail of one rule, including its `throttle=`/`pass=` rate gate, hit count and saved-airtime stat |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter move <from> <to>` | Move a rule so it ends up **at** index `<to>` (the rules in between shift; hit counters travel with the rule) |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
@@ -242,7 +243,9 @@ Notes:
   rules 2 and 3 become 1 and 2. Re-check `filter list` after deletions.
 - The repeater replies with short lines; `filter get <idx>` gives the most
   detail about a rule.
-- Counters (`filter stats`) reset to zero on reboot; the rules themselves do not.
+- Counters (`filter stats`) and per-rule rate state reset to zero on reboot —
+  the rate state means each [`throttle=`](#throttle) rule grants one free pass
+  after a reboot; the rules themselves do not.
 
 ## Common setups
 
@@ -283,6 +286,23 @@ filter add chan=#local,#weather sender=BotName
 # match the sender AND the message text:
 filter add chan=#local sender=^BotName$ text="^RX in place"
 ```
+
+### Slowing one sender down instead of muting them
+
+Bob floods `#test`, but you don't want him gone — just quieter. Let one
+message per minute through and drop the rest:
+
+```text
+filter add chan=#test sender="^bob" throttle=60
+filter get 0
+# r0 en drop chan=#test sender="^bob" throttle=60 pass=12 hits=5 air=2140
+```
+
+Reading that line: `pass=12` messages got through (one per minute), `hits=5`
+excess messages were dropped, and `air=2140` is the retransmit airtime those
+drops saved. Like every `sender=` rule, this matches the message *text*, not a
+verified identity — a renamed sender evades it (the honest limit of content
+matching on group text).
 
 ### Cutting advert noise
 
@@ -544,8 +564,50 @@ pressure without a hard cutoff.
 | `filter add type=advert action=forward prob=10` | Shadow-mode *sampling*: count a representative 10% of adverts without enforcing anything |
 
 Note: `hits` counts **decisions**, not condition matches — a packet the rule
-matched but then passed on a failed roll is not counted (and not shown in
+matched but then stepped aside on (a failed roll, or within a
+[`throttle=`](#throttle) budget — see below) is not counted (and not shown in
 `filter get`).
+
+### `throttle`
+
+A rule with `throttle=N` lets **at most one matching packet every N seconds
+slip past the rule untouched**; every other matching packet inside those N
+seconds triggers the rule's action (default: `drop`). `throttle` and `prob`
+answer the same question about a packet that matched all of a rule's
+conditions — *does the rule get to decide this packet?* — and a rule that
+steps aside behaves exactly as on a failed `prob` roll: evaluation continues
+with the next rule, exactly as if the conditions had not matched. This is a
+*rate gate*: "one per minute" instead of a mute.
+
+- Omit `throttle=` for the default: no limit.
+- It works on both actions: a `drop` rule with `throttle=60` drops the excess;
+  a `forward` probe with `throttle=60` forwards everything and counts exactly
+  the excess (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)).
+- **One budget per rule.** The rule's whole matched stream shares it — scope
+  the rule with `sender=`/`chan=`/etc. to scope the budget. **Careful:**
+  `chan=#test throttle=60` with no `sender=` limits the *channel* to one
+  message per minute total — first come, first served, and one busy sender
+  could starve everyone else.
+- Over-rate firings **do not extend** the window: a matching stream sustains
+  exactly one pass per N seconds however hard it is pushed ("1 per minute"
+  always, not "1 per quiet minute"). The boundary is exact: at N seconds it
+  is the next pass.
+- The rate state is RAM-only and resets on reboot — the first match after a
+  reboot is a free pass.
+- Combined with `prob=`: *prob filters what the rule sees; throttle meters
+  what it sees* — a failed roll never touches the budget.
+
+| Command | Effect |
+|---|---|
+| `filter add chan=#test sender="^bob" throttle=60` | Bob's `#test` messages: at most one per minute; the rest are dropped |
+| `filter add sender="^Bot" throttle=10` | Slow a chatty bot to one message per 10 s instead of muting it |
+| `filter add type=data throttle=600` | A misbehaving telemetry sender gets one report per 10 minutes relayed |
+| `filter add type=advert region=XX throttle=3600` | Adverts from a chatty region at one per hour through this repeater |
+| `filter add chan=#test sender="^bob" action=forward throttle=60` | Shadow measure: `hits` counts exactly what a `drop` version would catch |
+
+Note: `hits` counts **decisions** — for a throttle rule exactly the over-rate
+firings (the would-be drops); within-budget passes show as `pass=` in
+`filter get` and are not hits.
 
 ## Trying a rule before enforcing it (shadow mode)
 
@@ -557,6 +619,11 @@ probe sits matters:
   rule it shadows — it counts exactly what the drop would catch and, meanwhile,
   forwards (first match wins, so the drop never runs while the probe is
   active). When satisfied, flip the probe's action to `drop` (or delete it).
+- **Preview a throttle:** a `forward` probe with `throttle=` counts exactly
+  what the throttled drop would catch — its `hits` *are* the excess rate.
+  Probe and drop twin meter their own budgets, so the probe placed first
+  disarms the twin just like the warning below; keep only the probe while
+  measuring.
 - **Log what passes:** put a catch-all `forward` rule at the **end** of the
   list — it only sees packets no earlier rule matched, so it tallies surviving
   traffic without short-circuiting anything (e.g. `filter add type=txt

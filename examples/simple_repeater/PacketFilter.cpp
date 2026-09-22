@@ -26,12 +26,15 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     5   // v5: prob= match probability on rules (stored
-                                   // in the tail padding after regions, so the
-                                   // record size is unchanged); a v4 record is a
-                                   // byte-identical prefix whose prob byte reads 0
-                                   // (= always); v1/v2 configs discarded on upgrade
+#define FILTER_CFG_VERSION     6   // v6: throttle= rate gate (record grows 4 B:
+                                   // u16 throttle + 2 reserved pad bytes); the
+                                   // v4/v5 record is a byte-identical prefix
+                                   // ending at offsetof(throttle) and reads back
+                                   // with throttle == 0 (= no limit)
 #define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
+// v4/v5 record size: prob rides the tail padding and throttle grows the record
+// by 4 bytes, so v4/v5 records end where `throttle` begins
+#define FILTER_RULE_V4_PERSIST_BYTES  (offsetof(FilterRule, throttle))
 // v3 record size: v3 ended each rule record at its offsetof(hits) — the config
 // bytes plus the tail padding that preceded the (then-next) uint32_t. With v4
 // only appending `regions` after `text`, that equals regions' offset rounded
@@ -90,7 +93,11 @@ void FilterRules::resetStats() {
   limiter_drops = 0;
   budget_aborts = 0;
   air_saved_ms = 0;
-  for (int i = 0; i < num_rules; i++) { rules[i].hits = 0; rules[i].air_ms = 0; }
+  for (int i = 0; i < num_rules; i++) {
+    rules[i].hits = 0;
+    rules[i].air_ms = 0;
+    rules[i].throttle_pass = 0;   // rate state kept: resetting stats never grants a free pass
+  }
 }
 
 // ---------------------------------------------------------------- rule management
@@ -279,6 +286,25 @@ static bool probDecides(const FilterRule* r, const mesh::Packet* pkt) {
   return (x % 100) < r->prob;
 }
 
+// Rate gate for throttle=N rules: the stateful counterpart of probDecides().
+// Within budget the packet slips past the rule — the clock stamps, the pass
+// counts, and evaluation continues with the next rule exactly as on a failed
+// prob roll. Over rate (or throttle unset) the rule decides (fires): its
+// action applies. Over-rate drops do NOT extend the window, so a matching
+// stream sustains exactly one pass per N seconds however hard it is pushed
+// (the advert limiter's model, per rule).
+static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
+  if (r->throttle == 0) return true;   // unset = no limit: every match decides
+  if (r->throttle_seen &&
+      now_millis - r->throttle_last_ms < (uint32_t)r->throttle * 1000UL) {
+    return true;                       // over rate: decide (action applies)
+  }
+  r->throttle_last_ms = now_millis;    // within budget: slips past the rule
+  r->throttle_seen = true;
+  r->throttle_pass++;
+  return false;
+}
+
 // ---------------------------------------------------------------- matching
 
 static bool intervalMatches(const Interval& iv, int32_t v) {
@@ -408,6 +434,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
     if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
     if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
+    if (!throttleDecides(r, now_millis)) continue;   // within budget: slips past, like a failed roll
     r->hits++;
     if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
       r->air_ms += est_air_ms;
@@ -510,6 +537,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
     if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
+    if (!throttleDecides(r, millis())) continue;   // within budget: slips past, like a failed roll
     r->hits++;
     if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
       r->air_ms += est_air_ms;
@@ -554,22 +582,26 @@ void FilterRules::load(FILESYSTEM* fs) {
     uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
     if (file.read(hdr, 1) == 1 &&
         (ver = hdr[0], ver == FILTER_CFG_VERSION || ver == FILTER_CFG_VERSION - 1 ||
-         ver == FILTER_CFG_VERSION - 2) &&
+         ver == FILTER_CFG_VERSION - 2 || ver == FILTER_CFG_VERSION - 3) &&
         file.read(hdr, 4) == 4) {
       enabled = hdr[0] != 0;
       uint8_t nr = hdr[1] < FILTER_MAX_RULES ? hdr[1] : FILTER_MAX_RULES;
       uint8_t nc = hdr[2] < FILTER_MAX_CHANNELS ? hdr[2] : FILTER_MAX_CHANNELS;
-      size_t rule_bytes = (ver >= FILTER_CFG_VERSION - 1) ? FILTER_RULE_PERSIST_BYTES
+      // load() accepts every version for which record-layout code exists
+      // (currently 3..6); older configs were discarded only because no layout
+      // code for them was kept
+      size_t rule_bytes = (ver >= FILTER_CFG_VERSION)     ? FILTER_RULE_PERSIST_BYTES
+                        : (ver >= FILTER_CFG_VERSION - 2) ? FILTER_RULE_V4_PERSIST_BYTES
                                                          : FILTER_RULE_V3_PERSIST_BYTES;
       if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
           ok = (file.read((uint8_t*)&rules[i], rule_bytes) == rule_bytes);
-          if (ok && ver < FILTER_CFG_VERSION) {
+          if (ok && ver < FILTER_CFG_VERSION - 1) {
             // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
             rules[i].prob = 0;
           }
-          if (ok && rule_bytes < FILTER_RULE_PERSIST_BYTES) {
+          if (ok && rule_bytes == FILTER_RULE_V3_PERSIST_BYTES) {
             // v3 record: the read drags the old record's trailing padding bytes
             // into regions[0..1], so zero the whole regions field (predicate unset)
             memset(rules[i].regions, 0, sizeof(rules[i].regions));
@@ -901,6 +933,16 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     r->prob = (uint8_t)v;
     return true;
   }
+  if (strcmp(key, "throttle") == 0) {
+    char* end;
+    long v = strtol(val, &end, 10);
+    if (end == val || *end != 0 || v < 1 || v > 65535) {
+      strcpy(reply, "Err - throttle must be 1..65535 s (omit for no limit)");
+      return false;
+    }
+    r->throttle = (uint16_t)v;
+    return true;
+  }
   sprintf(reply, "Err - unknown param '%s'", key);
   return false;
 }
@@ -1058,6 +1100,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
     else radd(&out, &remain, " text=%s", r->text);
   }
   if (r->prob) radd(&out, &remain, " prob=%u", r->prob);
+  if (r->throttle) radd(&out, &remain, " throttle=%u pass=%lu", r->throttle, (unsigned long)r->throttle_pass);
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
   radd(&out, &remain, " air=%lu", (unsigned long)r->air_ms);
 }
