@@ -17,6 +17,9 @@
 //   limiter windows/cache/origin keys            -> advert rate limiter section
 //   persistence roundtrip/upgrade/truncation     -> management/persistence section
 //   CLI quoting/errors/capacity                  -> filter CLI surface section
+//   throttle spacing/window/fall-through/state   -> per-rule throttle (rate
+//       gate) section; throttle= parse/echo/capacity -> filter CLI surface;
+//       throttle persistence + v6 record growth  -> management/persistence
 //   regex budget/anchors/classes                 -> TinyRegex* tests
 //   hook order (battery gate -> checkPacket -> disable_fwd, MyMesh.cpp
 //       allowPacketForward; checkContent in onGroupDataRecv) is a MyMesh
@@ -988,17 +991,34 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 
 #include "FilterTestHelpers.h"
 
-// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v5 record is
-// the struct up to `hits` (the prob byte slots into the former tail padding,
-// so the v4 record is byte-identical in size); the v3 record is the same
-// struct with no `regions` field, padded to uint32_t alignment; the lazy-save
-// delay is 3000 ms)
-static constexpr size_t V4_RULE_BYTES = offsetof(FilterRule, hits);
+// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v6 record is
+// the struct up to `hits` (u16 throttle grows the v4/v5 record by 4 bytes;
+// prob's byte sits in the v4 tail padding), so every older record is a
+// byte-identical prefix; the v3 record is the same struct with no `regions`
+// field, padded to uint32_t alignment; the lazy-save delay is 3000 ms)
+static constexpr size_t V6_RULE_BYTES = offsetof(FilterRule, hits);
+static constexpr size_t V5_RULE_BYTES = offsetof(FilterRule, throttle);
 static constexpr size_t V3_RULE_BYTES =
     (offsetof(FilterRule, regions) + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
-static constexpr uint8_t CFG_VERSION = 5;
+static constexpr uint8_t CFG_VERSION = 6;
 static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static const char* CFG_FILE = "/filter_cfg";
+
+// rebuild a saved blob as an old-format blob with `ver` in the header and
+// `old_bytes`-long rule records (a v6 record's leading bytes are a
+// byte-identical old record)
+static std::vector<uint8_t> transmuteRuleRecords(const std::vector<uint8_t>& blob,
+                                                 uint8_t ver, size_t old_bytes) {
+  std::vector<uint8_t> out(blob.begin(), blob.begin() + 7);   // header + ratelimit
+  out[0] = ver;
+  size_t nr = blob[2];
+  for (size_t i = 0; i < nr; i++) {
+    const uint8_t* rec = blob.data() + 7 + i * V6_RULE_BYTES;
+    out.insert(out.end(), rec, rec + old_bytes);
+  }
+  out.insert(out.end(), blob.begin() + 7 + nr * V6_RULE_BYTES, blob.end());   // channels
+  return out;
+}
 
 // ---------------------------------------------------------------- rule management
 
@@ -1091,6 +1111,37 @@ TEST_F(FilterTest, StatsAreNeverPersisted) {
   EXPECT_EQ(restored.getRule(0)->hits, 0u);   // hits live in RAM only
 }
 
+TEST_F(FilterTest, ThrottleV6RoundTrip) {
+  expectOk(filter, "add type=advert throttle=60");
+  expectOk(filter, "add type=advert throttle=65535");
+  filter.getRule(0)->throttle_pass = 7;
+  filter.getRule(0)->throttle_seen = true;
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 2);
+  EXPECT_EQ(restored.getRule(0)->throttle, 60);
+  EXPECT_EQ(restored.getRule(1)->throttle, 65535);
+  // rate state is RAM-only, like hits
+  EXPECT_EQ(restored.getRule(0)->throttle_pass, 0u);
+  EXPECT_FALSE(restored.getRule(0)->throttle_seen);
+}
+
+TEST_F(FilterTest, ResetStatsClearsPassButNotBudget) {
+  expectOk(filter, "add type=advert throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+  ASSERT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);   // pass stamps the clock
+  ASSERT_EQ(filter.checkPacket(&pkt, 5000, nullptr), FILTER_ACT_DROP);
+
+  filter.resetStats();
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 0u);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  // the clock is deliberately NOT reset: stats never grant a free pass
+  EXPECT_EQ(filter.checkPacket(&pkt, 5000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 0u);
+}
+
 TEST_F(FilterTest, DisabledStatePersists) {
   filter.setEnabled(false);
   filter.save(&fs);
@@ -1128,13 +1179,13 @@ TEST_F(FilterTest, V3ConfigUpgradesToV4) {
   // transmute the v4 blob into a v3 blob: version byte 3, rule records stop
   // before `regions`
   auto& blob = fs.files[CFG_FILE];
-  ASSERT_GE(blob.size(), (size_t)(7 + V4_RULE_BYTES + sizeof(FilterChannel)));
+  ASSERT_GE(blob.size(), (size_t)(7 + V6_RULE_BYTES + sizeof(FilterChannel)));
   std::vector<uint8_t> v3(7 + V3_RULE_BYTES + sizeof(FilterChannel));
   memcpy(&v3[0], blob.data(), 5);
   v3[0] = 3;                                        // version
   memcpy(&v3[5], blob.data() + 5, 2);               // ratelimit
   memcpy(&v3[7], blob.data() + 7, V3_RULE_BYTES);   // rule record, pre-regions
-  memcpy(&v3[7 + V3_RULE_BYTES], blob.data() + 7 + V4_RULE_BYTES, sizeof(FilterChannel));
+  memcpy(&v3[7 + V3_RULE_BYTES], blob.data() + 7 + V6_RULE_BYTES, sizeof(FilterChannel));
   blob = v3;
 
   FilterRules upgraded;
@@ -1150,16 +1201,64 @@ TEST_F(FilterTest, V3ConfigUpgradesToV4) {
   EXPECT_EQ(upgraded.getAdvertRatelimit(), 7);
 }
 
+TEST_F(FilterTest, V5RecordMigratesWithThrottleZeroAndProbIntact) {
+  // a v5 record (156 B, ends where throttle begins) reads back byte-identical:
+  // prob keeps its byte while throttle — past the record's end — stays 0
+  // (= no limit); the dead padding byte before the record end must not leak
+  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
+  filter.save(&fs);
+  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 5, V5_RULE_BYTES);
+  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;   // dead tail byte, not guaranteed
+  fs.files[CFG_FILE] = blob;
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_EQ(r->prob, 50);                  // v5 keeps prob (prob-zeroing regression)
+  EXPECT_EQ(r->throttle, 0);
+  EXPECT_STREQ(r->regions, "TestNorth");   // region= survives (v3-wipe regression)
+  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+}
+
+TEST_F(FilterTest, V4RecordKeepsRegionsAndZerosProb) {
+  // a v4 record is the same 156 B layout, but its prob byte is not
+  // format-guaranteed: it must read as 0, while the region= list must survive
+  // (the v3 record wipe applies to v3 records only)
+  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
+  filter.save(&fs);
+  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 4, V5_RULE_BYTES);
+  blob[7 + offsetof(FilterRule, prob)] = 0xFF;       // old padding byte, not guaranteed
+  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;
+  fs.files[CFG_FILE] = blob;
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_EQ(r->prob, 0);                   // unset = always (100 %)
+  EXPECT_EQ(r->throttle, 0);
+  EXPECT_STREQ(r->regions, "TestNorth");   // not wiped
+  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+}
+
 TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   filter.addRule();
   filter.setEnabled(false);
   filter.save(&fs);
-  fs.files[CFG_FILE][0] = 9;   // bogus version
+  auto full = fs.files[CFG_FILE];
 
-  FilterRules restored;
-  restored.begin(&fs);
-  EXPECT_EQ(restored.getNumRules(), 0);
-  EXPECT_TRUE(restored.isEnabled());   // defaults
+  // accepted window is 3..6: a future v7 (downgrade guard) and the long-dead
+  // v0/v2 are discarded, and the node starts with defaults
+  for (uint8_t ver : { 0, 2, 7, 9 }) {
+    fs.files[CFG_FILE] = full;
+    fs.files[CFG_FILE][0] = ver;
+
+    FilterRules restored;
+    restored.begin(&fs);
+    EXPECT_EQ(restored.getNumRules(), 0) << "version " << (int)ver;
+    EXPECT_TRUE(restored.isEnabled()) << "version " << (int)ver;   // defaults
+  }
 }
 
 TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
@@ -1171,7 +1270,7 @@ TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
   // header promises 2 rules but the file stops after the first
   auto& blob = fs.files[CFG_FILE];
   blob[2] = 2;   // num_rules = 2
-  blob.resize(7 + V4_RULE_BYTES);   // cut after rule 0
+  blob.resize(7 + V6_RULE_BYTES);   // cut after rule 0
 
   FilterRules restored;
   restored.begin(&fs);
@@ -1296,20 +1395,6 @@ TEST_F(FilterTest, ProbPersistsRoundtrip) {
   EXPECT_EQ(digest_after, digest_before);   // padding canary: byte-identical record
 }
 
-TEST_F(FilterTest, V4ConfigLoadsProbUnset) {
-  expectOk(filter, "add type=advert prob=50");
-  filter.save(&fs);
-  auto& blob = fs.files[CFG_FILE];
-  blob[0] = 4;   // downgrade the header: a v4 record has no prob field
-  blob[7 + offsetof(FilterRule, prob)] = 0xFF;   // old padding byte, not guaranteed
-
-  FilterRules restored;
-  restored.begin(&fs);
-  ASSERT_EQ(restored.getNumRules(), 1);
-  EXPECT_EQ(restored.getRule(0)->prob, 0);   // unset = always (100 %)
-  EXPECT_EQ(restored.getRule(0)->hits, 0u);  // stats never persisted
-}
-
 TEST_F(FilterTest, ProbAlwaysDecides) {
   expectOk(filter, "add type=advert prob=100");
   for (int i = 0; i < 10; i++) {
@@ -1370,6 +1455,247 @@ TEST_F(FilterTest, ProbContentPathRollsOnce) {
   // or double-counting, whatever the roll said
   EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), v);
   EXPECT_LE(filter.getRule(0)->hits, 1u);
+}
+
+// ============================================================
+// UNIT TESTS: per-rule throttle (rate gate)
+// ============================================================
+
+// Native tests for the per-rule throttle= rate gate: the within-budget pass /
+// over-rate decision boundary, window stamping (drops don't extend it),
+// fall-through like a failed prob roll, per-rule budgets, the fixed order with
+// prob, shadow (forward) mode, the packet path and its advert-limiter
+// interplay, and millis() wrap safety. Time is injected via g_mock_millis
+// (content path) and the now_millis parameter (packet path).
+
+#include <gtest/gtest.h>
+
+#include "FilterTestHelpers.h"
+
+static constexpr uint32_t THROTTLE_AIR = 250;   // est_air_ms for drop billing
+
+// run checkContent() on a "<sender>: <text>" group-text packet delivered on
+// channel `name`, at injected millis() time `now_ms`. The message timestamp is
+// stamped into the hash-covered packet payload so each message is a distinct
+// packet (the packet hash — MAX_HASH_SIZE bytes — mixes the payload's start)
+static uint8_t throttleMsg(FilterRules& filter, mesh::Packet& pkt, const char* name,
+                           const char* sender, const char* text, uint32_t now_ms,
+                           uint32_t est_air_ms = 0, uint32_t ts = 12345) {
+  auto payload = makeGroupText(sender, text);
+  pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, payload.len);
+  memcpy(pkt.payload, payload.data, payload.len);
+  memcpy(pkt.payload, &ts, 4);
+  int ci = -1;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (strcmp(filter.getChannel(i)->name, name) == 0) { ci = i; break; }
+  }
+  EXPECT_GE(ci, 0) << name;
+  g_mock_millis = now_ms;
+  return filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, ci),
+                             payload.data, payload.len, nullptr, est_air_ms);
+}
+
+TEST_F(FilterTest, ThrottlePassesWithinBudgetAndFiresOverRate) {
+  // the headline case: Bob on #test at most one per minute
+  ASSERT_EQ(cli(filter, "add chan=#test sender=\"^bob\" throttle=60"), "OK - rule 0 added");
+  FilterRule* r = filter.getRule(0);
+  mesh::Packet pkt;
+
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "hi", 0, THROTTLE_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->throttle_pass, 1u);
+  EXPECT_EQ(r->hits, 0u);
+
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "hi 2", 20000, THROTTLE_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "hi 3", 59999, THROTTLE_AIR), FILTER_ACT_DROP);
+  EXPECT_EQ(r->hits, 2u);
+  EXPECT_EQ(r->air_ms, 2 * THROTTLE_AIR);   // excess drops bill airtime as usual
+  EXPECT_EQ(r->throttle_pass, 1u);
+
+  // at >= N seconds it is the next pass
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "hi 4", 60000, THROTTLE_AIR), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->throttle_pass, 2u);
+  EXPECT_EQ(r->hits, 2u);
+  EXPECT_EQ(r->air_ms, 2 * THROTTLE_AIR);
+  EXPECT_EQ(filter.getAirSavedMs(), 2 * THROTTLE_AIR);
+}
+
+TEST_F(FilterTest, ThrottleDropsDoNotExtendWindow) {
+  // sustained 1/min under a flood: over-rate firings never restart the clock
+  expectOk(filter, "add chan=#test sender=^bob throttle=60");
+  FilterRule* r = filter.getRule(0);
+  mesh::Packet pkt;
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m0", 0), FILTER_ACT_ALLOW);
+  for (uint32_t t = 1000; t < 60000; t += 1000) {
+    EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "mf", t), FILTER_ACT_DROP) << t;
+  }
+  EXPECT_EQ(r->throttle_pass, 1u);
+  EXPECT_EQ(r->hits, 59u);
+  // the window ran from the PASS, not the last drop: exactly 60 s is the next
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m60", 60000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->throttle_pass, 2u);
+}
+
+TEST_F(FilterTest, ThrottleFirstMatchAlwaysPasses) {
+  // nothing stamped yet: the very first match is the free pass
+  expectOk(filter, "add type=advert throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+  EXPECT_TRUE(filter.getRule(0)->throttle_seen);
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, ThrottleStateTravelsOnMoveAndDel) {
+  // rate state lives in the rule struct, so it rides the memmove like hits
+  FilterRule* a = filter.addRule();
+  FilterRule* b = filter.addRule();
+  a->throttle = 30; a->throttle_pass = 5; a->throttle_seen = true; a->throttle_last_ms = 123;
+  b->throttle = 90; b->throttle_pass = 7; b->throttle_seen = false; b->throttle_last_ms = 456;
+
+  filter.moveRule(0, 1);
+  EXPECT_EQ(filter.getRule(1)->throttle, 30);
+  EXPECT_EQ(filter.getRule(1)->throttle_pass, 5u);
+  EXPECT_TRUE(filter.getRule(1)->throttle_seen);
+  EXPECT_EQ(filter.getRule(1)->throttle_last_ms, 123u);
+
+  filter.delRule(1);   // delete the moved rule: b slides into slot 0
+  EXPECT_EQ(filter.getRule(0)->throttle, 90);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 7u);
+  EXPECT_FALSE(filter.getRule(0)->throttle_seen);
+  EXPECT_EQ(filter.getRule(0)->throttle_last_ms, 456u);
+}
+
+TEST_F(FilterTest, ThrottleFallsThroughToLaterRules) {
+  // within budget the packet slips past the rule — later rules still judge it
+  expectOk(filter, "add chan=#test sender=^bob throttle=60");   // rule 0
+  expectOk(filter, "add chan=#test");                          // rule 1: blanket drop
+  mesh::Packet pkt;
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m0", 0), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);      // stepped aside
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);      // the later drop caught the pass
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+
+  // over rate: the throttle rule decides first (first match wins)
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m1", 1000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+TEST_F(FilterTest, ThrottleBudgetIsPerRule) {
+  // two throttle rules over one stream meter independently
+  expectOk(filter, "add sender=^alice throttle=60");
+  expectOk(filter, "add sender=^bob throttle=60");
+  mesh::Packet pkt;
+
+  EXPECT_EQ(throttleMsg(filter, pkt, "Public", "alice", "m", 0), FILTER_ACT_ALLOW);
+  EXPECT_EQ(throttleMsg(filter, pkt, "Public", "bob", "m", 1000), FILTER_ACT_ALLOW);   // bob's own free pass
+  EXPECT_EQ(throttleMsg(filter, pkt, "Public", "alice", "m", 2000), FILTER_ACT_DROP);
+  EXPECT_EQ(throttleMsg(filter, pkt, "Public", "bob", "m", 3000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+  EXPECT_EQ(filter.getRule(1)->throttle_pass, 1u);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(1)->hits, 1u);
+}
+
+TEST_F(FilterTest, ThrottleWithProbProbGatesFirst) {
+  // prob filters what the rule sees; throttle meters what it sees: a failed
+  // roll never touches the budget (fixed order: probDecides() runs first)
+  ASSERT_EQ(cli(filter, "add chan=#test sender=^bob throttle=60 prob=50"), "OK - rule 0 added");
+  FilterRule* r = filter.getRule(0);
+
+  // roll oracle: force the gate to decide (over rate) so the verdict is the
+  // roll alone — drop = roll passed, allow = roll failed. Poking the RAM-only
+  // gate state does not change the deterministic per-packet roll.
+  int fail_ts = -1, pass_ts = -1;
+  for (uint32_t ts = 1; (fail_ts < 0 || pass_ts < 0) && ts < 1000; ts++) {
+    mesh::Packet pkt;
+    r->throttle_seen = true;
+    r->throttle_last_ms = 0;   // every probe is over rate -> the rule decides
+    if (throttleMsg(filter, pkt, "#test", "bob", "probe", 1000, 0, ts) == FILTER_ACT_DROP) {
+      if (pass_ts < 0) pass_ts = (int)ts;
+    } else if (fail_ts < 0) {
+      fail_ts = (int)ts;
+    }
+  }
+  ASSERT_GE(fail_ts, 0);
+  ASSERT_GE(pass_ts, 0);
+
+  // fresh gate state and counters
+  r->throttle_seen = false;
+  r->throttle_last_ms = 0;
+  r->throttle_pass = 0;
+  r->hits = 0;
+  r->air_ms = 0;
+  mesh::Packet pkt;
+
+  // the failed-roll packet slips past WITHOUT spending the budget ...
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "probe", 0, 0, (uint32_t)fail_ts), FILTER_ACT_ALLOW);
+  EXPECT_FALSE(r->throttle_seen);   // order is fixed: prob first, gate untouched
+  EXPECT_EQ(r->throttle_pass, 0u);
+
+  // ... so the first roll-passed packet still gets the free pass
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "probe", 1000, 0, (uint32_t)pass_ts), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->throttle_pass, 1u);
+
+  // another failed roll inside the window: still just a slip-past
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "probe", 2000, 0, (uint32_t)fail_ts), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->throttle_pass, 1u);
+
+  // a roll-passed packet inside the window is over rate: the rule decides
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "probe", 3000, 0, (uint32_t)pass_ts), FILTER_ACT_DROP);
+  EXPECT_EQ(r->hits, 1u);
+  EXPECT_EQ(r->throttle_pass, 1u);
+}
+
+TEST_F(FilterTest, ThrottleForwardShadowCountsExcess) {
+  // shadow mode: a forward probe counts exactly the excess a drop would catch
+  expectOk(filter, "add chan=#test sender=^bob action=forward throttle=60");
+  FilterRule* r = filter.getRule(0);
+  mesh::Packet pkt;
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m0", 0), FILTER_ACT_ALLOW);   // in budget: slips past
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m1", 1000), FILTER_ACT_FORWARD);
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m2", 2000), FILTER_ACT_FORWARD);
+  EXPECT_EQ(throttleMsg(filter, pkt, "#test", "bob", "m3", 61000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(r->hits, 2u);            // hits == the excess (a drop twin would drop these)
+  EXPECT_EQ(r->throttle_pass, 2u);
+  EXPECT_EQ(r->air_ms, 0u);          // forward bills nothing
+}
+
+TEST_F(FilterTest, ThrottleWrapAround) {
+  // unsigned-subtraction timing: correct verdicts across the millis() wrap
+  expectOk(filter, "add type=advert throttle=30");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+
+  uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
+  EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);   // free pass
+  // now has wrapped past 0 to ~16 s: 16.016 s elapsed, still over rate
+  EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
+  // wrapped and past the 30 s window: the next pass
+  EXPECT_EQ(filter.checkPacket(&pkt, 30016, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);
+}
+
+TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
+  // packet-level rules meter on the checkPacket path, and interleave with the
+  // advert rate limiter: a rule drop pre-empts it, a fall-through still hits it
+  expectOk(filter, "add type=advert throttle=10");
+  expectOk(filter, "ratelimit advert 1");
+  uint8_t key[4] = { 0x31, 0x32, 0x33, 0x34 };
+
+  auto a1 = makeAdvert(key);
+  EXPECT_EQ(filter.checkPacket(&a1, 0, nullptr), FILTER_ACT_ALLOW);   // free pass + first sighting
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);
+
+  auto a2 = makeAdvert(key);
+  a2.payload[0] = 0x99;
+  EXPECT_EQ(filter.checkPacket(&a2, 5000, nullptr), FILTER_ACT_DROP);   // over rate: rule decides, limiter not reached
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+
+  auto a3 = makeAdvert(key);
+  EXPECT_EQ(filter.checkPacket(&a3, 10000, nullptr), FILTER_ACT_DROP);  // in budget: slips past, limiter drops the repeat
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
 }
 
 // ============================================================
@@ -1669,6 +1995,57 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     EXPECT_EQ(cli(filter, c.cmd).find(c.err_fragment), 0) << c.cmd;
     EXPECT_EQ(filter.getNumRules(), 0) << c.cmd;   // rolled back, no half-rule
   }
+}
+
+// ---------------------------------------------------------------- throttle=
+
+TEST_F(FilterTest, ThrottleCliRoundTrip) {
+  expectOk(filter, "add type=advert");
+  expectOk(filter, "add type=advert throttle=60");
+  std::string g0 = cli(filter, "get 0");
+  std::string g1 = cli(filter, "get 1");
+  EXPECT_EQ(g0.find(" throttle="), std::string::npos);   // unset: no tokens at all
+  EXPECT_EQ(g0.find(" pass="), std::string::npos);
+  EXPECT_NE(g1.find(" throttle=60 pass=0"), std::string::npos);   // echo round-trips
+  filter.getRule(1)->throttle_pass = 3;
+  EXPECT_NE(cli(filter, "get 1").find(" throttle=60 pass=3"), std::string::npos);
+
+  // digest covers the record through hits, so throttle is part of it
+  std::string list = cli(filter, "list");
+  size_t colon = list.find(':');
+  size_t sp1 = list.find(' ', colon + 1), sp2 = list.find(' ', sp1 + 1);
+  ASSERT_NE(sp1, std::string::npos);
+  if (sp2 == std::string::npos) sp2 = list.size();
+  std::string tok0 = list.substr(sp1 + 1, sp2 - sp1 - 1);
+  std::string tok1 = list.substr(sp2 + 1);
+  ASSERT_EQ(tok0.size(), 6u);
+  ASSERT_EQ(tok1.size(), 6u);
+  EXPECT_NE(tok0, tok1);
+}
+
+TEST_F(FilterTest, ThrottleCliRejects) {
+  EXPECT_EQ(cli(filter, "add throttle=0"), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(cli(filter, "add throttle=65536"), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(cli(filter, "add throttle=abc"), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(cli(filter, "add throttle=60s"), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(cli(filter, "add throttle=-1"), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(cli(filter, "add throttle="), "Err - throttle must be 1..65535 s (omit for no limit)");
+  EXPECT_EQ(filter.getNumRules(), 0);   // every reject rolls the half-added rule back
+}
+
+TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
+  // every predicate set, throttle= at max width: the get line overflows the
+  // reply buffer and truncates per radd's order — the counters are echoed
+  // last, so the tail (air=) is cut first
+  ASSERT_EQ(cli(filter, "add type=advert route=flood hops=1 len=1 snr=0 path=^10$ "
+                        "hsize=1 chan=#t chanhash=AA region=TestNorth sender=\"^X\" "
+                        "text=\"^y\" prob=50 throttle=65535"),
+            "OK - rule 0 added");
+  std::string reply = cli(filter, "get 0");
+  EXPECT_EQ(reply.size(), (size_t)MAX_PACKET_PAYLOAD - 1);   // pinned truncation
+  EXPECT_NE(reply.find(" throttle=65535 pass=0"), std::string::npos);
+  EXPECT_NE(reply.find(" hits=0"), std::string::npos);
+  EXPECT_EQ(reply.find("air="), std::string::npos);   // the tail counter truncates away
 }
 
 TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
