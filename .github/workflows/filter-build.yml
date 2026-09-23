@@ -163,6 +163,11 @@ jobs:
           RANGE="HEAD"
           if [ "$FORCE_BUILD" = true ]; then
             SKIP=false
+            # forced builds still list changes since the previous release,
+            # when there is one to compare against
+            if [ -n "$PREV_TAG" ]; then
+              RANGE="${PREV_TAG}..HEAD"
+            fi
           elif [ -z "$PREV_TAG" ]; then
             # first release of this channel under the new scheme
             SKIP=false
