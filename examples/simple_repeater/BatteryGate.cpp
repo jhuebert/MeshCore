@@ -157,7 +157,7 @@ static bool parseMilliVolts(const char* tok, bool* numeric, uint16_t* out) {
 
 static void cliStatus(BatteryGate& gate, mesh::MainBoard& board, char* reply) {
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
+  int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "batt %umV; gate %s", board.getBattMilliVolts(),
        gate.isEnabled() ? "on" : "off");
   if (gate.isEnabled()) {

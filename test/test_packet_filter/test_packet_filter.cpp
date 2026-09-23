@@ -1797,7 +1797,7 @@ TEST_F(FilterTest, AirSavedShownInCli) {
   expectOk(filter, "add type=advert");
   mesh::Packet adv = makeAdvert(AIR_KEY);
   filter.checkPacket(&adv, 0, nullptr, EST_AIR);
-  EXPECT_NE(cli(filter, "stats").find("; air:337"), std::string::npos);
+  EXPECT_NE(cli(filter, "stats").find(" air:337;"), std::string::npos);
   EXPECT_NE(cli(filter, "get 0").find(" air=337"), std::string::npos);
 }
 
@@ -2042,10 +2042,10 @@ TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
                         "text=\"^y\" prob=50 throttle=65535"),
             "OK - rule 0 added");
   std::string reply = cli(filter, "get 0");
-  EXPECT_EQ(reply.size(), (size_t)MAX_PACKET_PAYLOAD - 1);   // pinned truncation
-  EXPECT_NE(reply.find(" throttle=65535 pass=0"), std::string::npos);
-  EXPECT_NE(reply.find(" hits=0"), std::string::npos);
-  EXPECT_EQ(reply.find("air="), std::string::npos);   // the tail counter truncates away
+  EXPECT_EQ(reply.size(), (size_t)160 - 1);   // pinned truncation (CLI_REPLY_MAX - 1)
+  EXPECT_NE(reply.find("prob=50"), std::string::npos);
+  EXPECT_EQ(reply.find("throttle=65535"), std::string::npos);   // tail truncates away
+  EXPECT_EQ(reply.find("air="), std::string::npos);
 }
 
 TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
@@ -2076,6 +2076,21 @@ TEST_F(FilterTest, LongCommandIsTruncatedSafely) {
 TEST_F(FilterTest, AddRejectsWhenFull) {
   for (int i = 0; i < FILTER_MAX_RULES; i++) filter.addRule();
   EXPECT_EQ(cli(filter, "add type=advert"), "Err - rule list full");
+}
+
+TEST_F(FilterTest, LongTokenErrorsStayWithinReplyBuffer) {
+  // token echoes (unknown param / expected key=value) are user-supplied and
+  // unbounded; replies must never exceed the real 160 B CLI reply buffer
+  // (mesh path reply is &temp[5] of temp[166])
+  std::string long_tok(150, 'a');
+  std::string reply = cli(filter, ("add " + long_tok).c_str());
+  EXPECT_LE(reply.size(), (size_t)160 - 1);
+  EXPECT_EQ(reply.find("Err - expected key=value"), 0);
+
+  reply = cli(filter, ("add " + long_tok + "=x").c_str());
+  EXPECT_LE(reply.size(), (size_t)160 - 1);
+  EXPECT_EQ(reply.find("Err - unknown param"), 0);
+  EXPECT_EQ(filter.getNumRules(), 0);
 }
 
 TEST_F(FilterTest, RuleIdxRejectsNonNumeric) {
@@ -2131,8 +2146,7 @@ TEST_F(FilterTest, ListAndStatsOutput) {
   EXPECT_EQ(list.find("on 1/16: 0eD"), 0);   // enabled + Drop digest line
 
   std::string stats = cli(filter, "stats");
-  EXPECT_EQ(stats.find("hits: 0:3"), 0);
-  EXPECT_NE(stats.find("; limiter:0 aborted:0"), std::string::npos);
+  EXPECT_EQ(stats.find("lim:0 abort:0 air:0; hits: 0:3"), 0);
 }
 
 // ---------------------------------------------------------------- channel store
@@ -2206,19 +2220,31 @@ TEST_F(FilterTest, ChanDelRemapsRuleMasks) {
             FILTER_ACT_DROP);
 }
 
-TEST_F(FilterTest, ChanListShowsDerivedFlag) {
+TEST_F(FilterTest, ChanListStaysWithinReplyBuffer) {
+  // real CLI reply buffers are 160 B (serial/ethernet reply[160]; mesh path is
+  // &temp[5] of temp[166] — CliUtil.h caps radd() at CLI_REPLY_MAX for this);
+  // a full chan list must never exceed that
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    ASSERT_EQ(cli(filter, ("chan add #c" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
+  }
   std::string reply = cli(filter, "chan list");
-  // "<idx>:<name> k<len> h<hash>" — Public's hash is sha256(its psk)[0]
+  EXPECT_LE(reply.size(), (size_t)160 - 1);   // radd leaves room for the NUL
+  EXPECT_NE(reply.find("0:Public"), std::string::npos);   // clean, not garbage
+}
+
+TEST_F(FilterTest, ChanListCompactFormat) {
+  std::string reply = cli(filter, "chan list");
+  // "<idx>:<name>:<hash>" — Public's hash is sha256(its psk)[0]
   char expect_head[40];
   auto pub = filter.getChannel(0);
-  snprintf(expect_head, sizeof(expect_head), "0:Public k%u h%02X", pub->secret_len, pub->hash);
+  snprintf(expect_head, sizeof(expect_head), "0:Public:%02X", pub->hash);
   EXPECT_NE(reply.find(expect_head), std::string::npos);
-  EXPECT_EQ(reply.find(" d"), std::string::npos);   // provisioned Public has an explicit psk
+  EXPECT_EQ(reply.find("k"), std::string::npos);   // no keylen field in the compact format
 
-  // a '#' channel with a companion-derived psk gets the " d" marker
+  // a '#' channel with a companion-derived psk still lists like any other
   ASSERT_EQ(cli(filter, "chan add #derived").substr(0, 3), "OK ");
   reply = cli(filter, "chan list");
-  EXPECT_NE(reply.find(" d"), std::string::npos);
+  EXPECT_NE(reply.find("#derived:"), std::string::npos);
 }
 
 // ---------------------------------------------------------------- ratelimit commands
