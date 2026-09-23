@@ -943,7 +943,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     r->throttle = (uint16_t)v;
     return true;
   }
-  sprintf(reply, "Err - unknown param '%s'", key);
+  snprintf(reply, CLI_REPLY_MAX, "Err - unknown param '%s'", key);   // key is a raw command token
   return false;
 }
 
@@ -955,7 +955,7 @@ static void cliStatus(FilterRules& filter, char* reply) {
     if (filter.getChannel(i)->name[0] != 0) used++;
   }
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
+  int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "%s; rules %d/%d; chans %d/%d; ratelimit advert %uh; cache %d/%d",
        filter.isEnabled() ? "on" : "off", filter.getNumRules(), FILTER_MAX_RULES,
        used, FILTER_MAX_CHANNELS, filter.getAdvertRatelimit(),
@@ -966,15 +966,14 @@ static void cliStatus(FilterRules& filter, char* reply) {
 
 static void cliChanList(FilterRules& filter, char* reply) {
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
+  int remain = CLI_REPLY_MAX;
   if (filter.getNumChannels() == 0) {
     strcpy(reply, "no channels");
     return;
   }
   for (int i = 0; i < filter.getNumChannels(); i++) {
     auto ch = filter.getChannel(i);
-    radd(&out, &remain, "%s%d:%s k%u h%02X%s", i ? " " : "", i, ch->name,
-         ch->secret_len, ch->hash, ch->secret_len == 16 && ch->name[0] == '#' ? " d" : "");
+    radd(&out, &remain, "%s%d:%s:%02X", i ? " " : "", i, ch->name, ch->hash);
   }
 }
 
@@ -1021,7 +1020,7 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
   while ((tok = nextToken(&p)) != NULL) {
     char* eq = strchr(tok, '=');
     if (eq == NULL) {
-      sprintf(reply, "Err - expected key=value, got '%s'", tok);
+      snprintf(reply, CLI_REPLY_MAX, "Err - expected key=value, got '%s'", tok);
       filter.delRule(idx);
       return;
     }
@@ -1036,7 +1035,7 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
 
 static void cliList(FilterRules& filter, char* reply) {
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
+  int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "%s %d/%d:", filter.isEnabled() ? "on" : "off",
        filter.getNumRules(), FILTER_MAX_RULES);
   for (int i = 0; i < filter.getNumRules(); i++) {
@@ -1050,7 +1049,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return; }
   auto r = filter.getRule(idx);
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
+  int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
        r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
@@ -1107,14 +1106,15 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
 
 static void cliStats(FilterRules& filter, char* reply) {
   char* out = reply;
-  int remain = MAX_PACKET_PAYLOAD;
-  radd(&out, &remain, "hits:");
+  int remain = CLI_REPLY_MAX;
+  // globals first, per-rule hits last: if the reply truncates, hits detail
+  // (recoverable via `get N`) is sacrificed before the summary counters
+  radd(&out, &remain, "lim:%lu abort:%lu air:%lu; hits:",
+       (unsigned long)filter.getLimiterDrops(), (unsigned long)filter.getBudgetAborts(),
+       (unsigned long)filter.getAirSavedMs());
   for (int i = 0; i < filter.getNumRules(); i++) {
     radd(&out, &remain, " %d:%lu", i, (unsigned long)filter.getRule(i)->hits);
   }
-  radd(&out, &remain, "; limiter:%lu aborted:%lu", (unsigned long)filter.getLimiterDrops(),
-       (unsigned long)filter.getBudgetAborts());
-  radd(&out, &remain, "; air:%lu", (unsigned long)filter.getAirSavedMs());
 }
 
 static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {

@@ -35,6 +35,11 @@ inline char* nextToken(char** p) {
   return t;
 }
 
+// all CLI reply buffers are 160 B: main.cpp uses char reply[160] (serial and
+// ethernet), and the mesh remote-CLI hands out &temp[5] of a uint8_t temp[166].
+// Reply writers must bound to this, never MAX_PACKET_PAYLOAD.
+#define CLI_REPLY_MAX 160
+
 // bounded reply append (CLI reply buffer is 160 bytes)
 inline void radd(char** out, int* remain, const char* fmt, ...) {
   if (*remain <= 0) return;
