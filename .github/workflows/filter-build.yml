@@ -318,6 +318,8 @@ jobs:
     needs: [version, validate-targets]
     if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    # a board that fails to build shouldn't block the release; it's just omitted
+    continue-on-error: true
     strategy:
       matrix:
         target: ${{ fromJson(needs.validate-targets.outputs.targets) }}
