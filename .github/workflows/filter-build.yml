@@ -292,17 +292,24 @@ jobs:
           # known targets come from platformio.ini via build.sh
           sh build.sh list > /tmp/known-targets.txt
 
-          # fail hard on unknown names instead of silently skipping them
-          for target in $(echo "$TARGETS" | tr ' ,' '\n'); do
+          # warn and skip unknown names instead of failing: a target can be
+          # valid on the dev branch but not yet on stable's upstream base
+          VALID_TARGETS=""
+          for target in $(echo "$TARGETS" | tr -d '\r' | tr ' ,' '\n'); do
             [ -z "$target" ] && continue
-            if ! grep -qx "$target" /tmp/known-targets.txt; then
-              echo "Unknown build target: '$target'" >&2
-              exit 1
+            if grep -qx "$target" /tmp/known-targets.txt; then
+              VALID_TARGETS="$VALID_TARGETS $target"
+            else
+              echo "Warning: unknown build target '$target' - skipped (not in this branch's platformio.ini)" >&2
             fi
           done
+          if [ -z "${VALID_TARGETS// }" ]; then
+            echo "No known build targets: every entry in the target list is unknown to this branch" >&2
+            exit 1
+          fi
 
-          # convert targets separated by comma/newline into a json array string
-          JSON_ARRAY=$(echo "$TARGETS" | tr ' ,' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          # convert targets separated by spaces into a json array string
+          JSON_ARRAY=$(echo "$VALID_TARGETS" | tr ' ' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
           echo "targets=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
