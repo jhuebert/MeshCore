@@ -293,7 +293,7 @@ jobs:
           sh build.sh list > /tmp/known-targets.txt
 
           # fail hard on unknown names instead of silently skipping them
-          for target in $(echo "$TARGETS" | tr ' ,' '\n'); do
+          for target in $(echo "$TARGETS" | tr -d '\r' | tr ' ,' '\n'); do
             [ -z "$target" ] && continue
             if ! grep -qx "$target" /tmp/known-targets.txt; then
               echo "Unknown build target: '$target'" >&2
@@ -302,7 +302,7 @@ jobs:
           done
 
           # convert targets separated by comma/newline into a json array string
-          JSON_ARRAY=$(echo "$TARGETS" | tr ' ,' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          JSON_ARRAY=$(echo "$TARGETS" | tr -d '\r' | tr ' ,' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
 
           echo "targets=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
