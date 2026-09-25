@@ -305,6 +305,22 @@ static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
   return false;
 }
 
+// Shared tail of checkPacket()/checkContent(): gates first (prob roll, then
+// throttle), then commit — count the hit and bill the saved airtime for DROP
+// decisions. `out` receives the rule's action.
+bool FilterRules::decideMatch(FilterRule* r, const mesh::Packet* pkt, uint32_t now_millis,
+                              uint32_t est_air_ms, uint8_t& out) {
+  if (!probDecides(r, pkt)) return false;          // failed roll: fall through as if not matched
+  if (!throttleDecides(r, now_millis)) return false;   // within budget: slips past, like a failed roll
+  r->hits++;
+  if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
+    r->air_ms += est_air_ms;
+    air_saved_ms += est_air_ms;
+  }
+  out = r->action;
+  return true;
+}
+
 // ---------------------------------------------------------------- matching
 
 static bool intervalMatches(const Interval& iv, int32_t v) {
@@ -418,13 +434,12 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   // caught by the content-hash tag) is cleared and a normal packet-level scan
   // runs.
   if (content_verdict.pkt == pkt) {
+    content_verdict.pkt = NULL;   // consume once, whatever the tag says
     uint8_t hash[MAX_HASH_SIZE];
     pkt->calculatePacketHash(hash);
     if (memcmp(hash, content_verdict.hash, MAX_HASH_SIZE) == 0) {
-      content_verdict.pkt = NULL;   // consume once
       return content_verdict.verdict;
     }
-    content_verdict.pkt = NULL;
   }
 
   uint8_t payload_type = pkt->getPayloadType();
@@ -433,15 +448,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
     FilterRule* r = &rules[i];
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
     if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
-    if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
-    if (!throttleDecides(r, now_millis)) continue;   // within budget: slips past, like a failed roll
-    r->hits++;
-    if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
-      r->air_ms += est_air_ms;
-      air_saved_ms += est_air_ms;
-    }
-    action = r->action;
-    break;   // first match wins
+    if (decideMatch(r, pkt, now_millis, est_air_ms, action)) break;   // first match wins
   }
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
@@ -536,15 +543,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((r->chan_flags & FILTER_CHANFLG_MASK_SET) && !channelMatchesStore(r, channel)) continue;
     if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
     if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
-    if (!probDecides(r, pkt)) continue;   // failed roll: fall through as if not matched
-    if (!throttleDecides(r, millis())) continue;   // within budget: slips past, like a failed roll
-    r->hits++;
-    if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
-      r->air_ms += est_air_ms;
-      air_saved_ms += est_air_ms;
-    }
-    verdict = r->action;
-    break;   // first match wins
+    if (decideMatch(r, pkt, millis(), est_air_ms, verdict)) break;   // first match wins
   }
 
   // stash the verdict (allow included) for checkPacket(); a drop verdict
@@ -738,11 +737,7 @@ static void formatInterval(const Interval& iv, char* dest, size_t sz, bool snr_m
 static bool parseHexHash(const char* s, uint8_t* out, uint8_t* out_len) {
   size_t n = strlen(s);
   if (n < 2 || n > 8 || (n & 1)) return false;
-  for (size_t i = 0; i < n; i += 2) {
-    int hi = hexVal(s[i]), lo = hexVal(s[i + 1]);
-    if (hi < 0 || lo < 0) return false;
-    out[i / 2] = (uint8_t)((hi << 4) | lo);
-  }
+  if (filterDecodeHex(s, n, out) == 0) return false;
   *out_len = (uint8_t)(n / 2);
   return true;
 }
@@ -803,7 +798,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
         if (nm[0] == '#' && filter.getNumChannels() >= FILTER_MAX_CHANNELS) {
           strcpy(reply, "Err - chan store full");
         } else {
-          sprintf(reply, "Err - unknown chan '%s'", nm);
+          snprintf(reply, CLI_REPLY_MAX, "Err - unknown chan '%s'", nm);
         }
         return false;
       }
@@ -833,7 +828,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
       else if (strcmp(t, "txt") == 0) r->type_mask |= FILTER_TYPE_GRP_TXT;
       else if (strcmp(t, "data") == 0) r->type_mask |= FILTER_TYPE_GRP_DATA;
       else if (strcmp(t, "any") == 0) { /* leave mask unset */ }
-      else { sprintf(reply, "Err - unknown type '%s'", t); return false; }
+      else { snprintf(reply, CLI_REPLY_MAX, "Err - unknown type '%s'", t); return false; }
     }
     return true;
   }
@@ -877,7 +872,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
         canon = "unscoped";   // keyword wins, even if a region were named "unscoped"
       } else {
         RegionEntry* reg = regions->findByNamePrefix(t);
-        if (reg == NULL) { sprintf(reply, "Err - unknown region '%s'", t); return false; }
+        if (reg == NULL) { snprintf(reply, CLI_REPLY_MAX, "Err - unknown region '%s'", t); return false; }
         canon = reg->name;
       }
       size_t used = strlen(list);
@@ -991,7 +986,7 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   }
   auto ch = filter.addChannel(name, psk);
   if (ch == NULL) { strcpy(reply, "Err - bad psk or store full"); return; }
-  sprintf(reply, "OK - chan %s h=%02X%s", ch->name, ch->hash,
+  snprintf(reply, CLI_REPLY_MAX, "OK - chan %s h=%02X%s", ch->name, ch->hash,
           psk == NULL ? " (derived)" : "");
 }
 
@@ -1002,7 +997,7 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
   auto ch = filter.findChannel(name);
   if (ch == NULL) { strcpy(reply, "Err - unknown channel"); return; }
   filter.delChannel(ch - filter.getChannel(0));
-  sprintf(reply, "OK - chan %s deleted", name);
+  snprintf(reply, CLI_REPLY_MAX, "OK - chan %s deleted", name);
 }
 
 static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
@@ -1030,7 +1025,7 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
       return;
     }
   }
-  sprintf(reply, "OK - rule %d added", idx);
+  snprintf(reply, CLI_REPLY_MAX, "OK - rule %d added", idx);
 }
 
 static void cliList(FilterRules& filter, char* reply) {
@@ -1158,19 +1153,13 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
   } else if (strcmp(cmd, "get") == 0) {
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) cliGet(filter, idx, reply);
-  } else if (strcmp(cmd, "enable") == 0) {
+  } else if (strcmp(cmd, "enable") == 0 || strcmp(cmd, "disable") == 0) {
+    bool on = (strcmp(cmd, "enable") == 0);
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
-      filter.getRule(idx)->enabled = true;
+      filter.getRule(idx)->enabled = on;
       filter.markDirty();
-      sprintf(reply, "OK - rule %d enabled", idx);
-    }
-  } else if (strcmp(cmd, "disable") == 0) {
-    int idx;
-    if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
-      filter.getRule(idx)->enabled = false;
-      filter.markDirty();
-      sprintf(reply, "OK - rule %d disabled", idx);
+      snprintf(reply, CLI_REPLY_MAX, "OK - rule %d %s", idx, on ? "enabled" : "disabled");
     }
   } else if (strcmp(cmd, "move") == 0) {
     int from, to;
@@ -1180,14 +1169,14 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
         strcpy(reply, "Err - move: source and target are the same rule");   // no-op move is rejected
       } else {
         filter.moveRule(from, to);
-        sprintf(reply, "OK - rule %d moved to %d", from, to);
+        snprintf(reply, CLI_REPLY_MAX, "OK - rule %d moved to %d", from, to);
       }
     }
   } else if (strcmp(cmd, "del") == 0) {
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
       filter.delRule(idx);
-      sprintf(reply, "OK - rule %d deleted", idx);
+      snprintf(reply, CLI_REPLY_MAX, "OK - rule %d deleted", idx);
     }
   } else if (strcmp(cmd, "clear") == 0) {
     filter.clearRules();
@@ -1195,16 +1184,16 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
   } else if (strcmp(cmd, "ratelimit") == 0) {
     char* sub = nextToken(&p);
     if (sub == NULL) {
-      sprintf(reply, "ratelimit advert %uh; cache %d/%d", filter.getAdvertRatelimit(),
+      snprintf(reply, CLI_REPLY_MAX, "ratelimit advert %uh; cache %d/%d", filter.getAdvertRatelimit(),
               filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
     } else if (strcmp(sub, "advert") == 0) {
       char* hs = nextToken(&p);
       long v = hs ? strtol(hs, NULL, 10) : -1;
       if (v < 0 || v > FILTER_ADVERT_HOURS_MAX) {
-        sprintf(reply, "Err - hours must be 0..%d (0=off)", FILTER_ADVERT_HOURS_MAX);
+        snprintf(reply, CLI_REPLY_MAX, "Err - hours must be 0..%d (0=off)", FILTER_ADVERT_HOURS_MAX);
       } else {
         filter.setAdvertRatelimit((uint16_t)v);
-        sprintf(reply, "OK - advert ratelimit %ldh", v);
+        snprintf(reply, CLI_REPLY_MAX, "OK - advert ratelimit %ldh", v);
       }
     } else if (strcmp(sub, "clear") == 0) {
       filter.clearAdvertCache();

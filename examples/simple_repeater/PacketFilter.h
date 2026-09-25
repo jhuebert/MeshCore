@@ -243,6 +243,13 @@ private:
   bool advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_millis);
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
+  // match gates + commit, shared by checkPacket()/checkContent(): run the prob
+  // roll and the throttle gate; when the rule decides, record the hit, bill
+  // the saved airtime, and store its action in `out`. Returns false when a
+  // gate slips the packet past the rule (evaluation continues with the next
+  // rule, exactly as on a failed predicate).
+  bool decideMatch(FilterRule* r, const mesh::Packet* pkt, uint32_t now_millis,
+                   uint32_t est_air_ms, uint8_t& out);
 };
 
 // CLI command handler: invoke with the command after "filter" (prefix removed).
