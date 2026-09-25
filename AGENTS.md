@@ -9,6 +9,62 @@ Remotes: `origin` = upstream `meshcore-dev/MeshCore` (never push there),
 `fork` = `jhuebert/MeshCore` (push here). Upstream has **no** AGENTS.md, so this
 file is fork-owned and does not conflict with upstream syncs.
 
+## Patterns become rules — ask first
+
+When a way of working turns out to persist — a convention the user applies
+repeatedly, a preference stated more than once, a pattern that emerged from a
+finished change and will likely recur — **ask the user** whether to codify it
+in this file before relying on it again. Never silently start following an
+unwritten rule, and never edit this file on your own initiative. Proposed
+wording plus a one-line rationale; the user decides.
+
+## Repo docs & code map — read this, then start
+
+Everything needed to begin work is here or in the two files below; an agent
+should not need to explore beyond them before making a change.
+
+**User guides (authoritative for behavior; keep in sync with code):**
+- `FILTER.md` — the packet filter's user manual: rule model, every predicate
+  (`type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`, `chan`, `chanhash`,
+  `region`, `sender`, `text`, `prob`, `throttle`, `action`), full command
+  reference, TinyRegex syntax + limits, real-world setups, quoting/sending
+  notes, troubleshooting. First stop for any CLI-semantics or
+  least-surprise question.
+- `BATTERY.md` — battery gate user manual: behavior, what suspension does
+  not touch, persistence, CLI reference.
+
+**When behavior changes, the matching guide section is updated in the same
+commit** — the guides are user-facing API documentation, not optional docs.
+
+**Code (`examples/simple_repeater/`):**
+- `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
+  `checkContent` decrypted-content single pass, verdict stash), advert rate
+  limiter, binary persistence (`load`/`save`, v3..v6), `filterCLI`.
+- `PacketFilterConfig.h` — all capacity tunables (`FILTER_MAX_RULES`, ...),
+  override via build flags; persistence-layout caveats noted inline.
+- `TinyRegex.h/.cpp` — vendored kokke/tiny-regex-c + step budget (see Hard
+  invariants; treat as upstream).
+- `CliUtil.h` — shared CLI helpers (`nextToken`, `radd`, `CLI_REPLY_MAX`)
+  used by filter and battery CLIs alike.
+- `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI.
+- `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
+  (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
+  dispatch, lazy-save loop).
+- `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
+
+**Tests:** `test/test_packet_filter/` (191 behavior-level cases: matching,
+content rules, limiter, persistence upgrades, CLI surface, TinyRegex) and
+`test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
+`NativeTestStubs.cpp`, `RegionMapStub.cpp`, `FilterTestHelpers.h`.
+
+**Build & CI:** `pio test -e native_packet_filter` / `-e
+native_battery_gate` (host-native, no hardware); firmware via
+`sh build.sh build-firmware <target>` (`sh build.sh list`), the filter fork's
+flash target being `xiao_s3_wio`. `.github/workflows/filter-build.yml` builds
+release channels (dev → `repeater-filter`, stable → `repeater-filter-stable`);
+`sync-upstream.yml` merges upstream weekly. Upstream's own docs live in
+`docs/` (MeshCore protocol/CLI generally) — not fork-filter documentation.
+
 ## Branch model
 
 - `repeater-filter` — dev release channel; the integration branch for all
