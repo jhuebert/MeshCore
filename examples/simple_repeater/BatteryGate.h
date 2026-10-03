@@ -39,7 +39,7 @@ class BatteryGate {
   uint8_t low_count;          // consecutive low readings (debounce)
   uint32_t drops;             // packets gated while suspended (RAM-only)
   unsigned long next_sample_at;
-  LazySave save_flag;       // needs save, written back by loop()
+  LazySave save_flag;         // needs save, written back by loop()
 
 public:
   BatteryGate();
@@ -73,15 +73,13 @@ public:
 
   void markDirty() { save_flag.markDirty(); }
 
-private:
-  // state of a fresh node, and the baseline load() resets to before reading
-  void resetToDefaults();
-
-public:
-
   // persistence: thresholds and enabled flag only (never the suspended state)
   void load(FILESYSTEM* fs);
   void save(FILESYSTEM* fs);
+
+private:
+  // state of a fresh node, and the baseline load() resets to before reading
+  void resetToDefaults();
 };
 
 // CLI command handler: invoke with the command after "battery" (prefix
