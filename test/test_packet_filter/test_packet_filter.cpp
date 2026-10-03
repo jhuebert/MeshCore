@@ -1369,33 +1369,73 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 
 #include "FilterTestHelpers.h"
 
-// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v6 record is
-// the struct up to `hits` (u16 throttle grows the v4/v5 record by 4 bytes;
-// prob's byte sits in the v4 tail padding), so every older record is a
-// byte-identical prefix; the v3 record is the same struct with no `regions`
-// field, padded to uint32_t alignment; the lazy-save delay is 3000 ms)
-static constexpr size_t V6_RULE_BYTES = offsetof(FilterRule, hits);
-static constexpr size_t V5_RULE_BYTES = offsetof(FilterRule, throttle);
-static constexpr size_t V3_RULE_BYTES =
-    (offsetof(FilterRule, regions) + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
+// ===================================================================
+// OLD-CONFIG BYTE FIXTURES — temporary, removed with the migration path
+// ===================================================================
+// These are the layouts older firmware actually wrote, written out as literal
+// byte values. They deliberately do NOT derive from FilterRule: the old
+// transmute helper built a v3/v4/v5 file by trimming a freshly saved v6 record,
+// so it moved with the struct and could never catch the struct changing under
+// an old config. The offsets below are historical facts. Delete this section
+// together with the v3..v6 branches in load().
+
 static constexpr uint8_t CFG_VERSION = 6;
 static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static const char* CFG_FILE = "/filter_cfg";
 
-// rebuild a saved blob as an old-format blob with `ver` in the header and
-// `old_bytes`-long rule records (a v6 record's leading bytes are a
-// byte-identical old record)
-static std::vector<uint8_t> transmuteRuleRecords(const std::vector<uint8_t>& blob,
-                                                 uint8_t ver, size_t old_bytes) {
-  std::vector<uint8_t> out(blob.begin(), blob.begin() + 7);   // header + ratelimit
-  out[0] = ver;
-  size_t nr = blob[2];
-  for (size_t i = 0; i < nr; i++) {
-    const uint8_t* rec = blob.data() + 7 + i * V6_RULE_BYTES;
-    out.insert(out.end(), rec, rec + old_bytes);
+// One rule record of `bytes` length, carrying: enabled, drop, type=advert,
+// hops=[2,4], sender="Bot", text="hi", region=TestNorth, prob=50,
+// throttle=1000 s. Fields past `bytes` do not exist in that version, which is
+// the point.
+static std::vector<uint8_t> oldRuleRecord(size_t bytes) {
+  std::vector<uint8_t> rec(bytes, 0);
+  rec[0] = 1;                     // enabled
+  rec[1] = FILTER_ACT_DROP;       // action
+  rec[2] = FILTER_TYPE_ADVERT;    // type_mask
+  rec[4] = 2;                     // hops.lo
+  rec[6] = 4;                     // hops.hi
+  rec[8] = FILTER_IV_LO_INC | FILTER_IV_HI_INC;
+  memcpy(&rec[50], "Bot", 3);     // sender
+  memcpy(&rec[74], "hi", 2);      // text
+  if (bytes >= FILTER_RULE_V4_BYTES) {
+    memcpy(&rec[122], "TestNorth", 9);   // regions: absent in v3
+    rec[154] = 50;                       // prob
   }
-  out.insert(out.end(), blob.begin() + 7 + nr * V6_RULE_BYTES, blob.end());   // channels
-  return out;
+  if (bytes >= FILTER_RULE_V6_BYTES) {
+    rec[156] = 0xE8;                     // throttle = 1000 s, little-endian
+    rec[157] = 0x03;
+  }
+  return rec;
+}
+
+// The provisioned Public channel: 16-byte well-known PSK, tag 0x11.
+static std::vector<uint8_t> oldChannelRecord() {
+  std::vector<uint8_t> ch(FILTER_CHAN_PERSIST_BYTES, 0);
+  const uint8_t psk[16] = { 0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+                            0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72 };
+  memcpy(&ch[0], "Public", 6);
+  memcpy(&ch[16], psk, sizeof(psk));
+  ch[48] = 16;    // secret_len
+  ch[49] = 0x11;  // sha256(psk)[0]: the 1-byte on-air tag
+  return ch;
+}
+
+// A complete config file: header(5) + ratelimit(2) + rule records + channels.
+static std::vector<uint8_t> oldCfgFile(uint8_t ver, size_t rule_bytes,
+                                       const std::vector<std::vector<uint8_t>>& chans,
+                                       uint16_t rl_hours = 0) {
+  std::vector<uint8_t> f;
+  f.push_back(ver);
+  f.push_back(1);                                  // enabled
+  f.push_back(1);                                  // num_rules
+  f.push_back((uint8_t)chans.size());              // num_channels
+  f.push_back(0);                                  // spare
+  f.push_back((uint8_t)(rl_hours & 0xFF));
+  f.push_back((uint8_t)(rl_hours >> 8));
+  const std::vector<uint8_t> rec = oldRuleRecord(rule_bytes);
+  f.insert(f.end(), rec.begin(), rec.end());
+  for (const auto& c : chans) f.insert(f.end(), c.begin(), c.end());
+  return f;
 }
 
 // ---------------------------------------------------------------- rule management
@@ -1549,22 +1589,8 @@ TEST_F(FilterTest, BeginProvisionsPublicChannelOnFreshNode) {
 // ---------------------------------------------------------------- version upgrades
 
 TEST_F(FilterTest, V3ConfigUpgradesToV4) {
-  // build a v3 store: one rule with hops=[2,4], one channel (Public)
-  filter.setAdvertRatelimit(7);
-  ASSERT_EQ(cli(filter, "add hops=[2,4]"), "OK - rule 0 added");
-  filter.save(&fs);
-
-  // transmute the v4 blob into a v3 blob: version byte 3, rule records stop
-  // before `regions`
-  auto& blob = fs.files[CFG_FILE];
-  ASSERT_GE(blob.size(), (size_t)(7 + V6_RULE_BYTES + sizeof(FilterChannel)));
-  std::vector<uint8_t> v3(7 + V3_RULE_BYTES + sizeof(FilterChannel));
-  memcpy(&v3[0], blob.data(), 5);
-  v3[0] = 3;                                        // version
-  memcpy(&v3[5], blob.data() + 5, 2);               // ratelimit
-  memcpy(&v3[7], blob.data() + 7, V3_RULE_BYTES);   // rule record, pre-regions
-  memcpy(&v3[7 + V3_RULE_BYTES], blob.data() + 7 + V6_RULE_BYTES, sizeof(FilterChannel));
-  blob = v3;
+  // a v3 store: one rule with hops=[2,4], one channel (Public), ratelimit 7
+  fs.files[CFG_FILE] = oldCfgFile(3, FILTER_RULE_V3_BYTES, { oldChannelRecord() }, 7);
 
   FilterRules upgraded;
   upgraded.begin(&fs);
@@ -1579,36 +1605,52 @@ TEST_F(FilterTest, V3ConfigUpgradesToV4) {
   EXPECT_EQ(upgraded.getAdvertRatelimit(), 7);
 }
 
-TEST_F(FilterTest, V5RecordMigratesWithThrottleZeroAndProbIntact) {
-  // a v5 record (156 B, ends where throttle begins) reads back byte-identical:
-  // prob keeps its byte while throttle — past the record's end — stays 0
-  // (= no limit); the dead padding byte before the record end must not leak
-  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
-  filter.save(&fs);
-  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 5, V5_RULE_BYTES);
-  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;   // dead tail byte, not guaranteed
-  fs.files[CFG_FILE] = blob;
+TEST_F(FilterTest, V6FixtureLoadsWithEverySettingIntact) {
+  fs.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() }, 7);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  ASSERT_EQ(restored.getNumChannels(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_TRUE(r->enabled);
+  EXPECT_EQ(r->action, FILTER_ACT_DROP);
+  EXPECT_EQ(r->type_mask, FILTER_TYPE_ADVERT);
+  EXPECT_STREQ(r->sender, "Bot");
+  EXPECT_STREQ(r->text, "hi");
+  EXPECT_STREQ(r->regions, "TestNorth");
+  EXPECT_EQ(r->prob, 50);
+  EXPECT_EQ(r->throttle, 1000);        // current version carries it
+  EXPECT_EQ(r->hits, 0u);              // stats are never persisted
+  EXPECT_EQ(restored.getAdvertRatelimit(), 7);
+  EXPECT_STREQ(restored.getChannel(0)->name, "Public");
+  EXPECT_EQ(restored.getChannel(0)->secret_len, 16);
+}
+
+TEST_F(FilterTest, V5FixtureKeepsProbAndRegionsWithThrottleZero) {
+  // v5 records end where `throttle` begins (156 B): throttle reads back as 0
+  // (= no limit) and the dead padding byte must not leak into it
+  std::vector<uint8_t> f = oldCfgFile(5, FILTER_RULE_V4_BYTES, { oldChannelRecord() });
+  f[7 + FILTER_RULE_V4_BYTES - 1] = 0xFF;   // dead tail byte, not guaranteed
+  fs.files[CFG_FILE] = f;
 
   FilterRules restored;
   restored.begin(&fs);
   ASSERT_EQ(restored.getNumRules(), 1);
   FilterRule* r = restored.getRule(0);
-  EXPECT_EQ(r->prob, 50);                  // v5 keeps prob (prob-zeroing regression)
+  EXPECT_EQ(r->prob, 50);                  // v5 keeps prob
   EXPECT_EQ(r->throttle, 0);
-  EXPECT_STREQ(r->regions, "TestNorth");   // region= survives (v3-wipe regression)
-  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+  EXPECT_STREQ(r->regions, "TestNorth");   // region= survives the v3 wipe
+  EXPECT_EQ(r->hits, 0u);
 }
 
-TEST_F(FilterTest, V4RecordKeepsRegionsAndZerosProb) {
-  // a v4 record is the same 156 B layout, but its prob byte is not
-  // format-guaranteed: it must read as 0, while the region= list must survive
-  // (the v3 record wipe applies to v3 records only)
-  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
-  filter.save(&fs);
-  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 4, V5_RULE_BYTES);
-  blob[7 + offsetof(FilterRule, prob)] = 0xFF;       // old padding byte, not guaranteed
-  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;
-  fs.files[CFG_FILE] = blob;
+TEST_F(FilterTest, V4FixtureZerosProbButKeepsRegions) {
+  // v4 shares the 156 B layout, but its prob byte is not format-guaranteed: it
+  // must read as 0, while the region list survives (the v3 wipe is v3-only)
+  std::vector<uint8_t> f = oldCfgFile(4, FILTER_RULE_V4_BYTES, { oldChannelRecord() });
+  f[7 + 154] = 0xFF;                       // old padding byte, not guaranteed
+  f[7 + 155] = 0xFF;
+  fs.files[CFG_FILE] = f;
 
   FilterRules restored;
   restored.begin(&fs);
@@ -1617,7 +1659,26 @@ TEST_F(FilterTest, V4RecordKeepsRegionsAndZerosProb) {
   EXPECT_EQ(r->prob, 0);                   // unset = always (100 %)
   EXPECT_EQ(r->throttle, 0);
   EXPECT_STREQ(r->regions, "TestNorth");   // not wiped
-  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+  EXPECT_EQ(r->hits, 0u);
+}
+
+TEST_F(FilterTest, V3FixtureWipesRegionsAndHasNoProbOrThrottle) {
+  // v3 records end where `regions` begins (124 B): the old trailing padding
+  // bytes get dragged into regions[0..1], so the whole field must be zeroed
+  std::vector<uint8_t> f = oldCfgFile(3, FILTER_RULE_V3_BYTES, { oldChannelRecord() });
+  f[7 + 122] = 0xFF;                       // padding that must NOT become a region
+  f[7 + 123] = 0xFF;
+  fs.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_STREQ(r->regions, "");            // wiped, not a garbage region
+  EXPECT_EQ(r->prob, 0);
+  EXPECT_EQ(r->throttle, 0);
+  EXPECT_STREQ(r->sender, "Bot");          // everything inside the record survives
+  EXPECT_STREQ(r->text, "hi");
 }
 
 TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
@@ -1660,7 +1721,7 @@ TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
   // header promises 2 rules but the file stops after the first
   auto& blob = fs.files[CFG_FILE];
   blob[2] = 2;   // num_rules = 2
-  blob.resize(7 + V6_RULE_BYTES);   // cut after rule 0
+  blob.resize(7 + FILTER_RULE_V6_BYTES);   // cut after rule 0
 
   FilterRules restored;
   restored.begin(&fs);

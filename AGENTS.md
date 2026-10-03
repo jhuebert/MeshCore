@@ -151,6 +151,19 @@ FILTER.md:
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
   in 2026-10 (alternation) — a stored pattern containing an unescaped `|`
   previously matched a literal pipe.
+- **Config integrity is length-checked, not checksummed.** A truncated save is
+  detected on load; a torn write of exactly the right length is not. Deliberately
+  no record checksum (the on-disk format is frozen) and no sidecar file (a second
+  file is a second thing to go missing). A checksum belongs *in* the record, and
+  the record only changes with `FILTER_CFG_VERSION` — so when a v7 is needed
+  anyway, put it there, and every config written before it must still load.
+  Rationale: stops a later "improvement" from quietly weakening config
+  compatibility.
+- **Old-version migration is temporary.** v3..v6 loading is kept for now and is
+  expected to be dropped once the field has migrated. Keep that code path and its
+  byte fixtures contiguous and clearly delimited, so removing it is one excision
+  rather than a scavenger hunt. Rationale: stops the migration path accreting
+  more versions before anyone removes it.
 
 ## Hard invariants (do not break)
 

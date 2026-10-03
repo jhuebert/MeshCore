@@ -28,6 +28,14 @@ public:
   void clear() { dirty = false; }
 };
 
+// Config integrity is length-checked, not checksummed: a truncated file is
+// detected on load, but a torn write that happens to be exactly the right
+// length is not. That is deliberate — no record checksum, because the on-disk
+// format is frozen, and no sidecar file, because a second file is a second
+// thing to go missing. A checksum belongs in the record, and the record can only
+// change when the config version does: when a v7 is needed anyway, put it
+// there. Every config this firmware writes must keep loading without one.
+
 // Open for reading, whatever the platform's default mode is.
 inline File fsOpenRead(FILESYSTEM* fs, const char* name) {
 #if defined(RP2040_PLATFORM)
