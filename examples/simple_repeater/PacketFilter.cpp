@@ -623,13 +623,13 @@ void FilterRules::save(FILESYSTEM* fs) {
 
 // ---------------------------------------------------------------- CLI
 
-// interval value: hops/len = unsigned decimal; snr = signed dB (snapped to the
-// quarter-dB grid, stored as quarter-dB int)
 // Which scale an Interval's endpoints are written in (FilterRule::snr stores
 // quarter-dB steps in the same int16 pair hops/len use as plain counts).
 enum IvUnit { IV_UNSIGNED,   // hops, len: plain decimal
               IV_SNR_DB };    // snr: signed dB, snapped to the quarter-dB grid
 
+// interval value: hops/len = unsigned decimal; snr = signed dB (snapped to the
+// quarter-dB grid, stored as quarter-dB int)
 static bool parseIvNum(const char* s, IvUnit unit, uint16_t* out) {
   if (unit == IV_SNR_DB) {
     char* end;
@@ -895,10 +895,6 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return setPattern(is_sender ? r->sender : r->text,
                       is_sender ? FILTER_SENDER_PATTERN_LEN : FILTER_TEXT_PATTERN_LEN,
                       val, key, reply);
-  }
-  if (strcmp(key, "text") == 0) {
-    if (val[0] == 0) { strcpy(reply, "Err - empty regex"); return false; }   // matches everything
-    return setPattern(r->text, FILTER_TEXT_PATTERN_LEN, val, "text", reply);
   }
   if (strcmp(key, "action") == 0) {
     if (strcmp(val, "drop") == 0) r->action = FILTER_ACT_DROP;
