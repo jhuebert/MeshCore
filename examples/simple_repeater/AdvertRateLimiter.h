@@ -42,7 +42,6 @@ public:
   bool enabled() const { return hours > 0; }
   int getCacheCount() const { return cache_count; }
   uint32_t getDrops() const { return drops; }
-  void clearCache();
   void resetDrops() { drops = 0; }
 
   // back to a freshly constructed limiter (empty cache, window off, no drops)
@@ -55,9 +54,32 @@ public:
   }
 
   // True if this advert must be dropped because the same origin was already
-  // relayed less than `hours` ago (counting that drop). Drops nothing while the
-  // limiter is off (hours == 0) or the origin is seen for the first time.
-  bool drop(const mesh::Packet* pkt, uint32_t now_millis);
+  // RELAYED less than `hours` ago. This only answers the question — it records
+  // nothing, because whether an advert actually gets relayed is decided after the
+  // stock forwarding checks. Recording here would spend a node's 48 h budget on
+  // adverts that never got forwarded: a repeater left in `set off`, or refusing
+  // them for hop-limit/region/loop reasons, would silently stop relaying those
+  // nodes for the rest of the window.
+  bool wouldDrop(const mesh::Packet* pkt, uint32_t now_millis);
+
+  // Record that this origin's advert was admitted for relay, starting its window.
+  // Called from the successful end of the forwarding hook, never from the check.
+  void recordForward(const mesh::Packet* pkt, uint32_t now_millis);
+
+  // Restart an origin's expired window. Not used by the forwarding path — the
+  // stamp is refreshed by recordForward() on admission — but the expiry semantics
+  // are easier to state (and to test) as their own step.
+  bool refreshExpired(const mesh::Packet* pkt, uint32_t now_millis);
+
+  // Drop the cache entirely.
+  void clearCache();
+
+private:
+  void clearCacheImpl();
+  // index of the cache slot holding this origin's 4-byte key, or -1
+  int findOrigin(const mesh::Packet* pkt) const;
+  // store this origin at `now`, evicting the oldest entry if the cache is full
+  void storeOrigin(const mesh::Packet* pkt, uint32_t now_millis);
 };
 
 #endif // _ADVERT_RATE_LIMITER_H

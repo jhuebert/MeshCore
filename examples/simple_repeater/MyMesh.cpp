@@ -457,6 +457,10 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
       return false;
     }
   }
+  // Every stock check passed, so this packet will be relayed: start the origin's
+  // advert window now. Doing it here rather than in checkPacket() is what keeps a
+  // refused advert from consuming a node's 48 h budget.
+  filter.onForwardAllowed(packet, millis());
   return true;
 }
 
@@ -465,6 +469,13 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
 }
 
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  // The battery gate outranks the filter. Without this, decryptable group traffic
+  // runs the content rules and banks hits/airtime while a suspended repeater is
+  // refusing to relay it, whereas an undecryptable packet of the same shape is
+  // counted as a battery drop — two different stories for the same suspension.
+  // Forwarding admission stays in allowPacketForward(), which counts once.
+  if (battGate.isSuspended()) return;
+
   if (filter.checkContent(packet, type, channel, data, len, recv_pkt_region, _radio->getEstAirtimeFor(packet->getRawLength())) == FILTER_ACT_DROP) {
     MESH_DEBUG_PRINTLN("filter: dropping group packet by content rule");
     packet->markDoNotRetransmit();
@@ -578,7 +589,15 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   } else {
     recv_pkt_region = NULL;
   }
-  return Mesh::onRecvPacket(pkt);
+  // Bracket ONE receive operation: the content verdict stashed by onGroupDataRecv()
+  // belongs to the packet being processed right now, and to no other. Clearing
+  // on both sides means a verdict cannot survive into a later packet, whatever
+  // core decides to do in between — including returning early or never reaching
+  // the forwarding hook at all.
+  filter.clearContentVerdict();
+  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
+  filter.clearContentVerdict();
+  return action;
 }
 
 void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const mesh::Identity &sender,
@@ -1312,6 +1331,11 @@ void MyMesh::loop() {
   bridge.loop();
 #endif
 
+  // Battery FIRST, before any receive can be dispatched: at a sampling boundary
+  // the receive that follows must see this loop's reading, not the previous one.
+  // One sample per interval, not one per packet.
+  battGate.loop(_fs, board);
+
   mesh::Mesh::loop();
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
@@ -1348,9 +1372,6 @@ void MyMesh::loop() {
 
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
-
-  // battery gate: periodic voltage sample + lazy config save
-  battGate.loop(_fs, board);
 
   // update uptime
   uint32_t now = millis();
