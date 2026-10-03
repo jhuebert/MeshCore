@@ -150,6 +150,12 @@ jobs:
               });
             }
 
+      - name: Setup Build Environment
+        # the promotion gate runs the native suites, and this runner has no
+        # PlatformIO of its own: without this the gate could only ever fail
+        if: inputs.promote_stable == true
+        uses: ./.github/actions/setup-build-environment
+
       - name: Promote repeater-filter-stable (explicit only)
         id: stable
         # Stable is NEVER promoted by the weekly schedule. Promoting means
