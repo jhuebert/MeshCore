@@ -26,7 +26,10 @@ check the voltage, and adjust or disable the gate.
 - **Hysteresis:** suspending takes the voltage below the *suspend* threshold;
   resuming requires the voltage to rise to the *resume* threshold. The gap
   between the two prevents the gate from flapping around a single threshold.
-  If no resume value is given, it defaults to suspend + 200 mV.
+  If no resume value is given, it defaults to suspend + 200 mV. Above 9800 mV
+  that default would fall outside the accepted range, so the command is refused
+  and you must pass the resume value explicitly (`Err - default resume exceeds
+  10000mV; specify resume`). Nothing is clamped silently.
 - **Drop counter:** a RAM-only counter of packets gated while suspended
   (resets on reboot, like the filter stats).
 
@@ -60,7 +63,8 @@ battery recovers.
 | `battery <suspend-mV> [resume-mV]` | Set thresholds and enable the gate |
 
 Thresholds are millivolts only (1..10000); the resume value must be strictly
-greater than the suspend value.
+greater than the suspend value. A rejected command always leaves the previous
+settings untouched — an `OK` reply means the values were actually applied.
 
 ### Examples
 

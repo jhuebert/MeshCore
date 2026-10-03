@@ -19,6 +19,9 @@ static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static constexpr unsigned long SAMPLE_INTERVAL_MS = 30000;
 
 #define BATT_CFG_FILE "/batt_cfg"
+// mirrors BATT_CFG_RECORD_BYTES / BATT_CFG_VERSION in BatteryGate.cpp
+static constexpr size_t BATT_CFG_RECORD_BYTES = 6;
+static constexpr uint8_t BATT_CFG_VERSION = 1;
 
 // Board stand-in whose voltage the tests inject.
 struct MockBoard : public mesh::MainBoard {
@@ -266,6 +269,38 @@ TEST_F(BatteryGateTest, RejectsResumeNotGreaterThanSuspend) {
   EXPECT_FALSE(gate.isEnabled());
 }
 
+// Without an explicit resume the CLI derives suspend + 200 mV. Near the top of
+// the range that derived value leaves the accepted band: it must be refused, not
+// clamped, and a previously configured gate must survive the refusal.
+TEST_F(BatteryGateTest, ImplicitResumeRefusesInsteadOfClamping) {
+  EXPECT_EQ(cli(gate, board, "9800"), "OK - gate on; suspend <9800mV; resume >=10000mV");
+  EXPECT_EQ(gate.getSuspendMilliVolts(), 9800);
+  EXPECT_EQ(gate.getResumeMilliVolts(), 10000);
+
+  for (const char* cmd : { "9801", "9900", "10000" }) {
+    std::string reply = cli(gate, board, cmd);
+    EXPECT_EQ(reply, "Err - default resume exceeds 10000mV; specify resume") << cmd;
+  }
+  // the refused commands changed nothing
+  EXPECT_EQ(gate.getSuspendMilliVolts(), 9800);
+  EXPECT_EQ(gate.getResumeMilliVolts(), 10000);
+  EXPECT_TRUE(gate.isEnabled());
+
+  // ... and an explicit resume in range is still accepted
+  EXPECT_EQ(cli(gate, board, "9900 10000").substr(0, 3), "OK ");
+  EXPECT_EQ(gate.getSuspendMilliVolts(), 9900);
+}
+
+TEST_F(BatteryGateTest, InvalidThresholdPairIsRejectedByTheApiToo) {
+  EXPECT_FALSE(gate.setThresholds(0, 100));
+  EXPECT_FALSE(gate.setThresholds(3400, 3400));
+  EXPECT_FALSE(gate.setThresholds(3400, 3300));
+  EXPECT_FALSE(gate.setThresholds(3400, 10001));
+  EXPECT_FALSE(gate.setThresholds(10001, 10002));
+  EXPECT_TRUE(gate.setThresholds(3400, 3700));
+  EXPECT_EQ(gate.getSuspendMilliVolts(), 3400);
+}
+
 TEST_F(BatteryGateTest, RejectsOutOfRange) {
   EXPECT_EQ(cli(gate, board, "0"), "Err - millivolts must be 1..10000");
   EXPECT_EQ(cli(gate, board, "10001"), "Err - millivolts must be 1..10000");
@@ -307,6 +342,53 @@ TEST_F(BatteryGateTest, LoadResetsStateTheFileCannotCarry) {
   EXPECT_FALSE(gate.isEnabled());
   EXPECT_EQ(gate.getSuspendMilliVolts(), 0);
   EXPECT_EQ(gate.getResumeMilliVolts(), 0);
+}
+
+// The loader must validate a whole record on locals before assigning anything
+// live: a record the CLI could never produce is still not adopted.
+TEST_F(BatteryGateTest, LoadValidatesTheWholeRecord) {
+  auto writeRec = [&](uint8_t version, uint8_t enabled, uint16_t susp, uint16_t res) {
+    uint8_t rec[BATT_CFG_RECORD_BYTES];
+    rec[0] = version;
+    rec[1] = enabled;
+    memcpy(&rec[2], &susp, 2);
+    memcpy(&rec[4], &res, 2);
+    fs.files[BATT_CFG_FILE].assign(rec, rec + BATT_CFG_RECORD_BYTES);
+  };
+
+  struct { uint8_t en; uint16_t s, r; bool keep; const char* why; } cases[] = {
+    { 0, 0,     0,     true,  "disabled with the shipped 0/0 default" },
+    { 0, 3400, 3700, true,  "disabled but retaining valid thresholds" },
+    { 1, 3400, 3700, true,  "enabled with valid thresholds" },
+    { 1, 0,     0,     false, "enabled with zero thresholds" },
+    { 1, 3400, 3400, false, "resume equal to suspend" },
+    { 1, 3700, 3400, false, "resume below suspend" },
+    { 1, 12000, 13000, false, "both above the accepted range" },
+    { 2, 3400, 3700, false, "enabled byte is neither 0 nor 1" },
+  };
+  for (auto& c : cases) {
+    writeRec(BATT_CFG_VERSION, c.en, c.s, c.r);
+    BatteryGate g;
+    g.begin(&fs);
+    g.load(&fs);
+    // a valid record is adopted; a disabled one simply stays disabled
+    EXPECT_EQ(g.isEnabled(), c.keep && c.en == 1) << c.why;
+    if (c.keep) {
+      EXPECT_EQ(g.getSuspendMilliVolts(), c.s) << c.why;
+      EXPECT_EQ(g.getResumeMilliVolts(), c.r) << c.why;
+    } else {
+      EXPECT_EQ(g.getSuspendMilliVolts(), 0) << c.why;
+      EXPECT_EQ(g.getResumeMilliVolts(), 0) << c.why;
+    }
+  }
+
+  // an unsupported version byte restores the defaults
+  writeRec(BATT_CFG_VERSION + 1, 1, 3400, 3700);
+  BatteryGate g;
+  g.begin(&fs);
+  g.load(&fs);
+  EXPECT_FALSE(g.isEnabled());
+  EXPECT_EQ(g.getSuspendMilliVolts(), 0);
 }
 
 TEST_F(BatteryGateTest, TruncatedFileGivesDefaults) {
