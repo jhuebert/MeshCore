@@ -142,6 +142,12 @@ static_assert(offsetof(FilterRule, throttle) ==
               "FilterRule::throttle must start where the v4/v5 record ended");
 static_assert(offsetof(FilterRule, hits) == offsetof(FilterRule, throttle) + 4,
               "u16 throttle + 2 reserved bytes must fill the gap before hits");
+// FILTER_PATH_HASH_SLOTS sizes FilterRule::path, so it moves every field after
+// it and a config saved by one build would not load in another. Name the knob
+// that was raised here, rather than failing on the record invariant it broke.
+static_assert(FILTER_PATH_HASH_SLOTS == 4,
+              "FilterRule::path size is in the persisted record: this needs a "
+              "FILTER_CFG_VERSION bump and migration code in load()");
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
   uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
