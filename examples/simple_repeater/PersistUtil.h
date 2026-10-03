@@ -59,7 +59,6 @@ inline File fsOpenRead(FILESYSTEM* fs, const char* name) {
   return fs->open(name);
 #endif
 }
-
 // Open for writing, replacing whatever is there: the platforms that cannot
 // truncate in place want the old file removed first.
 inline File fsOpenWrite(FILESYSTEM* fs, const char* name) {
@@ -71,6 +70,145 @@ inline File fsOpenWrite(FILESYSTEM* fs, const char* name) {
 #else
   return fs->open(name, "w", true);
 #endif
+}
+
+// ---------------------------------------------------------------- staged save
+//
+// Truncating the live config in place destroys the only good copy the moment a
+// write fails or power drops — and a battery-powered repeater is exactly where
+// brownouts happen. So a save is staged: write a scratch file, read it BACK and
+// validate it, keep the previous good file as a backup, and only then promote.
+// The caller keeps its dirty flag until this reports success.
+//
+// Config record bytes are unchanged. This is machinery around the file, not a
+// new format: `.tmp` and `.bak` are filesystem state, and neither is ever read
+// as a config on its own terms (a boot ignores `.tmp` entirely — an uncommitted
+// scratch file is not a config).
+//
+// Hardware note: this sequence is recoverable at the application level. It is
+// not a proof of atomicity against a brownout at the filesystem layer.
+
+#define PERSIST_TMP_SUFFIX ".tmp"
+#define PERSIST_BAK_SUFFIX ".bak"
+
+// `name` + suffix, bounded.
+inline void persistPath(char* dst, size_t sz, const char* name, const char* suffix) {
+  if (sz == 0) return;
+  size_t n = strlen(name);
+  size_t s = strlen(suffix);
+  if (n + s >= sz) { dst[0] = 0; return; }
+  memcpy(dst, name, n);
+  memcpy(dst + n, suffix, s + 1);
+}
+
+// Write one config file's records, and validate a file's records. Both get an
+// open File by reference and the caller's context; neither may depend on live
+// feature state, because validation runs on a scratch file that must be checked
+// without disturbing counters, rate history or suspension.
+typedef bool (*PersistWriteFn)(File& f, void* ctx);
+typedef bool (*PersistValidateFn)(File& f, void* ctx);
+
+// Save `name` as a staged transaction. Returns true only once the new canonical
+// file is committed AND read back as valid; on any failure the caller must keep
+// its dirty flag and retry later. Either the complete old config or the complete
+// new one remains loadable — never a mixture.
+// Three questions, three callbacks, because conflating them is a bug waiting to
+// happen: `writeFn` writes records; `writebackFn` checks the scratch file holds
+// exactly what we just wrote; `usableFn` only asks whether an existing file is a
+// config this firmware could load at all — used for the canonical and backup, so
+// a stale-but-valid config is never mistaken for an unusable one.
+inline bool saveStaged(FILESYSTEM* fs, const char* name,
+                       PersistWriteFn writeFn, void* write_ctx,
+                       PersistValidateFn writebackFn, void* writeback_ctx,
+                       PersistValidateFn usableFn, void* usable_ctx) {
+  char tmp[64], bak[64];
+  persistPath(tmp, sizeof(tmp), name, PERSIST_TMP_SUFFIX);
+  persistPath(bak, sizeof(bak), name, PERSIST_BAK_SUFFIX);
+
+  // 1. write the scratch file. fsOpenWrite() recreates it, which the platforms
+  //    that append to an existing file require.
+  File f = fsOpenWrite(fs, tmp);
+  if (!f) return false;
+  bool ok = writeFn(f, write_ctx);
+  f.flush();
+  f.close();
+  if (!ok) { fs->remove(tmp); return false; }
+
+  // 2. read the scratch file back through the same validator. This is the only
+  //    check this layer can make on the bytes: flush()/close() return void, so a
+  //    successful write API call is not evidence the file is usable.
+  {
+    File check = fsOpenRead(fs, tmp);
+    if (!check) { fs->remove(tmp); return false; }
+    ok = writebackFn(check, writeback_ctx);
+    check.close();
+  }
+  if (!ok) { fs->remove(tmp); return false; }
+
+  // 3. preserve the current good config as the backup. An INVALID canonical
+  //    must never displace a valid backup, so it is only removed (never
+  //    rotated in) — which also means promotion needs no rename-over-existing.
+  if (fs->exists(name)) {
+    bool canonical_good = false;
+    {
+      File check = fsOpenRead(fs, name);
+      if (check) { canonical_good = usableFn(check, usable_ctx); check.close(); }
+    }
+    if (canonical_good) {
+      if (fs->exists(bak) && !fs->remove(bak)) return false;
+      if (!fs->rename(name, bak)) return false;
+    } else if (!fs->remove(name)) {
+      return false;   // cannot clear it, so promotion would need rename-over
+    }
+  }
+
+  // 4. promote. The backup is still valid if this fails.
+  if (!fs->rename(tmp, name)) return false;
+  return true;
+}
+
+// Which file a load took its config from, so the caller can mark a repair save.
+enum PersistLoadSource {
+  PERSIST_LOAD_NONE = 0,      // nothing usable: the caller keeps its defaults
+  PERSIST_LOAD_CANONICAL,     // the live config
+  PERSIST_LOAD_RECOVERED,     // the last-good backup: schedule a repair save
+};
+
+// Decide WHICH file to load: the canonical one when it validates, otherwise the
+// last-good backup. This returns the chosen PATH rather than an open File because
+// the nRF52/STM32 file type has no default constructor, so a File cannot be
+// handed back through an out-parameter on every platform. The caller opens it.
+//
+// Only one file is open at a time — the Arduino filesystem API documents
+// single-open use, so each attempt is opened, validated and closed in turn.
+inline PersistLoadSource chooseConfigToLoad(FILESYSTEM* fs, const char* name,
+                                            PersistValidateFn usableFn, void* ctx,
+                                            char* out_path, size_t out_sz) {
+  if (fs->exists(name)) {
+    File f = fsOpenRead(fs, name);
+    if (f) {
+      bool ok = usableFn(f, ctx);
+      f.close();
+      if (ok) {
+        if (strlen(name) < out_sz) { strcpy(out_path, name); return PERSIST_LOAD_CANONICAL; }
+        return PERSIST_LOAD_NONE;
+      }
+    }
+  }
+  char bak[64];
+  persistPath(bak, sizeof(bak), name, PERSIST_BAK_SUFFIX);
+  if (fs->exists(bak)) {
+    File f = fsOpenRead(fs, bak);
+    if (f) {
+      bool ok = usableFn(f, ctx);
+      f.close();
+      if (ok) {
+        if (strlen(bak) < out_sz) { strcpy(out_path, bak); return PERSIST_LOAD_RECOVERED; }
+        return PERSIST_LOAD_NONE;
+      }
+    }
+  }
+  return PERSIST_LOAD_NONE;
 }
 
 #endif // _PERSIST_UTIL_H

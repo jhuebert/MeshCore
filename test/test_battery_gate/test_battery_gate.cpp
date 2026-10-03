@@ -428,6 +428,101 @@ TEST_F(BatteryGateTest, ReloadCancelsPendingEdits) {
 }
 
 // ============================================================
+// STAGED SAVE / CRASH RECOVERY
+// ============================================================
+
+TEST_F(BatteryGateTest, SaveLeavesNoScratchOrBackupOnAFreshDevice) {
+  gate.setThresholds(3400, 3700);
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+
+  ASSERT_TRUE(fs.exists(BATT_CFG_FILE));
+  EXPECT_FALSE(fs.exists("/batt_cfg.tmp"));
+  EXPECT_FALSE(fs.exists("/batt_cfg.bak"));
+}
+
+TEST_F(BatteryGateTest, SecondSaveKeepsThePreviousRecordAsBackup) {
+  gate.setThresholds(3400, 3700);
+  gate.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+
+  EXPECT_EQ(cli(gate, board, "3500 3800").substr(0, 3), "OK ");
+  gate.markDirty();
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+
+  ASSERT_TRUE(fs.exists("/batt_cfg.bak"));
+  EXPECT_FALSE(fs.exists("/batt_cfg.tmp"));
+
+  // canonical holds the new thresholds; the backup holds the old ones
+  BatteryGate now;
+  now.begin(&fs);
+  EXPECT_EQ(now.getSuspendMilliVolts(), 3500);
+
+  fs.files[BATT_CFG_FILE] = fs.files["/batt_cfg.bak"];
+  BatteryGate from_bak;
+  from_bak.begin(&fs);
+  EXPECT_EQ(from_bak.getSuspendMilliVolts(), 3400);
+}
+
+TEST_F(BatteryGateTest, RecoveryFromBackupSchedulesARepairSave) {
+  gate.setThresholds(3400, 3700);
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+  EXPECT_EQ(cli(gate, board, "3500 3800").substr(0, 3), "OK ");
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+
+  fs.remove(BATT_CFG_FILE);   // power loss during promotion
+
+  BatteryGate restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getSuspendMilliVolts(), 3400);   // the whole backup
+  EXPECT_FALSE(restored.isSuspended());                // RAM-only, not carried over
+
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  restored.loop(&fs, board);
+  EXPECT_TRUE(fs.exists(BATT_CFG_FILE));
+
+  BatteryGate after;
+  after.begin(&fs);
+  EXPECT_EQ(after.getSuspendMilliVolts(), 3400);
+}
+
+TEST_F(BatteryGateTest, FailedScratchWriteLeavesTheOldRecordIntact) {
+  gate.setThresholds(3400, 3700);
+  gate.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+  std::vector<uint8_t> original = fs.files[BATT_CFG_FILE];
+
+  EXPECT_EQ(cli(gate, board, "3500 3800").substr(0, 3), "OK ");
+  NativeFS broken;
+  broken.files[BATT_CFG_FILE] = original;
+  broken.fail_write = true;
+  gate.save(&broken);
+
+  EXPECT_EQ(broken.files[BATT_CFG_FILE].size(), original.size());
+  EXPECT_EQ(memcmp(broken.files[BATT_CFG_FILE].data(), original.data(), original.size()), 0);
+  EXPECT_FALSE(broken.exists("/batt_cfg.tmp"));
+  EXPECT_FALSE(broken.exists("/batt_cfg.bak"));
+}
+
+TEST_F(BatteryGateTest, OrphanScratchIsIgnoredOnBoot) {
+  gate.setThresholds(3400, 3700);
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+
+  fs.files["/batt_cfg.tmp"] = fs.files[BATT_CFG_FILE];
+  fs.files["/batt_cfg.tmp"].push_back(0xFF);
+
+  BatteryGate restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getSuspendMilliVolts(), 3400);
+}
+
+// ============================================================
 // PERSISTENCE
 // ============================================================
 

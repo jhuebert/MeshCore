@@ -100,50 +100,69 @@ void BatteryGate::loop(FILESYSTEM* fs, mesh::MainBoard& board) {
   if (save_flag.due()) save(fs);
 }
 
+// --- staged save callbacks -------------------------------------------------
+
+static bool batteryWriteFile(File& f, void* ctx) {
+  const BatteryGate& gate = *(const BatteryGate*)ctx;
+  uint8_t rec[BATT_CFG_RECORD_BYTES];
+  rec[0] = BATT_CFG_VERSION;
+  rec[1] = gate.isEnabled() ? 1 : 0;
+  uint16_t s = gate.getSuspendMilliVolts(), r = gate.getResumeMilliVolts();
+  memcpy(&rec[2], &s, 2);
+  memcpy(&rec[4], &r, 2);
+  return f.write(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES;
+}
+
+// Validate a battery record without touching the live gate: suspension, debounce
+// and the drop counter are RAM-only and must survive a readback check.
+static bool batteryValidateFile(File& f, void* ctx) {
+  (void)ctx;
+  uint8_t rec[BATT_CFG_RECORD_BYTES];
+  if (f.read(rec, BATT_CFG_RECORD_BYTES) != BATT_CFG_RECORD_BYTES) return false;
+  if (rec[0] != BATT_CFG_VERSION) return false;
+  uint16_t s, r;
+  memcpy(&s, &rec[2], 2);
+  memcpy(&r, &rec[4], 2);
+  // a disabled gate may keep the shipped 0/0 default or retain real thresholds
+  return (rec[1] == 0 && s == 0 && r == 0) ||
+         ((rec[1] == 0 || rec[1] == 1) && validThresholds(s, r));
+}
+
 void BatteryGate::load(FILESYSTEM* fs) {
   resetToDefaults();   // the file decides everything below; nothing survives from before
   save_flag.reset();   // a reload supersedes any edit still waiting to be written
 
-  if (!fs->exists(BATT_CFG_FILE)) return;
-  File file = fsOpenRead(fs, BATT_CFG_FILE);
-  if (file) {
-    uint8_t rec[BATT_CFG_RECORD_BYTES];
-    if (file.read(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES &&
-        rec[0] == BATT_CFG_VERSION) {
-      uint16_t s, r;
-      memcpy(&s, &rec[2], 2);
-      memcpy(&r, &rec[4], 2);
-      // A disabled gate may legitimately keep 0/0 (the shipped default) or
-      // retain real thresholds; anything else is a corrupt record. Validate the
-      // whole record on locals first, so a bad one never assigns live settings.
-      bool ok = (rec[1] == 0 && s == 0 && r == 0) ||
-                ((rec[1] == 0 || rec[1] == 1) && validThresholds(s, r));
-      if (!ok) {
-        enabled = false;
-        suspend_mV = 0;
-        resume_mV = 0;
-      } else {
-        enabled = (rec[1] == 1);
-        suspend_mV = s;
-        resume_mV = r;
-      }
-    }
+  char path[64];
+  PersistLoadSource src = chooseConfigToLoad(fs, BATT_CFG_FILE, batteryValidateFile, NULL,
+                                             path, sizeof(path));
+  if (src == PERSIST_LOAD_NONE) return;   // nothing usable: keep the defaults
+  File file = fsOpenRead(fs, path);
+  if (!file) return;
+
+  uint8_t rec[BATT_CFG_RECORD_BYTES];
+  if (file.read(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES) {
+    file.close();
+    uint16_t s, r;
+    memcpy(&s, &rec[2], 2);
+    memcpy(&r, &rec[4], 2);
+    enabled = (rec[1] == 1);
+    suspend_mV = s;
+    resume_mV = r;
+  } else {
     file.close();
   }
+
+  // Loaded from the backup, so put a good canonical file back at the next
+  // opportunity; the backup stays valid meanwhile.
+  if (src == PERSIST_LOAD_RECOVERED) markDirty();
 }
 
 void BatteryGate::save(FILESYSTEM* fs) {
-  File file = fsOpenWrite(fs, BATT_CFG_FILE);
-  if (!file) { save_flag.retryLater(); return; }   // wait out another delay before retrying
-  uint8_t rec[BATT_CFG_RECORD_BYTES];
-  rec[0] = BATT_CFG_VERSION;
-  rec[1] = enabled ? 1 : 0;
-  memcpy(&rec[2], &suspend_mV, 2);
-  memcpy(&rec[4], &resume_mV, 2);
-  bool ok = (file.write(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES);
-  file.close();
-  // only once the config is actually on disk: a failed write stays pending, but
-  // backs off a full delay instead of retrying on every loop
+  // Staged save: scratch file, read back, keep the current good file as a
+  // backup, then promote. Either the complete old record or the complete new one
+  // survives a failure — a battery feature is where brownouts actually happen.
+  bool ok = saveStaged(fs, BATT_CFG_FILE, batteryWriteFile, this,
+                       batteryValidateFile, NULL, batteryValidateFile, NULL);
   if (ok) save_flag.clear();
   else save_flag.retryLater();
 }

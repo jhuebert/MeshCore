@@ -745,6 +745,17 @@ is only needed for initial flashing and emergencies.
   one broader alternative such as `^Bot`.
 - Rules, channels, and settings survive reboots. Counters and the advert cache
   do not — they start fresh after every reboot.
+- An edit is written to flash about **3 seconds** after you make it (a burst of
+  commands costs one write, not one each). Power the repeater off within that
+  window and that edit is lost — everything before it is safe.
+- Saving is staged, so a crash or power cut mid-write cannot destroy your rules.
+  The repeater writes a scratch copy, reads it back to confirm it, keeps your
+  previous config as a backup, and only then swaps it in. If the main config ever
+  fails to load, the backup is used and a repaired copy is written at the next
+  save. So the worst case is that the most recent edit is lost, not the whole
+  rule list. (This is recovery in the firmware, not a guarantee about the flash
+  itself: a power cut *inside* the filesystem's own write can still damage the
+  underlying storage.)
 - Very complicated patterns can be slow to match. Prefer short, distinctive
   patterns like `^BEACON` over long wildcard chains. The `aborted` counter in
   `filter stats` grows if a pattern gives up mid-match; simplify it if you see

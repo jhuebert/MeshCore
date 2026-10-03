@@ -30,6 +30,7 @@ public:
   size_t pos = 0;
   bool valid = false;
   bool fs_fail_write = false;   // set from the owning store's fail_write
+  size_t truncate_to = SIZE_MAX;   // cut the file short on close: power loss
 
   operator bool() const { return valid; }
 
@@ -52,7 +53,13 @@ public:
   }
 
   void flush() {}
-  void close() {}
+  void close() {
+    // a power loss partway through leaves the file short — the bytes accepted so
+    // far are still there, the rest never made it
+    if (truncate_to != SIZE_MAX && backing != nullptr && backing->size() > truncate_to) {
+      backing->resize(truncate_to);
+    }
+  }
 };
 
 // In-memory stand-in for the Arduino FS class (exists/remove/mkdir/open).
@@ -61,7 +68,8 @@ public:
   std::map<std::string, std::vector<uint8_t>> files;
 
   bool exists(const char* path) { return files.count(path) > 0; }
-  void remove(const char* path) { files.erase(path); }
+  // returns bool like the real FS API, so transaction code can insist on it
+  bool remove(const char* path) { return files.erase(path) > 0; }
   void mkdir(const char*) {}
 
   // Fault injection for the persistence tests: a real filesystem can fail to
@@ -93,6 +101,7 @@ public:
       f.backing = &files[path];
       f.valid = true;
       f.fs_fail_write = fail_write;
+      f.truncate_to = truncate_to;
       return f;
     }
     return open(path);
@@ -115,6 +124,7 @@ public:
     f.backing = &files[path];
     f.valid = true;
     f.fs_fail_write = fail_write;
+    f.truncate_to = truncate_to;
     return f;
   }
 };
