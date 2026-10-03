@@ -46,12 +46,10 @@ bool patternValid(const char* pattern, char* err, size_t err_sz);
 
 // True if the pattern matches anywhere in `subject`. Alternatives are tried in
 // order and the first match wins. On step-budget exhaustion the whole
-// evaluation gives up: no match, patternAborted() true, fail-open (the engine
-// has always failed open).
-bool patternMatches(const char* pattern, const char* subject);
-
-// True if the last patternMatches() gave up on the step budget. Cleared by the
-// next patternMatches() call; the caller counts these as budget aborts.
-bool patternAborted(void);
+// evaluation gives up: no match, `*aborted` true, fail-open (the engine has
+// always failed open). `aborted` may be NULL when the caller does not count
+// budget aborts; it is written (false first) on every call, so it never carries
+// an earlier call's answer.
+bool patternMatches(const char* pattern, const char* subject, bool* aborted = NULL);
 
 #endif // _PATTERN_MATCH_H
