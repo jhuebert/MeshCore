@@ -737,10 +737,12 @@ static void formatInterval(const Interval& iv, char* dest, size_t sz, bool snr_m
            (iv.flags & FILTER_IV_HI_INC) ? ']' : ')');
 }
 
-// hex hash: 2..8 hex chars -> up to 4 leading bytes of a repeater pubkey hash
-static bool parseHexHash(const char* s, uint8_t* out, uint8_t* out_len) {
+// hex hash: 2..8 hex chars -> up to `max_bytes` leading bytes of a repeater
+// pubkey hash (1 for chanhash, 4 for a path entry). `max_bytes` is the caller's
+// storage size: a longer value is refused rather than written past it.
+static bool parseHexHash(const char* s, uint8_t* out, size_t max_bytes, uint8_t* out_len) {
   size_t n = strlen(s);
-  if (n < 2 || n > 8 || (n & 1)) return false;
+  if (n < 2 || n > 8 || (n & 1) || n / 2 > max_bytes) return false;
   if (filterDecodeHex(s, n, out) == 0) return false;
   *out_len = (uint8_t)(n / 2);
   return true;
@@ -769,7 +771,8 @@ static bool parsePath(const char* tok, FilterRule* r) {
   while ((seg = strsep(&sp, ">")) != NULL) {
     if (r->path.count >= FILTER_PATH_HASH_SLOTS) return false;
     uint8_t len;
-    if (!parseHexHash(seg, r->path.bytes[r->path.count], &len)) return false;
+    if (!parseHexHash(seg, r->path.bytes[r->path.count],
+                      sizeof(r->path.bytes[r->path.count]), &len)) return false;
     r->path.len[r->path.count] = len;
     r->path.count++;
   }
@@ -826,7 +829,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "chanhash") == 0) {
     uint8_t len;
-    if (!parseHexHash(val, &r->chan_hash, &len) || len != 1) {
+    if (!parseHexHash(val, &r->chan_hash, sizeof(r->chan_hash), &len)) {
       strcpy(reply, "Err - chanhash must be 2 hex chars");
       return false;
     }

@@ -2326,6 +2326,7 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     { "add path=A", "Err - bad path spec" },           // odd nibble
     { "add hsize=5", "Err - hsize values are 1..4" },
     { "add chanhash=ABCD", "Err - chanhash must be 2 hex chars" },
+    { "add chanhash=11223344", "Err - chanhash must be 2 hex chars" },   // fits a path entry, not chanhash
     { "add chan=nosuchchan", "Err - unknown chan" },   // non-# names must exist
     { "add region=Nowhere", "Err - unknown region" },
     { "add action=ban", "Err - action must be drop|forward" },
