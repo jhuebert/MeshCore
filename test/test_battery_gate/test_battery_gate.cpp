@@ -185,7 +185,7 @@ TEST_F(BatteryGateTest, NoResampleUsesCachedFlag) {
   board.mV = 3300;
   gate.loop(&fs, board);   // low #1
   board.mV = 100;          // wildly low, but not sampled yet
-  EXPECT_FALSE(gate.checkForward() == false);   // still forwarding: flag is cached, not live
+  EXPECT_TRUE(gate.checkForward());   // still forwarding: flag is cached, not live
 
   g_mock_millis += SAMPLE_INTERVAL_MS;
   gate.loop(&fs, board);   // now it samples 100 mV (low #2)
