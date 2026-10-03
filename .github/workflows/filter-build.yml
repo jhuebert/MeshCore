@@ -371,6 +371,9 @@ jobs:
           CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
+          # built outside out/ so the glob below cannot see the manifest itself:
+          # the redirect would create it before the listing ran, and it would
+          # record its own (still-being-written) sha256
           {
             echo "target: $TARGET"
             echo "source_sha: $SOURCE_SHA"
@@ -381,7 +384,8 @@ jobs:
               [ -f "$f" ] || continue
               echo "  - $(basename "$f")  sha256=$(sha256sum "$f" | cut -d' ' -f1)"
             done
-          } > "out/manifest-$TARGET.txt"
+          } > manifest-$TARGET.txt
+          mv manifest-$TARGET.txt "out/manifest-$TARGET.txt"
           cat "out/manifest-$TARGET.txt"
 
       - name: Upload Workflow Artifacts
