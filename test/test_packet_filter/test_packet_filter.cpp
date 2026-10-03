@@ -1496,6 +1496,8 @@ TEST_F(FilterTest, ExtraTokensAreRejectedBeforeAnythingChanges) {
     { "ratelimit clear junk",     "Err - usage: ratelimit clear" },
     { "stats junk",       "Err - usage: stats [reset]" },
     { "chan list 0 junk", "Err - usage: chan list [<start-idx>]" },
+    { "chan add #x 00112233445566778899aabbccddeeff junk", "Err - usage: filter chan add <name> [<psk-hex>]" },
+    { "chan del Public junk",     "Err - usage: filter chan del <name>" },
   };
   for (const auto& c : cases) {
     EXPECT_EQ(cli(filter, c.cmd), c.usage) << c.cmd;
@@ -1518,6 +1520,24 @@ TEST_F(FilterTest, RejectedTailsLeaveTheConfigUntouched) {
   EXPECT_EQ(cli(filter, "move 0 0 junk").substr(0, 5), "Err -");
   EXPECT_EQ(cli(filter, "ratelimit advert 0 junk").substr(0, 5), "Err -");
   EXPECT_EQ(filter.getAdvertRatelimit(), 48);
+}
+
+TEST_F(FilterTest, RejectedChanTailsLeaveTheStoreUntouched) {
+  // a trailing word on a channel command is a typo, not something to ignore: the
+  // channel must neither be added nor deleted
+  EXPECT_EQ(cli(filter, "chan add #new 00112233445566778899aabbccddeeff junk"),
+            "Err - usage: filter chan add <name> [<psk-hex>]");
+  EXPECT_EQ(filter.findChannel("#new"), nullptr);
+  ASSERT_NE(filter.findChannel("Public"), nullptr);
+
+  EXPECT_EQ(cli(filter, "chan del Public junk"), "Err - usage: filter chan del <name>");
+  ASSERT_NE(filter.findChannel("Public"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);
+
+  // the same commands without the tail still work
+  ASSERT_EQ(cli(filter, "chan add #new 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  EXPECT_EQ(cli(filter, "chan del Public"), "OK - chan Public deleted");
+  EXPECT_EQ(filter.getNumChannels(), 1);
 }
 
 TEST_F(FilterTest, OversizedAndUnbalancedCommandsAreRefusedWhole) {
