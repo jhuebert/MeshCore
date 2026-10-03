@@ -285,7 +285,9 @@ jobs:
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.version.outputs.branch }}
+          # the revision the release names, not the branch tip: the target list
+          # must describe the same tree the firmware is built from
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
@@ -347,7 +349,10 @@ jobs:
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.version.outputs.branch }}
+          # pinned, like the target list: if the branch moved after version
+          # selection, the manifest, the release body and the tag would all name
+          # a revision this job never built
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
