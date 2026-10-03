@@ -32,6 +32,7 @@
 #include "PacketFilterConfig.h"
 #include "PatternMatch.h"
 #include "PersistUtil.h"
+#include "AdvertRateLimiter.h"
 
 // actions
 #define FILTER_ACT_ALLOW     0
@@ -149,24 +150,12 @@ static_assert(FILTER_PATH_HASH_SLOTS == 4,
               "FilterRule::path size is in the persisted record: this needs a "
               "FILTER_CFG_VERSION bump and migration code in load()");
 
-struct AdvertSeenEntry {      // RAM-only; cleared on reboot
-  uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
-                              // advertRatelimitDrop); collision odds ~0.001%
-                              // per 256 distinct nodes, vanity-robust; worst
-                              // case is one falsely suppressed advert/window
-  uint32_t first_seen_millis; // by this repeater's own monotonic clock
-};
-
 class FilterRules {
   FilterRule rules[FILTER_MAX_RULES];
   int num_rules;
   FilterChannel channels[FILTER_MAX_CHANNELS];
   int num_channels;
-  AdvertSeenEntry advert_cache[FILTER_ADVERT_CACHE_SIZE];
-  int advert_cache_count;     // number of used entries (0..FILTER_ADVERT_CACHE_SIZE)
-  int advert_cache_head;      // ring head (oldest entry) once the cache is full
-  uint16_t ratelimit_hours;   // per-node advert repeat window; 0 = off
-  uint32_t limiter_drops;     // adverts dropped by the rate limiter
+  AdvertRateLimiter limiter;   // per-node advert repeat window
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
   uint64_t air_saved_ms;      // estimated TX airtime (ms) saved by rule + limiter drops
   uint64_t air_evaluated_ms;  // estimated TX airtime (ms) evaluated; both counters RAM-only
@@ -229,13 +218,13 @@ public:
   // supply keyed-channel candidates for core's group decryption
   int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
 
-  // advert rate limiter
-  void setAdvertRatelimit(uint16_t hours);
-  uint16_t getAdvertRatelimit() const { return ratelimit_hours; }
-  void clearAdvertCache();
-  int getAdvertCacheCount() const { return advert_cache_count; }
+  // advert rate limiter (state lives in AdvertRateLimiter)
+  void setAdvertRatelimit(uint16_t hours) { limiter.setHours(hours); markDirty(); }
+  uint16_t getAdvertRatelimit() const { return limiter.getHours(); }
+  void clearAdvertCache() { limiter.clearCache(); }
+  int getAdvertCacheCount() const { return limiter.getCacheCount(); }
   void markDirty() { save_flag.markDirty(); }
-  uint32_t getLimiterDrops() const { return limiter_drops; }
+  uint32_t getLimiterDrops() const { return limiter.getDrops(); }
   uint32_t getBudgetAborts() const { return budget_aborts; }
   uint64_t getAirSavedMs() const { return air_saved_ms; }   // airtime not relayed (drops)
   uint64_t getAirEvaluatedMs() const { return air_evaluated_ms; }
@@ -249,8 +238,6 @@ public:
   void save(FILESYSTEM* fs);
 
 private:
-  // per-node advert repeat window; returns true if the advert must be dropped
-  bool advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_millis);
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob

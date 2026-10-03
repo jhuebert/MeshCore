@@ -3,6 +3,7 @@
 
 #include "PacketFilter.h"
 #include "CliUtil.h"
+#include "AdvertRateLimiter.h"
 #include <inttypes.h>
 #include <helpers/TxtDataHelpers.h>
 
@@ -49,13 +50,8 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 FilterRules::FilterRules() {
   memset(rules, 0, sizeof(rules));
   memset(channels, 0, sizeof(channels));
-  memset(advert_cache, 0, sizeof(advert_cache));
   num_rules = 0;
   num_channels = 0;
-  advert_cache_count = 0;
-  advert_cache_head = 0;
-  ratelimit_hours = 0;
-  limiter_drops = 0;
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
@@ -87,7 +83,7 @@ void FilterRules::setEnabled(bool on) {
 }
 
 void FilterRules::resetStats() {
-  limiter_drops = 0;
+  limiter.resetDrops();
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
@@ -202,61 +198,6 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
     }
   }
   return n;
-}
-
-// ---------------------------------------------------------------- advert rate limiter
-
-void FilterRules::setAdvertRatelimit(uint16_t hours) {
-  ratelimit_hours = hours;
-  markDirty();
-}
-
-void FilterRules::clearAdvertCache() {
-  memset(advert_cache, 0, sizeof(advert_cache));
-  advert_cache_count = 0;
-  advert_cache_head = 0;
-}
-
-// per-node advert repeat window: "an advert for each node at most once every
-// N hours". Core guarantees checkPacket() sees each unique, signature-verified
-// advert exactly once, so each origin is recorded exactly once per window.
-bool FilterRules::advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_millis) {
-  uint32_t window_ms = (uint32_t)ratelimit_hours * 3600UL * 1000UL;
-  // cache key: 4 bytes sampled from the origin pubkey (payload[0..31]) at fixed
-  // offsets clear of the vanity zones at both ends — prefix/suffix grinding
-  // leaves the middle bytes uniformly random, so two vanity keys collide with
-  // plain random-chance odds instead of deterministically
-  static const uint8_t KEY_OFFSETS[4] = { 8, 14, 20, 26 };
-  uint8_t prefix[4];
-  for (int i = 0; i < 4; i++) prefix[i] = pkt->payload[KEY_OFFSETS[i]];
-
-  int total = advert_cache_count < FILTER_ADVERT_CACHE_SIZE ? advert_cache_count
-                                                           : FILTER_ADVERT_CACHE_SIZE;
-  for (int i = 0; i < total; i++) {
-    int idx = (advert_cache_count < FILTER_ADVERT_CACHE_SIZE)
-              ? i : (advert_cache_head + i) % FILTER_ADVERT_CACHE_SIZE;
-    AdvertSeenEntry* e = &advert_cache[idx];
-    if (memcmp(e->pub_key_prefix, prefix, sizeof(e->pub_key_prefix)) == 0) {
-      if (now_millis - e->first_seen_millis < window_ms) {
-        limiter_drops++;
-        return true;   // too soon: drop the repeat
-      }
-      e->first_seen_millis = now_millis;   // refresh: window restarts
-      return false;
-    }
-  }
-
-  // not seen in this window: record
-  AdvertSeenEntry* e;
-  if (advert_cache_count < FILTER_ADVERT_CACHE_SIZE) {
-    e = &advert_cache[advert_cache_count++];
-  } else {
-    e = &advert_cache[advert_cache_head];   // overwrite the oldest entry
-    advert_cache_head = (advert_cache_head + 1) % FILTER_ADVERT_CACHE_SIZE;
-  }
-  memcpy(e->pub_key_prefix, prefix, sizeof(e->pub_key_prefix));
-  e->first_seen_millis = now_millis;
-  return false;
 }
 
 // FNV-1a over the rule's predicate fields (a short display digest for `filter list`)
@@ -453,8 +394,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
   // limiter runs unless the rule list already dropped; forward adverts too
-  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() &&
-      ratelimit_hours > 0 && advertRatelimitDrop(pkt, now_millis)) {
+  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.drop(pkt, now_millis)) {
     air_saved_ms += est_air_ms;   // a limiter drop saves the same airtime
     return FILTER_ACT_DROP;
   }
@@ -587,7 +527,9 @@ void FilterRules::load(FILESYSTEM* fs) {
       size_t rule_bytes = (ver >= FILTER_CFG_VERSION)     ? FILTER_RULE_PERSIST_BYTES
                         : (ver >= FILTER_CFG_VERSION - 2) ? FILTER_RULE_V4_PERSIST_BYTES
                                                          : FILTER_RULE_V3_PERSIST_BYTES;
-      if (file.read((uint8_t*)&ratelimit_hours, 2) == 2) {
+      uint16_t rl_hours;
+      if (file.read((uint8_t*)&rl_hours, 2) == 2) {
+        limiter.setHours(rl_hours);
         bool ok = true;
         for (int i = 0; ok && i < nr; i++) {
           ok = (file.read((uint8_t*)&rules[i], rule_bytes) == rule_bytes);
@@ -624,7 +566,8 @@ void FilterRules::save(FILESYSTEM* fs) {
   hdr[3] = (uint8_t)num_channels;
   hdr[4] = 0;
   bool ok = (file.write(hdr, 5) == 5);
-  ok = ok && (file.write((uint8_t*)&ratelimit_hours, 2) == 2);
+  uint16_t rl_hours = limiter.getHours();
+  ok = ok && (file.write((uint8_t*)&rl_hours, 2) == 2);
   for (int i = 0; ok && i < num_rules; i++) {
     ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
   }
