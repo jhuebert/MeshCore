@@ -39,16 +39,13 @@ public:
 
   uint16_t getHours() const { return hours; }
   void setHours(uint16_t h) { hours = h; }
-  bool enabled() const { return hours > 0; }
   int getCacheCount() const { return cache_count; }
   uint32_t getDrops() const { return drops; }
   void resetDrops() { drops = 0; }
 
   // back to a freshly constructed limiter (empty cache, window off, no drops)
   void reset() {
-    memset(cache, 0, sizeof(cache));
-    cache_count = 0;
-    cache_head = 0;
+    clearCache();
     hours = 0;
     drops = 0;
   }
@@ -66,16 +63,10 @@ public:
   // Called from the successful end of the forwarding hook, never from the check.
   void recordForward(const mesh::Packet* pkt, uint64_t now_millis);
 
-  // Restart an origin's expired window. Not used by the forwarding path — the
-  // stamp is refreshed by recordForward() on admission — but the expiry semantics
-  // are easier to state (and to test) as their own step.
-  bool refreshExpired(const mesh::Packet* pkt, uint64_t now_millis);
-
   // Drop the cache entirely.
   void clearCache();
 
 private:
-  void clearCacheImpl();
   // index of the cache slot holding this origin's 4-byte key, or -1
   int findOrigin(const mesh::Packet* pkt) const;
   // store this origin at `now`, evicting the oldest entry if the cache is full
