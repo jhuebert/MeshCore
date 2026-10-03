@@ -3062,6 +3062,47 @@ TEST_F(FilterTest, LongIdleBeyondOneMillisWrapIsStillTimedCorrectly) {
   EXPECT_EQ(forwardPacket(filter, soon, t + 1000), FILTER_ACT_DROP);
 }
 
+// The content phase must read the same monotonic clock as the packet phase: a
+// raw millis() reading compares as a 32-bit wrap, so two messages 32 ms apart
+// would look 49.7 days apart and the throttled rule would hand out a free pass.
+TEST_F(FilterTest, ContentThrottleTimesRealElapsedTimeAcrossTheWrap) {
+  expectOk(filter, "add text=hello throttle=60");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  g_mock_millis = 0xfffffff0u;   // just before the 32-bit millis() wrap
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_ALLOW);   // free pass
+
+  g_mock_millis = 16;   // 32 ms later, across the wrap: the window is not spent
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+}
+
+// checkContent() evaluates packet-level rules too, so one rule's window can be
+// stamped by either phase. Across a wrap the two phases must still agree on how
+// much real time has passed.
+TEST_F(FilterTest, ThrottleWindowIsSharedByBothPhases) {
+  expectOk(filter, "add throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT);
+  auto body = makeGroupText("Alice", "hello");
+  auto chan = channelFromStore(filter, 0);
+
+  g_mock_millis = 0xfffffff0u;
+  ASSERT_EQ(filter.checkPacket(&pkt, g_mock_millis, nullptr), FILTER_ACT_ALLOW);   // free pass
+  g_mock_millis = 16;                    // 32 ms later, across the wrap
+  filter.uptimeMillis(g_mock_millis);    // the loop keeps the clock moving
+
+  // the content phase sees the window the packet phase started: 32 ms of real
+  // time has passed, so the rule still decides
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+}
+
 TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
   // packet-level rules meter on the checkPacket path, and interleave with the
   // advert rate limiter: a rule drop pre-empts it, a fall-through still hits it

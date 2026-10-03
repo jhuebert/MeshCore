@@ -608,9 +608,11 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 
   uint8_t verdict = FILTER_ACT_ALLOW;
   PacketHashCache pkt_hash(pkt);
-  // one clock reading for the whole scan: the throttle gate stamps state that
-  // checkPacket() writes too, and both phases read the same millis() clock
-  const uint32_t now = millis();
+  // one clock reading for the whole scan, folded into the same 64-bit
+  // accumulator checkPacket() reads: a raw millis() reading would compare as a
+  // 32-bit wrap and hand out a fresh throttle pass milliseconds after the last
+  // one, and both phases stamp the same rule's rate state
+  const uint64_t now = uptimeMillis(millis());
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled) continue;
