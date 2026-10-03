@@ -91,7 +91,10 @@ Inside a single `sender=`/`text=` pattern, `|` is the OR — see
 - Rules are evaluated **top to bottom**: the first enabled rule whose conditions all match decides the packet's fate, and later rules are not consulted. A rule with `action=forward` is terminal too — it counts the hit and forwards the packet, skipping the rest of the list.
 - Decryption-dependent conditions (keyed `chan=`, `sender=`, `text=`) can only match traffic the repeater actually decrypts. A rule carrying any of them is skipped for packets that never decrypt (adverts, wrong or missing keys), so a later packet-level rule still decides those.
 - Name each condition once per rule. Repeating a key (e.g. a second `text=`)
-  replaces the earlier value rather than adding another condition.
+  replaces the earlier value rather than adding another condition. That includes
+  the list conditions: `type=advert type=txt` is just `type=txt`, and
+  `chan=#a chan=#b` is just `chan=#b`. Repeating `path=` replaces the whole
+  chain. `chanhash=` is a separate condition, so it survives a repeated `chan=`.
 - A rule without `type=` applies to **all** packet types, including adverts and
   telemetry. Add `type=` when you want to narrow it.
 - Invalid input is rejected with `Err - ...`; no half-added rule is left behind.
@@ -103,7 +106,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 
 | Condition | Values | Matches |
 |---|---|---|
-| `type` | `advert`, `txt`, `data` (comma-combine) | Packet category. `txt` means **group text**, `data` means **group data** |
+| `type` | `advert`, `txt`, `data`, `any` (comma-combine) | Packet category. `txt` means **group text**, `data` means **group data**. `any` is the wildcard: all packet types, and it wins if it appears beside named types |
 | `route` | `flood` or `direct` | How the packet travelled; omit to match either |
 | `hops` | interval | Flood hop count (direct packets never match) |
 | `len` | interval | Payload size in bytes |
@@ -149,7 +152,20 @@ Content rules match against the repeater's store of named channels:
   the companion apps do. Just write `chan=#memes` in a rule; the channel is
   added to the store automatically.
 - Private (non-`#`) channels need a key: add them first with
-  `filter chan add <name> <psk-b64>`, then reference the name in a rule.
+  `filter chan add <name> <psk-hex>` (32 or 64 hex digits — 16 or 32 bytes),
+  then reference the name in a rule.
+- A channel name cannot contain `,`, `=`, `"` or control characters: those
+  cannot be represented in a rule's comma-separated `chan=` list, so a channel
+  named with them could never be referenced by any rule. Ordinary spaces are
+  fine — quote the value where you use it: `chan="two words"`. Names already in
+  the store from an older config are left alone; they stay visible in
+  `filter chan list` even though a rule cannot reference them.
+- The on-air channel hash is only one byte, so a channel's key can collide with
+  another's. The repeater offers core at most **4 distinct keys** per hash, and
+  only keys that differ count: several channel *names* sharing one key are free,
+  because they decrypt identically. `filter chan add` says so
+  (`multiple keys on this hash; core tries 4`) when a hash starts carrying keys
+  the repeater may never get to try.
 - Channel names are literal, not patterns: `chan=#test.*` does **not** mean
   "all test channels".
 - `chan=` only matches traffic the repeater can actually decrypt with the
@@ -168,6 +184,10 @@ Group-text messages look like `SenderName: message text` after decryption.
 - Use `sender=` **and** `text=` together in one rule when you need both.
 - These conditions only apply to group text. They never match adverts or
   binary group data.
+- The sender name and the text are read up to the end of the message, so a name
+  of any length can be matched, and a pattern anchored with `$` sees the real end
+  of the field rather than a shortened copy. A message with no `:` has no sender
+  field at all — `sender=` cannot match it, not even with `^$`.
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
   field unless you anchor it. The three most common shapes, at a glance:
 
@@ -212,7 +232,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
 | `filter clear` | Delete all rules (channels and ratelimit are kept) |
 | `filter chan` / `filter chan list` | List the stored channels |
-| `filter chan add <name> [<psk-b64>]` | Add a channel; key optional for `#` names |
+| `filter chan add <name> [<psk-hex>]` | Add a channel; key optional for `#` names, 32 or 64 hex digits |
 | `filter chan del <name>` | Remove a channel (existing rules are updated) |
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
 | `filter ratelimit advert <hours>` | Set the window (0–720 h; 0 = off) |
@@ -328,6 +348,12 @@ The first path entry is the earliest recorded relay, not necessarily your
 immediate neighbour. To match the *most recent* relay instead, use
 `path=A1B2C3$`. IDs can be written with 2, 4, 6, or 8 hex digits per entry;
 chain up to four with `>`, and use `^`/`$` to anchor the first/last entry.
+
+`path=` only ever matches **flood** traffic. A packet addressed directly to this
+repeater carries an *itinerary* between its two endpoints rather than the list of
+repeaters that relayed it, and a TRACE packet's path holds collected SNR values,
+not relay IDs — so `route=direct` packets never satisfy `path=`, even when their
+path bytes would match.
 
 ### Keeping unwanted regions off a channel
 

@@ -15,14 +15,17 @@ static int hexVal(char c) {
 }
 
 // Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
-static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
-  if ((in_len & 1) != 0) return 0;
+// `capacity` is the caller's output buffer: an over-long or odd-length input is
+// refused before any byte is written, so a rejected key can never partially
+// overwrite a live slot.
+static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capacity) {
+  if ((in_len & 1) != 0 || in_len / 2 > capacity) return 0;
   for (size_t i = 0; i < in_len; i += 2) {
     int hi = hexVal(in[i]), lo = hexVal(in[i + 1]);
     if (hi < 0 || lo < 0) return 0;
     out[i / 2] = (uint8_t)((hi << 4) | lo);
   }
-  return in_len / 2;
+  return (int)(in_len / 2);
 }
 
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
@@ -155,13 +158,30 @@ int FilterRules::indexOfChannel(const char* name) const {
   return -1;
 }
 
+// A channel name has to survive a round trip through a rule's chan= list,
+// which is comma-separated and made of `key=value` tokens. ',', '=' and '"'
+// therefore cannot be represented there, and a control character (a NUL above
+// all) would truncate the stored name. Ordinary spaces are fine: the value is
+// quoted where it is printed. Names already in the store are never re-validated
+// — an old config stays loadable and visible even if it predates this rule.
+static bool validChannelName(const char* name) {
+  for (const unsigned char* c = (const unsigned char*)name; *c; c++) {
+    if (*c < 0x20 || *c == 0x7f) return false;
+    if (*c == ',' || *c == '=' || *c == '"') return false;
+  }
+  return true;
+}
+
 FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   if (num_channels >= FILTER_MAX_CHANNELS) return NULL;
   if (name[0] == 0 || strlen(name) >= FILTER_CHAN_NAME_LEN) return NULL;
   if (findChannel(name) != NULL) return NULL;   // already in the store
+  if (!validChannelName(name)) return NULL;
 
-  FilterChannel* ch = &channels[num_channels];
-  memset(ch, 0, sizeof(FilterChannel));
+  // build the whole entry off to the side: a rejected key must leave the next
+  // live slot, and every existing channel, byte-for-byte unchanged
+  FilterChannel candidate;
+  memset(&candidate, 0, sizeof(candidate));
 
   if (psk_hex == NULL || psk_hex[0] == 0) {
     if (name[0] != '#') return NULL;   // psk required for non-hash channels
@@ -169,19 +189,23 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
     // (per the companion protocol; see plan §2.11)
     uint8_t digest[32];
     mesh::Utils::sha256(digest, sizeof(digest), (const uint8_t*)name, strlen(name));
-    memcpy(ch->secret, digest, 16);
-    ch->secret_len = 16;
+    memcpy(candidate.secret, digest, 16);
+    candidate.secret_len = 16;
   } else {
-    int len = filterDecodeHex(psk_hex, strlen(psk_hex), ch->secret);
+    // exactly 16 or 32 bytes of hex; anything else is refused before decoding
+    size_t hex_len = strlen(psk_hex);
+    if (hex_len != 32 && hex_len != 64) return NULL;
+    int len = filterDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
     if (len != 16 && len != 32) return NULL;
-    ch->secret_len = len;
+    candidate.secret_len = len;
   }
 
-  mesh::Utils::sha256(&ch->hash, sizeof(ch->hash), ch->secret, ch->secret_len);
-  StrHelper::strzcpy(ch->name, name, FILTER_CHAN_NAME_LEN);
+  mesh::Utils::sha256(&candidate.hash, sizeof(candidate.hash), candidate.secret, candidate.secret_len);
+  StrHelper::strzcpy(candidate.name, name, FILTER_CHAN_NAME_LEN);
+  channels[num_channels] = candidate;   // commit only once everything validated
   num_channels++;
   markDirty();
-  return ch;
+  return &channels[num_channels - 1];
 }
 
 void FilterRules::delChannel(int idx) {
@@ -205,11 +229,36 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
   int n = 0;
   for (int i = 0; i < num_channels && n < max_matches; i++) {
     if (channels[i].name[0] == 0) continue;   // null-key guard (same as BaseChatMesh)
-    if (channels[i].hash == hash[0]) {
-      dest[n].hash[0] = channels[i].hash;
-      memcpy(dest[n].secret, channels[i].secret, sizeof(dest[n].secret));
-      n++;
+    if (channels[i].hash != hash[0]) continue;
+    // Aliases of one key share a tag; handing core the same secret twice would
+    // burn one of its few candidate slots and could hide a channel that would
+    // actually decrypt. Compare the padded secrets, not the names.
+    bool dup = false;
+    for (int j = 0; j < n; j++) {
+      if (memcmp(dest[j].secret, channels[i].secret, sizeof(channels[i].secret)) == 0) { dup = true; break; }
     }
+    if (dup) continue;
+    dest[n].hash[0] = channels[i].hash;
+    memcpy(dest[n].secret, channels[i].secret, sizeof(dest[n].secret));
+    n++;
+  }
+  return n;
+}
+
+// Distinct secrets behind one on-air tag: aliases of a single key cost core
+// nothing, and this is what tells an admin a tag is carrying more keys than
+// core will ever try.
+static int distinctKeysOnHash(FilterRules& filter, uint8_t hash) {
+  int n = 0;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    auto c = filter.getChannel(i);
+    if (c->hash != hash) continue;
+    bool seen = false;
+    for (int j = 0; j < i; j++) {
+      auto o = filter.getChannel(j);
+      if (o->hash == hash && memcmp(o->secret, c->secret, sizeof(c->secret)) == 0) { seen = true; break; }
+    }
+    if (!seen) n++;
   }
   return n;
 }
@@ -270,7 +319,11 @@ static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
 // decisions. `out` receives the rule's action.
 bool FilterRules::decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t now_millis,
                               uint32_t est_air_ms, uint8_t& out) {
-  if (!probDecides(r, pkt_hash.get())) return false;   // failed roll: fall through as if not matched
+  // probDecides() would call pkt_hash.get() — a SHA-256 over the packet — even
+  // for the common unset/100 rule that returns true immediately. Gate it at the
+  // caller so only a rule that can actually fail the roll pays for the hash.
+  // Probability still runs before throttle.
+  if (r->prob > 0 && r->prob < 100 && !probDecides(r, pkt_hash.get())) return false;   // failed roll: fall through as if not matched
   if (!throttleDecides(r, now_millis)) return false;   // within budget: slips past, like a failed roll
   r->hits++;
   if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
@@ -301,6 +354,10 @@ static bool intervalMatches(const Interval& iv, int32_t v) {
 // Binary per-entry compare, NOT hex-string matching (odd-nibble alignment and
 // variable entry sizes make string matching incorrect — plan §4.2a).
 static bool pathMatches(const FilterRule* r, const mesh::Packet* pkt) {
+  // A recorded path is the flood relay history. A routed-direct packet's path is
+  // an itinerary between two endpoints, and a TRACE path collects SNRs rather
+  // than repeater IDs — neither is relay history, so neither may satisfy path=.
+  if (!pkt->isRouteFlood()) return false;
   uint8_t hsz = pkt->getPathHashSize();
   uint8_t n = pkt->getPathHashCount();
   if (n == 0) return false;          // 0-hop traffic never matches
@@ -443,16 +500,27 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
 
 // ---------------------------------------------------------------- content rules
 
-// GRP_TXT payload (after decrypt): ts(4) | txt_type(1) | "<sender>: <text>".
-// Content is sender-controlled: parse defensively, bounded by len (never strlen()).
+// Split a decrypted group-text body into "<sender>: <text>". Content is
+// sender-controlled, so parse defensively and bounded by len (never strlen()).
+// The decrypted block is zero-padded to the packet buffer, so the visible field
+// ends at the first NUL — parsing past it would invent a colon (and an empty
+// sender) out of padding. `has_text`/`has_sender` report which fields were
+// really present, so a caller can tell "no sender field" from "empty text".
 static void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t sender_sz,
-                           char* text, size_t text_sz) {
+                           char* text, size_t text_sz, bool* has_text, bool* has_sender) {
   sender[0] = 0;
   text[0] = 0;
-  if (len < 5) return;
+  *has_text = false;
+  *has_sender = false;
+  if (len < 5) return;   // too short for ts(4) + txt_type(1)
 
   const uint8_t* p = data + 5;
-  size_t n = len - 5;
+  // bounded to the first NUL within the decrypted body: everything after it is
+  // padding, not content
+  size_t n = 0;
+  const uint8_t* term = (const uint8_t*)memchr(p, 0, len - 5);
+  if (term != NULL) n = (size_t)(term - p);
+  else n = len - 5;
 
   const uint8_t* colon = NULL;
   for (size_t i = 0; i < n; i++) {
@@ -460,21 +528,24 @@ static void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t
   }
 
   if (colon == NULL) {   // no sender extractable; whole remainder is text
+    *has_text = true;
     size_t cpy = n < text_sz - 1 ? n : text_sz - 1;
     memcpy(text, p, cpy);
     text[cpy] = 0;
     return;
   }
 
-  size_t slen = colon - p;
+  size_t slen = (size_t)(colon - p);
   while (slen > 0 && (p[slen - 1] == ' ' || p[slen - 1] == '\t')) slen--;   // trim trailing spaces/tabs
   size_t cpy = slen < sender_sz - 1 ? slen : sender_sz - 1;
   memcpy(sender, p, cpy);
   sender[cpy] = 0;
+  *has_sender = true;
 
   const uint8_t* tp = colon + 1;
   size_t tlen = n - (size_t)(tp - p);
   while (tlen > 0 && (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n')) { tp++; tlen--; }
+  *has_text = true;
   cpy = tlen < text_sz - 1 ? tlen : text_sz - 1;
   memcpy(text, tp, cpy);
   text[cpy] = 0;
@@ -506,10 +577,11 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   // single pass over the WHOLE rule list in listed order: packet-level
   // predicates and content predicates alike — every predicate is computable
   // here, and first enabled match is terminal
-  char sender[64];
+  char sender[MAX_PACKET_PAYLOAD + 1];
   char text[MAX_PACKET_PAYLOAD + 1];
+  bool has_text = false, has_sender = false;
   bool parsed = (type == PAYLOAD_TYPE_GRP_TXT);
-  if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text));
+  if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text), &has_text, &has_sender);
 
   uint8_t verdict = FILTER_ACT_ALLOW;
   PacketHashCache pkt_hash(pkt);
@@ -522,8 +594,8 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if (!ruleMatchesPacket(r, pkt, type, region)) continue;
     uint8_t cp = contentPredicates(r);
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
-    if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !regexMatches(r->sender, sender))) continue;
-    if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !regexMatches(r->text, text))) continue;
+    if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !has_sender || !regexMatches(r->sender, sender))) continue;
+    if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !has_text || !regexMatches(r->text, text))) continue;
     if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) break;   // first match wins
   }
 
@@ -713,7 +785,7 @@ static void formatInterval(const Interval& iv, char* dest, size_t sz, IvUnit uni
 static bool parseHexHash(const char* s, uint8_t* out, size_t max_bytes, uint8_t* out_len) {
   size_t n = strlen(s);
   if (n < 2 || n > 8 || (n & 1) || n / 2 > max_bytes) return false;
-  if (filterDecodeHex(s, n, out) == 0) return false;
+  if (!filterDecodeHex(s, n, out, max_bytes)) return false;
   *out_len = (uint8_t)(n / 2);
   return true;
 }
@@ -722,7 +794,9 @@ static bool parseHexHash(const char* s, uint8_t* out, size_t max_bytes, uint8_t*
 // '^' anchors the first entry, '$' the last; both together mean the rule's
 // chain must span the whole path (e.g. path=^10$ matches 1-hop paths only)
 static bool parsePath(const char* tok, FilterRule* r) {
-  r->path.count = 0;
+  // clear the whole substructure, not just count/pos: replacing a long chain with
+  // a short one must leave no stale bytes behind for the rule digest to see
+  memset(&r->path, 0, sizeof(r->path));
   r->path.pos = FILTER_PATH_ANY;
   const char* s = tok;
   if (*s == '^') { r->path.pos = FILTER_PATH_FIRST; s++; }
@@ -785,6 +859,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   if (strcmp(key, "chan") == 0) {
     char names[80];
     if (!copyCsvList(val, names, sizeof(names))) { strcpy(reply, "Err - chan list too long"); return false; }
+    uint16_t mask = 0;
     char* np = names;
     char* nm;
     while ((nm = strsep(&np, ",")) != NULL) {
@@ -802,9 +877,12 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
         }
         return false;
       }
-      r->chan_mask |= (1 << idx);
-      r->chan_flags |= FILTER_CHANFLG_MASK_SET;
+      mask |= (1 << idx);
     }
+    // a repeated chan= replaces the earlier list rather than accumulating it;
+    // chanhash= is a separate predicate and its flag is left alone
+    r->chan_mask = mask;
+    r->chan_flags |= FILTER_CHANFLG_MASK_SET;
     return true;
   }
   if (strcmp(key, "chanhash") == 0) {
@@ -819,15 +897,20 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   if (strcmp(key, "type") == 0) {
     char vals[24];
     if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad type"); return false; }
+    uint8_t mask = 0;
+    bool any = false;
     char* vp = vals;
     char* t;
     while ((t = strsep(&vp, ",")) != NULL) {
-      if (strcmp(t, "advert") == 0) r->type_mask |= FILTER_TYPE_ADVERT;
-      else if (strcmp(t, "txt") == 0) r->type_mask |= FILTER_TYPE_GRP_TXT;
-      else if (strcmp(t, "data") == 0) r->type_mask |= FILTER_TYPE_GRP_DATA;
-      else if (strcmp(t, "any") == 0) { /* leave mask unset */ }
+      if (strcmp(t, "advert") == 0) mask |= FILTER_TYPE_ADVERT;
+      else if (strcmp(t, "txt") == 0) mask |= FILTER_TYPE_GRP_TXT;
+      else if (strcmp(t, "data") == 0) mask |= FILTER_TYPE_GRP_DATA;
+      else if (strcmp(t, "any") == 0) any = true;   // wildcard: wins even beside names
       else { snprintf(reply, CLI_REPLY_MAX, "Err - unknown type '%s'", t); return false; }
     }
+    // a repeated type= replaces the earlier one. Alternatives inside ONE value
+    // still OR, because that is how the list reads.
+    r->type_mask = any ? 0 : mask;
     return true;
   }
   if (strcmp(key, "route") == 0) {
@@ -880,13 +963,15 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   if (strcmp(key, "hsize") == 0) {
     char vals[12];
     if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad hsize"); return false; }
+    uint8_t mask = 0;
     char* vp = vals;
     char* t;
     while ((t = strsep(&vp, ",")) != NULL) {
       long v;
       if (!parseIntRange(t, 1, 4, &v)) { strcpy(reply, "Err - hsize values are 1..4"); return false; }
-      r->hash_size_mask |= (1 << (v - 1));
+      mask |= (1 << (v - 1));
     }
+    r->hash_size_mask = mask;   // a repeated hsize= replaces the earlier list
     return true;
   }
   if (strcmp(key, "sender") == 0 || strcmp(key, "text") == 0) {
@@ -957,15 +1042,30 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   if (name == NULL) { strcpy(reply, "Err - usage: filter chan add <name> [<psk-hex>]"); return; }
   if (strlen(name) >= FILTER_CHAN_NAME_LEN) { strcpy(reply, "Err - name too long"); return; }
   if (name[0] == '#' && name[1] == 0) { strcpy(reply, "Err - empty chan name"); return; }
+  if (!validChannelName(name)) {
+    strcpy(reply, "Err - chan name must not contain , = \" or control chars");
+    return;
+  }
   if (filter.findChannel(name) != NULL) { strcpy(reply, "Err - channel exists"); return; }
-  if ((psk == NULL || psk[0] == 0) && name[0] != '#') {
+  if (psk != NULL && psk[0]) {
+    size_t hex_len = strlen(psk);
+    if (hex_len != 32 && hex_len != 64) {
+      strcpy(reply, "Err - psk must be 32 or 64 hex chars");
+      return;
+    }
+  } else if (name[0] != '#') {
     strcpy(reply, "Err - psk required for non-# names");
     return;
   }
   auto ch = filter.addChannel(name, psk);
   if (ch == NULL) { strcpy(reply, "Err - bad psk or store full"); return; }
-  snprintf(reply, CLI_REPLY_MAX, "OK - chan %s h=%02X%s", ch->name, ch->hash,
-          psk == NULL ? " (derived)" : "");
+  // Core tries at most four distinct keys per on-air tag (Mesh.cpp). Aliases of
+  // one key are free, but a tag carrying more distinct keys than that has
+  // channels that will silently never decrypt here — say so instead.
+  int distinct = distinctKeysOnHash(filter, ch->hash);
+  snprintf(reply, CLI_REPLY_MAX, "OK - chan %s h=%02X%s%s", ch->name, ch->hash,
+           psk == NULL ? " (derived)" : "",
+           distinct > 1 ? " (multiple keys on this hash; core tries 4)" : "");
 }
 
 static void cliChanDel(FilterRules& filter, char* params, char* reply) {
@@ -1065,11 +1165,19 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
     }
   }
   if (r->chan_flags & FILTER_CHANFLG_MASK_SET) {
-    radd(&out, &remain, " chan=");
+    // quote the whole value when a referenced name contains a space: nextToken
+    // keeps it one token and the comma list still splits the names apart.
+    // Names can no longer contain a comma, so the list stays unambiguous.
+    bool quote = false;
+    for (int c = 0; c < filter.getNumChannels(); c++) {
+      if ((r->chan_mask & (1 << c)) && strchr(filter.getChannel(c)->name, ' ')) quote = true;
+    }
+    radd(&out, &remain, " chan=%s", quote ? "\"" : "");
     const char* sep = "";
     for (int c = 0; c < filter.getNumChannels(); c++) {
       if (r->chan_mask & (1 << c)) { radd(&out, &remain, "%s%s", sep, filter.getChannel(c)->name); sep = ","; }
     }
+    radd(&out, &remain, "%s", quote ? "\"" : "");
   }
   if (r->chan_flags & FILTER_CHANFLG_HASH_SET) radd(&out, &remain, " chanhash=%02X", r->chan_hash);
   if (r->regions[0]) radd(&out, &remain, " region=%s", r->regions);
