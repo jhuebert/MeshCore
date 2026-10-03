@@ -498,6 +498,9 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 
   uint8_t verdict = FILTER_ACT_ALLOW;
   PacketHashCache pkt_hash(pkt);
+  // one clock reading for the whole scan: the throttle gate stamps state that
+  // checkPacket() writes too, and both phases read the same millis() clock
+  const uint32_t now = millis();
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled) continue;
@@ -506,7 +509,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
     if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !regexMatches(r->sender, sender))) continue;
     if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !regexMatches(r->text, text))) continue;
-    if (decideMatch(r, pkt_hash, millis(), est_air_ms, verdict)) break;   // first match wins
+    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) break;   // first match wins
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
