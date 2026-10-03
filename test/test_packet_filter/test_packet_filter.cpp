@@ -1207,19 +1207,30 @@ TEST_F(FilterTest, SearchChannelsByHashDisabledWhenFilterOff) {
 
 #include "FilterTestHelpers.h"
 
+// Emulate MyMesh::allowPacketForward(): the filter check, and — only when the
+// packet survives it — the commit at the successful end of the forwarding hook.
+// Checking alone no longer starts an advert's rate-limit window, so a limiter
+// test that only calls checkPacket() is not exercising the real path.
+static uint8_t forwardPacket(FilterRules& filter, const mesh::Packet& pkt, uint32_t now_millis,
+                             const RegionEntry* region = nullptr, uint32_t est_air_ms = 0) {
+  uint8_t action = filter.checkPacket(&pkt, now_millis, region, est_air_ms);
+  if (action != FILTER_ACT_DROP) filter.onForwardAllowed(&pkt, now_millis);
+  return action;
+}
+
 TEST_F(FilterTest, FirstAdvertRecordedRepeatDropped) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
   auto pkt = makeAdvert(key);
 
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 
   // repeat flood advert within the 48h window (transport codes set to make a
   // distinct packet, same origin key)
   pkt.transport_codes[0] = 0x4242;
-  EXPECT_EQ(filter.checkPacket(&pkt, 5000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 5000), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);   // repeat not re-recorded
 }
@@ -1230,12 +1241,12 @@ TEST_F(FilterTest, DistinctOriginsTrackedIndependently) {
   uint8_t k2[4] = { 5, 6, 7, 8 };
   auto a1 = makeAdvert(k1);
   auto a2 = makeAdvert(k2)  ;
-  EXPECT_EQ(filter.checkPacket(&a1, 1000, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(filter.checkPacket(&a2, 1100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, a1, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, a2, 1100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 2);
 
   auto a1b = makeAdvert(k1);
-  EXPECT_EQ(filter.checkPacket(&a1b, 2000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, a1b, 2000, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
@@ -1244,12 +1255,12 @@ TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
   auto pkt = makeAdvert(key);
 
   uint32_t t0 = 1000;
-  EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
   // at exactly the window boundary the advert is allowed again...
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
   // ...and the window restarts from that moment
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, TimingIsWrapSafe) {
@@ -1258,11 +1269,11 @@ TEST_F(FilterTest, TimingIsWrapSafe) {
   auto pkt = makeAdvert(key);
 
   uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
-  EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
   // now has wrapped past 0 to ~16s: still inside the 1h window
-  EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 16000, nullptr), FILTER_ACT_DROP);
   // wrapped and past the window: allowed, entry refreshed
-  EXPECT_EQ(filter.checkPacket(&pkt, 3600UL * 1000 + 16000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 3600UL * 1000 + 16000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
@@ -1276,14 +1287,14 @@ TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
     pkt.payload[ADV_KEY_OFFSETS[1]] = 0x55;
     pkt.payload[ADV_KEY_OFFSETS[2]] = (uint8_t)(i >> 8);
     pkt.payload[ADV_KEY_OFFSETS[3]] = (uint8_t)(i >> 16);
-    EXPECT_EQ(filter.checkPacket(&pkt, 1000 + i, nullptr), FILTER_ACT_ALLOW);
+    EXPECT_EQ(forwardPacket(filter, pkt, 1000 + i, nullptr), FILTER_ACT_ALLOW);
   }
   EXPECT_EQ(filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
 
   // origin 0 is the oldest: one more advert evicts it
   uint8_t extra[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
   auto extra_pkt = makeAdvert(extra);
-  EXPECT_EQ(filter.checkPacket(&extra_pkt, 5000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, extra_pkt, 5000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
 
   // origin 0 has been evicted, so it is recorded fresh instead of dropped
@@ -1291,7 +1302,7 @@ TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
   pkt.payload[ADV_KEY_OFFSETS[1]] = 0x55;
   pkt.payload[ADV_KEY_OFFSETS[2]] = 0;
   pkt.payload[ADV_KEY_OFFSETS[3]] = 0;
-  EXPECT_EQ(filter.checkPacket(&pkt, 5100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 5100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 }
 
@@ -1299,9 +1310,9 @@ TEST_F(FilterTest, ClearEmptiesCacheButNotCounters) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 7, 7, 7, 7 };
   auto pkt = makeAdvert(key);
-  filter.checkPacket(&pkt, 1000, nullptr);
+  forwardPacket(filter, pkt, 1000, nullptr);
   pkt.transport_codes[0] = 1;
-  filter.checkPacket(&pkt, 2000, nullptr);
+  forwardPacket(filter, pkt, 2000, nullptr);
   ASSERT_GT(filter.getLimiterDrops(), 0u);
 
   filter.clearAdvertCache();
@@ -1310,7 +1321,7 @@ TEST_F(FilterTest, ClearEmptiesCacheButNotCounters) {
 
   // cleared cache: the origin is recorded again instead of dropped
   auto pkt2 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt2, 3000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt2, 3000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
@@ -1319,9 +1330,9 @@ TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 7, 7, 7, 7 };
   auto pkt = makeAdvert(key);
-  filter.checkPacket(&pkt, 1000, nullptr);
+  forwardPacket(filter, pkt, 1000, nullptr);
   pkt.transport_codes[0] = 1;
-  filter.checkPacket(&pkt, 2000, nullptr);
+  forwardPacket(filter, pkt, 2000, nullptr);
   ASSERT_EQ(filter.getLimiterDrops(), 1u);
 
   ASSERT_EQ(cli(filter, "ratelimit clear"), "OK - advert cache cleared");
@@ -1332,10 +1343,10 @@ TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
 TEST_F(FilterTest, RatelimitZeroIsOff) {
   uint8_t key[4] = { 3, 1, 4, 1 };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // nothing recorded while off
   pkt.transport_codes[0] = 2;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, OnlyFloodAdvertsAreLimited) {
@@ -1343,12 +1354,12 @@ TEST_F(FilterTest, OnlyFloodAdvertsAreLimited) {
   uint8_t key[4] = { 0x11, 0x22, 0x33, 0x44 };
   auto direct_adv = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ADVERT, 64, 1, 0);
   for (int i = 0; i < 4; i++) direct_adv.payload[ADV_KEY_OFFSETS[i]] = key[i];
-  EXPECT_EQ(filter.checkPacket(&direct_adv, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, direct_adv, 1000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // direct adverts not recorded
 
   auto flood_txt = makeAdvert(key);
   flood_txt.header = (ROUTE_TYPE_FLOOD & PH_ROUTE_MASK) | (PAYLOAD_TYPE_GRP_TXT << PH_TYPE_SHIFT);
-  EXPECT_EQ(filter.checkPacket(&flood_txt, 1100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, flood_txt, 1100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // non-advert types not recorded
 }
 
@@ -1358,9 +1369,9 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0x0A, 0x0B, 0x0C, 0x0D };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000, nullptr), FILTER_ACT_FORWARD);
   pkt.transport_codes[0] = 5;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
 }
 
@@ -1374,6 +1385,235 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 #include <gtest/gtest.h>
 
 #include "FilterTestHelpers.h"
+
+// The limiter's window means "relayed", not "received": a packet refused by the
+// stock forwarding checks after checkPacket() must not spend the origin's budget.
+
+TEST_F(FilterTest, RefusedAdvertDoesNotSpendTheOriginBudget) {
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x5A, 0x5B, 0x5C, 0x5D };
+  auto pkt = makeAdvert(key);
+
+  // checkPacket() passes, but the stock checks then refuse it (manual off, hop
+  // limit, unknown region, loop detect) so onForwardAllowed() never runs
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // nothing recorded
+
+  // the same origin must still be relayable later
+  pkt.transport_codes[0] = 1;
+  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+
+  // only once it is actually admitted does the window start
+  pkt.transport_codes[0] = 2;
+  EXPECT_EQ(forwardPacket(filter, pkt, 3000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);
+  pkt.transport_codes[0] = 3;
+  EXPECT_EQ(forwardPacket(filter, pkt, 4000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
+}
+
+TEST_F(FilterTest, RuleDropNeverCommitsAnAdvertWindow) {
+  filter.setAdvertRatelimit(48);
+  ASSERT_EQ(cli(filter, "add type=advert action=drop"), "OK - rule 0 added");
+  uint8_t key[4] = { 0x6A, 0x6B, 0x6C, 0x6D };
+  auto pkt = makeAdvert(key);
+
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // a rule drop is not a forward
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+}
+
+TEST_F(FilterTest, ForwardVerdictStillCommitsTheWindow) {
+  // action=forward is terminal for the rule list but the packet IS relayed, so
+  // the origin's window must start
+  filter.setAdvertRatelimit(48);
+  ASSERT_EQ(cli(filter, "add type=advert action=forward"), "OK - rule 0 added");
+  uint8_t key[4] = { 0x7A, 0x7B, 0x7C, 0x7D };
+  auto pkt = makeAdvert(key);
+
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);
+  pkt.transport_codes[0] = 9;
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
+}
+
+TEST_F(FilterTest, DisabledFilterKeepsNoAdvertHistory) {
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x8A, 0x8B, 0x8C, 0x8D };
+  auto pkt = makeAdvert(key);
+  filter.setEnabled(false);
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  filter.onForwardAllowed(&pkt, 1000);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+}
+
+TEST_F(FilterTest, CheckAloneRepeatedlyNeverSpendsTheBudget) {
+  // the exact bug: without a commit, every check passed and nothing was ever
+  // suppressed, so the limiter looked like it did nothing
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x9A, 0x9B, 0x9C, 0x9D };
+  for (int i = 0; i < 5; i++) {
+    auto pkt = makeAdvert(key);
+    pkt.transport_codes[0] = (uint8_t)i;
+    EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  }
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+}
+
+// ===================================================================
+// CONTENT VERDICT STASH LIFETIME
+// ===================================================================
+// checkContent() stashes a verdict for the packet being received, and
+// checkPacket() consumes it. The stash must never outlive that one receive
+// operation, or a verdict can be served to a completely unrelated packet that
+// later reuses the same buffer.
+
+TEST_F(FilterTest, PointerMismatchInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto other = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  const uint32_t after_content = filter.getRule(0)->hits;
+
+  // a DIFFERENT packet arrives and never gets a content scan of its own
+  EXPECT_EQ(forwardPacket(filter, other, 0, nullptr), FILTER_ACT_ALLOW);
+
+  // A must not be able to revive its stale stash: it is rescanned normally, and a
+  // content-only predicate has no content to match on this pass
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);   // not counted a second time
+}
+
+TEST_F(FilterTest, UnconsumedVerdictIsClearedByTheNextPacketScan) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  // no checkPacket() for pkt at all — it was dropped before the forwarding hook
+  const uint32_t after_content = filter.getRule(0)->hits;
+
+  // a brand new receive starts; the stash must not answer for it
+  auto advert = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 0);
+  EXPECT_EQ(forwardPacket(filter, advert, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);   // not revived for an unrelated packet
+}
+
+TEST_F(FilterTest, BracketingClearsAVerdictThatNeverReachesTheHook) {
+  // this is what MyMesh::onRecvPacket() does around one receive
+  auto runReceive = [&](mesh::Packet& pkt) {
+    filter.clearContentVerdict();
+    forwardPacket(filter, pkt, 0, nullptr);
+    filter.clearContentVerdict();
+  };
+
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  // content drop, then the forwarding hook is never reached (battery/loop/off)
+  filter.clearContentVerdict();
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  filter.clearContentVerdict();   // receive ends
+
+  // the same buffer address coming back with different content is rescanned
+  runReceive(pkt);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+}
+
+TEST_F(FilterTest, EnableToggleInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  const uint32_t after_content = filter.getRule(0)->hits;
+  filter.setEnabled(false);
+  filter.setEnabled(true);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);
+}
+
+TEST_F(FilterTest, RuleMutationInvalidatesAStashedVerdict) {
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  // remove the matching rule before the packet-level scan runs
+  ASSERT_EQ(cli(filter, "del 0"), "OK - rule 0 deleted");
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, ReloadInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  filter.load(&fs);   // a reload supersedes the rule list
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, PairedContentAndPacketStillCountsExactlyOnce) {
+  // the whole point of the stash: within ONE receive, a content drop must be
+  // counted once, not twice, and must not be re-ordered
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  filter.clearContentVerdict();
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr, 10), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr, 10), FILTER_ACT_DROP);
+  filter.clearContentVerdict();
+
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);          // counted once
+  EXPECT_EQ(filter.getAirSavedMs(), 10u);          // billed once
+  EXPECT_EQ(filter.getAirEvaluatedMs(), 10u);      // evaluated once
+}
+
+TEST_F(FilterTest, SamePointerNewPathAfterACompletedReceiveIsRescanned) {
+  // the packet hash excludes route/path, so only the receive bracketing and the
+  // pointer+hash guard stop a completed receive's verdict being reused
+  ASSERT_EQ(cli(filter, "add path=^10$"), "OK - rule 0 added");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 1);   // one hop
+  auto chan = channelFromStore(filter, 0);
+  uint8_t body[] = { 0, 0, 0, 0, TXT_TYPE_PLAIN, 'h', 'i' };
+
+  filter.clearContentVerdict();
+  filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body, sizeof(body), nullptr);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_DROP);
+  filter.clearContentVerdict();
+  const uint32_t after_first = filter.getRule(0)->hits;
+
+  // same buffer, same payload, but the path changed: the verdict for the first
+  // receive must not apply to the second
+  pkt.setPathHashSizeAndCount(1, 1);
+  pkt.path[0] = 0x20;
+  filter.clearContentVerdict();
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_first);
+}
 
 // ===================================================================
 // STAGED SAVE / CRASH RECOVERY
@@ -2609,17 +2849,17 @@ TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
   uint8_t key[4] = { 0x31, 0x32, 0x33, 0x34 };
 
   auto a1 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&a1, 0, nullptr), FILTER_ACT_ALLOW);   // free pass + first sighting
+  EXPECT_EQ(forwardPacket(filter, a1, 0), FILTER_ACT_ALLOW);   // free pass + first sighting
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);
 
   auto a2 = makeAdvert(key);
   a2.payload[0] = 0x99;
-  EXPECT_EQ(filter.checkPacket(&a2, 5000, nullptr), FILTER_ACT_DROP);   // over rate: rule decides, limiter not reached
+  EXPECT_EQ(forwardPacket(filter, a2, 5000), FILTER_ACT_DROP);   // over rate: rule decides, limiter not reached
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 
   auto a3 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&a3, 10000, nullptr), FILTER_ACT_DROP);  // in budget: slips past, limiter drops the repeat
+  EXPECT_EQ(forwardPacket(filter, a3, 10000), FILTER_ACT_DROP);  // in budget: slips past, limiter drops the repeat
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
 }
@@ -2690,10 +2930,10 @@ TEST_F(FilterTest, AirSavedNotBilledForForwardAllowLimiterPass) {
   // window is dropped and billed (no rule attribution)
   expectOk(filter, "ratelimit advert 1");
   mesh::Packet first = makeAdvert(AIR_KEY);
-  ASSERT_EQ(filter.checkPacket(&first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  ASSERT_EQ(forwardPacket(filter, first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAirSavedMs(), 0u);
   mesh::Packet again = makeAdvert(AIR_KEY);
-  ASSERT_EQ(filter.checkPacket(&again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  ASSERT_EQ(forwardPacket(filter, again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
   EXPECT_EQ(filter.getAirEvaluatedMs(), 4 * EST_AIR);
   EXPECT_EQ(filter.getAirSavedPercent(), 25u);
@@ -3777,10 +4017,10 @@ TEST_F(FilterTest, LimiterStillAppliesAfterForward) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0x21, 0x22, 0x23, 0x24 };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   pkt.transport_codes[0] = 7;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000), FILTER_ACT_DROP);   // limiter wins
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
   EXPECT_EQ(filter.getRule(0)->hits, 2u);   // one scan per received advert (single pass)
 }

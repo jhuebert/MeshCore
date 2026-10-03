@@ -49,6 +49,7 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t c
 // One definition, so construction and reload cannot drift apart — a field added
 // here is reset by both.
 void FilterRules::resetToDefaults() {
+  clearContentVerdict();   // a reload must never honour a verdict for the old rules
   memset(rules, 0, sizeof(rules));   // unpersisted tail bytes (padding, stats) stay deterministic
   memset(channels, 0, sizeof(channels));
   num_rules = 0;
@@ -82,10 +83,22 @@ void FilterRules::loop(FILESYSTEM* fs) {
 // ---------------------------------------------------------------- enable / stats
 
 void FilterRules::setEnabled(bool on) {
+  clearContentVerdict();   // the rule list just changed meaning for any stashed packet
   if (enabled != on) {
     enabled = on;
     markDirty();
   }
+}
+
+// Called from the successful end of allowPacketForward(), once every stock
+// forwarding check has passed. This is the only place an advert's window starts,
+// so a repeater that refuses to relay (manual off, hop limit, unknown region,
+// loop detect) never spends a node's budget.
+void FilterRules::onForwardAllowed(const mesh::Packet* pkt, uint32_t now_millis) {
+  if (!enabled) return;
+  if (pkt->getPayloadType() != PAYLOAD_TYPE_ADVERT) return;
+  if (!pkt->isRouteFlood()) return;      // the limiter only governs flood adverts
+  limiter.recordForward(pkt, now_millis);
 }
 
 void FilterRules::resetStats() {
@@ -459,17 +472,23 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   // one hash for this packet, shared by the stash guard and any prob roll below
   PacketHashCache pkt_hash(pkt);
 
-  // a verdict stashed by checkContent() for this exact packet is final:
-  // return it without rescanning (no double-counted hits, no reordering).
-  // Stale stash (different buffer, or the pool re-used it with new content,
-  // caught by the content-hash tag) is cleared and a normal packet-level scan
-  // runs.
-  if (content_verdict.pkt == pkt) {
-    content_verdict.pkt = NULL;   // consume once, whatever the tag says
-    if (memcmp(pkt_hash.get(), content_verdict.hash, MAX_HASH_SIZE) == 0) {
-      if (content_verdict.verdict != FILTER_ACT_DROP) billEvaluated(est_air_ms);
-      return content_verdict.verdict;
-    }
+  // A verdict stashed by checkContent() for this exact packet is final: return it
+  // without rescanning (no double-counted hits, no reordering).
+  //
+  // Whether the pointer matched or not, the stash is consumed HERE and now. It
+  // used to be cleared only inside the match branch, so a content verdict for a
+  // packet that never reached this hook — dropped earlier, or on a path that skips
+  // forwarding — lingered until some later packet happened to reuse the buffer.
+  // The pointer+hash pair is defence in depth for pool reuse, not the thing that
+  // bounds the stash's life; the receive bracketing in MyMesh::onRecvPacket() is.
+  const bool stash_matched = (content_verdict.pkt == pkt);
+  uint8_t stash_hash[MAX_HASH_SIZE];
+  memcpy(stash_hash, content_verdict.hash, MAX_HASH_SIZE);
+  const uint8_t stash_verdict = content_verdict.verdict;
+  clearContentVerdict();
+  if (stash_matched && memcmp(pkt_hash.get(), stash_hash, MAX_HASH_SIZE) == 0) {
+    if (stash_verdict != FILTER_ACT_DROP) billEvaluated(est_air_ms);
+    return stash_verdict;
   }
 
   billEvaluated(est_air_ms);
@@ -484,7 +503,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
   // limiter runs unless the rule list already dropped; forward adverts too
-  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.drop(pkt, now_millis)) {
+  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.wouldDrop(pkt, now_millis)) {
     billSaved(est_air_ms);   // a limiter drop saves the same airtime
     return FILTER_ACT_DROP;
   }
@@ -565,6 +584,10 @@ bool FilterRules::regexMatches(const char* pattern, const char* subject) {
 uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
                                   const uint8_t* data, size_t len, const RegionEntry* region,
                                   uint32_t est_air_ms) {
+  // A disabled filter or non-group traffic reaches no content scan. That must
+  // not carry a verdict over from an earlier sequence in this same receive, so
+  // drop any stash before returning rather than leaving it to answer later.
+  clearContentVerdict();
   if (!enabled) return FILTER_ACT_ALLOW;
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return FILTER_ACT_ALLOW;
 
@@ -578,6 +601,8 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text), &has_text, &has_sender);
 
   uint8_t verdict = FILTER_ACT_ALLOW;
+  // Disabled or non-group traffic reaches no content scan, so it must also not
+  // carry a verdict over from an earlier sequence in this same receive.
   PacketHashCache pkt_hash(pkt);
   // one clock reading for the whole scan: the throttle gate stamps state that
   // checkPacket() writes too, and both phases read the same millis() clock

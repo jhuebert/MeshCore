@@ -205,6 +205,14 @@ Group-text messages look like `SenderName: message text` after decryption.
 Independent of the rules, you can rate-limit flood adverts per originating
 node: *each node's advert is forwarded at most once every N hours.*
 
+The window counts adverts this repeater actually **admitted for relay**, not
+every advert it heard. An advert refused afterwards — by `set off`, a hop limit,
+an unknown region, loop detection, or the battery gate — does not use up the
+node's budget, so turning forwarding back on does not leave that node invisible
+for the rest of the window. The honest limit: an advert queued for transmission
+that never makes it onto the air still counts as admitted. Already-queued
+relays are not cancelled by turning the filter or the battery gate off.
+
 ```text
 filter ratelimit advert 48     # each origin forwarded at most every 48 h
 filter ratelimit clear         # optional: forget history, start clean

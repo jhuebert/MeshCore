@@ -213,6 +213,11 @@ public:
   void begin(FILESYSTEM* fs);      // load persisted config, pre-provision Public channel
   void loop(FILESYSTEM* fs);       // lazy dirty-flag save (same pattern as ClientACL)
 
+  // Forget any content verdict stashed for the packet currently being received.
+  // MyMesh::onRecvPacket() brackets one receive with this so a verdict can never
+  // outlive the operation that produced it; checkPacket() also consumes it.
+  void clearContentVerdict() { content_verdict.pkt = NULL; }
+
   bool isEnabled() const { return enabled; }
   void setEnabled(bool on);
 
@@ -248,6 +253,11 @@ public:
   uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region,
                       uint32_t est_air_ms = 0);
 
+  // Commit a forwarding decision that actually succeeded: starts an advert's
+  // rate-limit window. Called from the end of allowPacketForward(), never from
+  // the check, so the window means "relayed", not "received".
+  void onForwardAllowed(const mesh::Packet* pkt, uint32_t now_millis);
+
   // Single-pass evaluation of the ENTIRE rule list on a decrypted group
   // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
   // sender / text), in listed order; first enabled match decides (first match
@@ -266,7 +276,10 @@ public:
   uint16_t getAdvertRatelimit() const { return limiter.getHours(); }
   void clearAdvertCache() { limiter.clearCache(); }
   int getAdvertCacheCount() const { return limiter.getCacheCount(); }
-  void markDirty() { save_flag.markDirty(); }
+  // Any rule or channel mutation: the config is changing, so a verdict stashed
+  // under the old rules must not be honoured afterwards. markDirty() is the one
+  // place every mutation already passes through.
+  void markDirty() { clearContentVerdict(); save_flag.markDirty(); }
   uint32_t getLimiterDrops() const { return limiter.getDrops(); }
   uint32_t getBudgetAborts() const { return budget_aborts; }
   uint64_t getAirSavedMs() const { return air_saved_ms; }   // airtime not relayed (drops)

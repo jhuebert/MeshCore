@@ -33,6 +33,12 @@ check the voltage, and adjust or disable the gate.
 - **Drop counter:** a RAM-only counter of packets gated while suspended
   (resets on reboot, like the filter stats).
 
+Suspension is checked before the content rules too, so a decryptable group
+message does not get evaluated (and counted as a filter hit) while the repeater
+is refusing to relay it — it is accounted as a battery drop at forwarding
+admission instead, once, the same as any other packet. Traffic already queued for
+transmission is not cancelled by suspending.
+
 While suspended, `allowPacketForward()` rejects every packet — flood, direct,
 and group content alike. Everything the node originates on its own behalf
 (CLI replies, status responses, adverts) is unaffected.
