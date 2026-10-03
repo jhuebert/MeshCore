@@ -314,11 +314,28 @@ static bool pathMatches(const FilterRule* r, const mesh::Packet* pkt) {
   return false;
 }
 
+// Which content predicates a rule carries. Content predicates can only be
+// decided on decrypted group data, so the packet-level phase skips every rule
+// with a non-zero set, and checkContent() switches on that same value: the two
+// phases cannot disagree about what is deferred.
+enum FilterContent : uint8_t {
+  FILTER_CONTENT_NONE   = 0,
+  FILTER_CONTENT_CHAN   = 1 << 0,   // chan=   : the MAC-proven delivery channel
+  FILTER_CONTENT_SENDER = 1 << 1,   // sender= : regex over "<sender>:"
+  FILTER_CONTENT_TEXT   = 1 << 2,   // text=   : regex over the message text
+};
+
+static uint8_t contentPredicates(const FilterRule* r) {
+  uint8_t p = FILTER_CONTENT_NONE;
+  if (r->chan_flags & FILTER_CHANFLG_MASK_SET) p |= FILTER_CONTENT_CHAN;
+  if (r->sender[0] != 0) p |= FILTER_CONTENT_SENDER;
+  if (r->text[0] != 0) p |= FILTER_CONTENT_TEXT;
+  return p;
+}
+
 // Rules with content predicates are deferred to checkContent() (decrypted data).
 static bool ruleIsDeferred(const FilterRule* r) {
-  if (r->chan_flags & FILTER_CHANFLG_MASK_SET) return true;
-  if (r->sender[0] != 0 || r->text[0] != 0) return true;
-  return false;
+  return contentPredicates(r) != FILTER_CONTENT_NONE;
 }
 
 // exact match of `name` against one comma token of `list`
@@ -485,9 +502,10 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     FilterRule* r = &rules[i];
     if (!r->enabled) continue;
     if (!ruleMatchesPacket(r, pkt, type, region)) continue;
-    if ((r->chan_flags & FILTER_CHANFLG_MASK_SET) && !channelMatchesStore(r, channel)) continue;
-    if (r->sender[0] && (!parsed || !regexMatches(r->sender, sender))) continue;
-    if (r->text[0] && (!parsed || !regexMatches(r->text, text))) continue;
+    uint8_t cp = contentPredicates(r);
+    if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
+    if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !regexMatches(r->sender, sender))) continue;
+    if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !regexMatches(r->text, text))) continue;
     if (decideMatch(r, pkt, millis(), est_air_ms, verdict)) break;   // first match wins
   }
 
