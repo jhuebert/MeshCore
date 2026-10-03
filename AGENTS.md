@@ -38,8 +38,12 @@ commit** — the guides are user-facing API documentation, not optional docs.
 
 **Code (`examples/simple_repeater/`):**
 - `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
-  `checkContent` decrypted-content single pass, verdict stash), advert rate
-  limiter, binary persistence (`load`/`save`, v3..v6), `filterCLI`.
+  `checkContent` decrypted-content single pass, verdict stash), binary
+  persistence (`load`/`save`, v3..v6), `filterCLI`.
+- `AdvertRateLimiter.h/.cpp` — the per-origin advert repeat window: cache,
+  counters, and the check/commit split (see the fork's rule-model note).
+- `PersistUtil.h` — the lazy dirty-save pattern, the per-platform file opens, and
+  the shared staged-save transaction; also the config-integrity note.
 - `PacketFilterConfig.h` — all capacity tunables (`FILTER_MAX_RULES`, ...),
   override via build flags; persistence-layout caveats noted inline.
 - `TinyRegex.h/.cpp` — vendored kokke/tiny-regex-c + step budget (see Hard
@@ -85,6 +89,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/PacketFilter.h/.cpp`, `PacketFilterConfig.h`
 - `examples/simple_repeater/TinyRegex.h/.cpp`, `CliUtil.h`, `BatteryGate.h/.cpp`
 - `examples/simple_repeater/PatternMatch.h/.cpp`
+- `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
 - `FILTER.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
 
@@ -119,7 +124,11 @@ chars).
 CLI and filter semantics must work the way a user would guess without reading
 FILTER.md:
 
-- `filter get <idx>` output is valid `filter add` input (round-trip).
+- `filter get <idx>` is an **inspection** command: its reply shows the rule's
+  predicates plus counters, is truncated to the 160-byte transport, and is *not*
+  re-addable input (`add` rejects the `hits=`/`air=`/`pass=` metadata it prints).
+- `filter chan list [<start-idx>]` exists because a full store does not fit one
+  reply and `chan del` takes a name; a truncated listing ends with `next=N`.
 - Errors say what's wrong and what's accepted (e.g. `Err - chanhash must be 2
   hex chars`); usage lines enumerate the command surface.
 - Syntax reads like the concept: `[a,b]`-style intervals, comma lists, `*` =

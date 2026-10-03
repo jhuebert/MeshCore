@@ -19,7 +19,7 @@
 #define _PACKET_FILTER_CONFIG_H
 
 #ifndef FILTER_MAX_RULES
-  #define FILTER_MAX_RULES 16          // rule slots (~151 B each, incl. patterns)
+  #define FILTER_MAX_RULES 16          // rule slots (~180 B each, incl. patterns)
 #endif
 
 #ifndef FILTER_MAX_CHANNELS

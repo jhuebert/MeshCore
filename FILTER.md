@@ -17,8 +17,8 @@ access to the repeater is required.
 
 ## What it does
 
-The filter looks at every packet that reaches the repeater and decides whether
-to **forward** it or **drop** it.
+The filter decides whether the repeater should **relay** a packet onward or drop
+it. It governs *forwarding*, not every packet that arrives.
 
 - Each rule is a list of conditions. A packet that meets **all** of a rule's
   conditions is handled by that rule's action.
@@ -27,6 +27,17 @@ to **forward** it or **drop** it.
 - Rules that match on channel name, sender, or message text look at the
   *decrypted* message, so they only fire on traffic the repeater can actually
   read. Other rules (type, route, hops, signal strength, …) work on every packet.
+
+Two honest limits on what "every packet" means:
+
+- **Traffic addressed to this repeater is handled, not filtered.** A management
+  request for the node itself is answered directly; there is no relaying
+  decision to make. The filter never gates your ability to log in or read status.
+- **A packet addressed directly to this repeater is never decrypted.** Group
+  traffic that arrives over a direct (endpoint-to-endpoint) route does not pass
+  through the repeater's decryption, so `chan=`, `sender=` and `text=` cannot
+  match it here even when you have the key. Use packet-level conditions
+  (`route=`, `type=`, `chanhash=`) for that traffic.
 
 Everything is saved on the repeater and survives reboots.
 
@@ -40,8 +51,9 @@ filter on
 filter stats          # watch hits climb as #memes traffic arrives
 ```
 
-That's it. Rules default to **drop**, and `filter on` switches the whole filter
-on. To undo: `filter del 0` — rules are numbered **starting at 0**, so the
+Rules default to **drop**, and the filter is already **on** on a fresh node, so
+`filter on` here is belt-and-braces: it makes the state explicit rather than
+relying on a default. To undo: `filter del 0` — rules are numbered **starting at 0**, so the
 first rule is rule 0 (the repeater prints the number when it adds a rule) —
 or `filter clear` to remove all rules.
 
@@ -112,7 +124,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `len` | interval | Payload size in bytes |
 | `snr` | interval, dB | Received signal strength at your repeater |
 | `path` | `[^]HEX>HEX>…[$]` | Repeater IDs on the flood path (see [path examples](#path)) |
-| `hsize` | `1..4` (comma-combine) | Path ID size used by the packet |
+| `hsize` | `1..4` (comma-combine) | Path ID size used by the packet. `4` is accepted for completeness but is reserved by the protocol and never appears on air |
 | `chan` | channel name(s) | Keyed channel — proven by decryption (see [Channels](#channels-senders-and-message-text)) |
 | `chanhash` | 2 hex digits | On-air channel tag, no key needed (see [chanhash examples](#chanhash)) |
 | `region` | region name(s), `unscoped` (comma-combine) | Flood region the packet arrived in (direct packets never match) |
@@ -120,7 +132,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `text` | pattern | Message text in group text |
 | `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
 | `throttle` | seconds, `1..65535` | Rate gate: the rule decides only the matches that exceed one per N seconds; one per N seconds slips past (see [throttle examples](#throttle)) |
-| `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read and behave as `forward` — the stored value is unchanged, only the keyword and display moved |
+| `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read as `forward` — the stored value is unchanged, only the keyword and display moved. The *rule ordering* around them is not identical on old firmware (see [Upgrading from earlier firmware](#upgrading-from-earlier-firmware)) |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
 message is decrypted. Everything else is checked before forwarding and works on
@@ -139,7 +151,12 @@ Used by `hops`, `len`, and `snr`:
 
 Examples: `hops=[2,*]` = at least 2 hops · `len=[*,80]` = at most 80 bytes ·
 `snr=[*,-8.5]` = signal of −8.5 dB or weaker. Fractional SNR values use
-quarter-dB steps: `.00`, `.25`, `.50`, `.75`.
+quarter-dB steps: `.00`, `.25`, `.50`, `.75`, and a value that is not a quarter
+is rounded to the nearest one (`snr=-8.5` means −8.50 dB; `snr=-8.6` becomes
+−8.50). SNR is stored as signed quarter-dB values, so the usable range is
+−32768…32767 quarter-dB — far beyond any real radio reading. Plain numeric
+predicates (`hops=`, `len=`) are unsigned and top out at 32767; the endpoints you
+can usefully write are much lower than that.
 
 ## Channels, senders, and message text
 
@@ -168,6 +185,10 @@ Content rules match against the repeater's store of named channels:
   the repeater may never get to try.
 - Channel names are literal, not patterns: `chan=#test.*` does **not** mean
   "all test channels".
+- If you delete the last channel a rule named, that rule's `chan=` list becomes
+  empty and the rule stops matching **anything** — deliberately. It is not
+  turned into a catch-all, so deleting a channel can never quietly widen a rule
+  into dropping every packet of that type. Re-point the rule or remove it.
 - `chan=` only matches traffic the repeater can actually decrypt with the
   stored key — a strong identity check. By contrast, `chanhash=` matches a
   1-byte tag carried on-air, which other channels can collide with; use it only
@@ -593,7 +614,10 @@ pressure without a hard cutoff.
   expresses "80% pressure, guaranteed floor".
 - The roll is **deterministic per packet**: the same packet always gets the
   same verdict from the same rule, so counters are stable and repeatable.
-  A retransmitted copy is a new packet and rolls again.
+  Note what that means for retransmits: the roll is derived from the payload and
+  packet type, so a copy forwarded by a neighbour to reach this repeater rolls
+  **identically** to the first copy — it is the same message. A genuinely new
+  message (different body or timestamp) is a new packet and rolls afresh.
 - Determinism is scoped to the rule **as stored**: the roll is salted with a
   digest of the rule's own fields, so editing a `prob=` rule (or reading the
   same config under firmware whose rule record differs) re-rolls it. `prob` is
@@ -693,9 +717,12 @@ Two things to remember:
   the earlier rule matches first and the drop never fires.
 
 The probe's worth is also visible in **RF terms**: `filter stats` includes
-`air:<ms>:<percent>%` — the estimated time-on-air the packets dropped so far would
-have consumed on retransmit (rule drops and rate-limiter drops; the same
-estimate the repeater itself bills airtime with). `filter get <idx>` shows the
+`air:<ms>:<percent>%` — an *estimate* of the time-on-air the packets dropped so
+far would have consumed had they been relayed (rule drops and rate-limiter
+drops). It is the repeater's own airtime estimate applied to the received packet
+length, not a measurement of what the channel was doing, and not a count of
+confirmed transmissions. Treat it as a comparative figure between "with the rule"
+and "without it", not as a channel-utilisation figure. `filter get <idx>` shows the
 per-rule share as `air=<ms>`. A shadow `forward` probe itself bills nothing
 (`air=0`, since its packets are still relayed) — flip it to `drop` and those
 same hits start accumulating the estimate, which is usually the number that
@@ -770,11 +797,19 @@ is only needed for initial flashing and emergencies.
   which keeps counting correctly no matter how long it stays on — including past
   the ~49.7-day point where a 32-bit millisecond counter wraps. State is
   RAM-only, so both start fresh after a reboot.
+- A `len=` larger than the largest packet the radio can carry is accepted as
+  valid syntax but can never match a real packet — the payload is bounded by the
+  packet buffer, so keep length predicates within what a message can actually be.
 - Very complicated patterns can be slow to match. Prefer short, distinctive
   patterns like `^BEACON` over long wildcard chains. The `aborted` counter in
   `filter stats` grows if a pattern gives up mid-match; simplify it if you see
   that. Several alternatives multiply that cost — see
   [Alternation](#alternation).
+- When a pattern gives up, **that rule simply does not match** — it does not
+  disable the whole filter. A later rule, including a plain drop, can still
+  decide the packet. So a growing `aborted` counter means "some of your patterns
+  stopped being checked", not "the filter is off"; check which rules carry
+  patterns before assuming traffic is being handled.
 - Rules are evaluated **top to bottom, first match wins** over the whole list —
   packet-level and content conditions live in the same ordered list. Older
   fork firmware ran content rules in a separate second pass; with interleaved
@@ -787,21 +822,33 @@ is only needed for initial flashing and emergencies.
   on reboot, so this self-heals.
 - Configs are compatible in both directions: the stored action value did not
   change with the `logonly` → `forward` rename, so firmware that still says
-  `logonly` reads `forward` rules and behaves identically (count, then
-  forward).
+  `logonly` reads and forwards a `forward` rule. That is *format* compatibility —
+  the stored byte means the same thing. It is not a claim that old firmware
+  behaves identically: a two-pass implementation evaluated rules differently, so
+  the same config could decide differently on old code. If the exact outcome
+  matters, check it on the firmware you actually run.
 - One stored pattern is read differently by firmware from 2026-10 onwards: an
   unescaped `|` used to mean a literal pipe and now means OR — write `\|` if
   you want a literal pipe. A pattern built on a bare quantifier (`*Bot`) or a
   misplaced anchor (`A^B`) is accepted as before, but now matches nothing
   instead of matching or not depending on whichever pattern the engine compiled
   before it.
-- **Never lock out your own admin.** Rules are first-match-wins, so a broad
-  early drop rule can silence remote admin login from your app (login replies
-  ride the flood path). Before enabling any catch-all drop rule, add a
-  higher-priority `forward` rule that admits your own traffic — e.g.
-  `filter add chan=<admin channel> action=forward`, or keep rule 0 as an
-  `sender=<your name> action=forward`. Test it from the app while you still
-  have serial access.
+- **What a filter rule is, and is not.** Rules match on *what a packet says*,
+  not on who is allowed to send it. A sender name is chosen freely by whoever
+  writes the message, a channel key is shared by everyone holding it, and the
+  protocol's message tag is two bytes. So a `sender=` or `chan=` rule is a
+  **content policy**, not authentication: it reduces noise, it does not prove an
+  identity. Treat it that way, and do not rely on it as a security boundary.
+- **Keeping remote admin reachable.** A management request addressed *to this
+  repeater* is answered directly, so your own filter — and the battery gate —
+  never block logging in to it. Remote admin still depends on the path working:
+  a drop rule on an *intermediate* repeater between your app and this one can
+  silence the reply before it arrives. So before enabling a broad drop rule,
+  add a higher-priority `forward` rule for the traffic you need relayed — e.g.
+  `filter add chan=<admin channel> action=forward` — and test it from the app
+  while you still have serial access. A rule exception here is about the
+  *relay path*, not about authorising the login: nothing in this filter makes a
+  management packet authenticated.
 
 ## Writing sender/text patterns
 
