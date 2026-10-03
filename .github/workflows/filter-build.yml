@@ -430,10 +430,11 @@ jobs:
           # Every build writes a manifest naming its target, the source SHA and
           # the files it produced. Collecting them here means a dev release that
           # published only some boards says so, loudly, instead of implying the
-          # whole list was covered.
+          # whole list was covered. They are read from where the previous step
+          # moved them: the asset directory no longer holds them.
           SUMMARY=""
           COUNT=0
-          for m in out/manifest-*.txt; do
+          for m in .manifests/manifest-*.txt; do
             [ -f "$m" ] || continue
             COUNT=$((COUNT + 1))
             TARGET=$(sed -n 's/^target: //p' "$m")
@@ -442,7 +443,11 @@ jobs:
           if [ "$COUNT" = 0 ]; then
             BODY="_No build manifests were produced._"
           else
-            BODY="### Boards in this release\n\n$(printf "$SUMMARY")"
+            # %b, not the bare format: SUMMARY starts with "-", which printf
+            # would otherwise read as an option and refuse. The header joins the
+            # same expansion, so the list below it is real newlines rather than
+            # literal "\n" text on the heading line.
+            BODY="### Boards in this release$(printf '\n\n%b' "$SUMMARY")"
           fi
           {
             echo "summary<<MANIFEST_EOF"
