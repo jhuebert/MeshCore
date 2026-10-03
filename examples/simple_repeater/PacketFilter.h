@@ -181,7 +181,7 @@ class FilterRules {
     uint8_t verdict;          // FILTER_ACT_* (allow included)
   } content_verdict;
   bool enabled;
-  LazySave save_flag;       // needs save, written back by loop()
+  LazySave save_flag;         // needs save, written back by loop()
 
 public:
   FilterRules();
