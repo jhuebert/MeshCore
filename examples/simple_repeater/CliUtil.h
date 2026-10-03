@@ -10,6 +10,7 @@
 #ifndef _CLI_UTIL_H
 #define _CLI_UTIL_H
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,21 +40,48 @@ inline char* nextToken(char** p) {
 }
 
 // Copy a command tail (everything after the verb) into a scratch buffer for
-// nextToken() to consume in place, truncating safely at the buffer size.
+// nextToken() to consume in place. Returns false if the command does not fit.
+//
+// Reporting the overflow matters: truncating a command and then acting on the
+// prefix is safe memory, but not safe policy — `filter chan add name <psk>...`
+// cut short would store a mangled name. A command that does not fit is refused
+// whole.
 // Deliberately dependency-free: both CLI handlers use it, and the battery
 // gate's host test build links neither StrHelper nor ltoa().
-inline void cliCopyCommand(char* buf, size_t sz, const char* command) {
-  if (sz == 0) return;
+inline bool cliCopyCommand(char* buf, size_t sz, const char* command) {
+  if (sz == 0) return false;
   size_t n = strlen(command);
-  if (n >= sz) n = sz - 1;
-  memcpy(buf, command, n);
-  buf[n] = 0;
+  if (n >= sz) return false;
+  memcpy(buf, command, n + 1);
+  return true;
 }
 
 // all CLI reply buffers are 160 B: main.cpp uses char reply[160] (serial and
 // ethernet), and the mesh remote-CLI hands out &temp[5] of a uint8_t temp[166].
 // Reply writers must bound to this, never MAX_PACKET_PAYLOAD.
 #define CLI_REPLY_MAX 160
+
+// An odd number of double quotes means the tokenizer would swallow the rest of
+// the line into one value. Cheap to check up front, and it turns a silent
+// misparse into an error the user can see.
+inline bool cliQuotesBalanced(const char* command) {
+  int n = 0;
+  for (const char* s = command; *s; s++) if (*s == '"') n++;
+  return (n % 2) == 0;
+}
+
+// Refuse a trailing token the command form does not take, using that form's
+// usage line. Silently ignoring the tail turns a typo into a no-op that still
+// replies OK, which is the worst failure mode a management command can have:
+// `filter off junk` would report success while doing something the user did not
+// ask for, or the opposite. Call this BEFORE any side effect.
+inline bool cliNoExtra(char* p, char* reply, const char* usage) {
+  if (nextToken(&p) != NULL) {
+    snprintf(reply, CLI_REPLY_MAX, "%s", usage);
+    return false;
+  }
+  return true;
+}
 
 // bounded reply append (CLI reply buffer is 160 bytes)
 inline void radd(char** out, int* remain, const char* fmt, ...) {
@@ -71,12 +99,14 @@ inline void radd(char** out, int* remain, const char* fmt, ...) {
 // Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
 // byte ("12x", "0x10"), an empty token and an out-of-range value are all
 // refused. Callers keep their own error wording, which is why this only
-// answers yes/no.
+// answers yes/no. `out` is left untouched unless the whole token parses, so a
+// rejected value can never leave a stale one behind.
 inline bool parseIntRange(const char* tok, long lo, long hi, long* out) {
   if (tok == NULL || tok[0] == 0) return false;
+  errno = 0;
   char* end;
   long v = strtol(tok, &end, 10);
-  if (end == tok || *end != 0 || v < lo || v > hi) return false;
+  if (end == tok || *end != 0 || errno == ERANGE || v < lo || v > hi) return false;
   *out = v;
   return true;
 }

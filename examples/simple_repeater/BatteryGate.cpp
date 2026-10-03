@@ -206,14 +206,19 @@ static void cliStatus(BatteryGate& gate, mesh::MainBoard& board, char* reply) {
 }
 
 void batteryCLI(BatteryGate& gate, mesh::MainBoard& board, const char* command, char* reply) {
+  // Refused whole rather than acted on as a prefix, and unbalanced quotes are an
+  // error rather than a silent misparse — both checked before anything changes.
   char buf[MAX_PACKET_PAYLOAD + 1];
-  cliCopyCommand(buf, sizeof(buf), command);
+  if (!cliQuotesBalanced(command)) { strcpy(reply, "Err - unbalanced quotes"); return; }
+  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
   char* p = buf;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {
+    if (!cliNoExtra(p, reply, BATT_USAGE)) return;
     cliStatus(gate, board, reply);
   } else if (strcmp(cmd, "off") == 0) {
+    if (!cliNoExtra(p, reply, BATT_USAGE)) return;
     gate.setEnabled(false);
     snprintf(reply, CLI_REPLY_MAX, "OK - battery gate off");
   } else {
