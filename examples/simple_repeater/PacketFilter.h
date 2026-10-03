@@ -150,6 +150,22 @@ static_assert(FILTER_PATH_HASH_SLOTS == 4,
               "FilterRule::path size is in the persisted record: this needs a "
               "FILTER_CFG_VERSION bump and migration code in load()");
 
+// One packet hash per scan, computed on first use. The prob roll and the
+// content-verdict stash guard both need Packet::calculatePacketHash(), a SHA-256
+// over the payload; hashing per prob-enabled rule made a list of prob rules pay
+// one hash per matching rule on every packet.
+class PacketHashCache {
+  const mesh::Packet* pkt;
+  uint8_t hash[MAX_HASH_SIZE];
+  bool valid;
+public:
+  explicit PacketHashCache(const mesh::Packet* p) : pkt(p), valid(false) { memset(hash, 0, sizeof(hash)); }
+  const uint8_t* get() {
+    if (!valid) { pkt->calculatePacketHash(hash); valid = true; }
+    return hash;
+  }
+};
+
 class FilterRules {
   FilterRule rules[FILTER_MAX_RULES];
   int num_rules;
@@ -247,7 +263,7 @@ private:
   // the saved airtime, and store its action in `out`. Returns false when a
   // gate slips the packet past the rule (evaluation continues with the next
   // rule, exactly as on a failed predicate).
-  bool decideMatch(FilterRule* r, const mesh::Packet* pkt, uint32_t now_millis,
+  bool decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t now_millis,
                    uint32_t est_air_ms, uint8_t& out);
 };
 

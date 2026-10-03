@@ -225,12 +225,10 @@ static uint32_t ruleDigest(const FilterRule* r) {
 // packet hash salted with the rule digest. rand() is never seeded anywhere, so
 // it would replay the same sequence every boot; this roll is idempotent under
 // the stash re-scan (same packet -> same verdict) and exact-testable.
-static bool probDecides(const FilterRule* r, const mesh::Packet* pkt) {
+static bool probDecides(const FilterRule* r, const uint8_t* pkt_hash) {
   if (r->prob == 0 || r->prob >= 100) return true;   // unset = always (100 %)
-  uint8_t h[MAX_HASH_SIZE];
-  pkt->calculatePacketHash(h);   // same hash the stash guard uses
   uint32_t x = ruleDigest(r) ^ 2166136261u;   // per-rule salt
-  for (int i = 0; i < MAX_HASH_SIZE; i++) { x ^= h[i]; x *= 16777619u; }
+  for (int i = 0; i < MAX_HASH_SIZE; i++) { x ^= pkt_hash[i]; x *= 16777619u; }
   return (x % 100) < r->prob;
 }
 
@@ -256,9 +254,9 @@ static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
 // Shared tail of checkPacket()/checkContent(): gates first (prob roll, then
 // throttle), then commit — count the hit and bill the saved airtime for DROP
 // decisions. `out` receives the rule's action.
-bool FilterRules::decideMatch(FilterRule* r, const mesh::Packet* pkt, uint32_t now_millis,
+bool FilterRules::decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t now_millis,
                               uint32_t est_air_ms, uint8_t& out) {
-  if (!probDecides(r, pkt)) return false;          // failed roll: fall through as if not matched
+  if (!probDecides(r, pkt_hash.get())) return false;   // failed roll: fall through as if not matched
   if (!throttleDecides(r, now_millis)) return false;   // within budget: slips past, like a failed roll
   r->hits++;
   if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
@@ -393,6 +391,9 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
                                  uint32_t est_air_ms) {
   if (!enabled) return FILTER_ACT_ALLOW;
 
+  // one hash for this packet, shared by the stash guard and any prob roll below
+  PacketHashCache pkt_hash(pkt);
+
   // a verdict stashed by checkContent() for this exact packet is final:
   // return it without rescanning (no double-counted hits, no reordering).
   // Stale stash (different buffer, or the pool re-used it with new content,
@@ -400,9 +401,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   // runs.
   if (content_verdict.pkt == pkt) {
     content_verdict.pkt = NULL;   // consume once, whatever the tag says
-    uint8_t hash[MAX_HASH_SIZE];
-    pkt->calculatePacketHash(hash);
-    if (memcmp(hash, content_verdict.hash, MAX_HASH_SIZE) == 0) {
+    if (memcmp(pkt_hash.get(), content_verdict.hash, MAX_HASH_SIZE) == 0) {
       if (content_verdict.verdict != FILTER_ACT_DROP) air_evaluated_ms += est_air_ms;
       return content_verdict.verdict;
     }
@@ -415,7 +414,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
     FilterRule* r = &rules[i];
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
     if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
-    if (decideMatch(r, pkt, now_millis, est_air_ms, action)) break;   // first match wins
+    if (decideMatch(r, pkt_hash, now_millis, est_air_ms, action)) break;   // first match wins
   }
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
@@ -498,6 +497,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text));
 
   uint8_t verdict = FILTER_ACT_ALLOW;
+  PacketHashCache pkt_hash(pkt);
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     if (!r->enabled) continue;
@@ -506,7 +506,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
     if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !regexMatches(r->sender, sender))) continue;
     if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !regexMatches(r->text, text))) continue;
-    if (decideMatch(r, pkt, millis(), est_air_ms, verdict)) break;   // first match wins
+    if (decideMatch(r, pkt_hash, millis(), est_air_ms, verdict)) break;   // first match wins
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
@@ -517,7 +517,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   // checkPacket for it) until the next packet clears it by pointer or
   // content-hash mismatch
   content_verdict.pkt = pkt;
-  pkt->calculatePacketHash(content_verdict.hash);
+  memcpy(content_verdict.hash, pkt_hash.get(), MAX_HASH_SIZE);   // same hash the roll uses
   content_verdict.verdict = verdict;
   return verdict;
 }
