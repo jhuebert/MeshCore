@@ -32,6 +32,12 @@
 
 #include "FilterTestHelpers.h"
 
+// The on-disk config path and the lazy-save delay, mirroring PacketFilter.cpp.
+static constexpr uint8_t CFG_VERSION = 6;
+static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
+static const char* CFG_FILE = "/filter_cfg";
+
+
 // ============================================================
 // UNIT TESTS: TinyRegex (vendored tiny-regex-c + step budget)
 // ============================================================
@@ -1370,6 +1376,202 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 #include "FilterTestHelpers.h"
 
 // ===================================================================
+// STAGED SAVE / CRASH RECOVERY
+// ===================================================================
+// A save must never leave the only good configuration destroyed: the scratch
+// file is written and read back before the live one is touched, and the previous
+// good file is kept as a backup. At every point a reset can happen, a fresh load
+// must yield the complete old config or the complete new one — never a mixture.
+
+TEST_F(FilterTest, SaveLeavesNoScratchOrBackupOnAFreshDevice) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+
+  ASSERT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));   // promoted, not left behind
+  EXPECT_FALSE(fs.exists("/filter_cfg.bak"));   // nothing to back up yet
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, SecondSaveKeepsThePreviousConfigAsBackup) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);
+
+  ASSERT_TRUE(fs.exists(CFG_FILE));
+  ASSERT_TRUE(fs.exists("/filter_cfg.bak"));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));
+
+  // canonical is the new config, backup is the old one
+  FilterRules now;
+  now.begin(&fs);
+  EXPECT_EQ(now.getNumRules(), 2);
+
+  // swapping the canonical away leaves the backup loadable on its own
+  fs.files[CFG_FILE] = fs.files["/filter_cfg.bak"];
+  FilterRules from_bak;
+  from_bak.begin(&fs);
+  EXPECT_EQ(from_bak.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, LoadFallsBackToBackupWhenCanonicalIsCorrupt) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);   // now: canonical = 2 rules, backup = 1 rule
+
+  // corrupt the canonical beyond use: a bad header
+  fs.files[CFG_FILE][2] = 99;   // num_rules over capacity
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);   // the backup, whole
+}
+
+TEST_F(FilterTest, RecoveryFromBackupSchedulesARepairSave) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);
+
+  fs.remove(CFG_FILE);   // power loss during promotion: canonical gone, backup fine
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+
+  // the recovered-from-backup load must get a good canonical file back
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  restored.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));
+
+  // and a fresh boot now reads the repaired canonical
+  FilterRules after;
+  after.begin(&fs);
+  EXPECT_EQ(after.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, OrphanScratchIsIgnoredOnBoot) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+
+  // an uncommitted scratch file is not a config: it must be ignored entirely
+  fs.files["/filter_cfg.tmp"] = fs.files[CFG_FILE];
+  fs.files["/filter_cfg.tmp"].push_back(0xFF);   // even a malformed one
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);   // the canonical, unaffected
+}
+
+TEST_F(FilterTest, InvalidCanonicalIsNotPromotedOverAValidBackup) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);   // backup = 1 rule, canonical = 2 rules
+  std::vector<uint8_t> good_backup = fs.files["/filter_cfg.bak"];
+
+  fs.files[CFG_FILE][1] = 9;   // corrupt the canonical's header
+  ASSERT_EQ(cli(filter, "add hops=[1,2]"), "OK - rule 2 added");
+  filter.save(&fs);
+
+  // the valid backup must NOT have been replaced by the corrupt canonical...
+  EXPECT_EQ(fs.files["/filter_cfg.bak"].size(), good_backup.size());
+  EXPECT_EQ(memcmp(fs.files["/filter_cfg.bak"].data(), good_backup.data(), good_backup.size()), 0);
+  // ... and the new canonical is the good config we just wrote (3 rules)
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 3);
+}
+
+TEST_F(FilterTest, FailedScratchWriteKeepsTheOldConfigIntact) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  NativeFS broken;
+  broken.files[CFG_FILE] = original;
+  broken.fail_write = true;      // the scratch write accepts nothing
+  filter.save(&broken);
+
+  // the good config is untouched, no scratch is left, nothing was promoted
+  EXPECT_EQ(broken.files[CFG_FILE].size(), original.size());
+  EXPECT_EQ(memcmp(broken.files[CFG_FILE].data(), original.data(), original.size()), 0);
+  EXPECT_FALSE(broken.exists("/filter_cfg.tmp"));
+  EXPECT_FALSE(broken.exists("/filter_cfg.bak"));
+
+  // the edit is still pending, so it lands once writing works again
+  filter.save(&fs);
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 2);
+}
+
+TEST_F(FilterTest, FailedScratchOpenLeavesTheOldConfigIntact) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  NativeFS broken;
+  broken.files[CFG_FILE] = original;
+  broken.fail_open = true;
+  filter.save(&broken);
+  EXPECT_EQ(broken.write_open_attempts, 1u);   // tried once, gave up
+  EXPECT_EQ(broken.files[CFG_FILE].size(), original.size());
+  EXPECT_FALSE(broken.exists("/filter_cfg.bak"));
+}
+
+TEST_F(FilterTest, CorruptScratchReadbackIsNotPromoted) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+
+  // a store that accepts the bytes but truncates them models a power loss
+  // partway through: the readback must reject it and leave the old config alone
+  NativeFS torn;
+  torn.files[CFG_FILE] = original;
+  torn.truncate_to = 12;
+  filter.save(&torn);
+
+  EXPECT_EQ(torn.files[CFG_FILE].size(), original.size());
+  EXPECT_EQ(memcmp(torn.files[CFG_FILE].data(), original.data(), original.size()), 0);
+  EXPECT_FALSE(torn.exists("/filter_cfg.tmp"));
+}
+
+TEST_F(FilterTest, StatsAndRateStateStayRamOnlyAcrossAStagedSave) {
+  ASSERT_EQ(cli(filter, "add type=advert throttle=60"), "OK - rule 0 added");
+  filter.save(&fs);
+  FilterRule* r = filter.getRule(0);
+  r->hits = 7;
+  r->air_ms = 1234;
+  r->throttle_pass = 3;
+  filter.setAdvertRatelimit(12);
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->hits, 0u);          // never persisted
+  EXPECT_EQ(restored.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(restored.getRule(0)->throttle_pass, 0u);
+  EXPECT_EQ(restored.getRule(0)->throttle, 60);      // config is persisted
+  EXPECT_EQ(restored.getAdvertRatelimit(), 12);
+}
+
+// ===================================================================
 // OLD-CONFIG BYTE FIXTURES — temporary, removed with the migration path
 // ===================================================================
 // These are the layouts older firmware actually wrote, written out as literal
@@ -1378,10 +1580,6 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 // so it moved with the struct and could never catch the struct changing under
 // an old config. The offsets below are historical facts. Delete this section
 // together with the v3..v6 branches in load().
-
-static constexpr uint8_t CFG_VERSION = 6;
-static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
-static const char* CFG_FILE = "/filter_cfg";
 
 // One rule record of `bytes` length, carrying: enabled, drop, type=advert,
 // hops=[2,4], sender="Bot", text="hi", region=TestNorth, prob=50,

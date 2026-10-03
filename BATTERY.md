@@ -54,6 +54,13 @@ flag itself is **never persisted** — it is recomputed from the live voltage on
 every boot, so a reboot mid-suspend can never leave the repeater off after the
 battery recovers.
 
+A `battery` command is written to flash about **3 seconds** later; a power cut
+inside that window loses that change, not the whole file. The write itself is
+staged — scratch copy, read back and checked, previous config kept as a backup,
+and only then swapped in — so a crash mid-write cannot leave you without a
+usable configuration. If `/batt_cfg` ever fails to load, the backup is used and
+repaired on the next save.
+
 ## CLI reference
 
 | Command | Effect |

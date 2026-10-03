@@ -677,119 +677,181 @@ static bool validChannel(const FilterChannel* c) {
   return true;
 }
 
+// Parse a config file from an open handle.
+//
+// Shared by load() and by the staged-save readback validator, so there is exactly
+// one definition of "a file this firmware can use". `rules_out`/`chans_out` may be
+// NULL for a validation-only pass: the counts are still reported, so a scratch
+// file can be checked without allocating a second whole filter, and nothing live
+// (counters, throttle/rate state, limiter history) is touched either way.
+//
+// Returns false only when the file is unusable as a whole (bad header, truncated
+// header, or a ratelimit outside the documented range). A bad RECORD ends the
+// parse at that point and leaves the counts short: sizes are fixed, so the valid
+// prefix is what loads and surviving rules keep their indices.
+static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* chans_out,
+                            bool& out_enabled, uint8_t& out_nr, uint8_t& out_nc,
+                            uint16_t& out_rl) {
+  out_enabled = true;
+  out_nr = 0;
+  out_nc = 0;
+  out_rl = 0;
+
+  uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
+  uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
+  if (file.read(hdr, 1) != 1) return false;
+  ver = hdr[0];
+  if (ver < 3 || ver > FILTER_CFG_VERSION) return false;
+  if (file.read(hdr, 4) != 4) return false;
+
+  // The header describes the file's own SHAPE, so a bad one means we no longer
+  // know where the records are: reject the whole file rather than guess.
+  if (hdr[0] > 1 || hdr[1] > FILTER_MAX_RULES || hdr[2] > FILTER_MAX_CHANNELS) return false;
+
+  uint8_t nr = hdr[1];
+  uint8_t nc = hdr[2];
+  size_t rule_bytes = (ver >= 6) ? FILTER_RULE_V6_BYTES
+                    : (ver >= 4) ? FILTER_RULE_V4_BYTES
+                                 : FILTER_RULE_V3_BYTES;
+  uint16_t rl_hours;
+  if (file.read((uint8_t*)&rl_hours, 2) != 2) return false;
+  if (rl_hours > FILTER_ADVERT_HOURS_MAX) return false;   // not a window we write
+  out_rl = rl_hours;
+  out_enabled = hdr[0] != 0;
+
+  for (int i = 0; i < nr; i++) {
+    uint8_t raw[FILTER_RULE_V6_BYTES];
+    if (file.read(raw, rule_bytes) != rule_bytes) break;   // truncated
+    // `enabled` is a bool, so a persisted byte it could never hold is
+    // unrepresentable in the converted field and cannot be range-checked there —
+    // it has to be refused while it is still just bytes.
+    if (raw[0] > 1) break;
+    FilterRule probe;
+    memset(&probe, 0, sizeof(probe));   // RAM-only stats/state stay zero
+    memcpy(&probe, raw, rule_bytes);
+    if (ver < 5) {
+      // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
+      probe.prob = 0;
+    }
+    if (rule_bytes == FILTER_RULE_V3_BYTES) {
+      // v3 record: the read drags the old record's trailing padding bytes into
+      // regions[0..1], so zero the whole regions field (predicate unset)
+      memset(probe.regions, 0, sizeof(probe.regions));
+    }
+    if (!validRule(&probe)) break;
+    if (rules_out) rules_out[i] = probe;
+    out_nr++;
+  }
+
+  for (int i = 0; i < nc; i++) {
+    FilterChannel probe;
+    memset(&probe, 0, sizeof(probe));
+    if (file.read((uint8_t*)&probe, FILTER_CHAN_PERSIST_BYTES) != FILTER_CHAN_PERSIST_BYTES) break;
+    if (!validChannel(&probe)) break;
+    if (chans_out) chans_out[i] = probe;
+    out_nc++;
+  }
+  return true;
+}
+
+// --- staged save callbacks -------------------------------------------------
+//
+// These take only what is being written, never live state: the readback check
+// runs on the scratch file and must not disturb counters, rate history or the
+// advert cache.
+
+struct FilterFileCtx {
+  int expect_rules;     // -1 = "just tell me it parses" (load/probe mode)
+  int expect_channels;
+};
+
+static bool filterWriteFile(File& f, void* ctx) {
+  FilterRules& filter = *(FilterRules*)ctx;
+  uint8_t hdr[5];
+  hdr[0] = FILTER_CFG_VERSION;
+  hdr[1] = filter.isEnabled() ? 1 : 0;
+  hdr[2] = (uint8_t)filter.getNumRules();
+  hdr[3] = (uint8_t)filter.getNumChannels();
+  hdr[4] = 0;
+  if (f.write(hdr, 5) != 5) return false;
+  uint16_t rl_hours = filter.getAdvertRatelimit();
+  if (f.write((uint8_t*)&rl_hours, 2) != 2) return false;
+  for (int i = 0; i < filter.getNumRules(); i++) {
+    if (f.write((const uint8_t*)filter.getRule(i), FILTER_RULE_PERSIST_BYTES) != FILTER_RULE_PERSIST_BYTES) return false;
+  }
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    if (f.write((const uint8_t*)filter.getChannel(i), FILTER_CHAN_PERSIST_BYTES) != FILTER_CHAN_PERSIST_BYTES) return false;
+  }
+  return true;
+}
+
+static bool filterValidateFile(File& f, void* ctx) {
+  const FilterFileCtx* want = (const FilterFileCtx*)ctx;
+  bool en;
+  uint8_t nr, nc;
+  uint16_t rl;
+  if (!parseConfigFile(f, NULL, NULL, en, nr, nc, rl)) return false;
+  // on a save readback, the file must hold exactly what we just wrote
+  if (want != NULL) {
+    if (want->expect_rules >= 0 && nr != (uint8_t)want->expect_rules) return false;
+    if (want->expect_channels >= 0 && nc != (uint8_t)want->expect_channels) return false;
+  }
+  return true;
+}
+
 void FilterRules::load(FILESYSTEM* fs) {
   resetToDefaults();   // the file decides everything below; nothing survives from before
   save_flag.reset();   // a reload supersedes any edit still waiting to be written
 
-  if (!fs->exists(FILTER_CFG_FILE)) return;
-  File file = fsOpenRead(fs, FILTER_CFG_FILE);
-  if (file) {
-    uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
-    uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
-    // Record sizes are the frozen literals, and the version map names versions
-    // outright rather than counting back from the current one.
-    if (file.read(hdr, 1) == 1 &&
-        (ver = hdr[0], ver >= 3 && ver <= FILTER_CFG_VERSION) &&
-        file.read(hdr, 4) == 4) {
-      // The header describes the file's own SHAPE, so a bad one means we no
-      // longer know where the records are: reject the whole file rather than
-      // guess. (A bad *record* is different — sizes are fixed, so the next
-      // record is still locatable, which is why that case keeps a prefix.)
-      if (hdr[0] > 1 || hdr[1] > FILTER_MAX_RULES || hdr[2] > FILTER_MAX_CHANNELS) {
-        file.close();
-        return;
-      }
-      uint8_t nr = hdr[1];
-      uint8_t nc = hdr[2];
-      size_t rule_bytes = (ver >= 6) ? FILTER_RULE_V6_BYTES
-                        : (ver >= 4) ? FILTER_RULE_V4_BYTES
-                                     : FILTER_RULE_V3_BYTES;
-      uint16_t rl_hours;
-      if (file.read((uint8_t*)&rl_hours, 2) == 2) {
-        if (rl_hours > FILTER_ADVERT_HOURS_MAX) {   // not a window this firmware writes
-          file.close();
-          return;
-        }
-        limiter.setHours(rl_hours);
+  char path[64];
+  PersistLoadSource src = chooseConfigToLoad(fs, FILTER_CFG_FILE, filterValidateFile, NULL,
+                                             path, sizeof(path));
+  if (src == PERSIST_LOAD_NONE) return;   // nothing usable: keep the defaults
+  File file = fsOpenRead(fs, path);
+  if (!file) return;
 
-        // Read into locals and adopt only what validates, so a rejected record
-        // cannot leave a half-built object behind for a later rule to read.
-        // Records are fixed-size, so the valid PREFIX is what we keep: indices
-        // of surviving rules stay put, which the CLI's index semantics depend on.
-        FilterRule loaded[FILTER_MAX_RULES];
-        memset(loaded, 0, sizeof(loaded));   // RAM-only stats/state stay zero
-        int good_rules = 0;
-        for (int i = 0; i < nr; i++) {
-          uint8_t raw[FILTER_RULE_V6_BYTES];
-          if (file.read(raw, rule_bytes) != rule_bytes) break;   // truncated
-          // `enabled` is a bool, so a persisted byte it could never hold is
-          // unrepresentable in the converted field and cannot be range-checked
-          // there — it has to be refused while it is still just bytes.
-          if (raw[0] > 1) break;
-          memcpy(&loaded[i], raw, rule_bytes);
-          if (ver < 5) {
-            // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
-            loaded[i].prob = 0;
-          }
-          if (rule_bytes == FILTER_RULE_V3_BYTES) {
-            // v3 record: the read drags the old record's trailing padding bytes
-            // into regions[0..1], so zero the whole regions field (predicate unset)
-            memset(loaded[i].regions, 0, sizeof(loaded[i].regions));
-          }
-          if (!validRule(&loaded[i])) break;
-          good_rules++;
-        }
-
-        FilterChannel loaded_ch[FILTER_MAX_CHANNELS];
-        memset(loaded_ch, 0, sizeof(loaded_ch));
-        int good_chans = 0;
-        for (int i = 0; i < nc; i++) {
-          if (file.read((uint8_t*)&loaded_ch[i], FILTER_CHAN_PERSIST_BYTES) != FILTER_CHAN_PERSIST_BYTES) break;
-          if (!validChannel(&loaded_ch[i])) break;
-          good_chans++;
-        }
-
-        enabled = hdr[0] != 0;
-        if (good_rules > 0) { memcpy(rules, loaded, good_rules * sizeof(FilterRule)); }
-        if (good_chans > 0) { memcpy(channels, loaded_ch, good_chans * sizeof(FilterChannel)); }
-        num_rules = good_rules;
-        num_channels = good_chans;
-        // a rule whose chan_mask named a channel we did not adopt is still
-        // adopted, but only after the mask is confined to the channels that
-        // exist: MASK_SET with no bits is the documented inert rule, never a
-        // catch-all (see section 5 of the review)
-        for (int i = 0; i < num_rules; i++) {
-          uint16_t keep = 0;
-          for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1 << c)) keep |= (1 << c);
-          rules[i].chan_mask = keep;
-        }
-      }
+  FilterRule loaded[FILTER_MAX_RULES];
+  memset(loaded, 0, sizeof(loaded));   // RAM-only stats/state stay zero
+  FilterChannel loaded_ch[FILTER_MAX_CHANNELS];
+  memset(loaded_ch, 0, sizeof(loaded_ch));
+  bool en = true;
+  uint8_t nr = 0, nc = 0;
+  uint16_t rl = 0;
+  if (parseConfigFile(file, loaded, loaded_ch, en, nr, nc, rl)) {
+    file.close();
+    enabled = en;
+    limiter.setHours(rl);
+    if (nr > 0) memcpy(rules, loaded, nr * sizeof(FilterRule));
+    if (nc > 0) memcpy(channels, loaded_ch, nc * sizeof(FilterChannel));
+    num_rules = nr;
+    num_channels = nc;
+    // a rule whose chan_mask named a channel we did not adopt still counts, but
+    // its mask is confined to the channels that exist: MASK_SET with no bits is
+    // the documented inert rule, never a catch-all
+    for (int i = 0; i < num_rules; i++) {
+      uint16_t keep = 0;
+      for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1 << c)) keep |= (1 << c);
+      rules[i].chan_mask = keep;
     }
+  } else {
     file.close();
   }
+
+  // Loaded from the backup, so the canonical file is missing or unusable: get a
+  // good one back on disk at the next opportunity. The backup itself stays valid
+  // in the meantime, so a further failure costs nothing.
+  if (src == PERSIST_LOAD_RECOVERED) markDirty();
 }
 
 void FilterRules::save(FILESYSTEM* fs) {
-  File file = fsOpenWrite(fs, FILTER_CFG_FILE);
-  if (!file) { save_flag.retryLater(); return; }   // wait out another delay before retrying
-  uint8_t hdr[5];
-  hdr[0] = FILTER_CFG_VERSION;
-  hdr[1] = enabled ? 1 : 0;
-  hdr[2] = (uint8_t)num_rules;
-  hdr[3] = (uint8_t)num_channels;
-  hdr[4] = 0;
-  bool ok = (file.write(hdr, 5) == 5);
-  uint16_t rl_hours = limiter.getHours();
-  ok = ok && (file.write((uint8_t*)&rl_hours, 2) == 2);
-  for (int i = 0; ok && i < num_rules; i++) {
-    ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
-  }
-  for (int i = 0; ok && i < num_channels; i++) {
-    ok = (file.write((uint8_t*)&channels[i], FILTER_CHAN_PERSIST_BYTES) == FILTER_CHAN_PERSIST_BYTES);
-  }
-  file.close();
-  // only once the config is actually on disk: a failed write stays pending, but
-  // backs off a full delay instead of retrying on every loop
+  // Staged: write a scratch file, read it back through the same parser, keep the
+  // current good file as a backup, and only then promote. Either the complete
+  // old config or the complete new one survives a failure or a brownout.
+  FilterFileCtx want = { getNumRules(), getNumChannels() };   // the writeback must match these
+  FilterFileCtx any = { -1, -1 };                             // "just tell me it parses"
+  bool ok = saveStaged(fs, FILTER_CFG_FILE, filterWriteFile, this,
+                       filterValidateFile, &want, filterValidateFile, &any);
+  // Dirty state is cleared only once the new file is committed and validated.
   if (ok) save_flag.clear();
   else save_flag.retryLater();
 }
