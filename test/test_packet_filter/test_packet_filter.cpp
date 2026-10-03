@@ -2664,7 +2664,8 @@ TEST_F(FilterTest, ProbUnsetRuleDoesNotHashThePacket) {
   EXPECT_EQ(mockShaFinalizeCount(), 0u);
 
   // a rule that always passes the gate is still free
-  ASSERT_EQ(cli(filter, "add type=advert prob=100"), "OK - rule 1 added");
+  filter.clearRules();
+  ASSERT_EQ(cli(filter, "add type=advert prob=100"), "OK - rule 0 added");
   mockShaFinalizeCount() = 0;
   EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(mockShaFinalizeCount(), 0u);
@@ -2672,13 +2673,14 @@ TEST_F(FilterTest, ProbUnsetRuleDoesNotHashThePacket) {
 
 TEST_F(FilterTest, ProbSetRuleHashesOncePerScan) {
   // several nontrivial prob rules over one scan still share a single hash
-  ASSERT_EQ(cli(filter, "add type=advert prob=50 region=TestNorth"), "OK - rule 0 added");
-  ASSERT_EQ(cli(filter, "add type=advert prob=50 region=TestSouth"), "OK - rule 1 added");
-  ASSERT_EQ(cli(filter, "add type=advert prob=50"), "OK - rule 2 added");
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(cli(filter, "add type=advert prob=1"), "OK - rule " + std::to_string(i) + " added");
+  }
   auto pkt = probAdvert(3);
 
   mockShaFinalizeCount() = 0;
-  filter.checkPacket(&pkt, 0, nullptr);   // verdict is whatever the roll says
+  ASSERT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  for (int i = 0; i < 3; i++) EXPECT_EQ(filter.getRule(i)->hits, 0u);
   EXPECT_EQ(mockShaFinalizeCount(), 1u);   // exactly one: shared across the scan
 }
 
@@ -2990,16 +2992,14 @@ TEST_F(FilterTest, ThrottleForwardShadowCountsExcess) {
 }
 
 TEST_F(FilterTest, ThrottleWrapAround) {
-  // Real elapsed time is what governs the window. Before the 64-bit clock, the
-  // wrap made 16 real seconds read as 49.7 days, so this test's old expectation
-  // ("past the 30 s window") described a bug rather than a behaviour.
+  // The throttle window must use elapsed time across the millis() wrap.
   expectOk(filter, "add type=advert throttle=30");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
 
   uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
   EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);   // free pass
 
-  // 32 ms later, across the wrap: still inside the 30 s window, so the rule decides
+  // 16.016 s later, across the wrap: still inside the 30 s window.
   EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
 
   // ~30 s of REAL time later (also after the wrap): now it is the one that slips
@@ -3036,16 +3036,16 @@ TEST_F(FilterTest, LongIdleBeyondOneMillisWrapIsStillTimedCorrectly) {
 
   EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);   // free pass, stamps
 
-  // just over 49.7 days of real uptime, crossing the 32-bit wrap many times
   const uint64_t fifty_days = 50ULL * 24 * 3600 * 1000ULL;
-  EXPECT_EQ(filter.checkPacket(&pkt, (uint32_t)(fifty_days + 1000), nullptr), FILTER_ACT_ALLOW);
+  uint32_t t = advanceFilterClock(filter, 0, fifty_days);
+  EXPECT_EQ(filter.checkPacket(&pkt, t + 1000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);   // the window genuinely lapsed
 
   // and the limiter agrees: an origin last relayed 50 days ago is not suppressed.
   // The clock advances monotonically throughout, as millis() does.
   filter.clearRules();   // the limiter is a separate concern from the throttle above
   filter.setAdvertRatelimit(48);
-  uint32_t t = (uint32_t)(fifty_days + 2000);   // continue from where the clock is
+  t += 2000;   // continue from where the clock is
   uint8_t key[4] = { 0xA1, 0xA2, 0xA3, 0xA4 };
   auto advert = makeAdvert(key);
   EXPECT_EQ(forwardPacket(filter, advert, t), FILTER_ACT_ALLOW);
@@ -3791,15 +3791,14 @@ TEST_F(FilterTest, ChanAddKeepsStoreIntactAfterRejectedKey) {
   // a rejected key must not have written anywhere: the live store is unchanged
   // and the next unused slot is still pristine
   ASSERT_EQ(cli(filter, "chan add keep 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
-  uint8_t before[FILTER_MAX_CHANNELS];
-  memcpy(before, filter.getChannel(0), sizeof(before[0]));
+  FilterChannel before = *filter.getChannel(0);
   FilterChannel snapshot_keep = *filter.getChannel(1);
 
   EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff0011"), "Err - psk must be 32 or 64 hex chars");
   EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff00"), "Err - psk must be 32 or 64 hex chars");
 
   EXPECT_EQ(filter.getNumChannels(), 2);   // no new entry either way
-  EXPECT_EQ(memcmp(before, filter.getChannel(0), sizeof(before[0])), 0);
+  EXPECT_EQ(memcmp(&before, filter.getChannel(0), sizeof(before)), 0);
   EXPECT_EQ(filter.findChannel("bad"), nullptr);
   // the slot the failed adds would have used is still empty
   EXPECT_EQ(filter.getChannel(2)->name[0], 0);
