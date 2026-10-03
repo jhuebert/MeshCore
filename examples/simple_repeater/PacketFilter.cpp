@@ -1011,6 +1011,15 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
   snprintf(reply, CLI_REPLY_MAX, "OK - chan %s deleted", name);
 }
 
+// Undo a rejected `filter add`: the half-built rule plus any channel `chan=`
+// auto-provisioned while parsing. A stored '#' key is not inert — it makes the
+// repeater a decryption candidate for that channel — so it must not outlive a
+// failed add. Auto-provisioned names are appended, so dropping the tail is safe.
+static void rollbackAdd(FilterRules& filter, int idx, int chans_before) {
+  filter.delRule(idx);
+  for (int i = filter.getNumChannels(); i > chans_before; i--) filter.delChannel(i - 1);
+}
+
 static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
   // an odd quote count would silently swallow the tokens that follow
   int quotes = 0;
@@ -1020,6 +1029,7 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
   FilterRule* r = filter.addRule();
   if (r == NULL) { strcpy(reply, "Err - rule list full"); return; }
   int idx = filter.getNumRules() - 1;
+  int chans_before = filter.getNumChannels();
 
   char* p = params;
   char* tok;
@@ -1027,12 +1037,12 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
     char* eq = strchr(tok, '=');
     if (eq == NULL) {
       snprintf(reply, CLI_REPLY_MAX, "Err - expected key=value, got '%s'", tok);
-      filter.delRule(idx);
+      rollbackAdd(filter, idx, chans_before);
       return;
     }
     *eq = 0;
     if (!addRuleParam(filter, r, regions, tok, eq + 1, reply)) {
-      filter.delRule(idx);   // roll back the half-added rule
+      rollbackAdd(filter, idx, chans_before);
       return;
     }
   }

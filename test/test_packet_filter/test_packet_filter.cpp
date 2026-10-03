@@ -2259,6 +2259,19 @@ TEST_F(FilterTest, AddChanAutoProvisionsHashChannels) {
   EXPECT_EQ(filter.getRule(0)->chan_flags, FILTER_CHANFLG_MASK_SET);
 }
 
+TEST_F(FilterTest, AddRollsBackAutoProvisionedChannels) {
+  // a rejected later param must not leave a '#' key in the store: it would
+  // keep the repeater decrypting that channel
+  EXPECT_EQ(cli(filter, "add chan=#leaky type=wat"), "Err - unknown type 'wat'");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  EXPECT_EQ(filter.getNumChannels(), 1);            // only Public is left
+  EXPECT_EQ(filter.findChannel("#leaky"), nullptr);
+  // ...and a later successful add still provisions
+  expectOk(filter, "add chan=#fresh");
+  EXPECT_NE(filter.findChannel("#fresh"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 2);
+}
+
 TEST_F(FilterTest, AddRegionPredicateCanonicalizesViaPrefix) {
   expectOk(filter, "add region=TestN");
   EXPECT_STREQ(filter.getRule(0)->regions, "TestNorth");   // prefix lookup
