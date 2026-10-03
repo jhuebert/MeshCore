@@ -111,17 +111,17 @@ void BatteryGate::load(FILESYSTEM* fs) {
 }
 
 void BatteryGate::save(FILESYSTEM* fs) {
-  save_flag.clear();
   File file = fsOpenWrite(fs, BATT_CFG_FILE);
-  if (file) {
-    uint8_t rec[BATT_CFG_RECORD_BYTES];
-    rec[0] = BATT_CFG_VERSION;
-    rec[1] = enabled ? 1 : 0;
-    memcpy(&rec[2], &suspend_mV, 2);
-    memcpy(&rec[4], &resume_mV, 2);
-    file.write(rec, BATT_CFG_RECORD_BYTES);
-    file.close();
-  }
+  if (!file) return;   // keep the dirty flag: the write is retried by loop()
+  uint8_t rec[BATT_CFG_RECORD_BYTES];
+  rec[0] = BATT_CFG_VERSION;
+  rec[1] = enabled ? 1 : 0;
+  memcpy(&rec[2], &suspend_mV, 2);
+  memcpy(&rec[4], &resume_mV, 2);
+  bool ok = (file.write(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES);
+  file.close();
+  // only once the config is actually on disk: a failed write stays pending
+  if (ok) save_flag.clear();
 }
 
 // ---------------------------------------------------------------- CLI

@@ -615,25 +615,25 @@ void FilterRules::load(FILESYSTEM* fs) {
 }
 
 void FilterRules::save(FILESYSTEM* fs) {
-  save_flag.clear();
   File file = fsOpenWrite(fs, FILTER_CFG_FILE);
-  if (file) {
-    uint8_t hdr[5];
-    hdr[0] = FILTER_CFG_VERSION;
-    hdr[1] = enabled ? 1 : 0;
-    hdr[2] = (uint8_t)num_rules;
-    hdr[3] = (uint8_t)num_channels;
-    hdr[4] = 0;
-    bool ok = (file.write(hdr, 5) == 5);
-    ok = ok && (file.write((uint8_t*)&ratelimit_hours, 2) == 2);
-    for (int i = 0; ok && i < num_rules; i++) {
-      ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
-    }
-    for (int i = 0; ok && i < num_channels; i++) {
-      ok = (file.write((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
-    }
-    file.close();
+  if (!file) return;   // keep the dirty flag: the write is retried by loop()
+  uint8_t hdr[5];
+  hdr[0] = FILTER_CFG_VERSION;
+  hdr[1] = enabled ? 1 : 0;
+  hdr[2] = (uint8_t)num_rules;
+  hdr[3] = (uint8_t)num_channels;
+  hdr[4] = 0;
+  bool ok = (file.write(hdr, 5) == 5);
+  ok = ok && (file.write((uint8_t*)&ratelimit_hours, 2) == 2);
+  for (int i = 0; ok && i < num_rules; i++) {
+    ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
   }
+  for (int i = 0; ok && i < num_channels; i++) {
+    ok = (file.write((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
+  }
+  file.close();
+  // only once the config is actually on disk: a failed write stays pending
+  if (ok) save_flag.clear();
 }
 
 // ---------------------------------------------------------------- CLI
