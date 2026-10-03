@@ -1314,11 +1314,9 @@ static void rollbackAdd(FilterRules& filter, int idx, int chans_before) {
 }
 
 static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
-  // an odd quote count would silently swallow the tokens that follow
-  int quotes = 0;
-  for (const char* s = params; *s; s++) if (*s == '"') quotes++;
-  if (quotes & 1) { strcpy(reply, "Err - unbalanced quotes"); return; }
-
+  // filterCLI() has already refused an unbalanced command, and the tokenizer
+  // cannot hand this tail an odd quote count: an odd quote in the verb would
+  // swallow the rest of the line and leave nothing here to misparse.
   FilterRule* r = filter.addRule();
   if (r == NULL) { strcpy(reply, "Err - rule list full"); return; }
   int idx = filter.getNumRules() - 1;

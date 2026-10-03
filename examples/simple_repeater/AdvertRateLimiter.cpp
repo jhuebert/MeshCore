@@ -12,13 +12,11 @@ AdvertRateLimiter::AdvertRateLimiter() {
   reset();
 }
 
-void AdvertRateLimiter::clearCacheImpl() {
+void AdvertRateLimiter::clearCache() {
   memset(cache, 0, sizeof(cache));
   cache_count = 0;
   cache_head = 0;
 }
-
-void AdvertRateLimiter::clearCache() { clearCacheImpl(); }
 
 int AdvertRateLimiter::findOrigin(const mesh::Packet* pkt) const {
   uint8_t prefix[4];
@@ -58,16 +56,6 @@ bool AdvertRateLimiter::wouldDrop(const mesh::Packet* pkt, uint64_t now_millis) 
       now_millis - cache[idx].first_seen_millis >= window_ms) return false;
   drops++;
   return true;   // too soon: suppress the repeat
-}
-
-bool AdvertRateLimiter::refreshExpired(const mesh::Packet* pkt, uint64_t now_millis) {
-  if (hours == 0) return false;
-  const uint64_t window_ms = (uint64_t)hours * 3600ULL * 1000ULL;
-  const int idx = findOrigin(pkt);
-  if (idx < 0) return false;
-  if (now_millis < cache[idx].first_seen_millis + window_ms) return false;
-  cache[idx].first_seen_millis = now_millis;   // window restarts
-  return true;
 }
 
 void AdvertRateLimiter::recordForward(const mesh::Packet* pkt, uint64_t now_millis) {
