@@ -558,6 +558,11 @@ pressure without a hard cutoff.
 - The roll is **deterministic per packet**: the same packet always gets the
   same verdict from the same rule, so counters are stable and repeatable.
   A retransmitted copy is a new packet and rolls again.
+- Determinism is scoped to the rule **as stored**: the roll is salted with a
+  digest of the rule's own fields, so editing a `prob=` rule (or reading the
+  same config under firmware whose rule record differs) re-rolls it. `prob` is
+  dosing, not a stable contract — use a plain drop rule where "exactly these
+  packets" matters.
 - `prob=0` is rejected — a 0% rule is a disabled rule; use
   `filter disable <idx>` instead.
 
