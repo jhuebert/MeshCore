@@ -16,16 +16,31 @@
 // costs one flash write instead of one per edit.
 #define LAZY_SAVE_DELAY_MS 3000
 
-// Dirty flag plus write-back timer for one persisted config. Clear it only
-// after the config has actually been written (see Config::save callers).
+// Dirty flag plus write-back timer for one persisted config.
+//
+// Elapsed time is computed in uint32_t so that a millis() wrap is handled for a
+// full cycle. The host's `unsigned long` is 64-bit, so writing these fields as
+// unsigned long would silently make host tests unable to model the wrap the MCU
+// actually has.
 class LazySave {
   bool dirty;
-  unsigned long dirty_since;
+  uint32_t dirty_since;
 public:
   LazySave() : dirty(false), dirty_since(0) {}
   void markDirty() { dirty = true; dirty_since = millis(); }
-  bool due() const { return dirty && millis() - dirty_since >= LAZY_SAVE_DELAY_MS; }
+  bool due() const { return dirty && (uint32_t)(millis() - dirty_since) >= LAZY_SAVE_DELAY_MS; }
+
+  // The config reached the disk. Only call this after a confirmed write.
   void clear() { dirty = false; }
+
+  // A save attempt failed: stay dirty, but wait out another full delay before
+  // trying again. Without this, due() stays true on every loop iteration and a
+  // full or failing filesystem is opened and truncated at firmware-loop speed.
+  void retryLater() { if (dirty) dirty_since = millis(); }
+
+  // Forget pending work entirely — a reload or a reset-to-defaults, which must
+  // not inherit an edit the file no longer reflects.
+  void reset() { dirty = false; dirty_since = 0; }
 };
 
 // Config integrity is length-checked, not checksummed: a truncated file is

@@ -679,6 +679,7 @@ static bool validChannel(const FilterChannel* c) {
 
 void FilterRules::load(FILESYSTEM* fs) {
   resetToDefaults();   // the file decides everything below; nothing survives from before
+  save_flag.reset();   // a reload supersedes any edit still waiting to be written
 
   if (!fs->exists(FILTER_CFG_FILE)) return;
   File file = fsOpenRead(fs, FILTER_CFG_FILE);
@@ -770,7 +771,7 @@ void FilterRules::load(FILESYSTEM* fs) {
 
 void FilterRules::save(FILESYSTEM* fs) {
   File file = fsOpenWrite(fs, FILTER_CFG_FILE);
-  if (!file) return;   // keep the dirty flag: the write is retried by loop()
+  if (!file) { save_flag.retryLater(); return; }   // wait out another delay before retrying
   uint8_t hdr[5];
   hdr[0] = FILTER_CFG_VERSION;
   hdr[1] = enabled ? 1 : 0;
@@ -784,11 +785,13 @@ void FilterRules::save(FILESYSTEM* fs) {
     ok = (file.write((uint8_t*)&rules[i], FILTER_RULE_PERSIST_BYTES) == FILTER_RULE_PERSIST_BYTES);
   }
   for (int i = 0; ok && i < num_channels; i++) {
-    ok = (file.write((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
+    ok = (file.write((uint8_t*)&channels[i], FILTER_CHAN_PERSIST_BYTES) == FILTER_CHAN_PERSIST_BYTES);
   }
   file.close();
-  // only once the config is actually on disk: a failed write stays pending
+  // only once the config is actually on disk: a failed write stays pending, but
+  // backs off a full delay instead of retrying on every loop
   if (ok) save_flag.clear();
+  else save_flag.retryLater();
 }
 
 // ---------------------------------------------------------------- CLI

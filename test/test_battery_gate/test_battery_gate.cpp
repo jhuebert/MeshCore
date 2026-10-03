@@ -308,6 +308,125 @@ TEST_F(BatteryGateTest, RejectsOutOfRange) {
   EXPECT_FALSE(gate.isEnabled());
 }
 
+// The schedule must not depend on an absolute deadline that a 32-bit millis()
+// wrap could collide with, and must take exactly one sample per loop.
+TEST_F(BatteryGateTest, FirstSampleHappensOnceNotOncePerLoop) {
+  board.mV = 100;   // very low: first sample is low #1
+  gate.setThresholds(3400, 3600);
+  gate.loop(&fs, board);
+  EXPECT_FALSE(gate.isSuspended());   // one reading is not enough
+
+  // looping again in the same instant must NOT immediately take low #2: the
+  // gate waits out the interval rather than sampling twice to catch up
+  gate.loop(&fs, board);
+  EXPECT_FALSE(gate.isSuspended());
+  EXPECT_EQ(gate.getDropCount(), 0u);
+}
+
+TEST_F(BatteryGateTest, SamplingSurvivesAMillisWrap) {
+  gate.setThresholds(3400, 3600);
+  g_mock_millis = 0xFFFFF000u;   // ~4 s before UINT32_MAX
+  board.mV = 100;
+  gate.loop(&fs, board);         // immediate sample: low #1
+
+  g_mock_millis = 0xFFFFFFFFu;
+  board.mV = 4000;
+  gate.loop(&fs, board);         // no interval elapsed: no sample, so low #1 stands
+
+  g_mock_millis += 1;            // wrapped to 0
+  gate.loop(&fs, board);
+  EXPECT_FALSE(gate.isSuspended());
+
+  // 30 s measured across the wrap: the good reading lands as low #2, which
+  // resets the debounce rather than suspending
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  board.mV = 4000;
+  gate.loop(&fs, board);
+  EXPECT_FALSE(gate.isSuspended());
+
+  // ... and two lows in a row across the wrap still suspend
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  board.mV = 100;
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);
+  EXPECT_TRUE(gate.isSuspended());
+}
+
+TEST_F(BatteryGateTest, OffDisarmsSamplingAndEnableRearmsIt) {
+  gate.setThresholds(3400, 3600);
+  EXPECT_TRUE(gate.isEnabled());
+
+  gate.setEnabled(false);
+  board.mV = 100;
+  for (int i = 0; i < 5; i++) { g_mock_millis += SAMPLE_INTERVAL_MS; gate.loop(&fs, board); }
+  EXPECT_FALSE(gate.isSuspended());   // disarmed: no sampling while off
+
+  // re-enabling re-arms and evaluates promptly, without waiting out an interval
+  gate.setEnabled(true);
+  gate.loop(&fs, board);              // low #1
+  EXPECT_FALSE(gate.isSuspended());
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);              // low #2
+  EXPECT_TRUE(gate.isSuspended());
+}
+
+TEST_F(BatteryGateTest, ReArmingThresholdsClearsSuspensionAndDebounce) {
+  board.mV = 100;
+  gate.setThresholds(3400, 3600);
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);
+  ASSERT_TRUE(gate.isSuspended());
+
+  // the battery recovers and the thresholds are re-armed around a healthy
+  // voltage: the gate must be re-evaluated on the next sample rather than left
+  // suspended until the next interval
+  board.mV = 4000;
+  EXPECT_EQ(cli(gate, board, "1000 2000").substr(0, 3), "OK ");
+  EXPECT_TRUE(gate.isSuspended());   // not cleared by the command alone...
+  gate.loop(&fs, board);
+  EXPECT_FALSE(gate.isSuspended());  // ...the next sample confirms recovery
+
+  // ... and a low reading now trips again, needing two consecutive readings as
+  // before, with the old debounce state cleared by re-arming
+  board.mV = 100;
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);         // low #1
+  EXPECT_FALSE(gate.isSuspended());
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);         // low #2
+  EXPECT_TRUE(gate.isSuspended());
+}
+
+TEST_F(BatteryGateTest, FailedSaveRetriesSlowlyNotEveryLoop) {
+  gate.setThresholds(3400, 3700);
+
+  NativeFS broken;
+  broken.fail_open = true;   // every open for writing fails
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  for (int i = 0; i < 100; i++) gate.loop(&broken, board);
+
+  // 100 loops in the same instant must NOT mean 100 open attempts
+  EXPECT_LE(broken.write_open_attempts, 1u);
+  EXPECT_FALSE(broken.exists(BATT_CFG_FILE));
+
+  // the edit is still pending, so it lands once the filesystem recovers
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  gate.loop(&fs, board);
+  EXPECT_TRUE(fs.exists(BATT_CFG_FILE));
+}
+
+TEST_F(BatteryGateTest, ReloadCancelsPendingEdits) {
+  gate.setThresholds(3400, 3700);
+  gate.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+
+  gate.load(&fs);   // nothing on disk: defaults, and no resurrected pre-load edit
+  gate.loop(&fs, board);
+  EXPECT_FALSE(fs.exists(BATT_CFG_FILE));
+}
+
 // ============================================================
 // PERSISTENCE
 // ============================================================
