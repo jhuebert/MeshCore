@@ -28,7 +28,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "FilterTestHelpers.h"
 
@@ -36,6 +38,18 @@
 static constexpr uint8_t CFG_VERSION = 6;
 static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static const char* CFG_FILE = "/filter_cfg";
+
+static std::vector<std::string> splitOnSpace(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ' ') { out.push_back(cur); cur.clear(); }
+    else cur += c;
+  }
+  out.push_back(cur);
+  return out;
+}
+
 
 
 // ============================================================
@@ -1463,6 +1477,166 @@ TEST_F(FilterTest, CheckAloneRepeatedlyNeverSpendsTheBudget) {
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);
 }
 
+// A command the CLI does not understand, or a typo'd tail, must never look like
+// it worked. Silently ignoring the tail turns a mistake into a success reply.
+TEST_F(FilterTest, ExtraTokensAreRejectedBeforeAnythingChanges) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");   // so index checks pass
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  struct Case { const char* cmd; const char* usage; };
+  const Case cases[] = {
+    { "on junk",          "Err - usage: on" },
+    { "off junk",         "Err - usage: off" },
+    { "list junk",        "Err - usage: list" },
+    { "clear junk",       "Err - usage: clear" },
+    { "get 0 junk",       "Err - usage: get <idx>" },
+    { "enable 0 junk",    "Err - usage: enable|disable <idx>" },
+    { "del 0 junk",       "Err - usage: del <idx>" },
+    { "move 0 1 junk",    "Err - usage: move <from> <to>" },
+    { "ratelimit advert 48 junk", "Err - usage: ratelimit advert <hours>" },
+    { "ratelimit clear junk",     "Err - usage: ratelimit clear" },
+    { "stats junk",       "Err - usage: stats [reset]" },
+    { "chan list 0 junk", "Err - usage: chan list [<start-idx>]" },
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(cli(filter, c.cmd), c.usage) << c.cmd;
+  }
+}
+
+TEST_F(FilterTest, RejectedTailsLeaveTheConfigUntouched) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.setEnabled(true);
+  filter.setAdvertRatelimit(48);
+  filter.clearAdvertCache();
+
+  // every one of these would have mutated something if the tail were ignored
+  EXPECT_EQ(cli(filter, "off junk").substr(0, 5), "Err -");
+  EXPECT_TRUE(filter.isEnabled());
+  EXPECT_EQ(cli(filter, "clear junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(cli(filter, "del 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(cli(filter, "move 0 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "ratelimit advert 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getAdvertRatelimit(), 48);
+}
+
+TEST_F(FilterTest, OversizedAndUnbalancedCommandsAreRefusedWhole) {
+  // a valid prefix plus an invalid tail must not be applied as the prefix
+  std::string long_cmd = "add sender=";
+  long_cmd += std::string(300, 'a');
+  EXPECT_EQ(cli(filter, long_cmd.c_str()), "Err - command too long");
+  EXPECT_EQ(filter.getNumRules(), 0);
+
+  EXPECT_EQ(cli(filter, "off \"unterminated"), "Err - unbalanced quotes");
+  EXPECT_TRUE(filter.isEnabled());   // nothing was applied
+
+  EXPECT_EQ(cli(filter, "chan add \"a b 00112233445566778899aabbccddeeff"),
+            "Err - unbalanced quotes");
+  EXPECT_EQ(filter.findChannel("a b 00112233445566778899aabbccddeeff"), nullptr);
+}
+
+TEST_F(FilterTest, StatsResetClearsCountersButKeepsRateState) {
+  filter.setAdvertRatelimit(48);
+  // bank an advert window first, with no rule in the way
+  uint8_t key[4] = { 0x11, 0x22, 0x33, 0x44 };
+  auto relayed = makeAdvert(key);
+  EXPECT_EQ(forwardPacket(filter, relayed, 1000), FILTER_ACT_ALLOW);
+  ASSERT_EQ(filter.getAdvertCacheCount(), 1);
+
+  // then bank a rule hit and some throttle state
+  ASSERT_EQ(cli(filter, "add type=advert throttle=60"), "OK - rule 0 added");
+  filter.getRule(0)->throttle_seen = true;    // spend the free pass
+  uint8_t other_key[4] = { 0x55, 0x66, 0x77, 0x88 };
+  auto dropped = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, dropped, 1000), FILTER_ACT_DROP);
+  filter.getRule(0)->throttle_pass = 5;   // a counter
+  ASSERT_GT(filter.getRule(0)->hits, 0u);
+
+  EXPECT_EQ(cli(filter, "stats reset"), "OK - filter stats reset");
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+  // throttle_pass is a counter, so it goes with the rest...
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 0u);
+  // ... but the RATE state is not: a stats reset must never hand a throttled
+  // rule a free pass, which is what throttle_seen/throttle_last_ms carry
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);     // advert history is not a counter
+  EXPECT_EQ(filter.getAdvertRatelimit(), 48);
+  EXPECT_EQ(cli(filter, "stats").substr(0, 4), "lim:");
+  EXPECT_TRUE(filter.getRule(0)->throttle_seen);
+  // The invariant, stated behaviourally: throttle=N lets one match per N
+  // seconds slip PAST the rule; the rest are decided by it. Right after a reset
+  // the window is still open, so this match must be decided — a stats reset buys
+  // no extra slips.
+  auto within = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, within, 2000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+
+  // once the window has genuinely passed, the next match is the one that slips
+  auto after = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, after, 62000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+}
+
+TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
+  // fill the store with long names so the listing cannot fit in one reply
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    std::string name = "longchannel" + std::to_string(i);   // distinct, and long enough to overflow
+    std::string add = cli(filter, ("chan add " + name + " 00112233445566778899aabbccddeeff").c_str());
+    ASSERT_EQ(add.substr(0, 3), "OK ") << name << " -> " << add;
+  }
+  ASSERT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
+
+  std::string head = cli(filter, "chan list");
+  EXPECT_GT(head.size(), 0u);
+  size_t next_at = head.find("; next=");
+  ASSERT_NE(next_at, std::string::npos) << "a full store must say where to resume";
+
+  int start = atoi(head.substr(next_at + 7).c_str());
+  EXPECT_GT(start, 0);
+  EXPECT_LT(start, filter.getNumChannels());
+  // every visible entry is whole: the marker follows a complete "idx:name:hash"
+  EXPECT_EQ(head.find(":") != std::string::npos, true);
+
+  // the resumed listing starts at the index the marker named
+  std::string tail = cli(filter, ("chan list " + std::to_string(start)).c_str());
+  size_t p0 = tail.find(":");
+  ASSERT_NE(p0, std::string::npos);
+  EXPECT_EQ(atoi(tail.substr(0, p0).c_str()), start);
+
+  // together the two pages name every channel exactly once, in order, and never
+  // split an entry: each token is a whole "idx:name:hash"
+  std::vector<int> seen;
+  for (const std::string* page : { &head, &tail }) {
+    for (const std::string& tok : splitOnSpace(*page)) {
+      if (tok.empty() || !isdigit((unsigned char)tok[0])) continue;   // skip the "next=N" marker
+      // a whole entry is exactly "idx:name:hash": two colons, and no cut name
+      EXPECT_EQ(std::count(tok.begin(), tok.end(), ':'), 2) << "partial entry: " << tok;
+      int idx = atoi(tok.substr(0, tok.find(':')).c_str());
+      EXPECT_EQ(std::find(seen.begin(), seen.end(), idx), seen.end()) << "repeated index " << idx;
+      seen.push_back(idx);
+    }
+  }
+  ASSERT_EQ(seen.size(), (size_t)filter.getNumChannels());
+  for (int i = 0; i < filter.getNumChannels(); i++) EXPECT_EQ(seen[i], i) << "coverage gap at " << i;
+
+  // walking to the end eventually stops offering a continuation
+  std::string last = cli(filter, ("chan list " + std::to_string(filter.getNumChannels() - 1)).c_str());
+  EXPECT_EQ(last.find("; next="), std::string::npos);
+  // ... and past the end is an error, not an empty success
+  EXPECT_EQ(cli(filter, ("chan list " + std::to_string(filter.getNumChannels())).c_str()).substr(0, 5), "Err -");
+}
+
+TEST_F(FilterTest, ShortStoreListsWithoutAContinuation) {
+  // the bare listing keeps its old shape when everything fits
+  ASSERT_EQ(cli(filter, "chan add #one 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  std::string all = cli(filter, "chan list");
+  EXPECT_EQ(all.find("; next="), std::string::npos);
+  EXPECT_NE(all.find("0:Public"), std::string::npos);
+  EXPECT_NE(all.find("1:#one"), std::string::npos);
+}
+
 // ===================================================================
 // CONTENT VERDICT STASH LIFETIME
 // ===================================================================
@@ -2469,18 +2643,6 @@ TEST_F(FilterTest, LoopSavesOnceWhenClean) {
 #include <SHA256.h>        // mockShaFinalizeCount(): packet-hash cost probe
 
 static const uint8_t PROB_KEY[4] = { 0x11, 0x22, 0x33, 0x44 };
-
-// Split a reply on spaces (test-only helper for parsing `filter list`).
-static std::vector<std::string> splitOnSpace(const std::string& s) {
-  std::vector<std::string> out;
-  std::string cur;
-  for (char c : s) {
-    if (c == ' ') { out.push_back(cur); cur.clear(); }
-    else cur += c;
-  }
-  out.push_back(cur);
-  return out;
-}
 
 // distinct packets: same shape, varying first payload byte (the packet hash
 // covers the payload, so each i rolls independently)
@@ -3799,7 +3961,7 @@ TEST_F(FilterTest, RatelimitCommands) {
   EXPECT_EQ(cli(filter, "ratelimit advert -1"), "Err - hours must be 0..720 (0=off)");
   EXPECT_EQ(cli(filter, "ratelimit advert 0"), "OK - advert ratelimit 0h");
   EXPECT_EQ(filter.getAdvertRatelimit(), 0);
-  EXPECT_EQ(cli(filter, "ratelimit bogus"), "Err - usage: ratelimit advert <hours>|clear");
+  EXPECT_EQ(cli(filter, "ratelimit bogus"), "Err - usage: ratelimit [advert <hours>|clear]");
   // a non-number must not be read as 0, which would silently turn the limiter off
   EXPECT_EQ(cli(filter, "ratelimit advert abc"), "Err - hours must be 0..720 (0=off)");
   EXPECT_EQ(cli(filter, "ratelimit advert 12x"), "Err - hours must be 0..720 (0=off)");

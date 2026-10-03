@@ -1210,17 +1210,48 @@ static void cliStatus(FilterRules& filter, char* reply) {
        (unsigned long)filter.getBudgetAborts());
 }
 
-static void cliChanList(FilterRules& filter, char* reply) {
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  if (filter.getNumChannels() == 0) {
+// List channels from `start`. A full store does not fit the 160-byte reply, and
+// `chan del` takes a NAME — so a channel that was cut off could neither be seen
+// nor reliably removed. `filter chan list <start-idx>` walks the rest, and a
+// truncated listing ends with `next=N` naming the first index not shown. Entries
+// are only ever appended whole; the bare form keeps its old format whenever
+// everything fits.
+static void cliChanList(FilterRules& filter, int start, char* reply) {
+  const int n = filter.getNumChannels();
+  if (n == 0) {
     strcpy(reply, "no channels");
     return;
   }
-  for (int i = 0; i < filter.getNumChannels(); i++) {
-    auto ch = filter.getChannel(i);
-    radd(&out, &remain, "%s%d:%s:%02X", i ? " " : "", i, ch->name, ch->hash);
+  if (start >= n) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - start index %d is past the last channel (%d)", start, n - 1);
+    return;
   }
+
+  char entry[FILTER_CHAN_NAME_LEN + 16];   // "<idx>:<name>:<2 hex>", plus a leading space
+  // pass 1: exactly the old listing, so a store that fits is unchanged
+  char* out = reply;
+  int remain = CLI_REPLY_MAX;
+  int i = start;
+  bool complete = true;
+  for (; i < n; i++) {
+    auto ch = filter.getChannel(i);
+    snprintf(entry, sizeof(entry), "%s%d:%s:%02X", (i > start) ? " " : "", i, ch->name, ch->hash);
+    if ((int)strlen(entry) >= remain) { complete = false; break; }
+    radd(&out, &remain, "%s", entry);
+  }
+  if (complete) return;
+
+  // pass 2: re-list with room held back for the continuation marker
+  out = reply;
+  remain = CLI_REPLY_MAX - 14;   // "; next=NNN" and the NUL
+  i = start;
+  for (; i < n; i++) {
+    auto ch = filter.getChannel(i);
+    snprintf(entry, sizeof(entry), "%s%d:%s:%02X", (i > start) ? " " : "", i, ch->name, ch->hash);
+    if ((int)strlen(entry) >= remain) break;
+    radd(&out, &remain, "%s", entry);
+  }
+  radd(&out, &remain, "; next=%d", i);   // resume here
 }
 
 static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
@@ -1405,42 +1436,66 @@ static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
   return true;
 }
 
+#define FILTER_USAGE "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats"
+
 void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions) {
+  // An oversized command is refused whole rather than acted on as a prefix, and
+  // unbalanced quotes are an error rather than a silent misparse. Both are
+  // checked before anything is touched.
   char buf[MAX_PACKET_PAYLOAD + 1];
-  cliCopyCommand(buf, sizeof(buf), command);
+  if (!cliQuotesBalanced(command)) { strcpy(reply, "Err - unbalanced quotes"); return; }
+  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
   char* p = buf;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {
     cliStatus(filter, reply);
   } else if (strcmp(cmd, "on") == 0) {
+    if (!cliNoExtra(p, reply, "Err - usage: on")) return;
     filter.setEnabled(true);
     strcpy(reply, "OK - filter on");
   } else if (strcmp(cmd, "off") == 0) {
+    if (!cliNoExtra(p, reply, "Err - usage: off")) return;
     filter.setEnabled(false);
     strcpy(reply, "OK - filter off");
   } else if (strcmp(cmd, "chan") == 0) {
     char* sub = nextToken(&p);
     if (sub == NULL || strcmp(sub, "list") == 0) {
-      cliChanList(filter, reply);
+      char* tok = nextToken(&p);
+      int start = 0;
+      if (tok != NULL) {
+        long v;
+        if (!parseIntRange(tok, 0, FILTER_MAX_CHANNELS - 1, &v)) {
+          strcpy(reply, "Err - chan list start index must be 0..15");
+          return;
+        }
+        start = (int)v;
+      }
+      if (!cliNoExtra(p, reply, "Err - usage: chan list [<start-idx>]")) return;
+      cliChanList(filter, start, reply);
     } else if (strcmp(sub, "add") == 0) {
       cliChanAdd(filter, p, reply);
     } else if (strcmp(sub, "del") == 0) {
       cliChanDel(filter, p, reply);
     } else {
-      strcpy(reply, "Err - usage: chan list|add <name> [<psk>]|del <name>");
+      strcpy(reply, "Err - usage: chan list [<start-idx>]|add <name> [<psk-hex>]|del <name>");
     }
   } else if (strcmp(cmd, "add") == 0) {
     cliAdd(filter, regions, p, reply);
   } else if (strcmp(cmd, "list") == 0) {
+    if (!cliNoExtra(p, reply, "Err - usage: list")) return;
     cliList(filter, reply);
   } else if (strcmp(cmd, "get") == 0) {
     int idx;
-    if (cliRuleIdx(filter, nextToken(&p), idx, reply)) cliGet(filter, idx, reply);
+    if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
+      if (!cliNoExtra(p, reply, "Err - usage: get <idx>")) return;
+      cliGet(filter, idx, reply);
+    }
   } else if (strcmp(cmd, "enable") == 0 || strcmp(cmd, "disable") == 0) {
     bool on = (strcmp(cmd, "enable") == 0);
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
+      if (!cliNoExtra(p, reply, "Err - usage: enable|disable <idx>")) return;
       filter.getRule(idx)->enabled = on;
       filter.markDirty();
       snprintf(reply, CLI_REPLY_MAX, "OK - rule %d %s", idx, on ? "enabled" : "disabled");
@@ -1449,6 +1504,7 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
     int from, to;
     if (cliRuleIdx(filter, nextToken(&p), from, reply) &&
         cliRuleIdx(filter, nextToken(&p), to, reply)) {
+      if (!cliNoExtra(p, reply, "Err - usage: move <from> <to>")) return;
       if (from == to) {
         strcpy(reply, "Err - move: source and target are the same rule");   // no-op move is rejected
       } else {
@@ -1459,10 +1515,12 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
   } else if (strcmp(cmd, "del") == 0) {
     int idx;
     if (cliRuleIdx(filter, nextToken(&p), idx, reply)) {
+      if (!cliNoExtra(p, reply, "Err - usage: del <idx>")) return;
       filter.delRule(idx);
       snprintf(reply, CLI_REPLY_MAX, "OK - rule %d deleted", idx);
     }
   } else if (strcmp(cmd, "clear") == 0) {
+    if (!cliNoExtra(p, reply, "Err - usage: clear")) return;
     filter.clearRules();
     strcpy(reply, "OK - rules cleared (chans kept)");
   } else if (strcmp(cmd, "ratelimit") == 0) {
@@ -1474,19 +1532,33 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
       long v;
       if (!parseIntRange(nextToken(&p), 0, FILTER_ADVERT_HOURS_MAX, &v)) {
         snprintf(reply, CLI_REPLY_MAX, "Err - hours must be 0..%d (0=off)", FILTER_ADVERT_HOURS_MAX);
+      } else if (!cliNoExtra(p, reply, "Err - usage: ratelimit advert <hours>")) {
+        return;
       } else {
         filter.setAdvertRatelimit((uint16_t)v);
         snprintf(reply, CLI_REPLY_MAX, "OK - advert ratelimit %ldh", v);
       }
     } else if (strcmp(sub, "clear") == 0) {
+      if (!cliNoExtra(p, reply, "Err - usage: ratelimit clear")) return;
       filter.clearAdvertCache();
       strcpy(reply, "OK - advert cache cleared");
     } else {
-      strcpy(reply, "Err - usage: ratelimit advert <hours>|clear");
+      strcpy(reply, "Err - usage: ratelimit [advert <hours>|clear]");
     }
   } else if (strcmp(cmd, "stats") == 0) {
-    cliStats(filter, reply);
+    char* sub = nextToken(&p);
+    if (sub == NULL) {
+      cliStats(filter, reply);
+    } else if (strcmp(sub, "reset") == 0) {
+      if (!cliNoExtra(p, reply, "Err - usage: stats [reset]")) return;
+      // counters only: the advert history and every rule's rate budget survive,
+      // so a stats reset can never hand a throttled rule a free pass
+      filter.resetStats();
+      strcpy(reply, "OK - filter stats reset");
+    } else {
+      strcpy(reply, "Err - usage: stats [reset]");
+    }
   } else {
-    strcpy(reply, "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats");
+    strcpy(reply, FILTER_USAGE);
   }
 }

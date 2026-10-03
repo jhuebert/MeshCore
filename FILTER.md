@@ -234,12 +234,14 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
 | `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
+| `filter stats` | Totals: limiter drops, regex aborts, airtime saved, and a per-rule hit count |
+| `filter stats reset` | Zero the counters above (per-rule hits, airtime saved, limiter drops, regex aborts). Rate state is **not** reset: a throttled rule gets no free pass, and advert history is kept |
 | `filter get <idx>` | Full detail of one rule, including its `throttle=`/`pass=` rate gate, hit count and saved-airtime stat |
 | `filter enable <idx>` / `filter disable <idx>` | Toggle a single rule |
 | `filter move <from> <to>` | Move a rule so it ends up **at** index `<to>` (the rules in between shift; hit counters travel with the rule) |
 | `filter del <idx>` | Delete a rule (later rules shift down one index) |
 | `filter clear` | Delete all rules (channels and ratelimit are kept) |
-| `filter chan` / `filter chan list` | List the stored channels |
+| `filter chan` / `filter chan list [<start-idx>]` | List the stored channels. A full store does not fit one reply, so a cut-off listing ends with `next=N`; repeat the command with that index to see the rest |
 | `filter chan add <name> [<psk-hex>]` | Add a channel; key optional for `#` names, 32 or 64 hex digits |
 | `filter chan del <name>` | Remove a channel (existing rules are updated) |
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
@@ -1001,6 +1003,8 @@ filter get 0
 filter stats
 ```
 
+| Typo in a command did nothing | Nothing is ignored any more: a command with an unexpected extra word, unbalanced quotes, or an over-long line is refused with a usage line and changes nothing |
+| A channel is missing from `filter chan list` | The store holds more than fits one reply — the listing ends with `next=N`; run `filter chan list N` for the rest |
 | Symptom | Check |
 |---|---|
 | Rule gets no hits | Is the filter on (`filter on`)? Is the rule enabled? Did an earlier rule match first? |
