@@ -580,7 +580,9 @@ TEST_F(FilterTest, LenInterval) {
   expectOk(filter, "add len=[180,*]");
   auto short_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
   auto edge = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 180);
-  auto long_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 200);
+  // the largest payload the packet buffer can hold; there is no 200-byte
+  // packet the firmware could process
+  auto long_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, MAX_PACKET_PAYLOAD);
   EXPECT_EQ(filter.checkPacket(&short_pkt, 0, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.checkPacket(&edge, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.checkPacket(&long_pkt, 0, nullptr), FILTER_ACT_DROP);
@@ -626,6 +628,9 @@ TEST_F(FilterTest, HashSizePredicate) {
   expectOk(filter, "add hsize=2,3");
   auto h1 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
   auto h2 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 2, 2);
+  // hsize=4 is artificial: Packet::setPath rejects hash_size 4 as reserved for
+  // future use (Packet.cpp), so no such packet can arrive. This case only
+  // exercises the matcher's arithmetic — it is not on-air coverage.
   auto h4 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 4, 2);
   EXPECT_EQ(filter.checkPacket(&h1, 0, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.checkPacket(&h2, 0, nullptr), FILTER_ACT_DROP);
