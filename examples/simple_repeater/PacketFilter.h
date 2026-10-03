@@ -238,6 +238,8 @@ public:
   void save(FILESYSTEM* fs);
 
 private:
+  // state of a fresh node, and the baseline load() resets to before reading
+  void resetToDefaults();
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob

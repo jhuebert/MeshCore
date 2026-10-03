@@ -47,16 +47,25 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 
 // ---------------------------------------------------------------- initialization
 
-FilterRules::FilterRules() {
-  memset(rules, 0, sizeof(rules));
+// The state a node starts in, and the state load() must return to before it
+// reads the file: empty rule and channel stores, filter on, no RAM-only stats.
+// One definition, so construction and reload cannot drift apart — a field added
+// here is reset by both.
+void FilterRules::resetToDefaults() {
+  memset(rules, 0, sizeof(rules));   // unpersisted tail bytes (padding, stats) stay deterministic
   memset(channels, 0, sizeof(channels));
   num_rules = 0;
   num_channels = 0;
+  limiter.reset();
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
   content_verdict.pkt = NULL;
   enabled = true;
+}
+
+FilterRules::FilterRules() {
+  resetToDefaults();
 }
 
 void FilterRules::begin(FILESYSTEM* fs) {
@@ -504,10 +513,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // guards against layout drift.
 
 void FilterRules::load(FILESYSTEM* fs) {
-  memset(rules, 0, sizeof(rules));   // unpersisted tail bytes (padding, stats) stay deterministic
-  num_rules = 0;
-  num_channels = 0;
-  enabled = true;
+  resetToDefaults();   // the file decides everything below; nothing survives from before
 
   if (!fs->exists(FILTER_CFG_FILE)) return;
   File file = fsOpenRead(fs, FILTER_CFG_FILE);

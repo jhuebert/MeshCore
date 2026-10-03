@@ -73,6 +73,12 @@ public:
 
   void markDirty() { save_flag.markDirty(); }
 
+private:
+  // state of a fresh node, and the baseline load() resets to before reading
+  void resetToDefaults();
+
+public:
+
   // persistence: thresholds and enabled flag only (never the suspended state)
   void load(FILESYSTEM* fs);
   void save(FILESYSTEM* fs);
