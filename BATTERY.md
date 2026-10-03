@@ -11,18 +11,26 @@ physical access, or manual intervention required.
 
 A repeater otherwise repeats until the battery dies, leaving the node dark with
 no warning. The battery gate flips that failure mode: repeating stops while
-there is still charge to spare, so the node stays **reachable** — CLI replies
-and status responses are originated by the node itself, never forwarded, and
-the node's own adverts continue. An admin can log in over the mesh at any time,
-check the voltage, and adjust or disable the gate.
+there is still charge to spare, so the node itself stays **reachable** — CLI
+replies and status responses are originated by the node, never forwarded, and
+the node's own adverts continue.
+
+One honest qualification: *this* node answers for itself, but reaching it over
+the mesh still needs the path to work. Remote admin and discovery replies depend
+on intermediate repeaters actually relaying; a repeater on that path that is
+itself suspended or filtered will stop the reply getting through. Suspension
+protects the battery; it does not guarantee end-to-end reachability.
 
 ## Behaviour
 
-- **Sampling:** the battery is measured every 30 s (first sample immediately
-  after boot, so the gate is correct right away).
+- **Sampling:** the battery is measured every 30 s. The first sample happens
+  immediately, but one reading is not enough to suspend — so after a reboot a
+  genuinely flat battery takes roughly **30 seconds** before the gate closes.
+  That debounce is deliberate, not a delay to be improved on.
 - **Debounce:** **2 consecutive readings** below the suspend threshold are
   required before suspending — rejects transient sags (e.g. the voltage dip
-  right after a transmission).
+  right after a transmission). Resuming needs only **one** reading back above
+  the resume threshold.
 - **Hysteresis:** suspending takes the voltage below the *suspend* threshold;
   resuming requires the voltage to rise to the *resume* threshold. The gap
   between the two prevents the gate from flapping around a single threshold.
@@ -58,7 +66,8 @@ and group content alike. Everything the node originates on its own behalf
 Thresholds (and the enabled flag) persist in **`/batt_cfg`**. The suspended
 flag itself is **never persisted** — it is recomputed from the live voltage on
 every boot, so a reboot mid-suspend can never leave the repeater off after the
-battery recovers.
+battery recovers. The consequence, stated plainly: a reboot also restarts the
+two-reading debounce, so it costs you the ~30 s grace period again.
 
 A `battery` command is written to flash about **3 seconds** later; a power cut
 inside that window loses that change, not the whole file. The write itself is
