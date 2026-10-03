@@ -10,7 +10,6 @@
 #define BATT_SAMPLE_INTERVAL_MS  30000  // sample every 30 s
 #define BATT_DEBOUNCE_READINGS   2      // consecutive low readings to suspend
 #define BATT_RESUME_MARGIN_MV    200    // default resume = suspend + this
-#define BATT_SAVE_DELAY_MS       3000   // lazy dirty-write delay (like ClientACL)
 
 BatteryGate::BatteryGate() {
   enabled = false;
@@ -20,8 +19,6 @@ BatteryGate::BatteryGate() {
   low_count = 0;
   drops = 0;
   next_sample_at = 0;   // sample immediately on the first loop()
-  dirty = false;
-  dirty_since = 0;
 }
 
 void BatteryGate::begin(FILESYSTEM* fs) {
@@ -82,9 +79,7 @@ void BatteryGate::loop(FILESYSTEM* fs, mesh::MainBoard& board) {
       sample(board);
     }
   }
-  if (dirty && millis() - dirty_since >= BATT_SAVE_DELAY_MS) {
-    save(fs);
-  }
+  if (save_flag.due()) save(fs);
 }
 
 void BatteryGate::load(FILESYSTEM* fs) {
@@ -97,11 +92,7 @@ void BatteryGate::load(FILESYSTEM* fs) {
   next_sample_at = 0;
 
   if (!fs->exists(BATT_CFG_FILE)) return;
-#if defined(RP2040_PLATFORM)
-  File file = fs->open(BATT_CFG_FILE, "r");
-#else
-  File file = fs->open(BATT_CFG_FILE);
-#endif
+  File file = fsOpenRead(fs, BATT_CFG_FILE);
   if (file) {
     uint8_t rec[BATT_CFG_RECORD_BYTES];
     if (file.read(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES &&
@@ -120,15 +111,8 @@ void BatteryGate::load(FILESYSTEM* fs) {
 }
 
 void BatteryGate::save(FILESYSTEM* fs) {
-  dirty = false;
-  #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-    fs->remove(BATT_CFG_FILE);
-    File file = fs->open(BATT_CFG_FILE, FILE_O_WRITE);
-  #elif defined(RP2040_PLATFORM)
-    File file = fs->open(BATT_CFG_FILE, "w");
-  #else
-    File file = fs->open(BATT_CFG_FILE, "w", true);
-  #endif
+  save_flag.clear();
+  File file = fsOpenWrite(fs, BATT_CFG_FILE);
   if (file) {
     uint8_t rec[BATT_CFG_RECORD_BYTES];
     rec[0] = BATT_CFG_VERSION;
