@@ -342,7 +342,9 @@ TEST(PatternMatchValidation, LegacyPipePatternsKeepTheirUsableBranches) {
   EXPECT_TRUE(patternMatches("|A", "A"));
   EXPECT_FALSE(patternMatches("|A", "zz"));
   EXPECT_FALSE(patternMatches("", "anything"));   // empty pattern is never a wildcard
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  patternMatches("A||B", "A", &aborted);
+  EXPECT_FALSE(aborted);
 }
 
 TEST(PatternMatchValidation, OverLongPatternIsRejectedNotTruncated) {
@@ -350,9 +352,10 @@ TEST(PatternMatchValidation, OverLongPatternIsRejectedNotTruncated) {
   // the API must still refuse it instead of reading past its split buffer
   std::string over(FILTER_SENDER_PATTERN_LEN + FILTER_TEXT_PATTERN_LEN, 'a');
   EXPECT_EQ(why(over.c_str()), "");     // no wrapper reason: the caller's length check
-  EXPECT_FALSE(patternMatches(over.c_str(), "aa"));
-  EXPECT_FALSE(patternMatches(over.c_str(), over.c_str()));
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  EXPECT_FALSE(patternMatches(over.c_str(), "aa", &aborted));
+  EXPECT_FALSE(patternMatches(over.c_str(), over.c_str(), &aborted));
+  EXPECT_FALSE(aborted);
 }
 
 TEST(PatternMatchValidation, GroupedSpellingSplitsAtThePipe) {
@@ -385,12 +388,14 @@ TEST(PatternMatchNoAlternation, UnchangedDialectWithoutPipe) {
 
 TEST(PatternMatchBudget, AbortStopsEvaluationAndIsReported) {
   re_set_step_budget(10);
-  EXPECT_FALSE(patternMatches("a*a*a*a*a*b|a*a*a*a*a*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-  EXPECT_TRUE(patternAborted());
+  bool aborted = false;
+  EXPECT_FALSE(patternMatches("a*a*a*a*a*b|a*a*a*a*a*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &aborted));
+  EXPECT_TRUE(aborted);
 
-  // a cheap pattern afterwards clears the flag (as the engine does per call)
-  EXPECT_TRUE(patternMatches("abc|cde", "xxabcxx"));
-  EXPECT_FALSE(patternAborted());
+  // the flag is written per call, so a cheap pattern afterwards reports its own
+  // result (as the engine does per call)
+  EXPECT_TRUE(patternMatches("abc|cde", "xxabcxx", &aborted));
+  EXPECT_FALSE(aborted);
   re_set_step_budget(5000);   // restore the compiled-in default
 }
 
@@ -398,8 +403,9 @@ TEST(PatternMatchBudget, BudgetIsPerAlternative) {
   // each alternative gets the full budget, so a later branch can still match
   // after an expensive earlier one that ran out of patience
   re_set_step_budget(20);
-  EXPECT_TRUE(patternMatches("a*a*a*a*a*b|abc", "abc"));
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  EXPECT_TRUE(patternMatches("a*a*a*a*a*b|abc", "abc", &aborted));
+  EXPECT_FALSE(aborted);
   re_set_step_budget(5000);
 }
 

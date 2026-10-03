@@ -477,8 +477,9 @@ bool FilterRules::channelMatchesStore(const FilterRule* r, const mesh::GroupChan
 }
 
 bool FilterRules::regexMatches(const char* pattern, const char* subject) {
-  if (patternMatches(pattern, subject)) return true;
-  if (patternAborted()) budget_aborts++;   // fail-open: worst case is a spam message repeated
+  bool aborted = false;
+  if (patternMatches(pattern, subject, &aborted)) return true;
+  if (aborted) budget_aborts++;   // fail-open: worst case is a spam message repeated
   return false;
 }
 
