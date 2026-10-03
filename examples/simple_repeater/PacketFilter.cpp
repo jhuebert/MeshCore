@@ -36,16 +36,10 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t c
                                    // v4/v5 record is a byte-identical prefix
                                    // ending at offsetof(throttle) and reads back
                                    // with throttle == 0 (= no limit)
-#define FILTER_RULE_PERSIST_BYTES  (offsetof(FilterRule, hits))   // config fields only; stats excluded
-// v4/v5 record size: prob rides the tail padding and throttle grows the record
-// by 4 bytes, so v4/v5 records end where `throttle` begins
-#define FILTER_RULE_V4_PERSIST_BYTES  (offsetof(FilterRule, throttle))
-// v3 record size: v3 ended each rule record at its offsetof(hits) — the config
-// bytes plus the tail padding that preceded the (then-next) uint32_t. With v4
-// only appending `regions` after `text`, that equals regions' offset rounded
-// up to uint32_t alignment.
-#define FILTER_RULE_V3_PERSIST_BYTES  ((offsetof(FilterRule, regions) + (alignof(uint32_t) - 1)) \
-                                       & ~(alignof(uint32_t) - 1))
+// Rule and channel record sizes live in PacketFilter.h, frozen as literals
+// alongside the static_asserts that tie them to the live struct.
+#define FILTER_RULE_PERSIST_BYTES  FILTER_RULE_V6_BYTES   // config fields only; stats excluded
+
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
 // ---------------------------------------------------------------- initialization
@@ -638,9 +632,9 @@ void FilterRules::load(FILESYSTEM* fs) {
       // load() accepts every version for which record-layout code exists
       // (currently 3..6); older configs were discarded only because no layout
       // code for them was kept
-      size_t rule_bytes = (ver >= FILTER_CFG_VERSION)     ? FILTER_RULE_PERSIST_BYTES
-                        : (ver >= FILTER_CFG_VERSION - 2) ? FILTER_RULE_V4_PERSIST_BYTES
-                                                         : FILTER_RULE_V3_PERSIST_BYTES;
+      size_t rule_bytes = (ver >= 6) ? FILTER_RULE_V6_BYTES
+                        : (ver >= 4) ? FILTER_RULE_V4_BYTES
+                                     : FILTER_RULE_V3_BYTES;
       uint16_t rl_hours;
       if (file.read((uint8_t*)&rl_hours, 2) == 2) {
         limiter.setHours(rl_hours);
@@ -651,14 +645,14 @@ void FilterRules::load(FILESYSTEM* fs) {
             // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
             rules[i].prob = 0;
           }
-          if (ok && rule_bytes == FILTER_RULE_V3_PERSIST_BYTES) {
+          if (ok && rule_bytes == FILTER_RULE_V3_BYTES) {
             // v3 record: the read drags the old record's trailing padding bytes
             // into regions[0..1], so zero the whole regions field (predicate unset)
             memset(rules[i].regions, 0, sizeof(rules[i].regions));
           }
         }
         for (int i = 0; ok && i < nc; i++) {
-          ok = (file.read((uint8_t*)&channels[i], sizeof(FilterChannel)) == sizeof(FilterChannel));
+          ok = (file.read((uint8_t*)&channels[i], FILTER_CHAN_PERSIST_BYTES) == FILTER_CHAN_PERSIST_BYTES);
         }
         if (ok) {
           num_rules = nr;

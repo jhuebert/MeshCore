@@ -150,6 +150,30 @@ static_assert(FILTER_PATH_HASH_SLOTS == 4,
               "FilterRule::path size is in the persisted record: this needs a "
               "FILTER_CFG_VERSION bump and migration code in load()");
 
+// On-disk rule record sizes, in BYTES, frozen as literals.
+//
+// These used to be derived from offsetof(FilterRule, ...). That was a trap: the
+// moment a field moved, every historical size silently changed too, and a config
+// written by an older firmware would load as something it never was — with no
+// compile error and no test failure to explain it. A format is a promise to
+// bytes that already exist in the field, so the historical sizes are numbers,
+// not expressions.
+#define FILTER_RULE_V3_BYTES  124   // ends where `regions` began, padded to uint32_t
+#define FILTER_RULE_V4_BYTES  156   // v4 and v5 share one size: ends where `throttle` begins
+#define FILTER_RULE_V6_BYTES  160   // current: ends where the RAM-only `hits` counter begins
+#define FILTER_CHAN_PERSIST_BYTES  50
+
+// The frozen sizes must still describe THIS struct. These asserts are the
+// tripwire: a new or moved field in the persisted prefix makes one of them fail,
+// which is the moment to bump FILTER_CFG_VERSION and add migration code in
+// load() — never to edit the frozen numbers to match.
+static_assert(offsetof(FilterRule, throttle) == FILTER_RULE_V4_BYTES,
+              "v4/v5 record size is frozen at 156 B; the live struct no longer matches");
+static_assert(offsetof(FilterRule, hits) == FILTER_RULE_V6_BYTES,
+              "v6 record size is frozen at 160 B; the live struct no longer matches");
+static_assert(sizeof(FilterChannel) == FILTER_CHAN_PERSIST_BYTES,
+              "channel record size is frozen at 50 B; the live struct no longer matches");
+
 // One packet hash per scan, computed on first use. The prob roll and the
 // content-verdict stash guard both need Packet::calculatePacketHash(), a SHA-256
 // over the payload; hashing per prob-enabled rule made a list of prob rules pay
