@@ -33,6 +33,10 @@ public:
   operator bool() const { return valid; }
 
   size_t read(uint8_t* buf, size_t len) {
+    // a zero-length or past-EOF read must not form a data pointer: an empty
+    // backing store has data() == nullptr, and memcpy() from it is UB even for
+    // n == 0
+    if (backing == nullptr || pos >= backing->size() || len == 0) return 0;
     size_t n = len < (backing->size() - pos) ? len : (backing->size() - pos);
     memcpy(buf, backing->data() + pos, n);
     pos += n;
@@ -40,10 +44,13 @@ public:
   }
 
   size_t write(const uint8_t* buf, size_t len) {
+    if (backing == nullptr) return 0;
     backing->insert(backing->end(), buf, buf + len);
+    pos = backing->size();   // append-only shim: the handle ends up at EOF
     return len;
   }
 
+  void flush() {}
   void close() {}
 };
 
@@ -63,7 +70,26 @@ public:
     return f;
   }
 
-  NativeFile open(const char* path, const char* mode) { return open(path); }
+  // Arduino (RP2040) flavour: "r" reads, "w" creates/truncates. Honouring the
+  // mode is what lets a test exercise the RP2040 open paths.
+  NativeFile open(const char* path, const char* mode) {
+    if (mode != nullptr && mode[0] == 'w') {
+      files[path].clear();
+      NativeFile f;
+      f.backing = &files[path];
+      f.valid = true;
+      return f;
+    }
+    return open(path);
+  }
+
+  bool rename(const char* from, const char* to) {
+    auto it = files.find(from);
+    if (it == files.end()) return false;
+    files[to] = it->second;
+    files.erase(it);
+    return true;
+  }
 
   // Arduino (ESP32) flavour: open(..., "w", true) truncates/creates.
   NativeFile open(const char* path, const char* mode, bool truncate) {

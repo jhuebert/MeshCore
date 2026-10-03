@@ -4,8 +4,9 @@
 // RegionMap::findByNamePrefix() — used by the `region=` CLI predicate — is
 // resolved here, from a fixed table so tests are deterministic.
 //
-// NOTE: the stub touches no RegionMap members, so tests may pass a null
-// RegionMap* to filterCLI().
+// The real constructor is provided here too, so tests can hold an actual
+// RegionMap instance: calling findByNamePrefix() through a null RegionMap* is
+// undefined behaviour even when the callee never touches `this`.
 
 #include <helpers/RegionMap.h>
 
@@ -16,6 +17,14 @@ static RegionEntry g_test_regions[] = {
   { 2, 0, 0, "TestSouth" },
   { 3, 1, 0, "TestNorthEast" },
 };
+
+RegionMap::RegionMap(TransportKeyStore& store) : _store(&store) {
+  next_id = 1; num_regions = 0;
+  default_id = home_id = 0;
+  wildcard.id = wildcard.parent = 0;
+  wildcard.flags = 0;
+  strcpy(wildcard.name, "*");
+}
 
 RegionEntry* RegionMap::findByNamePrefix(const char* prefix) {
   for (auto& r : g_test_regions) {
