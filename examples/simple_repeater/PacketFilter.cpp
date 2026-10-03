@@ -54,6 +54,8 @@ void FilterRules::resetToDefaults() {
   memset(channels, 0, sizeof(channels));
   num_rules = 0;
   num_channels = 0;
+  uptime_ms = 0;
+  last_millis = millis();   // the accumulator starts from the boot clock
   limiter.reset();
   budget_aborts = 0;
   air_saved_ms = 0;
@@ -77,6 +79,10 @@ void FilterRules::begin(FILESYSTEM* fs) {
 }
 
 void FilterRules::loop(FILESYSTEM* fs) {
+  // Keep the monotonic clock moving even when nothing else does: an idle
+  // repeater still has to notice the 32-bit wrap, and it gets at least one loop
+  // per 49.7 days without trying.
+  uptimeMillis(millis());
   if (save_flag.due()) save(fs);
 }
 
@@ -98,7 +104,7 @@ void FilterRules::onForwardAllowed(const mesh::Packet* pkt, uint32_t now_millis)
   if (!enabled) return;
   if (pkt->getPayloadType() != PAYLOAD_TYPE_ADVERT) return;
   if (!pkt->isRouteFlood()) return;      // the limiter only governs flood adverts
-  limiter.recordForward(pkt, now_millis);
+  limiter.recordForward(pkt, uptimeMillis(now_millis));
 }
 
 void FilterRules::resetStats() {
@@ -309,10 +315,10 @@ static bool probDecides(const FilterRule* r, const uint8_t* pkt_hash) {
 // action applies. Over-rate drops do NOT extend the window, so a matching
 // stream sustains exactly one pass per N seconds however hard it is pushed
 // (the advert limiter's model, per rule).
-static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
+static bool throttleDecides(FilterRule* r, uint64_t now_millis) {
   if (r->throttle == 0) return true;   // unset = no limit: every match decides
   if (r->throttle_seen &&
-      now_millis - r->throttle_last_ms < (uint32_t)r->throttle * 1000UL) {
+      now_millis - r->throttle_last_ms < (uint64_t)r->throttle * 1000ULL) {
     return true;                       // over rate: decide (action applies)
   }
   r->throttle_last_ms = now_millis;    // within budget: slips past the rule
@@ -324,7 +330,7 @@ static bool throttleDecides(FilterRule* r, uint32_t now_millis) {
 // Shared tail of checkPacket()/checkContent(): gates first (prob roll, then
 // throttle), then commit — count the hit and bill the saved airtime for DROP
 // decisions. `out` receives the rule's action.
-bool FilterRules::decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t now_millis,
+bool FilterRules::decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint64_t now_millis,
                               uint32_t est_air_ms, uint8_t& out) {
   // probDecides() would call pkt_hash.get() — a SHA-256 over the packet — even
   // for the common unset/100 rule that returns true immediately. Gate it at the
@@ -470,6 +476,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   if (!enabled) return FILTER_ACT_ALLOW;
 
   // one hash for this packet, shared by the stash guard and any prob roll below
+  const uint64_t now = uptimeMillis(now_millis);
   PacketHashCache pkt_hash(pkt);
 
   // A verdict stashed by checkContent() for this exact packet is final: return it
@@ -498,12 +505,12 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
     FilterRule* r = &rules[i];
     if (!r->enabled || ruleIsDeferred(r)) continue;   // deferred rules decide on decrypted content
     if (!ruleMatchesPacket(r, pkt, payload_type, region)) continue;
-    if (decideMatch(r, pkt_hash, now_millis, est_air_ms, action)) break;   // first match wins
+    if (decideMatch(r, pkt_hash, now, est_air_ms, action)) break;   // first match wins
   }
   if (action == FILTER_ACT_DROP) return FILTER_ACT_DROP;
 
   // limiter runs unless the rule list already dropped; forward adverts too
-  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.wouldDrop(pkt, now_millis)) {
+  if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.wouldDrop(pkt, now)) {
     billSaved(est_air_ms);   // a limiter drop saves the same airtime
     return FILTER_ACT_DROP;
   }
@@ -632,7 +639,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 }
 
 // ---------------------------------------------------------------- persistence
-// Binary format (version 2): header + config-only rule records + raw channel
+// Binary format (version 6): header + config-only rule records + raw channel
 // structs. Rule records are the FilterRule struct up to (excluding) `hits` —
 // stats are memory-only and never touch the file. All struct members are
 // fixed-size arrays/scalars (no pointers) and structs are memset(0) before use,

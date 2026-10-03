@@ -127,7 +127,8 @@ struct FilterRule {
                            // is never persisted (persist ends at offsetof(hits))
   // RAM-only throttle state — never persisted (persist ends at offsetof(hits));
   // travels with the rule on move/del, like hits
-  uint32_t throttle_last_ms; // millis() stamp of the last within-budget pass
+  uint64_t throttle_last_ms; // stamp of the last within-budget pass, on this
+                            // repeater's 64-bit monotonic clock (never persisted)
   uint32_t throttle_pass;    // within-budget passes (slipped past the rule)
   bool     throttle_seen;    // a pass has been stamped (first match = free pass)
 };
@@ -196,6 +197,12 @@ class FilterRules {
   FilterChannel channels[FILTER_MAX_CHANNELS];
   int num_channels;
   AdvertRateLimiter limiter;   // per-node advert repeat window
+  // A 64-bit monotonic clock folded from the 32-bit millis(). Unsigned
+  // subtraction handles exactly one wrap: it cannot tell 49.7 days + 1 s from
+  // 1 s, so a repeater left up long enough would spuriously rate-limit a rule or
+  // an origin the moment it returned. RAM-only; nothing here is persisted.
+  uint64_t uptime_ms;
+  uint32_t last_millis;
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
   uint64_t air_saved_ms;      // estimated TX airtime (ms) saved by rule + limiter drops
   uint64_t air_evaluated_ms;  // estimated TX airtime (ms) evaluated; both counters RAM-only
@@ -217,6 +224,16 @@ public:
   // MyMesh::onRecvPacket() brackets one receive with this so a verdict can never
   // outlive the operation that produced it; checkPacket() also consumes it.
   void clearContentVerdict() { content_verdict.pkt = NULL; }
+
+  // Fold the 32-bit millis() into the 64-bit accumulator and return it. Safe to
+  // call as often as the loop runs — each call adds the time since the previous
+  // one, and equal readings add zero — which is what lets loop() guarantee the
+  // wrap is noticed even when no packet arrives.
+  uint64_t uptimeMillis(uint32_t now_millis) {
+    uptime_ms += (uint32_t)(now_millis - last_millis);
+    last_millis = now_millis;
+    return uptime_ms;
+  }
 
   bool isEnabled() const { return enabled; }
   void setEnabled(bool on);
@@ -309,7 +326,7 @@ private:
   // the saved airtime, and store its action in `out`. Returns false when a
   // gate slips the packet past the rule (evaluation continues with the next
   // rule, exactly as on a failed predicate).
-  bool decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t now_millis,
+  bool decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint64_t now_millis,
                    uint32_t est_air_ms, uint8_t& out);
 };
 

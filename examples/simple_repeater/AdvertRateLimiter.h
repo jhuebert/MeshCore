@@ -24,7 +24,7 @@ struct AdvertSeenEntry {      // RAM-only; cleared on reboot
                               // AdvertRateLimiter::drop); collision odds ~0.001%
                               // per 256 distinct nodes, vanity-robust; worst
                               // case is one falsely suppressed advert/window
-  uint32_t first_seen_millis; // by this repeater's own monotonic clock
+  uint64_t first_seen_millis; // on this repeater's own 64-bit monotonic clock
 };
 
 class AdvertRateLimiter {
@@ -60,16 +60,16 @@ public:
   // adverts that never got forwarded: a repeater left in `set off`, or refusing
   // them for hop-limit/region/loop reasons, would silently stop relaying those
   // nodes for the rest of the window.
-  bool wouldDrop(const mesh::Packet* pkt, uint32_t now_millis);
+  bool wouldDrop(const mesh::Packet* pkt, uint64_t now_millis);
 
   // Record that this origin's advert was admitted for relay, starting its window.
   // Called from the successful end of the forwarding hook, never from the check.
-  void recordForward(const mesh::Packet* pkt, uint32_t now_millis);
+  void recordForward(const mesh::Packet* pkt, uint64_t now_millis);
 
   // Restart an origin's expired window. Not used by the forwarding path — the
   // stamp is refreshed by recordForward() on admission — but the expiry semantics
   // are easier to state (and to test) as their own step.
-  bool refreshExpired(const mesh::Packet* pkt, uint32_t now_millis);
+  bool refreshExpired(const mesh::Packet* pkt, uint64_t now_millis);
 
   // Drop the cache entirely.
   void clearCache();
@@ -79,7 +79,7 @@ private:
   // index of the cache slot holding this origin's 4-byte key, or -1
   int findOrigin(const mesh::Packet* pkt) const;
   // store this origin at `now`, evicting the oldest entry if the cache is full
-  void storeOrigin(const mesh::Packet* pkt, uint32_t now_millis);
+  void storeOrigin(const mesh::Packet* pkt, uint64_t now_millis);
 };
 
 #endif // _ADVERT_RATE_LIMITER_H

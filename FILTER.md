@@ -766,6 +766,10 @@ is only needed for initial flashing and emergencies.
   rule list. (This is recovery in the firmware, not a guarantee about the flash
   itself: a power cut *inside* the filesystem's own write can still damage the
   underlying storage.)
+- The advert window and `throttle=` are measured on the repeater's own uptime,
+  which keeps counting correctly no matter how long it stays on — including past
+  the ~49.7-day point where a 32-bit millisecond counter wraps. State is
+  RAM-only, so both start fresh after a reboot.
 - Very complicated patterns can be slow to match. Prefer short, distinctive
   patterns like `^BEACON` over long wildcard chains. The `aborted` counter in
   `filter stats` grows if a pattern gives up mid-match; simplify it if you see
