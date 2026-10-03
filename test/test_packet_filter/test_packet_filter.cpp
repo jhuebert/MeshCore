@@ -1681,6 +1681,136 @@ TEST_F(FilterTest, V3FixtureWipesRegionsAndHasNoProbOrThrottle) {
   EXPECT_STREQ(r->text, "hi");
 }
 
+// A config file is untrusted input: each of these records contains a field this
+// firmware could never have written, and none of them may become a live rule.
+// Rule-record byte offsets, in the frozen layout: path occupies 22..43 as
+// bytes[4][4] (22..37), len[4] (38..41), count (42), pos (43); hash_size_mask
+// is 44; chan_mask 46..47; chan_hash 48; chan_flags 49; sender 50; text 74;
+// regions 122; prob 154; throttle 156.
+TEST_F(FilterTest, MalformedRuleRecordsAreRejectedNotSanitised) {
+  struct Case { const char* what; size_t off; uint8_t val; };
+  const Case cases[] = {
+    { "enabled byte above 1",            0,   2 },
+    { "action neither drop/forward",     1,   0 },
+    { "undefined type_mask bit",         2,   0x80 },
+    { "undefined route_mask bit",        3,   0x80 },
+    { "undefined interval flag",         8,   0x20 },
+    { "path count beyond its slots",     42,  FILTER_PATH_HASH_SLOTS + 1 },
+    { "undefined path anchor",           43,  0x80 },
+    { "undefined hash_size_mask bit",    44,  0x80 },
+    { "undefined chan_flags bit",        49,  0x80 },
+    { "prob above 100",                  154, 200 },
+  };
+
+  for (const auto& c : cases) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    f[7 + c.off] = c.val;
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+
+    FilterRules restored;
+    restored.begin(&bad);
+    // the record is rejected, so the valid prefix is empty
+    EXPECT_EQ(restored.getNumRules(), 0) << c.what;
+  }
+}
+
+TEST_F(FilterTest, UnterminatedStoredStringRejectsTheRecord) {
+  // sender/text/regions are fixed-size char arrays; a record whose bytes fill
+  // one end to end has no NUL and would be read past its storage
+  for (size_t off : { (size_t)50, (size_t)74, (size_t)122 }) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    const size_t width = (off == 50) ? FILTER_SENDER_PATTERN_LEN
+                       : (off == 74) ? FILTER_TEXT_PATTERN_LEN : FILTER_REGION_LIST_LEN;
+    for (size_t i = 0; i < width; i++) f[7 + off + i] = 'x';
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 0) << "unterminated field at offset " << off;
+  }
+}
+
+TEST_F(FilterTest, MalformedChannelRecordIsRejected) {
+  {   // empty name: a slot no rule and no `chan del <name>` could ever reach
+    std::vector<uint8_t> ch = oldChannelRecord();
+    ch[0] = 0;
+    NativeFS bad;
+    bad.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { ch });
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumChannels(), 0);
+  }
+  {   // key length this firmware never writes
+    std::vector<uint8_t> ch = oldChannelRecord();
+    ch[48] = 17;
+    NativeFS bad;
+    bad.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { ch });
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumChannels(), 0);
+  }
+}
+
+TEST_F(FilterTest, BadHeaderRejectsTheWholeFile) {
+  // the header describes the file's SHAPE: if it lies, we no longer know where
+  // the records are, so nothing is adopted rather than guessed at
+  struct Case { const char* what; size_t off; uint8_t val; };
+  const Case cases[] = {
+    { "enabled byte above 1",     1, 2 },
+    { "more rules than capacity", 2, FILTER_MAX_RULES + 1 },
+    { "more channels than capacity", 3, FILTER_MAX_CHANNELS + 1 },
+  };
+  for (const auto& c : cases) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    f[c.off] = c.val;
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 0) << c.what;
+    EXPECT_EQ(restored.getNumChannels(), 0) << c.what;
+  }
+
+  // a ratelimit window outside the documented range is refused too
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() }, 5);
+  f[5] = 0xFF; f[6] = 0x03;   // 1023 h, above the 720 h maximum
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);
+  EXPECT_EQ(restored.getAdvertRatelimit(), 0);
+}
+
+TEST_F(FilterTest, RuleReferencingAnAbsentChannelIsConfinedNotWidened) {
+  // a rule may name a channel the file did not store; the surviving mask must be
+  // confined to channels that exist, and must never widen into a catch-all
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+  f[7 + 46] = 0xFF; f[7 + 47] = 0xFF;   // chan_mask: every bit
+  f[7 + 49] = FILTER_CHANFLG_MASK_SET;  // MASK_SET with channels that exist
+  NativeFS one;
+  one.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&one);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getNumChannels(), 1);
+  EXPECT_EQ(restored.getRule(0)->chan_mask, 0x01);   // only the stored channel
+
+  // ... and with no channel stored at all, MASK_SET + empty mask stays inert
+  std::vector<uint8_t> g = oldCfgFile(6, FILTER_RULE_V6_BYTES, {});
+  g[7 + 49] = FILTER_CHANFLG_MASK_SET;
+  NativeFS none;
+  none.files[CFG_FILE] = g;
+  FilterRules r2;
+  r2.begin(&none);
+  ASSERT_EQ(r2.getNumRules(), 1);
+  EXPECT_EQ(r2.getRule(0)->chan_mask, 0);
+  EXPECT_NE(r2.getRule(0)->chan_flags & FILTER_CHANFLG_MASK_SET, 0);   // still set, matches nothing
+}
+
 TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   filter.addRule();
   filter.setEnabled(false);
@@ -1712,7 +1842,7 @@ TEST_F(FilterTest, LoadResetsStateTheFileCannotCarry) {
   EXPECT_EQ(filter.getNumRules(), 0);
 }
 
-TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
+TEST_F(FilterTest, TruncatedConfigAdoptsOnlyCompleteRecords) {
   filter.setAdvertRatelimit(3);
   filter.addRule();
   filter.addRule();
@@ -1725,26 +1855,43 @@ TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
 
   FilterRules restored;
   restored.begin(&fs);
-  EXPECT_EQ(restored.getNumRules(), 0);   // nothing half-loaded
+  // Rule 0 arrived whole, so it is kept; rule 1 never arrived, so there is no
+  // half-built second rule. Records are fixed-size, so the valid PREFIX is what
+  // loads — surviving rules keep their indices.
+  EXPECT_EQ(restored.getNumRules(), 1);
 }
 
-TEST_F(FilterTest, TruncatedConfigAllOrNothingAtEveryLength) {
-  // fuzz-lite: cut the saved blob at every byte offset; the loader must never
-  // half-load (rules/channels appear only when the whole file reads cleanly)
+TEST_F(FilterTest, TruncatedConfigNeverYieldsAHalfRecordAtAnyLength) {
+  // fuzz-lite: cut the saved blob at every byte offset. Whatever the length, the
+  // loader must adopt only records that fully arrived, in order, and never a
+  // partial one.
   filter.setAdvertRatelimit(5);
-  ASSERT_EQ(cli(filter, "add type=advert hops=[1,2] path=10>20"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "add type=advert hops=[1,2] path=10>20 prob=50"), "OK - rule 0 added");
   ASSERT_EQ(cli(filter, "chan add #x aabbccddeeff00112233445566778899").substr(0, 3), "OK ");
   filter.save(&fs);
   auto full = fs.files[CFG_FILE];
   ASSERT_GT(full.size(), (size_t)8);
+  const size_t HDR = 7, REC = FILTER_RULE_V6_BYTES, CHAN = FILTER_CHAN_PERSIST_BYTES;
 
   for (size_t len = 0; len < full.size(); len++) {
     NativeFS cut;
     cut.files[CFG_FILE] = std::vector<uint8_t>(full.begin(), full.begin() + len);
     FilterRules restored;
-    restored.begin(&cut);   // must not crash or half-load
-    EXPECT_EQ(restored.getNumRules(), 0) << "truncated at " << len;
-    EXPECT_EQ(restored.getNumChannels(), 0) << "truncated at " << len;
+    restored.begin(&cut);   // must not crash
+
+    // only whole records may appear, and only as a prefix of what was written
+    size_t want_rules = (len >= HDR + REC) ? 1 : 0;
+    size_t want_chans = (len > HDR + REC) ? std::min<size_t>((len - HDR - REC) / CHAN, 2) : 0;
+    EXPECT_EQ(restored.getNumRules(), want_rules) << "truncated at " << len;
+    EXPECT_EQ(restored.getNumChannels(), want_chans) << "truncated at " << len;
+
+    // an adopted record is a whole record, not a plausible-looking prefix
+    if (want_rules) {
+      const FilterRule* r = restored.getRule(0);
+      EXPECT_EQ(r->prob, 50) << "truncated at " << len;
+      EXPECT_EQ(r->hops.lo, 1) << "truncated at " << len;
+      EXPECT_EQ(r->path.count, 2) << "truncated at " << len;
+    }
   }
 
   // the full blob still loads intact
