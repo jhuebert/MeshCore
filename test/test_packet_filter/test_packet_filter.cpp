@@ -2327,6 +2327,28 @@ TEST_F(FilterTest, MalformedRuleRecordsAreRejectedNotSanitised) {
   }
 }
 
+// A rejected rule record must not drag the channel records out of alignment:
+// sizes are fixed, so the records after it are still consumed and the channels
+// that follow a bad rule still load. Reading channels from the middle of a rule
+// record would adopt that rule's bytes as a channel.
+TEST_F(FilterTest, RejectedRuleRecordDoesNotShiftTheChannelRecords) {
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+  f[2] = 2;   // num_rules = 2
+  // the second rule record, placed where the header now says it is
+  const std::vector<uint8_t> rec2 = oldRuleRecord(FILTER_RULE_V6_BYTES);
+  f.insert(f.end() - FILTER_CHAN_PERSIST_BYTES, rec2.begin(), rec2.end());
+  f[7] = 2;   // rule 0's enabled byte: a value a bool could never hold
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);          // the bad record ends the rule list
+  ASSERT_EQ(restored.getNumChannels(), 1);        // ... and the channel still loads
+  EXPECT_STREQ(restored.getChannel(0)->name, "Public");
+  EXPECT_EQ(restored.getChannel(0)->secret_len, 16);
+}
+
 TEST_F(FilterTest, UnterminatedStoredStringRejectsTheRecord) {
   // sender/text/regions are fixed-size char arrays; a record whose bytes fill
   // one end to end has no NUL and would be read past its storage
