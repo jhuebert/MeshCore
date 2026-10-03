@@ -168,10 +168,15 @@ jobs:
         run: |
           set -euo pipefail
           SOURCE="${STABLE_SOURCE:-repeater-filter}"
-          if ! git rev-parse --verify "refs/remotes/origin/$SOURCE" >/dev/null; then
+          if ! SOURCE_SHA=$(git rev-parse --verify "refs/remotes/origin/$SOURCE"); then
             echo "No such branch to promote from: $SOURCE" >&2
             exit 1
           fi
+          # git cherry and `git checkout <rev> -- README.md` both work from the
+          # verified revision directly. Resolving it to a SHA is what keeps a
+          # source branch that exists only as origin/<name> from failing the
+          # cherry: the branch may well be the one checked out here, and a
+          # `git branch --force` for it would be refused.
           STABLE_BEFORE=$(git rev-parse refs/remotes/origin/repeater-filter-stable)
 
           # Everything happens on a scratch branch. The real stable branch is
@@ -185,7 +190,7 @@ jobs:
           # never lands in an intermediate commit just to be overwritten later.
           if ! git merge origin/main --no-commit --no-ff; then
             git diff --name-only --diff-filter=U > stable-conflicted-files.txt || true
-            git checkout repeater-filter -- README.md
+            git checkout "$SOURCE_SHA" -- README.md
             if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
               git merge --abort || true
               echo "conflict=true" >> $GITHUB_OUTPUT
@@ -193,14 +198,19 @@ jobs:
               exit 1
             fi
           fi
-          git checkout repeater-filter -- README.md
+          git checkout "$SOURCE_SHA" -- README.md
           if [ -f .git/MERGE_HEAD ]; then
             git commit --no-edit
           fi
 
           # cherry-pick the filter commits not yet on stable (git cherry matches
-          # by patch-id, so already-picked commits are skipped); oldest first
-          PICKS=$(git cherry HEAD "$SOURCE" origin/dev | grep '^+' | cut -d' ' -f2 || true)
+          # by patch-id, so already-picked commits are skipped); oldest first.
+          # git cherry is called on its own so a failure of it aborts the step
+          # under `set -e`: with the whole pipeline guarded, a git error and a
+          # genuine "nothing to pick" are indistinguishable, and the second would
+          # publish a promotion that silently contained none of its commits.
+          CHERRY=$(git cherry HEAD "$SOURCE_SHA" origin/dev)
+          PICKS=$(printf '%s\n' "$CHERRY" | grep '^+' | cut -d' ' -f2 || true)
           PICK_COUNT=0
           for c in $PICKS; do
             # skip fork-owned-README-only commits; the README is synced below
@@ -220,7 +230,7 @@ jobs:
           done
 
           # keep the fork-owned README in step with the source branch
-          git checkout repeater-filter -- README.md
+          git checkout "$SOURCE_SHA" -- README.md
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "docs: sync fork README"
