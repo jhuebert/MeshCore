@@ -214,7 +214,16 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
   return n;
 }
 
-// FNV-1a over the rule's predicate fields (a short display digest for `filter list`)
+// FNV-1a over the rule's stored predicate fields. Two jobs, deliberately the
+// same bytes: the short digest `filter list` shows per rule, and the per-rule
+// salt of the prob roll (see probDecides()).
+//
+// Its range is the whole persisted record — &action up to &hits — which
+// includes reserved tail padding that is not format-guaranteed. So editing a
+// rule, or reading it under firmware whose record differs, changes this digest
+// and therefore re-rolls which packets a prob= rule decides. That is intended:
+// prob is dosing, not a stable contract (see FILTER.md). Anything that needs a
+// stable rule identity wants a different function, not this one.
 static uint32_t ruleDigest(const FilterRule* r) {
   uint32_t h = 2166136261u;
   const uint8_t* p = (const uint8_t*)&r->action;
