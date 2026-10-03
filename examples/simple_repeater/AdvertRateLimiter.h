@@ -15,6 +15,8 @@
 #include <Arduino.h>
 #include <Mesh.h>
 
+#include <string.h>
+
 #include "PacketFilterConfig.h"
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
@@ -42,6 +44,15 @@ public:
   uint32_t getDrops() const { return drops; }
   void clearCache();
   void resetDrops() { drops = 0; }
+
+  // back to a freshly constructed limiter (empty cache, window off, no drops)
+  void reset() {
+    memset(cache, 0, sizeof(cache));
+    cache_count = 0;
+    cache_head = 0;
+    hours = 0;
+    drops = 0;
+  }
 
   // True if this advert must be dropped because the same origin was already
   // relayed less than `hours` ago (counting that drop). Drops nothing while the

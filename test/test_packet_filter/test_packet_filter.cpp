@@ -1515,6 +1515,18 @@ TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   }
 }
 
+TEST_F(FilterTest, LoadResetsStateTheFileCannotCarry) {
+  filter.setAdvertRatelimit(9);
+  filter.setEnabled(false);
+  filter.addRule();
+  fs.remove(CFG_FILE);   // nothing to load
+
+  filter.load(&fs);      // a reload must not inherit anything from before
+  EXPECT_EQ(filter.getAdvertRatelimit(), 0);   // was left at 9
+  EXPECT_TRUE(filter.isEnabled());             // was left off
+  EXPECT_EQ(filter.getNumRules(), 0);
+}
+
 TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
   filter.setAdvertRatelimit(3);
   filter.addRule();

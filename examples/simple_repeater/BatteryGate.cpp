@@ -11,7 +11,10 @@
 #define BATT_DEBOUNCE_READINGS   2      // consecutive low readings to suspend
 #define BATT_RESUME_MARGIN_MV    200    // default resume = suspend + this
 
-BatteryGate::BatteryGate() {
+// The state a node starts in, and the baseline load() resets to before it
+// reads the file: gate off, no thresholds, nothing suspended. One definition,
+// so construction and reload cannot drift apart.
+void BatteryGate::resetToDefaults() {
   enabled = false;
   suspended = false;
   suspend_mV = 0;
@@ -19,6 +22,10 @@ BatteryGate::BatteryGate() {
   low_count = 0;
   drops = 0;
   next_sample_at = 0;   // sample immediately on the first loop()
+}
+
+BatteryGate::BatteryGate() {
+  resetToDefaults();
 }
 
 void BatteryGate::begin(FILESYSTEM* fs) {
@@ -46,9 +53,7 @@ bool BatteryGate::setThresholds(uint16_t suspend, uint16_t resume) {
   resume_mV = resume;
   low_count = 0;
   next_sample_at = 0;   // re-evaluate immediately on the next loop()
-  if (!enabled) {
-    enabled = true;
-  }
+  enabled = true;
   markDirty();
   return true;
 }
@@ -83,13 +88,7 @@ void BatteryGate::loop(FILESYSTEM* fs, mesh::MainBoard& board) {
 }
 
 void BatteryGate::load(FILESYSTEM* fs) {
-  enabled = false;
-  suspended = false;
-  suspend_mV = 0;
-  resume_mV = 0;
-  low_count = 0;
-  drops = 0;
-  next_sample_at = 0;
+  resetToDefaults();   // the file decides everything below; nothing survives from before
 
   if (!fs->exists(BATT_CFG_FILE)) return;
   File file = fsOpenRead(fs, BATT_CFG_FILE);

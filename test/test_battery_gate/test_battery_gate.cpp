@@ -299,6 +299,16 @@ TEST_F(BatteryGateTest, MissingFileGivesDefaults) {
   EXPECT_EQ(fresh.getResumeMilliVolts(), 0);
 }
 
+TEST_F(BatteryGateTest, LoadResetsStateTheFileCannotCarry) {
+  gate.setThresholds(3400, 3700);
+  fs.remove(BATT_CFG_FILE);   // nothing to load
+
+  gate.load(&fs);        // a reload must not inherit anything from before
+  EXPECT_FALSE(gate.isEnabled());
+  EXPECT_EQ(gate.getSuspendMilliVolts(), 0);
+  EXPECT_EQ(gate.getResumeMilliVolts(), 0);
+}
+
 TEST_F(BatteryGateTest, TruncatedFileGivesDefaults) {
   gate.setThresholds(3400, 3700);
   g_mock_millis = CFG_SAVE_DELAY_MS;

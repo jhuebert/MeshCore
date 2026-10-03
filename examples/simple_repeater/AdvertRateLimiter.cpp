@@ -2,14 +2,8 @@
 
 #include "AdvertRateLimiter.h"
 
-#include <string.h>
-
 AdvertRateLimiter::AdvertRateLimiter() {
-  memset(cache, 0, sizeof(cache));
-  cache_count = 0;
-  cache_head = 0;
-  hours = 0;
-  drops = 0;
+  reset();
 }
 
 void AdvertRateLimiter::clearCache() {
