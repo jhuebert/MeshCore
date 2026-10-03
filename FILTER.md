@@ -748,7 +748,7 @@ is only needed for initial flashing and emergencies.
   early drop rule can silence remote admin login from your app (login replies
   ride the flood path). Before enabling any catch-all drop rule, add a
   higher-priority `forward` rule that admits your own traffic — e.g.
-  `filter add 0 chan=<admin channel> action=forward`, or keep rule 0 as an
+  `filter add chan=<admin channel> action=forward`, or keep rule 0 as an
   `sender=<your name> action=forward`. Test it from the app while you still
   have serial access.
 
