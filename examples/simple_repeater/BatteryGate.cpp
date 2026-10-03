@@ -12,6 +12,15 @@
 #define BATT_RESUME_MARGIN_MV    200    // default resume = suspend + this
 #define BATT_USAGE "Err - usage: battery | battery off | battery <suspend-mV> [resume-mV]"
 
+// One definition of a usable pair of thresholds, shared by setThresholds(),
+// the CLI and load(), so a value the CLI refuses can never be applied by
+// another route. Both ends live in 1..10000 mV and resume must exceed suspend.
+static bool validThresholds(uint16_t suspend, uint16_t resume) {
+  if (suspend < BATT_MV_MIN || suspend > BATT_MV_MAX) return false;
+  if (resume < BATT_MV_MIN || resume > BATT_MV_MAX) return false;
+  return resume > suspend;
+}
+
 // The state a node starts in, and the baseline load() resets to before it
 // reads the file: gate off, no thresholds, nothing suspended. One definition,
 // so construction and reload cannot drift apart.
@@ -46,9 +55,7 @@ void BatteryGate::setEnabled(bool on) {
 }
 
 bool BatteryGate::setThresholds(uint16_t suspend, uint16_t resume) {
-  if (suspend < BATT_MV_MIN || suspend > BATT_MV_MAX) return false;
-  if (resume < BATT_MV_MIN || resume > BATT_MV_MAX) return false;
-  if (resume <= suspend) return false;
+  if (!validThresholds(suspend, resume)) return false;
 
   suspend_mV = suspend;
   resume_mV = resume;
@@ -97,13 +104,22 @@ void BatteryGate::load(FILESYSTEM* fs) {
     uint8_t rec[BATT_CFG_RECORD_BYTES];
     if (file.read(rec, BATT_CFG_RECORD_BYTES) == BATT_CFG_RECORD_BYTES &&
         rec[0] == BATT_CFG_VERSION) {
-      enabled = rec[1] != 0;
-      memcpy(&suspend_mV, &rec[2], 2);
-      memcpy(&resume_mV, &rec[4], 2);
-      if (resume_mV <= suspend_mV) {   // defensive: corrupted config
+      uint16_t s, r;
+      memcpy(&s, &rec[2], 2);
+      memcpy(&r, &rec[4], 2);
+      // A disabled gate may legitimately keep 0/0 (the shipped default) or
+      // retain real thresholds; anything else is a corrupt record. Validate the
+      // whole record on locals first, so a bad one never assigns live settings.
+      bool ok = (rec[1] == 0 && s == 0 && r == 0) ||
+                ((rec[1] == 0 || rec[1] == 1) && validThresholds(s, r));
+      if (!ok) {
         enabled = false;
         suspend_mV = 0;
         resume_mV = 0;
+      } else {
+        enabled = (rec[1] == 1);
+        suspend_mV = s;
+        resume_mV = r;
       }
     }
     file.close();
@@ -194,10 +210,19 @@ void batteryCLI(BatteryGate& gate, mesh::MainBoard& board, const char* command, 
         return;
       }
     } else {
-      res = susp + BATT_RESUME_MARGIN_MV;   // default hysteresis margin
+      // default hysteresis margin, computed wide enough not to wrap, and
+      // rejected if it would fall outside the accepted range — never clamped
+      long implicit_resume = (long)susp + BATT_RESUME_MARGIN_MV;
+      if (implicit_resume > BATT_MV_MAX) {
+        snprintf(reply, CLI_REPLY_MAX, "Err - default resume exceeds %umV; specify resume", BATT_MV_MAX);
+        return;
+      }
+      res = (uint16_t)implicit_resume;
     }
-    // range and hysteresis are both validated above, so this cannot fail
-    gate.setThresholds(susp, res);
+    if (!gate.setThresholds(susp, res)) {   // no path may report a rejected config as applied
+      badMilliVolts(cmd, reply);
+      return;
+    }
     snprintf(reply, CLI_REPLY_MAX, "OK - gate on; suspend <%umV; resume >=%umV", susp, res);
   }
 }
