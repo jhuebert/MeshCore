@@ -261,7 +261,7 @@ bool FilterRules::decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint32_t
   r->hits++;
   if (r->action == FILTER_ACT_DROP) {   // bill the airtime this drop saves
     r->air_ms += est_air_ms;
-    air_saved_ms += est_air_ms;
+    billSaved(est_air_ms);
   }
   out = r->action;
   return true;
@@ -402,12 +402,12 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
   if (content_verdict.pkt == pkt) {
     content_verdict.pkt = NULL;   // consume once, whatever the tag says
     if (memcmp(pkt_hash.get(), content_verdict.hash, MAX_HASH_SIZE) == 0) {
-      if (content_verdict.verdict != FILTER_ACT_DROP) air_evaluated_ms += est_air_ms;
+      if (content_verdict.verdict != FILTER_ACT_DROP) billEvaluated(est_air_ms);
       return content_verdict.verdict;
     }
   }
 
-  air_evaluated_ms += est_air_ms;
+  billEvaluated(est_air_ms);
   uint8_t payload_type = pkt->getPayloadType();
   uint8_t action = FILTER_ACT_ALLOW;
   for (int i = 0; i < num_rules; i++) {
@@ -420,7 +420,7 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
 
   // limiter runs unless the rule list already dropped; forward adverts too
   if (payload_type == PAYLOAD_TYPE_ADVERT && pkt->isRouteFlood() && limiter.drop(pkt, now_millis)) {
-    air_saved_ms += est_air_ms;   // a limiter drop saves the same airtime
+    billSaved(est_air_ms);   // a limiter drop saves the same airtime
     return FILTER_ACT_DROP;
   }
 
@@ -513,7 +513,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
-  if (verdict == FILTER_ACT_DROP) air_evaluated_ms += est_air_ms;
+  if (verdict == FILTER_ACT_DROP) billEvaluated(est_air_ms);
 
   // stash the verdict (allow included) for checkPacket(); a drop verdict
   // lingers (core marks the packet DoNotRetransmit and never calls
