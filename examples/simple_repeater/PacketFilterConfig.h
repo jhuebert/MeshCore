@@ -7,6 +7,13 @@
 //
 // NOTE: FilterRule::chan_mask is 16 bits wide; if FILTER_MAX_CHANNELS is
 // raised above 16, widen chan_mask accordingly (see PacketFilter.h).
+//
+// NOTE: FILTER_PATH_HASH_SLOTS and FILTER_REGION_LIST_LEN are not just
+// capacities: both live inside FilterRule, so changing either moves every
+// field after it and a config written by one build would not load in another.
+// PacketFilter.h static_asserts refuse to build when that happens; raising one
+// is a layout change that needs a FILTER_CFG_VERSION bump plus migration code
+// in load(), not an edit to this file alone.
 
 #ifndef _PACKET_FILTER_CONFIG_H
 #define _PACKET_FILTER_CONFIG_H

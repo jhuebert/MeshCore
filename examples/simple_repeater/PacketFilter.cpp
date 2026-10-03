@@ -737,7 +737,8 @@ static bool parsePath(const char* tok, FilterRule* r) {
   const char* s = tok;
   if (*s == '^') { r->path.pos = FILTER_PATH_FIRST; s++; }
 
-  char buf[4 * 9];
+  // worst case: every slot at its 8-hex-char maximum, plus the '>' separators
+  char buf[FILTER_PATH_HASH_SLOTS * 9];
   size_t tlen = strlen(s);
   if (tlen == 0 || tlen >= sizeof(buf)) return false;
   memcpy(buf, s, tlen + 1);
