@@ -2350,6 +2350,7 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     { "add path=zz", "Err - bad path spec" },          // not hex
     { "add path=A", "Err - bad path spec" },           // odd nibble
     { "add hsize=5", "Err - hsize values are 1..4" },
+    { "add hsize=2x", "Err - hsize values are 1..4" },   // atoi() would have read 2
     { "add chanhash=ABCD", "Err - chanhash must be 2 hex chars" },
     { "add chanhash=11223344", "Err - chanhash must be 2 hex chars" },   // fits a path entry, not chanhash
     { "add chan=nosuchchan", "Err - unknown chan" },   // non-# names must exist
@@ -2667,6 +2668,11 @@ TEST_F(FilterTest, RatelimitCommands) {
   EXPECT_EQ(cli(filter, "ratelimit advert 0"), "OK - advert ratelimit 0h");
   EXPECT_EQ(filter.getAdvertRatelimit(), 0);
   EXPECT_EQ(cli(filter, "ratelimit bogus"), "Err - usage: ratelimit advert <hours>|clear");
+  // a non-number must not be read as 0, which would silently turn the limiter off
+  EXPECT_EQ(cli(filter, "ratelimit advert abc"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(cli(filter, "ratelimit advert 12x"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(cli(filter, "ratelimit advert"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(filter.getAdvertRatelimit(), 0);
 }
 
 // ---------------------------------------------------------------- resetStats

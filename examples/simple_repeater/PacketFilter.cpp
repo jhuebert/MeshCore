@@ -589,8 +589,13 @@ void FilterRules::save(FILESYSTEM* fs) {
 
 // interval value: hops/len = unsigned decimal; snr = signed dB (snapped to the
 // quarter-dB grid, stored as quarter-dB int)
-static bool parseIvNum(const char* s, bool snr_mode, uint16_t* out) {
-  if (snr_mode) {
+// Which scale an Interval's endpoints are written in (FilterRule::snr stores
+// quarter-dB steps in the same int16 pair hops/len use as plain counts).
+enum IvUnit { IV_UNSIGNED,   // hops, len: plain decimal
+              IV_SNR_DB };    // snr: signed dB, snapped to the quarter-dB grid
+
+static bool parseIvNum(const char* s, IvUnit unit, uint16_t* out) {
+  if (unit == IV_SNR_DB) {
     char* end;
     float f = strtof(s, &end);
     if (end == s || *end != 0) return false;
@@ -598,42 +603,42 @@ static bool parseIvNum(const char* s, bool snr_mode, uint16_t* out) {
     if (q < -32768 || q > 32767) return false;
     *out = (uint16_t)(int16_t)q;
   } else {
-    char* end;
-    long v = strtol(s, &end, 10);
-    if (end == s || *end != 0 || v < 0 || v > 32767) return false;   // endpoints are compared as int16
+    long v;
+    if (!parseIntRange(s, 0, 32767, &v)) return false;   // endpoints are compared as int16
     *out = (uint16_t)v;
   }
   return true;
 }
 
 // "[a,b]" / "(a,*]" / bare value = exact; bracket/paren = inclusive/exclusive.
-// snr_mode: values are signed dB (e.g. "0.0", "-3.25").
-static bool parseInterval(const char* tok, Interval& iv, bool snr_mode) {
+// IV_SNR_DB: values are signed dB (e.g. "0.0", "-3.25").
+static bool parseInterval(const char* tok, Interval& iv, IvUnit unit) {
   memset(&iv, 0, sizeof(iv));
   if (tok[0] == '[' || tok[0] == '(') {
     uint8_t flags = (tok[0] == '[') ? FILTER_IV_LO_INC : 0;
     const char* comma = strchr(tok, ',');
     if (comma == NULL) return false;
     size_t len = strlen(tok);
-    char endc = tok[len - 1];
+    const char* hend = tok + len - 1;
+    char endc = *hend;
     if (endc != ']' && endc != ')') return false;
     flags |= (endc == ']') ? FILTER_IV_HI_INC : 0;
 
     char los[24], his[24];
-    size_t llen = comma - tok - 1;
-    size_t hlen = len - 1 - (size_t)(comma - tok) - 1;
+    size_t llen = (size_t)(comma - tok) - 1;
+    size_t hlen = (size_t)(hend - (comma + 1));
     if (llen == 0 || llen >= sizeof(los) || hlen == 0 || hlen >= sizeof(his)) return false;
     memcpy(los, tok + 1, llen); los[llen] = 0;
     memcpy(his, comma + 1, hlen); his[hlen] = 0;
 
     if (strcmp(los, "*") == 0) {
       flags |= FILTER_IV_LO_ANY;
-    } else if (!parseIvNum(los, snr_mode, &iv.lo)) {
+    } else if (!parseIvNum(los, unit, &iv.lo)) {
       return false;
     }
     if (strcmp(his, "*") == 0) {
       flags |= FILTER_IV_HI_ANY;
-    } else if (!parseIvNum(his, snr_mode, &iv.hi)) {
+    } else if (!parseIvNum(his, unit, &iv.hi)) {
       return false;
     }
     if ((flags & FILTER_IV_LO_ANY) && (flags & FILTER_IV_HI_ANY)) {
@@ -646,19 +651,19 @@ static bool parseInterval(const char* tok, Interval& iv, bool snr_mode) {
   }
 
   // bare value = exact
-  if (!parseIvNum(tok, snr_mode, &iv.lo)) return false;
+  if (!parseIvNum(tok, unit, &iv.lo)) return false;
   iv.hi = iv.lo;
   iv.flags = FILTER_IV_LO_INC | FILTER_IV_HI_INC;
   return true;
 }
 
-static void formatInterval(const Interval& iv, char* dest, size_t sz, bool snr_mode) {
+static void formatInterval(const Interval& iv, char* dest, size_t sz, IvUnit unit) {
   char lo[16], hi[16];
   if (iv.flags & FILTER_IV_LO_ANY) strcpy(lo, "*");
-  else if (snr_mode) snprintf(lo, sizeof(lo), "%.2f", (float)(int16_t)iv.lo / 4.0f);
+  else if (unit == IV_SNR_DB) snprintf(lo, sizeof(lo), "%.2f", (float)(int16_t)iv.lo / 4.0f);
   else snprintf(lo, sizeof(lo), "%u", iv.lo);
   if (iv.flags & FILTER_IV_HI_ANY) strcpy(hi, "*");
-  else if (snr_mode) snprintf(hi, sizeof(hi), "%.2f", (float)(int16_t)iv.hi / 4.0f);
+  else if (unit == IV_SNR_DB) snprintf(hi, sizeof(hi), "%.2f", (float)(int16_t)iv.hi / 4.0f);
   else snprintf(hi, sizeof(hi), "%u", iv.hi);
   snprintf(dest, sz, "%c%s,%s%c",
            (iv.flags & FILTER_IV_LO_INC) ? '[' : '(',
@@ -729,12 +734,21 @@ static bool setPattern(char* dest, size_t dest_sz, const char* pattern, const ch
   return false;
 }
 
+// Copy a comma-separated CLI value into a scratch buffer for strsep() to walk
+// in place. False if the value does not fit: a list is never truncated, so a
+// too-long one is a clean error instead of a silently shortened rule.
+static bool copyCsvList(const char* val, char* buf, size_t sz) {
+  size_t len = strlen(val);
+  if (len >= sz) return false;
+  memcpy(buf, val, len + 1);
+  return true;
+}
+
 static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
                          const char* key, const char* val, char* reply) {
   if (strcmp(key, "chan") == 0) {
     char names[80];
-    if (strlen(val) >= sizeof(names)) { strcpy(reply, "Err - chan list too long"); return false; }
-    strcpy(names, val);
+    if (!copyCsvList(val, names, sizeof(names))) { strcpy(reply, "Err - chan list too long"); return false; }
     char* np = names;
     char* nm;
     while ((nm = strsep(&np, ",")) != NULL) {
@@ -768,8 +782,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "type") == 0) {
     char vals[24];
-    if (strlen(val) >= sizeof(vals)) { strcpy(reply, "Err - bad type"); return false; }
-    strcpy(vals, val);
+    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad type"); return false; }
     char* vp = vals;
     char* t;
     while ((t = strsep(&vp, ",")) != NULL) {
@@ -787,16 +800,13 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     else { strcpy(reply, "Err - route must be flood|direct"); return false; }
     return true;
   }
-  if (strcmp(key, "hops") == 0) {
-    if (!parseInterval(val, r->hops, false)) { strcpy(reply, "Err - bad hops interval"); return false; }
-    return true;
-  }
-  if (strcmp(key, "len") == 0) {
-    if (!parseInterval(val, r->len, false)) { strcpy(reply, "Err - bad len interval"); return false; }
-    return true;
-  }
-  if (strcmp(key, "snr") == 0) {
-    if (!parseInterval(val, r->snr, true)) { strcpy(reply, "Err - bad snr interval"); return false; }
+  if (strcmp(key, "hops") == 0 || strcmp(key, "len") == 0 || strcmp(key, "snr") == 0) {
+    const bool is_snr = (strcmp(key, "snr") == 0);
+    Interval* iv = is_snr ? &r->snr : (strcmp(key, "hops") == 0 ? &r->hops : &r->len);
+    if (!parseInterval(val, *iv, is_snr ? IV_SNR_DB : IV_UNSIGNED)) {
+      snprintf(reply, CLI_REPLY_MAX, "Err - bad %s interval", key);
+      return false;
+    }
     return true;
   }
   if (strcmp(key, "path") == 0) {
@@ -808,8 +818,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "region") == 0) {
     char vals[80];
-    if (strlen(val) >= sizeof(vals)) { strcpy(reply, "Err - region list too long"); return false; }
-    strcpy(vals, val);
+    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - region list too long"); return false; }
     char list[FILTER_REGION_LIST_LEN];
     list[0] = 0;
     char* vp = vals;
@@ -834,20 +843,22 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "hsize") == 0) {
     char vals[12];
-    if (strlen(val) >= sizeof(vals)) { strcpy(reply, "Err - bad hsize"); return false; }
-    strcpy(vals, val);
+    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad hsize"); return false; }
     char* vp = vals;
     char* t;
     while ((t = strsep(&vp, ",")) != NULL) {
-      int v = atoi(t);
-      if (v < 1 || v > 4) { strcpy(reply, "Err - hsize values are 1..4"); return false; }
+      long v;
+      if (!parseIntRange(t, 1, 4, &v)) { strcpy(reply, "Err - hsize values are 1..4"); return false; }
       r->hash_size_mask |= (1 << (v - 1));
     }
     return true;
   }
-  if (strcmp(key, "sender") == 0) {
+  if (strcmp(key, "sender") == 0 || strcmp(key, "text") == 0) {
     if (val[0] == 0) { strcpy(reply, "Err - empty regex"); return false; }   // matches everything
-    return setPattern(r->sender, FILTER_SENDER_PATTERN_LEN, val, "sender", reply);
+    const bool is_sender = (strcmp(key, "sender") == 0);
+    return setPattern(is_sender ? r->sender : r->text,
+                      is_sender ? FILTER_SENDER_PATTERN_LEN : FILTER_TEXT_PATTERN_LEN,
+                      val, key, reply);
   }
   if (strcmp(key, "text") == 0) {
     if (val[0] == 0) { strcpy(reply, "Err - empty regex"); return false; }   // matches everything
@@ -860,9 +871,8 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return true;
   }
   if (strcmp(key, "prob") == 0) {
-    char* end;
-    long v = strtol(val, &end, 10);
-    if (end == val || *end != 0 || v < 1 || v > 100) {
+    long v;
+    if (!parseIntRange(val, 1, 100, &v)) {
       strcpy(reply, "Err - prob must be 1..100 (omit for 100%)");
       return false;
     }
@@ -870,9 +880,8 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return true;
   }
   if (strcmp(key, "throttle") == 0) {
-    char* end;
-    long v = strtol(val, &end, 10);
-    if (end == val || *end != 0 || v < 1 || v > 65535) {
+    long v;
+    if (!parseIntRange(val, 1, 65535, &v)) {
       strcpy(reply, "Err - throttle must be 1..65535 s (omit for no limit)");
       return false;
     }
@@ -1009,9 +1018,9 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (r->route_mask) radd(&out, &remain, " route=%s",
                           (r->route_mask & FILTER_ROUTE_FLOOD) ? "flood" : "direct");
   char ivs[24];
-  if (r->hops.flags) { formatInterval(r->hops, ivs, sizeof(ivs), false); radd(&out, &remain, " hops=%s", ivs); }
-  if (r->len.flags) { formatInterval(r->len, ivs, sizeof(ivs), false); radd(&out, &remain, " len=%s", ivs); }
-  if (r->snr.flags) { formatInterval(r->snr, ivs, sizeof(ivs), true); radd(&out, &remain, " snr=%s", ivs); }
+  if (r->hops.flags) { formatInterval(r->hops, ivs, sizeof(ivs), IV_UNSIGNED); radd(&out, &remain, " hops=%s", ivs); }
+  if (r->len.flags) { formatInterval(r->len, ivs, sizeof(ivs), IV_UNSIGNED); radd(&out, &remain, " len=%s", ivs); }
+  if (r->snr.flags) { formatInterval(r->snr, ivs, sizeof(ivs), IV_SNR_DB); radd(&out, &remain, " snr=%s", ivs); }
   if (r->path.count) {
     radd(&out, &remain, " path=%s", (r->path.pos & FILTER_PATH_FIRST) ? "^" : "");
     for (int e = 0; e < r->path.count; e++) {
@@ -1138,9 +1147,8 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
       snprintf(reply, CLI_REPLY_MAX, "ratelimit advert %uh; cache %d/%d", filter.getAdvertRatelimit(),
               filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
     } else if (strcmp(sub, "advert") == 0) {
-      char* hs = nextToken(&p);
-      long v = hs ? strtol(hs, NULL, 10) : -1;
-      if (v < 0 || v > FILTER_ADVERT_HOURS_MAX) {
+      long v;
+      if (!parseIntRange(nextToken(&p), 0, FILTER_ADVERT_HOURS_MAX, &v)) {
         snprintf(reply, CLI_REPLY_MAX, "Err - hours must be 0..%d (0=off)", FILTER_ADVERT_HOURS_MAX);
       } else {
         filter.setAdvertRatelimit((uint16_t)v);

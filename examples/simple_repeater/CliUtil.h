@@ -5,12 +5,14 @@
 //
 // nextToken() and radd() were previously duplicated (and had diverged) in
 // PacketFilter.cpp and BatteryGate.cpp — new CLI helpers belong here instead.
+// Same for parseIntRange(), which both CLIs spelled out per parameter.
 
 #ifndef _CLI_UTIL_H
 #define _CLI_UTIL_H
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // split the next space-separated token off in place; spaces inside double
 // quotes stay part of the token and the quote characters themselves are
@@ -51,6 +53,19 @@ inline void radd(char** out, int* remain, const char* fmt, ...) {
   if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
   *out += n;
   *remain -= n;
+}
+
+// Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
+// byte ("12x", "0x10"), an empty token and an out-of-range value are all
+// refused. Callers keep their own error wording, which is why this only
+// answers yes/no.
+inline bool parseIntRange(const char* tok, long lo, long hi, long* out) {
+  if (tok == NULL || tok[0] == 0) return false;
+  char* end;
+  long v = strtol(tok, &end, 10);
+  if (end == tok || *end != 0 || v < lo || v > hi) return false;
+  *out = v;
+  return true;
 }
 
 #endif
