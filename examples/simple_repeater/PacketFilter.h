@@ -256,6 +256,12 @@ public:
 private:
   // state of a fresh node, and the baseline load() resets to before reading
   void resetToDefaults();
+  // Airtime telemetry, both RAM-only. `billEvaluated` counts a packet that was
+  // looked at exactly once per packet — checkPacket() bills every packet it
+  // scans, except one checkContent() already dropped and billed there.
+  // `billSaved` counts airtime a drop or a limiter drop will not spend.
+  void billEvaluated(uint32_t est_air_ms) { air_evaluated_ms += est_air_ms; }
+  void billSaved(uint32_t est_air_ms) { air_saved_ms += est_air_ms; }
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob
