@@ -3919,8 +3919,6 @@ TEST_F(FilterTest, SearchChannelsSkipsAliasKeys) {
   bool found_other = false;
   uint8_t other_secret[PUB_KEY_SIZE] = {0};
   for (int i = 0; i < 16; i++) {
-    char t[3];
-    snprintf(t, sizeof(t), "%02x", (unsigned)(strtoul(other.substr(i * 2, 2).c_str(), NULL, 16)));
     other_secret[i] = (uint8_t)strtoul(other.substr(i * 2, 2).c_str(), NULL, 16);
   }
   for (int i = 0; i < n; i++) if (memcmp(dest[i].secret, other_secret, PUB_KEY_SIZE) == 0) found_other = true;
@@ -4387,7 +4385,6 @@ TEST_F(FilterTest, MoveForwardAndBackward) {
   expectOk(filter, "add hops=22");
   expectOk(filter, "add hops=33");
   ASSERT_EQ(cli(filter, "move 0 2"), "OK - rule 0 moved to 2");   // rule ends up AT index 2
-  EXPECT_LE(strlen("OK - rule 15 moved to 15"), (size_t)160);   // remote-CLI reply discipline
   EXPECT_EQ(filter.getRule(0)->hops.lo, 22);
   EXPECT_EQ(filter.getRule(1)->hops.lo, 33);
   EXPECT_EQ(filter.getRule(2)->hops.lo, 11);
