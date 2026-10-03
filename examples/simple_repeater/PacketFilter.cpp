@@ -614,6 +614,69 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // so a raw write/read is deterministic on a given platform; the version byte
 // guards against layout drift.
 
+// A config file is untrusted input, not a serialized live C++ object: these
+// bytes came off a flash filesystem and may be truncated, stale, or hand-made.
+// A record is adopted only if every field in it is one this firmware could
+// itself have written.
+//
+// Malformed values REJECT the record rather than being masked or clamped into
+// range. Sanitising would silently turn a rule into a *different* rule, and
+// because matching is first-match-wins that changes which rule decides a packet
+// — quietly losing a predicate is worse than not having the rule at all.
+static bool validRule(const FilterRule* r) {
+  if (r->action != FILTER_ACT_DROP && r->action != FILTER_ACT_FORWARD) return false;
+  const uint8_t type_bits = FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA;
+  if (r->type_mask & ~type_bits) return false;
+  if (r->route_mask & ~(FILTER_ROUTE_FLOOD | FILTER_ROUTE_DIRECT)) return false;
+
+  // interval predicates: known flag bits, and an endpoint pair that is not
+  // inverted (lo > hi can never be satisfied)
+  const uint8_t iv_bits = FILTER_IV_LO_INC | FILTER_IV_HI_INC | FILTER_IV_LO_ANY |
+                          FILTER_IV_HI_ANY | FILTER_IV_SET;
+  const Interval* ivs[3] = { &r->hops, &r->len, &r->snr };
+  for (int i = 0; i < 3; i++) {
+    if (ivs[i]->flags & ~iv_bits) return false;
+    if (!(ivs[i]->flags & (FILTER_IV_LO_ANY | FILTER_IV_LO_INC)) &&
+        !(ivs[i]->flags & (FILTER_IV_HI_ANY | FILTER_IV_HI_INC)) &&
+        (int32_t)ivs[i]->lo > (int32_t)ivs[i]->hi) return false;
+  }
+
+  // path: a chain shorter than its slot count, entries no wider than a hash,
+  // and an anchor this firmware knows
+  if (r->path.count > FILTER_PATH_HASH_SLOTS) return false;
+  if (r->path.pos & ~(FILTER_PATH_FIRST | FILTER_PATH_LAST)) return false;
+  for (uint8_t i = 0; i < r->path.count; i++) {
+    if (r->path.len[i] == 0 || r->path.len[i] > sizeof(r->path.bytes[i])) return false;
+  }
+  if (r->hash_size_mask & ~0x0F) return false;            // sizes 1..4
+
+  if (r->chan_flags & ~(FILTER_CHANFLG_MASK_SET | FILTER_CHANFLG_HASH_SET)) return false;
+  // A chan_mask naming a channel the file does not store is tolerated here and
+  // confined after the channels are known: narrowing a rule's scope can only
+  // make it match less, whereas rejecting the whole record would change which
+  // rule decides a packet. MASK_SET with an empty mask is legal — a chan= whose
+  // last channel was deleted is inert, never a wildcard.
+
+  // every stored string must be NUL-terminated inside its own storage
+  if (memchr(r->sender, 0, sizeof(r->sender)) == NULL) return false;
+  if (memchr(r->text, 0, sizeof(r->text)) == NULL) return false;
+  if (memchr(r->regions, 0, sizeof(r->regions)) == NULL) return false;
+
+  if (r->prob > 100) return false;                       // 0 = unset = 100 %
+  return true;
+}
+
+// A channel entry needs a name that fits and terminates, and a key length this
+// firmware uses. The stored hash is a derived byte, not an input, so any value
+// is accepted — but an empty name is not: it would occupy a slot that no rule
+// and no `chan del <name>` can ever refer to.
+static bool validChannel(const FilterChannel* c) {
+  if (c->name[0] == 0) return false;
+  if (memchr(c->name, 0, sizeof(c->name)) == NULL) return false;
+  if (c->secret_len != 16 && c->secret_len != 32) return false;
+  return true;
+}
+
 void FilterRules::load(FILESYSTEM* fs) {
   resetToDefaults();   // the file decides everything below; nothing survives from before
 
@@ -622,41 +685,82 @@ void FilterRules::load(FILESYSTEM* fs) {
   if (file) {
     uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
     uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
+    // Record sizes are the frozen literals, and the version map names versions
+    // outright rather than counting back from the current one.
     if (file.read(hdr, 1) == 1 &&
-        (ver = hdr[0], ver == FILTER_CFG_VERSION || ver == FILTER_CFG_VERSION - 1 ||
-         ver == FILTER_CFG_VERSION - 2 || ver == FILTER_CFG_VERSION - 3) &&
+        (ver = hdr[0], ver >= 3 && ver <= FILTER_CFG_VERSION) &&
         file.read(hdr, 4) == 4) {
-      enabled = hdr[0] != 0;
-      uint8_t nr = hdr[1] < FILTER_MAX_RULES ? hdr[1] : FILTER_MAX_RULES;
-      uint8_t nc = hdr[2] < FILTER_MAX_CHANNELS ? hdr[2] : FILTER_MAX_CHANNELS;
-      // load() accepts every version for which record-layout code exists
-      // (currently 3..6); older configs were discarded only because no layout
-      // code for them was kept
+      // The header describes the file's own SHAPE, so a bad one means we no
+      // longer know where the records are: reject the whole file rather than
+      // guess. (A bad *record* is different — sizes are fixed, so the next
+      // record is still locatable, which is why that case keeps a prefix.)
+      if (hdr[0] > 1 || hdr[1] > FILTER_MAX_RULES || hdr[2] > FILTER_MAX_CHANNELS) {
+        file.close();
+        return;
+      }
+      uint8_t nr = hdr[1];
+      uint8_t nc = hdr[2];
       size_t rule_bytes = (ver >= 6) ? FILTER_RULE_V6_BYTES
                         : (ver >= 4) ? FILTER_RULE_V4_BYTES
                                      : FILTER_RULE_V3_BYTES;
       uint16_t rl_hours;
       if (file.read((uint8_t*)&rl_hours, 2) == 2) {
+        if (rl_hours > FILTER_ADVERT_HOURS_MAX) {   // not a window this firmware writes
+          file.close();
+          return;
+        }
         limiter.setHours(rl_hours);
-        bool ok = true;
-        for (int i = 0; ok && i < nr; i++) {
-          ok = (file.read((uint8_t*)&rules[i], rule_bytes) == rule_bytes);
-          if (ok && ver < FILTER_CFG_VERSION - 1) {
+
+        // Read into locals and adopt only what validates, so a rejected record
+        // cannot leave a half-built object behind for a later rule to read.
+        // Records are fixed-size, so the valid PREFIX is what we keep: indices
+        // of surviving rules stay put, which the CLI's index semantics depend on.
+        FilterRule loaded[FILTER_MAX_RULES];
+        memset(loaded, 0, sizeof(loaded));   // RAM-only stats/state stay zero
+        int good_rules = 0;
+        for (int i = 0; i < nr; i++) {
+          uint8_t raw[FILTER_RULE_V6_BYTES];
+          if (file.read(raw, rule_bytes) != rule_bytes) break;   // truncated
+          // `enabled` is a bool, so a persisted byte it could never hold is
+          // unrepresentable in the converted field and cannot be range-checked
+          // there — it has to be refused while it is still just bytes.
+          if (raw[0] > 1) break;
+          memcpy(&loaded[i], raw, rule_bytes);
+          if (ver < 5) {
             // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
-            rules[i].prob = 0;
+            loaded[i].prob = 0;
           }
-          if (ok && rule_bytes == FILTER_RULE_V3_BYTES) {
+          if (rule_bytes == FILTER_RULE_V3_BYTES) {
             // v3 record: the read drags the old record's trailing padding bytes
             // into regions[0..1], so zero the whole regions field (predicate unset)
-            memset(rules[i].regions, 0, sizeof(rules[i].regions));
+            memset(loaded[i].regions, 0, sizeof(loaded[i].regions));
           }
+          if (!validRule(&loaded[i])) break;
+          good_rules++;
         }
-        for (int i = 0; ok && i < nc; i++) {
-          ok = (file.read((uint8_t*)&channels[i], FILTER_CHAN_PERSIST_BYTES) == FILTER_CHAN_PERSIST_BYTES);
+
+        FilterChannel loaded_ch[FILTER_MAX_CHANNELS];
+        memset(loaded_ch, 0, sizeof(loaded_ch));
+        int good_chans = 0;
+        for (int i = 0; i < nc; i++) {
+          if (file.read((uint8_t*)&loaded_ch[i], FILTER_CHAN_PERSIST_BYTES) != FILTER_CHAN_PERSIST_BYTES) break;
+          if (!validChannel(&loaded_ch[i])) break;
+          good_chans++;
         }
-        if (ok) {
-          num_rules = nr;
-          num_channels = nc;
+
+        enabled = hdr[0] != 0;
+        if (good_rules > 0) { memcpy(rules, loaded, good_rules * sizeof(FilterRule)); }
+        if (good_chans > 0) { memcpy(channels, loaded_ch, good_chans * sizeof(FilterChannel)); }
+        num_rules = good_rules;
+        num_channels = good_chans;
+        // a rule whose chan_mask named a channel we did not adopt is still
+        // adopted, but only after the mask is confined to the channels that
+        // exist: MASK_SET with no bits is the documented inert rule, never a
+        // catch-all (see section 5 of the review)
+        for (int i = 0; i < num_rules; i++) {
+          uint16_t keep = 0;
+          for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1 << c)) keep |= (1 << c);
+          rules[i].chan_mask = keep;
         }
       }
     }

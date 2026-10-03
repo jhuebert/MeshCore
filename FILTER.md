@@ -996,3 +996,5 @@ filter stats
 | "Bad/long regex" error | Pattern too long (see [Limits](#limits-and-good-to-knows)) or broken syntax; shorten or simplify |
 | `aborted` counter grows | Pattern too complex — simplify it |
 | Drop rule never fires | An earlier overlapping rule (often a `forward` probe) is matching first |
+| A rule vanished after a reboot | The saved config was truncated or corrupt. Rules load only if each record is one this firmware could have written; the records that survived keep their indices, and everything from the first bad record on is dropped. Add the missing rules again with `filter add` |
+| A rule with `chan=` matches nothing after removing a channel | Expected: deleting the last channel a rule named leaves the mask empty, and the rule stays inert rather than becoming a catch-all. Point it at a channel that exists, or drop the `chan=` |
