@@ -42,7 +42,6 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out) {
 // up to uint32_t alignment.
 #define FILTER_RULE_V3_PERSIST_BYTES  ((offsetof(FilterRule, regions) + (alignof(uint32_t) - 1)) \
                                        & ~(alignof(uint32_t) - 1))
-#define FILTER_SAVE_DELAY_MS   3000          // lazy dirty-write delay (like ClientACL)
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
 // ---------------------------------------------------------------- initialization
@@ -62,8 +61,6 @@ FilterRules::FilterRules() {
   air_evaluated_ms = 0;
   content_verdict.pkt = NULL;
   enabled = true;
-  dirty = false;
-  dirty_since = 0;
 }
 
 void FilterRules::begin(FILESYSTEM* fs) {
@@ -77,9 +74,7 @@ void FilterRules::begin(FILESYSTEM* fs) {
 }
 
 void FilterRules::loop(FILESYSTEM* fs) {
-  if (dirty && millis() - dirty_since >= FILTER_SAVE_DELAY_MS) {
-    save(fs);
-  }
+  if (save_flag.due()) save(fs);
 }
 
 // ---------------------------------------------------------------- enable / stats
@@ -575,11 +570,7 @@ void FilterRules::load(FILESYSTEM* fs) {
   enabled = true;
 
   if (!fs->exists(FILTER_CFG_FILE)) return;
-#if defined(RP2040_PLATFORM)
-  File file = fs->open(FILTER_CFG_FILE, "r");
-#else
-  File file = fs->open(FILTER_CFG_FILE);
-#endif
+  File file = fsOpenRead(fs, FILTER_CFG_FILE);
   if (file) {
     uint8_t hdr[5];   // version, enabled, num_rules, num_channels, (spare)
     uint8_t ver;      // version byte; hdr[] is reused for the remaining fields
@@ -623,20 +614,9 @@ void FilterRules::load(FILESYSTEM* fs) {
   }
 }
 
-static File filterOpenWrite(FILESYSTEM* fs, const char* filename) {
-  #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-    fs->remove(filename);
-    return fs->open(filename, FILE_O_WRITE);
-  #elif defined(RP2040_PLATFORM)
-    return fs->open(filename, "w");
-  #else
-    return fs->open(filename, "w", true);
-  #endif
-}
-
 void FilterRules::save(FILESYSTEM* fs) {
-  dirty = false;
-  File file = filterOpenWrite(fs, FILTER_CFG_FILE);
+  save_flag.clear();
+  File file = fsOpenWrite(fs, FILTER_CFG_FILE);
   if (file) {
     uint8_t hdr[5];
     hdr[0] = FILTER_CFG_VERSION;

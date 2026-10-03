@@ -31,6 +31,7 @@
 #include <helpers/RegionMap.h>       // RegionEntry (region= predicate)
 #include "PacketFilterConfig.h"
 #include "PatternMatch.h"
+#include "PersistUtil.h"
 
 // actions
 #define FILTER_ACT_ALLOW     0
@@ -169,8 +170,7 @@ class FilterRules {
     uint8_t verdict;          // FILTER_ACT_* (allow included)
   } content_verdict;
   bool enabled;
-  bool dirty;                 // needs save
-  unsigned long dirty_since;
+  LazySave save_flag;       // needs save, written back by loop()
 
 public:
   FilterRules();
@@ -228,7 +228,7 @@ public:
   uint16_t getAdvertRatelimit() const { return ratelimit_hours; }
   void clearAdvertCache();
   int getAdvertCacheCount() const { return advert_cache_count; }
-  void markDirty() { dirty = true; dirty_since = millis(); }
+  void markDirty() { save_flag.markDirty(); }
   uint32_t getLimiterDrops() const { return limiter_drops; }
   uint32_t getBudgetAborts() const { return budget_aborts; }
   uint64_t getAirSavedMs() const { return air_saved_ms; }   // airtime not relayed (drops)

@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include <Mesh.h>
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
+#include "PersistUtil.h"
 
 // accepted threshold range, in millivolts
 #define BATT_MV_MIN  1
@@ -38,8 +39,7 @@ class BatteryGate {
   uint8_t low_count;          // consecutive low readings (debounce)
   uint32_t drops;             // packets gated while suspended (RAM-only)
   unsigned long next_sample_at;
-  bool dirty;                 // needs save
-  unsigned long dirty_since;
+  LazySave save_flag;       // needs save, written back by loop()
 
 public:
   BatteryGate();
@@ -71,7 +71,7 @@ public:
   // take one reading and apply debounce + hysteresis
   void sample(mesh::MainBoard& board);
 
-  void markDirty() { dirty = true; dirty_since = millis(); }
+  void markDirty() { save_flag.markDirty(); }
 
   // persistence: thresholds and enabled flag only (never the suspended state)
   void load(FILESYSTEM* fs);
