@@ -199,7 +199,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   if (psk_hex == NULL || psk_hex[0] == 0) {
     if (name[0] != '#') return NULL;   // psk required for non-hash channels
     // hashtag channels are public-by-construction: secret = sha256(name)[0..15]
-    // (per the companion protocol; see plan §2.11)
+    // (per the companion protocol)
     uint8_t digest[32];
     mesh::Utils::sha256(digest, sizeof(digest), (const uint8_t*)name, strlen(name));
     memcpy(candidate.secret, digest, 16);
@@ -365,7 +365,7 @@ static bool intervalMatches(const Interval& iv, int32_t v) {
 // Path chain predicate: sliding window of adjacent hash entries over pkt->path.
 // Each entry is a prefix compare of min(rule_len, path_hash_size) bytes.
 // Binary per-entry compare, NOT hex-string matching (odd-nibble alignment and
-// variable entry sizes make string matching incorrect — plan §4.2a).
+// variable entry sizes make string matching incorrect).
 static bool pathMatches(const FilterRule* r, const mesh::Packet* pkt) {
   // A recorded path is the flood relay history. A routed-direct packet's path is
   // an itinerary between two endpoints, and a TRACE path collects SNRs rather

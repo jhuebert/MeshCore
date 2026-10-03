@@ -21,9 +21,10 @@
 
 struct AdvertSeenEntry {      // RAM-only; cleared on reboot
   uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
-                              // AdvertRateLimiter::drop); collision odds ~0.001%
-                              // per 256 distinct nodes, vanity-robust; worst
-                              // case is one falsely suppressed advert/window
+                              // KEY_OFFSETS in AdvertRateLimiter.cpp); collision
+                              // odds ~0.001% per 256 distinct nodes,
+                              // vanity-robust; worst case is one falsely
+                              // suppressed advert/window
   uint64_t first_seen_millis; // on this repeater's own 64-bit monotonic clock
 };
 
