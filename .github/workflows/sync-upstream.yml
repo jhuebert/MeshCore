@@ -40,7 +40,6 @@ jobs:
     name: Sync upstream and filter branches
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.gate.outputs.changed }}
       dev_changed: ${{ steps.gate.outputs.dev_changed }}
       stable_changed: ${{ steps.gate.outputs.stable_changed }}
     steps:
@@ -296,11 +295,6 @@ jobs:
           STABLE=false
           if [ "$MERGED" = "true" ]; then DEV=true; fi
           if [ "$STABLE_PUSHED" = "true" ]; then STABLE=true; fi
-          if [ "$DEV" = true ] || [ "$STABLE" = true ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
           echo "dev_changed=$DEV" >> $GITHUB_OUTPUT
           echo "stable_changed=$STABLE" >> $GITHUB_OUTPUT
 
