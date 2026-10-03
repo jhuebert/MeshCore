@@ -2990,17 +2990,76 @@ TEST_F(FilterTest, ThrottleForwardShadowCountsExcess) {
 }
 
 TEST_F(FilterTest, ThrottleWrapAround) {
-  // unsigned-subtraction timing: correct verdicts across the millis() wrap
+  // Real elapsed time is what governs the window. Before the 64-bit clock, the
+  // wrap made 16 real seconds read as 49.7 days, so this test's old expectation
+  // ("past the 30 s window") described a bug rather than a behaviour.
   expectOk(filter, "add type=advert throttle=30");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
 
   uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
   EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);   // free pass
-  // now has wrapped past 0 to ~16 s: 16.016 s elapsed, still over rate
+
+  // 32 ms later, across the wrap: still inside the 30 s window, so the rule decides
   EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
-  // wrapped and past the 30 s window: the next pass
-  EXPECT_EQ(filter.checkPacket(&pkt, 30016, nullptr), FILTER_ACT_ALLOW);
+
+  // ~30 s of REAL time later (also after the wrap): now it is the one that slips
+  EXPECT_EQ(filter.checkPacket(&pkt, 46000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);
+}
+
+// Advance the filter's monotonic clock by `total_ms`, the way a real loop would.
+// uptimeMillis() folds one 32-bit wrap at a time, so an idle period longer than
+// that only counts correctly if the loop kept ticking through it — which in
+// firmware it does, since FilterRules::loop() runs unconditionally. A single jump
+// of more than one wrap is not representable and must not be asked for.
+static uint32_t advanceFilterClock(FilterRules& filter, uint32_t from, uint64_t total_ms) {
+  const uint64_t STEP = 0xF0000000ULL;   // ~15.6 days, comfortably under one wrap
+  uint32_t t = from;
+  uint64_t done = 0;
+  while (done + STEP <= total_ms) {
+    t += (uint32_t)STEP;
+    filter.uptimeMillis(t);
+    done += STEP;
+  }
+  t += (uint32_t)(total_ms - done);
+  filter.uptimeMillis(t);
+  return t;
+}
+
+TEST_F(FilterTest, LongIdleBeyondOneMillisWrapIsStillTimedCorrectly) {
+  // The case a 32-bit clock cannot express at all: a rule dormant for longer than
+  // one full millis cycle. Unsigned subtraction read 49.7 days + 1 s as 1 s, so
+  // the returning packet was wrongly rate-limited; the 64-bit accumulator sees the
+  // real elapsed time and lets the window lapse.
+  expectOk(filter, "add type=advert throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);   // free pass, stamps
+
+  // just over 49.7 days of real uptime, crossing the 32-bit wrap many times
+  const uint64_t fifty_days = 50ULL * 24 * 3600 * 1000ULL;
+  EXPECT_EQ(filter.checkPacket(&pkt, (uint32_t)(fifty_days + 1000), nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);   // the window genuinely lapsed
+
+  // and the limiter agrees: an origin last relayed 50 days ago is not suppressed.
+  // The clock advances monotonically throughout, as millis() does.
+  filter.clearRules();   // the limiter is a separate concern from the throttle above
+  filter.setAdvertRatelimit(48);
+  uint32_t t = (uint32_t)(fifty_days + 2000);   // continue from where the clock is
+  uint8_t key[4] = { 0xA1, 0xA2, 0xA3, 0xA4 };
+  auto advert = makeAdvert(key);
+  EXPECT_EQ(forwardPacket(filter, advert, t), FILTER_ACT_ALLOW);
+
+  t = advanceFilterClock(filter, t, fifty_days);   // 50 days of uptime, ticked
+  auto later = makeAdvert(key);
+  later.transport_codes[0] = 3;
+  EXPECT_EQ(forwardPacket(filter, later, t), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+
+  // ... while inside the window it still suppresses, wrap or no wrap
+  auto soon = makeAdvert(key);
+  soon.transport_codes[0] = 4;
+  EXPECT_EQ(forwardPacket(filter, soon, t + 1000), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
