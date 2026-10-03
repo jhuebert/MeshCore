@@ -1083,7 +1083,7 @@ static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
 
 void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions) {
   char buf[MAX_PACKET_PAYLOAD + 1];
-  StrHelper::strzcpy(buf, command, sizeof(buf));
+  cliCopyCommand(buf, sizeof(buf), command);
   char* p = buf;
   char* cmd = nextToken(&p);
 

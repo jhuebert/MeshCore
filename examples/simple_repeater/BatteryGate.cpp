@@ -10,6 +10,7 @@
 #define BATT_SAMPLE_INTERVAL_MS  30000  // sample every 30 s
 #define BATT_DEBOUNCE_READINGS   2      // consecutive low readings to suspend
 #define BATT_RESUME_MARGIN_MV    200    // default resume = suspend + this
+#define BATT_USAGE "Err - usage: battery | battery off | battery <suspend-mV> [resume-mV]"
 
 // The state a node starts in, and the baseline load() resets to before it
 // reads the file: gate off, no thresholds, nothing suspended. One definition,
@@ -125,17 +126,25 @@ void BatteryGate::save(FILESYSTEM* fs) {
 
 // ---------------------------------------------------------------- CLI
 
-static bool parseMilliVolts(const char* tok, bool* numeric, uint16_t* out) {
-  *numeric = false;
-  if (tok == NULL || tok[0] == 0) return false;
-  for (const char* q = tok; *q; q++) {
-    if (*q < '0' || *q > '9') return false;
-  }
-  *numeric = true;
-  long v = strtol(tok, NULL, 10);
-  if (v < BATT_MV_MIN || v > BATT_MV_MAX) return false;
+static bool parseMilliVolts(const char* tok, uint16_t* out) {
+  long v;
+  if (!parseIntRange(tok, BATT_MV_MIN, BATT_MV_MAX, &v)) return false;
   *out = (uint16_t)v;
   return true;
+}
+
+// why a millivolt token was refused: all digits but out of range, or not a
+// number at all (which is a usage mistake, not a value mistake)
+static void badMilliVolts(const char* tok, char* reply) {
+  bool numeric = (tok != NULL && tok[0] != 0);
+  for (const char* q = tok; numeric && *q; q++) {
+    if (*q < '0' || *q > '9') numeric = false;
+  }
+  if (numeric) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - millivolts must be %d..%d", BATT_MV_MIN, BATT_MV_MAX);
+  } else {
+    snprintf(reply, CLI_REPLY_MAX, "%s", BATT_USAGE);
+  }
 }
 
 static void cliStatus(BatteryGate& gate, mesh::MainBoard& board, char* reply) {
@@ -155,8 +164,7 @@ static void cliStatus(BatteryGate& gate, mesh::MainBoard& board, char* reply) {
 
 void batteryCLI(BatteryGate& gate, mesh::MainBoard& board, const char* command, char* reply) {
   char buf[MAX_PACKET_PAYLOAD + 1];
-  strncpy(buf, command, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = 0;
+  cliCopyCommand(buf, sizeof(buf), command);
   char* p = buf;
   char* cmd = nextToken(&p);
 
@@ -164,40 +172,32 @@ void batteryCLI(BatteryGate& gate, mesh::MainBoard& board, const char* command, 
     cliStatus(gate, board, reply);
   } else if (strcmp(cmd, "off") == 0) {
     gate.setEnabled(false);
-    strcpy(reply, "OK - battery gate off");
+    snprintf(reply, CLI_REPLY_MAX, "OK - battery gate off");
   } else {
     uint16_t susp, res;
-    bool numeric;
-    if (!parseMilliVolts(cmd, &numeric, &susp)) {
-      if (numeric) {
-        sprintf(reply, "Err - millivolts must be %d..%d", BATT_MV_MIN, BATT_MV_MAX);
-      } else {
-        strcpy(reply, "Err - usage: battery | battery off | battery <suspend-mV> [resume-mV]");
-      }
+    if (!parseMilliVolts(cmd, &susp)) {
+      badMilliVolts(cmd, reply);
       return;
     }
     char* tok = nextToken(&p);
     if (tok != NULL) {
-      if (!parseMilliVolts(tok, &numeric, &res)) {
-        if (numeric) {
-          sprintf(reply, "Err - millivolts must be %d..%d", BATT_MV_MIN, BATT_MV_MAX);
-        } else {
-          strcpy(reply, "Err - usage: battery | battery off | battery <suspend-mV> [resume-mV]");
-        }
+      if (!parseMilliVolts(tok, &res)) {
+        badMilliVolts(tok, reply);
         return;
       }
       if (res <= susp) {
-        strcpy(reply, "Err - resume must be greater than suspend");
+        snprintf(reply, CLI_REPLY_MAX, "Err - resume must be greater than suspend");
         return;
       }
       if (nextToken(&p) != NULL) {
-        strcpy(reply, "Err - usage: battery | battery off | battery <suspend-mV> [resume-mV]");
+        snprintf(reply, CLI_REPLY_MAX, "%s", BATT_USAGE);
         return;
       }
     } else {
       res = susp + BATT_RESUME_MARGIN_MV;   // default hysteresis margin
     }
+    // range and hysteresis are both validated above, so this cannot fail
     gate.setThresholds(susp, res);
-    sprintf(reply, "OK - gate on; suspend <%umV; resume >=%umV", susp, res);
+    snprintf(reply, CLI_REPLY_MAX, "OK - gate on; suspend <%umV; resume >=%umV", susp, res);
   }
 }
