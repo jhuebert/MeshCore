@@ -712,6 +712,29 @@ TEST_F(FilterTest, PathNotMatchedOnDirectTraffic) {
   EXPECT_EQ(filter.checkPacket(&direct, 0, nullptr), FILTER_ACT_ALLOW);
 }
 
+// A recorded path is flood relay history. A routed-direct packet carries an
+// ITINERARY between two endpoints, and a TRACE path collects SNRs — neither is
+// relay history, so path bytes that would match a flood chain must not match.
+TEST_F(FilterTest, PathNeverMatchesRoutedDirectOrTrace) {
+  expectOk(filter, "add path=10");
+
+  auto direct = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(direct.path[0], 0x10);   // would match if route were ignored
+  EXPECT_EQ(filter.checkPacket(&direct, 0, nullptr), FILTER_ACT_ALLOW);
+
+  auto tdirect = makePacket(ROUTE_TYPE_TRANSPORT_DIRECT, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&tdirect, 0, nullptr), FILTER_ACT_ALLOW);
+
+  auto trace = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_TRACE, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&trace, 0, nullptr), FILTER_ACT_ALLOW);
+
+  // the flood equivalents still match — the predicate did not stop working
+  auto flood = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&flood, 0, nullptr), FILTER_ACT_DROP);
+  auto tflood = makePacket(ROUTE_TYPE_TRANSPORT_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&tflood, 0, nullptr), FILTER_ACT_DROP);
+}
+
 TEST_F(FilterTest, PathChainOutOfOrderNoMatch) {
   // 20>30 must appear as adjacent, in-order entries: 10 30 20 40 does not match
   expectOk(filter, "add path=20>30");
@@ -856,6 +879,96 @@ TEST_F(FilterTest, NoColonMeansAllText) {
   uint8_t raw[] = { 0, 0, 0, 0, TXT_TYPE_PLAIN, 'B', 'E', 'A', 'C', 'O', 'N', '!' };
   EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
             FILTER_ACT_DROP);
+}
+
+// The decrypted block is zero-padded to the packet buffer: parsing must stop at
+// the first NUL, and must not manufacture an empty sender that `^$` can match.
+TEST_F(FilterTest, GroupTextParsingStopsAtFirstNul) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // "Alice: hello", then padding. A colon sitting in the padding must not split
+  // a second (empty) sender out of the text.
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  raw[4] = TXT_TYPE_PLAIN;
+  memcpy(raw + 5, "Alice: hello", 12);
+  raw[40] = ':';            // well past the first NUL: this is padding
+  raw[41] = 'Z';
+
+  expectOk(filter, "add sender=^Alice$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // the text really is "hello": the padding colon was not treated as a separator
+  filter.clearRules();
+  expectOk(filter, "add text=^hello$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, MissingSenderFieldIsNotAnEmptySender) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // no colon at all: there is text but NO sender field, so `sender=^$` must not
+  // match an empty sender that was never there
+  expectOk(filter, "add sender=^$");
+  {
+    uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+    raw[4] = TXT_TYPE_PLAIN;
+    memcpy(raw + 5, "no sender here", 14);
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+              FILTER_ACT_ALLOW);
+  }
+
+  // a body that really is just ":" has an empty sender AND an empty text
+  filter.clearRules();
+  expectOk(filter, "add sender=^$");
+  expectOk(filter, "add text=^$");
+  {
+    uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+    raw[4] = TXT_TYPE_PLAIN;
+    raw[5] = ':';
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+              FILTER_ACT_DROP);
+  }
+}
+
+// The scratch sender buffer used to be 64 bytes: a longer name was truncated,
+// and everything past 63 bytes was invisible to sender= patterns.
+TEST_F(FilterTest, SenderBeyondSixtyFourBytesIsVisible) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // 100 'a' then 10 'Z': the tail only exists past the old 64-byte buffer
+  std::string name(100, 'a');
+  name += std::string(10, 'Z');
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  raw[4] = TXT_TYPE_PLAIN;
+  std::string body = name + ": hi";
+  memcpy(raw + 5, body.c_str(), body.size());
+
+  expectOk(filter, "add sender=ZZZZZZZZZZ$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // a start-anchored pattern spans the WHOLE name, Z tail included
+  filter.clearRules();
+  expectOk(filter, "add sender=^a+Z+$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // a name that is all 'a' does not satisfy the Z-anchored pattern
+  filter.clearRules();
+  expectOk(filter, "add sender=ZZZZZZZZZZ$");
+  {
+    uint8_t r2[MAX_PACKET_PAYLOAD] = {0};
+    r2[4] = TXT_TYPE_PLAIN;
+    std::string b2 = std::string(110, 'a') + ": hi";
+    memcpy(r2 + 5, b2.c_str(), b2.size());
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, r2, sizeof(r2), nullptr),
+              FILTER_ACT_ALLOW);
+  }
 }
 
 TEST_F(FilterTest, ShortPayloadParsesToEmpty) {
@@ -1620,8 +1733,21 @@ TEST_F(FilterTest, LoopSavesOnceWhenClean) {
 #include <string>
 
 #include "FilterTestHelpers.h"
+#include <SHA256.h>        // mockShaFinalizeCount(): packet-hash cost probe
 
 static const uint8_t PROB_KEY[4] = { 0x11, 0x22, 0x33, 0x44 };
+
+// Split a reply on spaces (test-only helper for parsing `filter list`).
+static std::vector<std::string> splitOnSpace(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ' ') { out.push_back(cur); cur.clear(); }
+    else cur += c;
+  }
+  out.push_back(cur);
+  return out;
+}
 
 // distinct packets: same shape, varying first payload byte (the packet hash
 // covers the payload, so each i rolls independently)
@@ -1629,6 +1755,36 @@ static mesh::Packet probAdvert(int i) {
   mesh::Packet p = makeAdvert(PROB_KEY);
   p.payload[0] = (uint8_t)i;   // not one of the advert-limiter key offsets
   return p;
+}
+
+// A rule that cannot fail the roll must not pay for a packet hash: the hash is
+// computed by Packet::calculatePacketHash(), so the mock SHA's finalize counter
+// is the observable cost.
+TEST_F(FilterTest, ProbUnsetRuleDoesNotHashThePacket) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  auto pkt = probAdvert(7);
+
+  mockShaFinalizeCount() = 0;
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);   // matched and dropped
+  EXPECT_EQ(mockShaFinalizeCount(), 0u);
+
+  // a rule that always passes the gate is still free
+  ASSERT_EQ(cli(filter, "add type=advert prob=100"), "OK - rule 1 added");
+  mockShaFinalizeCount() = 0;
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(mockShaFinalizeCount(), 0u);
+}
+
+TEST_F(FilterTest, ProbSetRuleHashesOncePerScan) {
+  // several nontrivial prob rules over one scan still share a single hash
+  ASSERT_EQ(cli(filter, "add type=advert prob=50 region=TestNorth"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "add type=advert prob=50 region=TestSouth"), "OK - rule 1 added");
+  ASSERT_EQ(cli(filter, "add type=advert prob=50"), "OK - rule 2 added");
+  auto pkt = probAdvert(3);
+
+  mockShaFinalizeCount() = 0;
+  filter.checkPacket(&pkt, 0, nullptr);   // verdict is whatever the roll says
+  EXPECT_EQ(mockShaFinalizeCount(), 1u);   // exactly one: shared across the scan
 }
 
 TEST_F(FilterTest, ProbParseRejectsInvalid) {
@@ -2209,6 +2365,81 @@ TEST_F(FilterTest, AddTypePredicate) {
             FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA);
 }
 
+// A repeated list key REPLACES the earlier value (as every scalar key already
+// did); alternatives inside one value still OR.
+TEST_F(FilterTest, RepeatedListPredicateReplaces) {
+  ASSERT_EQ(cli(filter, "add type=advert,txt type=txt"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->type_mask, FILTER_TYPE_GRP_TXT);
+
+  ASSERT_EQ(cli(filter, "add hsize=1,2,3 hsize=4"), "OK - rule 1 added");
+  EXPECT_EQ(filter.getRule(1)->hash_size_mask, 1 << 3);
+
+  // 'any' is the wildcard and wins even beside named types, in one value or
+  // as a later replacement
+  ASSERT_EQ(cli(filter, "add type=advert,any"), "OK - rule 2 added");
+  EXPECT_EQ(filter.getRule(2)->type_mask, 0);
+  ASSERT_EQ(cli(filter, "add type=advert type=any"), "OK - rule 3 added");
+  EXPECT_EQ(filter.getRule(3)->type_mask, 0);
+  // ... and a following named type replaces the wildcard again
+  ASSERT_EQ(cli(filter, "add type=any type=data"), "OK - rule 4 added");
+  EXPECT_EQ(filter.getRule(4)->type_mask, FILTER_TYPE_GRP_DATA);
+
+  // unknown and empty elements are still refused, and leave nothing behind
+  EXPECT_EQ(cli(filter, "add type=advert type=bogus").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 5);
+  EXPECT_EQ(cli(filter, "add type=advert,type=").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 5);
+}
+
+TEST_F(FilterTest, RepeatedChanPredicateReplaces) {
+  ASSERT_EQ(cli(filter, "chan add #a 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_EQ(cli(filter, "chan add #b 00112233445566778899aabbccddee00").substr(0, 3), "OK ");
+
+  // the second chan= wins: only #b is in the mask
+  ASSERT_EQ(cli(filter, "add chan=#a chan=#b"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 1 << filter.indexOfChannel("#b"));
+
+  // either order, and chanhash= is a separate predicate that survives
+  ASSERT_EQ(cli(filter, "add chanhash=E6 chan=#a"), "OK - rule 1 added");
+  EXPECT_EQ(filter.getRule(1)->chan_mask, 1 << filter.indexOfChannel("#a"));
+  EXPECT_NE(filter.getRule(1)->chan_flags & FILTER_CHANFLG_HASH_SET, 0);
+  ASSERT_EQ(cli(filter, "add chan=#a chanhash=E6"), "OK - rule 2 added");
+  EXPECT_EQ(filter.getRule(2)->chan_mask, 1 << filter.indexOfChannel("#a"));
+  EXPECT_NE(filter.getRule(2)->chan_flags & FILTER_CHANFLG_HASH_SET, 0);
+}
+
+TEST_F(FilterTest, RepeatedPathPredicateReplacesWholesale) {
+  // replacing a long chain with a short one must leave no stale path bytes
+  // behind, so it must be indistinguishable from adding the short chain
+  // directly — including the rule digest, which covers the path bytes
+  ASSERT_EQ(cli(filter, "add path=^11223344>55667788$ path=^11$"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "add path=^11$"), "OK - rule 1 added");
+
+  // `filter list` prints "<idx><e|d><D|F><3 hex digest>" per rule after the header
+  std::string l = cli(filter, "list");
+  std::vector<std::string> toks;
+  for (const std::string& t : splitOnSpace(l.substr(l.find(':') + 1))) {
+    if (!t.empty()) toks.push_back(t);
+  }
+  ASSERT_EQ(toks.size(), 2u);
+  std::string d0 = toks[0].substr(toks[0].size() - 3);
+  std::string d1 = toks[1].substr(toks[1].size() - 3);
+  EXPECT_EQ(d0, d1);
+}
+
+TEST_F(FilterTest, FailedLaterValueRollsBackAutoProvisionedChan) {
+  EXPECT_EQ(cli(filter, "add chan=#keep chan=#drop type=bogus").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  // both auto-provisioned names go: a failed add leaves no key behind
+  EXPECT_EQ(filter.findChannel("#keep"), nullptr);
+  EXPECT_EQ(filter.findChannel("#drop"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);   // only Public
+
+  // ... but a successful add may leave an earlier auto-provisioned name in place
+  ASSERT_EQ(cli(filter, "add chan=#keep chan=#drop").substr(0, 3), "OK ");
+  EXPECT_EQ(filter.getNumChannels(), 3);
+}
+
 TEST_F(FilterTest, AddRoutePredicate) {
   expectOk(filter, "add route=flood");
   EXPECT_EQ(filter.getRule(0)->route_mask, FILTER_ROUTE_FLOOD);
@@ -2586,16 +2817,173 @@ TEST_F(FilterTest, ChanAddErrors) {
   EXPECT_EQ(cli(filter, "chan"), cli(filter, "chan list"));   // bare = list
   EXPECT_EQ(cli(filter, "chan add"), "Err - usage: filter chan add <name> [<psk-hex>]");
   EXPECT_EQ(cli(filter, "chan add Public"), "Err - channel exists");
-  EXPECT_EQ(cli(filter, "chan add #x deadbeef"), "Err - bad psk or store full");  // odd length
+  EXPECT_EQ(cli(filter, "chan add #x deadbeef"), "Err - psk must be 32 or 64 hex chars");  // odd length
   std::string long_name(FILTER_CHAN_NAME_LEN, 'n');
   EXPECT_EQ(cli(filter, ("chan add " + long_name).c_str()), "Err - name too long");
   EXPECT_EQ(cli(filter, "chan del nosuch"), "Err - unknown channel");
 }
 
 TEST_F(FilterTest, ChanAddRejectsBadPskLength) {
-  // psk must decode to exactly 16 or 32 bytes
-  EXPECT_EQ(cli(filter, "chan add bad1 0011"), "Err - bad psk or store full");
-  EXPECT_EQ(cli(filter, "chan add bad2 001122334455667788990011223344556677"), "Err - bad psk or store full");
+  // psk must be exactly 16 or 32 bytes of hex
+  EXPECT_EQ(cli(filter, "chan add bad1 0011"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad2 001122334455667788990011223344556677"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad3 00112233445566778899001122334455667788"), "Err - psk must be 32 or 64 hex chars");  // 33 bytes
+  EXPECT_EQ(cli(filter, "chan add bad4 0011223344556677889900112233445566778899aabb"), "Err - psk must be 32 or 64 hex chars");  // 19 bytes, odd
+  EXPECT_EQ(cli(filter, "chan add bad5 zz112233445566778899001122334455"), "Err - bad psk or store full");  // 32 chars, not hex
+  EXPECT_EQ(filter.getNumChannels(), 1);   // none of them stored anything
+}
+
+TEST_F(FilterTest, ChanAddKeepsStoreIntactAfterRejectedKey) {
+  // a rejected key must not have written anywhere: the live store is unchanged
+  // and the next unused slot is still pristine
+  ASSERT_EQ(cli(filter, "chan add keep 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  uint8_t before[FILTER_MAX_CHANNELS];
+  memcpy(before, filter.getChannel(0), sizeof(before[0]));
+  FilterChannel snapshot_keep = *filter.getChannel(1);
+
+  EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff0011"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff00"), "Err - psk must be 32 or 64 hex chars");
+
+  EXPECT_EQ(filter.getNumChannels(), 2);   // no new entry either way
+  EXPECT_EQ(memcmp(before, filter.getChannel(0), sizeof(before[0])), 0);
+  EXPECT_EQ(filter.findChannel("bad"), nullptr);
+  // the slot the failed adds would have used is still empty
+  EXPECT_EQ(filter.getChannel(2)->name[0], 0);
+  EXPECT_EQ(memcmp(&snapshot_keep, filter.getChannel(1), sizeof(snapshot_keep)), 0);
+}
+
+TEST_F(FilterTest, ChanNameRejectsUnrepresentableChars) {
+  // a name has to survive a chan= list, so ',', '=', '"' and control chars are
+  // refused; an ordinary space is fine (quoted)
+  EXPECT_EQ(cli(filter, "chan add \"a,b\" 00112233445566778899aabbccddeeff"),
+            "Err - chan name must not contain , = \" or control chars");
+  EXPECT_EQ(cli(filter, "chan add \"a=b\" 00112233445566778899aabbccddeeff"),
+            "Err - chan name must not contain , = \" or control chars");
+  EXPECT_EQ(filter.getNumChannels(), 1);   // only Public
+
+  EXPECT_EQ(cli(filter, "chan add \"two words\" 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_NE(filter.findChannel("two words"), nullptr);
+}
+
+TEST_F(FilterTest, ChanNameValidationIsSharedByEveryCreationPath) {
+  // addChannel() is the single gate: the CLI, `filter add chan=#x`
+  // auto-provisioning and the direct API all refuse the same names
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  EXPECT_EQ(filter.addChannel("a,b", KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("a=b", KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("a\"b", KEY), nullptr);
+  std::string ctl = "a";
+  ctl += '\t';
+  ctl += "b";
+  EXPECT_EQ(filter.addChannel(ctl.c_str(), KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("ctrl\x01", KEY), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);
+  // hashtag names go through the same gate
+  EXPECT_EQ(filter.addChannel("#a,b", NULL), nullptr);
+
+  // a space is allowed through every path
+  ASSERT_NE(filter.addChannel("a b", KEY), nullptr);
+  EXPECT_EQ(cli(filter, "add chan=\"a b\""), "OK - rule 0 added");
+}
+
+TEST_F(FilterTest, QuotedChanNameSurvivesRuleRoundTrip) {
+  ASSERT_EQ(cli(filter, "chan add \"two words\" 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_EQ(cli(filter, "add chan=\"two words\""), "OK - rule 0 added");
+  // the printed value is quoted, so nextToken keeps it one token
+  std::string got = cli(filter, "get 0");
+  EXPECT_NE(got.find("chan=\"two words\""), std::string::npos);
+  // and feeding it back is accepted (predicate snippet only)
+  EXPECT_EQ(cli(filter, "add chan=\"two words\""), "OK - rule 1 added");
+}
+
+// Hex-encode a key buffer (test-only helper for the collision fixtures).
+static std::string hexKey(const uint8_t* k, size_t n) {
+  std::string s;
+  char t[3];
+  for (size_t i = 0; i < n; i++) { snprintf(t, sizeof(t), "%02x", k[i]); s += t; }
+  return s;
+}
+
+// A DIFFERENT 16-byte key whose on-air tag (sha256(secret)[0]) is `tag`. The
+// tag is one byte wide, so such a key always exists and turns up within a few
+// hundred tries — the collision group below is real, not simulated.
+static std::string findKeyWithTag(uint8_t tag) {
+  uint8_t key[16];
+  for (uint32_t n = 0; n < 200000u; n++) {
+    memset(key, 0, sizeof(key));
+    key[0] = n & 0xff;
+    key[1] = (n >> 8) & 0xff;
+    uint8_t h[32];
+    mesh::Utils::sha256(h, sizeof(h), key, sizeof(key));
+    if (h[0] == tag) return hexKey(key, sizeof(key));
+  }
+  return "";
+}
+
+TEST_F(FilterTest, ChanAddNotesSharedHashKeys) {
+  // core tries at most four distinct keys per on-air tag (Mesh.cpp); an alias of
+  // an existing key is free, a second DISTINCT key is worth saying out loud
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  std::string first = cli(filter, (std::string("chan add one ") + KEY).c_str());
+  EXPECT_NE(first.find("OK - chan one h="), std::string::npos);
+  EXPECT_EQ(first.find("multiple keys"), std::string::npos);
+
+  // same key under another name = alias: still one key on the tag
+  std::string alias = cli(filter, (std::string("chan add two ") + KEY).c_str());
+  EXPECT_NE(alias.find("OK - chan two h="), std::string::npos);
+  EXPECT_EQ(alias.find("multiple keys"), std::string::npos);
+
+  // a different key that collides on the same one-byte tag
+  std::string other = findKeyWithTag(filter.findChannel("one")->hash);
+  ASSERT_FALSE(other.empty());
+  std::string collide = cli(filter, ("chan add three " + other).c_str());
+  EXPECT_NE(collide.find("OK - chan three h="), std::string::npos);
+  EXPECT_NE(collide.find("multiple keys on this hash; core tries 4"), std::string::npos);
+}
+
+TEST_F(FilterTest, SearchChannelsSkipsAliasKeys) {
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  ASSERT_EQ(cli(filter, (std::string("chan add base ") + KEY).c_str()).substr(0, 3), "OK ");
+  uint8_t tag = filter.findChannel("base")->hash;
+  uint8_t h[1] = { tag };
+
+  // four aliases of one key: core sees a single candidate, not four
+  for (int i = 0; i < 4; i++) {
+    ASSERT_EQ(cli(filter, ("chan add alias" + std::to_string(i) + " " + KEY).c_str()).substr(0, 3), "OK ");
+  }
+  mesh::GroupChannel dest[4];
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 4), 1);
+
+  // add a genuinely different channel sharing the tag: without deduplication it
+  // would consume a fifth slot that core never has, so it would never decrypt
+  std::string other = findKeyWithTag(tag);
+  ASSERT_FALSE(other.empty());
+  ASSERT_EQ(cli(filter, ("chan add other " + other).c_str()).substr(0, 3), "OK ");
+
+  int n = filter.searchChannelsByHash(h, dest, 4);
+  ASSERT_EQ(n, 2);   // the alias group plus the distinct key both still fit
+  bool found_other = false;
+  uint8_t other_secret[PUB_KEY_SIZE] = {0};
+  for (int i = 0; i < 16; i++) {
+    char t[3];
+    snprintf(t, sizeof(t), "%02x", (unsigned)(strtoul(other.substr(i * 2, 2).c_str(), NULL, 16)));
+    other_secret[i] = (uint8_t)strtoul(other.substr(i * 2, 2).c_str(), NULL, 16);
+  }
+  for (int i = 0; i < n; i++) if (memcmp(dest[i].secret, other_secret, PUB_KEY_SIZE) == 0) found_other = true;
+  EXPECT_TRUE(found_other);
+}
+
+TEST_F(FilterTest, SearchChannelsRespectsCapacityAndFilterOff) {
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(cli(filter, ("chan add c" + std::to_string(i) + " " + KEY).c_str()).substr(0, 3), "OK ");
+  }
+  uint8_t h[1] = { filter.findChannel("c0")->hash };
+  mesh::GroupChannel dest[4];
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 0), 0);        // no capacity
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 1), 1);        // one slot: the alias group fits
+  filter.setEnabled(false);
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 4), 0);        // filter off: stock behaviour
 }
 
 TEST_F(FilterTest, ChanStoreFull) {
