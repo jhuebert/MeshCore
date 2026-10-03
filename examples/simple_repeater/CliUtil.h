@@ -13,6 +13,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // split the next space-separated token off in place; spaces inside double
 // quotes stay part of the token and the quote characters themselves are
@@ -35,6 +36,18 @@ inline char* nextToken(char** p) {
   *w = 0;
   *p = s;
   return t;
+}
+
+// Copy a command tail (everything after the verb) into a scratch buffer for
+// nextToken() to consume in place, truncating safely at the buffer size.
+// Deliberately dependency-free: both CLI handlers use it, and the battery
+// gate's host test build links neither StrHelper nor ltoa().
+inline void cliCopyCommand(char* buf, size_t sz, const char* command) {
+  if (sz == 0) return;
+  size_t n = strlen(command);
+  if (n >= sz) n = sz - 1;
+  memcpy(buf, command, n);
+  buf[n] = 0;
 }
 
 // all CLI reply buffers are 160 B: main.cpp uses char reply[160] (serial and
