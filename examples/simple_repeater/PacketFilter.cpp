@@ -144,10 +144,15 @@ void FilterRules::moveRule(int from, int to) {
 // ---------------------------------------------------------------- channel store
 
 FilterChannel* FilterRules::findChannel(const char* name) {
+  int i = indexOfChannel(name);
+  return i < 0 ? NULL : &channels[i];
+}
+
+int FilterRules::indexOfChannel(const char* name) const {
   for (int i = 0; i < num_channels; i++) {
-    if (strcmp(channels[i].name, name) == 0) return &channels[i];
+    if (strcmp(channels[i].name, name) == 0) return i;   // every slot below the count is named
   }
-  return NULL;
+  return -1;
 }
 
 FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
@@ -775,11 +780,12 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     char* nm;
     while ((nm = strsep(&np, ",")) != NULL) {
       if (nm[0] == 0 || (nm[0] == '#' && nm[1] == 0)) { strcpy(reply, "Err - empty chan name"); return false; }
-      FilterChannel* ch = filter.findChannel(nm);
-      if (ch == NULL && nm[0] == '#') {
-        ch = filter.addChannel(nm, NULL);   // auto-provision '#' names with derived PSK
+      int idx = filter.indexOfChannel(nm);
+      if (idx < 0 && nm[0] == '#') {
+        filter.addChannel(nm, NULL);   // auto-provision '#' names with derived PSK
+        idx = filter.indexOfChannel(nm);
       }
-      if (ch == NULL) {
+      if (idx < 0) {
         if (nm[0] == '#' && filter.getNumChannels() >= FILTER_MAX_CHANNELS) {
           strcpy(reply, "Err - chan store full");
         } else {
@@ -787,7 +793,6 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
         }
         return false;
       }
-      int idx = ch - filter.getChannel(0);
       r->chan_mask |= (1 << idx);
       r->chan_flags |= FILTER_CHANFLG_MASK_SET;
     }
@@ -917,15 +922,11 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
 // ---------------------------------------------------------------- CLI commands
 
 static void cliStatus(FilterRules& filter, char* reply) {
-  int used = 0;
-  for (int i = 0; i < filter.getNumChannels(); i++) {
-    if (filter.getChannel(i)->name[0] != 0) used++;
-  }
   char* out = reply;
   int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "%s; rules %d/%d; chans %d/%d; ratelimit advert %uh; cache %d/%d",
        filter.isEnabled() ? "on" : "off", filter.getNumRules(), FILTER_MAX_RULES,
-       used, FILTER_MAX_CHANNELS, filter.getAdvertRatelimit(),
+       filter.getNumChannels(), FILTER_MAX_CHANNELS, filter.getAdvertRatelimit(),
        filter.getAdvertRatelimit() ? filter.getAdvertCacheCount() : 0, FILTER_ADVERT_CACHE_SIZE);
   radd(&out, &remain, "; limiter %lu; aborted %lu", (unsigned long)filter.getLimiterDrops(),
        (unsigned long)filter.getBudgetAborts());
@@ -966,9 +967,9 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
   char* p = params;
   char* name = nextToken(&p);
   if (name == NULL) { strcpy(reply, "Err - usage: filter chan del <name>"); return; }
-  auto ch = filter.findChannel(name);
-  if (ch == NULL) { strcpy(reply, "Err - unknown channel"); return; }
-  filter.delChannel(ch - filter.getChannel(0));
+  int idx = filter.indexOfChannel(name);
+  if (idx < 0) { strcpy(reply, "Err - unknown channel"); return; }
+  filter.delChannel(idx);
   snprintf(reply, CLI_REPLY_MAX, "OK - chan %s deleted", name);
 }
 
