@@ -60,7 +60,6 @@ void FilterRules::resetToDefaults() {
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
-  content_verdict.pkt = NULL;
   enabled = true;
 }
 
@@ -608,8 +607,6 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   if (parsed) parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text), &has_text, &has_sender);
 
   uint8_t verdict = FILTER_ACT_ALLOW;
-  // Disabled or non-group traffic reaches no content scan, so it must also not
-  // carry a verdict over from an earlier sequence in this same receive.
   PacketHashCache pkt_hash(pkt);
   // one clock reading for the whole scan: the throttle gate stamps state that
   // checkPacket() writes too, and both phases read the same millis() clock
@@ -628,10 +625,8 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
   if (verdict == FILTER_ACT_DROP) billEvaluated(est_air_ms);
 
-  // stash the verdict (allow included) for checkPacket(); a drop verdict
-  // lingers (core marks the packet DoNotRetransmit and never calls
-  // checkPacket for it) until the next packet clears it by pointer or
-  // content-hash mismatch
+  // Stash the verdict for checkPacket() within this receive. Content drops skip
+  // that hook, so MyMesh::onRecvPacket() clears any unconsumed verdict on return.
   content_verdict.pkt = pkt;
   memcpy(content_verdict.hash, pkt_hash.get(), MAX_HASH_SIZE);   // same hash the roll uses
   content_verdict.verdict = verdict;
@@ -1039,21 +1034,11 @@ static bool setPattern(char* dest, size_t dest_sz, const char* pattern, const ch
   return false;
 }
 
-// Copy a comma-separated CLI value into a scratch buffer for strsep() to walk
-// in place. False if the value does not fit: a list is never truncated, so a
-// too-long one is a clean error instead of a silently shortened rule.
-static bool copyCsvList(const char* val, char* buf, size_t sz) {
-  size_t len = strlen(val);
-  if (len >= sz) return false;
-  memcpy(buf, val, len + 1);
-  return true;
-}
-
 static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
                          const char* key, const char* val, char* reply) {
   if (strcmp(key, "chan") == 0) {
     char names[80];
-    if (!copyCsvList(val, names, sizeof(names))) { strcpy(reply, "Err - chan list too long"); return false; }
+    if (!cliCopyCommand(names, sizeof(names), val)) { strcpy(reply, "Err - chan list too long"); return false; }
     uint16_t mask = 0;
     char* np = names;
     char* nm;
@@ -1091,7 +1076,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "type") == 0) {
     char vals[24];
-    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad type"); return false; }
+    if (!cliCopyCommand(vals, sizeof(vals), val)) { strcpy(reply, "Err - bad type"); return false; }
     uint8_t mask = 0;
     bool any = false;
     char* vp = vals;
@@ -1132,7 +1117,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "region") == 0) {
     char vals[80];
-    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - region list too long"); return false; }
+    if (!cliCopyCommand(vals, sizeof(vals), val)) { strcpy(reply, "Err - region list too long"); return false; }
     char list[FILTER_REGION_LIST_LEN];
     list[0] = 0;
     char* vp = vals;
@@ -1157,7 +1142,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   }
   if (strcmp(key, "hsize") == 0) {
     char vals[12];
-    if (!copyCsvList(val, vals, sizeof(vals))) { strcpy(reply, "Err - bad hsize"); return false; }
+    if (!cliCopyCommand(vals, sizeof(vals), val)) { strcpy(reply, "Err - bad hsize"); return false; }
     uint8_t mask = 0;
     char* vp = vals;
     char* t;
@@ -1314,9 +1299,6 @@ static void rollbackAdd(FilterRules& filter, int idx, int chans_before) {
 }
 
 static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* reply) {
-  // filterCLI() has already refused an unbalanced command, and the tokenizer
-  // cannot hand this tail an odd quote count: an odd quote in the verb would
-  // swallow the rest of the line and leave nothing here to misparse.
   FilterRule* r = filter.addRule();
   if (r == NULL) { strcpy(reply, "Err - rule list full"); return; }
   int idx = filter.getNumRules() - 1;
