@@ -14,7 +14,7 @@
 #include "CliUtil.h"        // CLI_REPLY_MAX
 
 // payload offsets the advert rate limiter samples its 4-byte origin key from
-// (mirrors the fixed KEY_OFFSETS in PacketFilter.cpp)
+// (mirrors the fixed KEY_OFFSETS in AdvertRateLimiter.cpp)
 static const uint8_t ADV_KEY_OFFSETS[4] = { 8, 14, 20, 26 };
 
 // Build a packet with the given header fields. mesh::Packet's constructor only
