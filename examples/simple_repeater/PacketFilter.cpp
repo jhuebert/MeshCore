@@ -1263,6 +1263,7 @@ static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
   char* name = nextToken(&p);
   char* psk = nextToken(&p);
   if (name == NULL) { strcpy(reply, "Err - usage: filter chan add <name> [<psk-hex>]"); return; }
+  if (!cliNoExtra(p, reply, "Err - usage: filter chan add <name> [<psk-hex>]")) return;
   if (strlen(name) >= FILTER_CHAN_NAME_LEN) { strcpy(reply, "Err - name too long"); return; }
   if (name[0] == '#' && name[1] == 0) { strcpy(reply, "Err - empty chan name"); return; }
   if (!validChannelName(name)) {
@@ -1295,6 +1296,7 @@ static void cliChanDel(FilterRules& filter, char* params, char* reply) {
   char* p = params;
   char* name = nextToken(&p);
   if (name == NULL) { strcpy(reply, "Err - usage: filter chan del <name>"); return; }
+  if (!cliNoExtra(p, reply, "Err - usage: filter chan del <name>")) return;
   int idx = filter.indexOfChannel(name);
   if (idx < 0) { strcpy(reply, "Err - unknown channel"); return; }
   filter.delChannel(idx);
