@@ -1473,7 +1473,8 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
       if (tok != NULL) {
         long v;
         if (!parseIntRange(tok, 0, FILTER_MAX_CHANNELS - 1, &v)) {
-          strcpy(reply, "Err - chan list start index must be 0..15");
+          snprintf(reply, CLI_REPLY_MAX, "Err - chan list start index must be 0..%d",
+                   FILTER_MAX_CHANNELS - 1);
           return;
         }
         start = (int)v;
