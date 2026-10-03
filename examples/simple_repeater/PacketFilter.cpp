@@ -716,8 +716,8 @@ static bool validChannel(const FilterChannel* c) {
 //
 // Returns false only when the file is unusable as a whole (bad header, truncated
 // header, or a ratelimit outside the documented range). A bad RECORD ends the
-// parse at that point and leaves the counts short: sizes are fixed, so the valid
-// prefix is what loads and surviving rules keep their indices.
+// RULE list at that point and leaves the rule count short: sizes are fixed, so
+// the valid prefix is what loads and surviving rules keep their indices.
 static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* chans_out,
                             bool& out_enabled, uint8_t& out_nr, uint8_t& out_nc,
                             uint16_t& out_rl) {
@@ -748,13 +748,20 @@ static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* ch
   out_rl = rl_hours;
   out_enabled = hdr[0] != 0;
 
+  // A bad record ends the rule list — the prefix that survived is what loads, and
+  // surviving rules keep their indices. The records after it are still consumed
+  // so the channel records stay at their own offset; reading channels from the
+  // middle of a rule record would adopt that rule's bytes as a channel.
+  bool bad_rule = false;
+  bool truncated = false;
   for (int i = 0; i < nr; i++) {
     uint8_t raw[FILTER_RULE_V6_BYTES];
-    if (file.read(raw, rule_bytes) != rule_bytes) break;   // truncated
+    if (file.read(raw, rule_bytes) != rule_bytes) { truncated = true; break; }   // truncated
+    if (bad_rule) continue;
     // `enabled` is a bool, so a persisted byte it could never hold is
     // unrepresentable in the converted field and cannot be range-checked there —
     // it has to be refused while it is still just bytes.
-    if (raw[0] > 1) break;
+    if (raw[0] > 1) { bad_rule = true; continue; }
     FilterRule probe;
     memset(&probe, 0, sizeof(probe));   // RAM-only stats/state stay zero
     memcpy(&probe, raw, rule_bytes);
@@ -767,10 +774,13 @@ static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* ch
       // regions[0..1], so zero the whole regions field (predicate unset)
       memset(probe.regions, 0, sizeof(probe.regions));
     }
-    if (!validRule(&probe)) break;
+    if (!validRule(&probe)) { bad_rule = true; continue; }
     if (rules_out) rules_out[i] = probe;
     out_nr++;
   }
+  // A truncated rule region leaves the channel offset unknown, so channels are
+  // read only when every rule record the header promised was there.
+  if (truncated) return true;
 
   for (int i = 0; i < nc; i++) {
     FilterChannel probe;
