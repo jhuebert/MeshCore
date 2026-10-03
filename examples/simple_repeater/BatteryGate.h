@@ -38,7 +38,13 @@ class BatteryGate {
   uint16_t resume_mV;         // resume when voltage rises to this (hysteresis)
   uint8_t low_count;          // consecutive low readings (debounce)
   uint32_t drops;             // packets gated while suspended (RAM-only)
-  unsigned long next_sample_at;
+  // Sampling schedule: an explicit "sample next loop" flag plus the time of the
+  // last sample. A deadline stored as an absolute millis() value cannot tell a
+  // wrapped deadline from an unarmed timer, and 0 as a sentinel conflates the
+  // two. uint32_t (not unsigned long) so host tests model the MCU's 32-bit
+  // millis() wrap.
+  uint32_t last_sample_ms;
+  bool sample_pending;
   LazySave save_flag;         // needs save, written back by loop()
 
 public:

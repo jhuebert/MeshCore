@@ -1811,6 +1811,93 @@ TEST_F(FilterTest, RuleReferencingAnAbsentChannelIsConfinedNotWidened) {
   EXPECT_NE(r2.getRule(0)->chan_flags & FILTER_CHANFLG_MASK_SET, 0);   // still set, matches nothing
 }
 
+// A failed save must stay pending but back off: due() staying true on every
+// loop would reopen and truncate the file at firmware-loop speed.
+TEST_F(FilterTest, FailedSaveRetriesSlowlyNotEveryLoop) {
+  filter.addRule();
+  filter.markDirty();
+
+  NativeFS broken;
+  broken.fail_open = true;   // every open for writing fails
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  for (int i = 0; i < 100; i++) filter.loop(&broken);   // high loop frequency
+
+  // 100 loops in the same instant must NOT mean 100 open attempts: a failing
+  // filesystem used to be opened and truncated at firmware-loop speed
+  EXPECT_LE(broken.write_open_attempts, 1u);
+  EXPECT_FALSE(broken.exists(CFG_FILE));
+
+  // once the delay has passed again it tries again, and succeeds when it can
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_GT(fs.files[CFG_FILE].size(), 0u);
+}
+
+TEST_F(FilterTest, FailedWriteKeepsTheEditPending) {
+  filter.addRule();
+  filter.markDirty();
+
+  NativeFS broken;
+  broken.fail_write = true;   // opens fine, accepts nothing
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&broken);
+  // a partial write must not be mistaken for a committed config
+  EXPECT_TRUE(broken.files[CFG_FILE].empty());
+
+  broken.fail_write = false;
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  filter.loop(&broken);
+  EXPECT_GT(broken.files[CFG_FILE].size(), 0u);
+}
+
+TEST_F(FilterTest, RetryDelaySurvivesAMillisWrap) {
+  // stamp an edit just before the 32-bit wrap, then let the delay elapse across
+  // it: the retry must still become due exactly once the delay has passed, and
+  // not before — the elapsed time has to be computed in 32 bits
+  filter.addRule();
+  g_mock_millis = 0xFFFFFF00u;   // ~256 ms before UINT32_MAX
+  filter.markDirty();            // the edit is stamped just before the wrap
+
+  g_mock_millis = 0xFFFFFFFFu;
+  filter.loop(&fs);              // 255 ms elapsed: still inside the delay
+  EXPECT_FALSE(fs.exists(CFG_FILE));
+
+  g_mock_millis += 1;            // wrapped to 0
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // 256 ms: still inside the delay
+
+  g_mock_millis += CFG_SAVE_DELAY_MS;     // now past it, measured across the wrap
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+}
+
+TEST_F(FilterTest, ReloadCancelsPendingEdits) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+
+  filter.load(&fs);   // the file decides everything; a pending edit must not survive it
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // nothing resurrected a pre-load edit
+}
+
+TEST_F(FilterTest, DebounceAndWrapBoundaries) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = 0;
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // 0 ms: inside the debounce
+
+  g_mock_millis = CFG_SAVE_DELAY_MS - 1;
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // one millisecond short
+
+  g_mock_millis += 1;
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));    // exactly the delay
+}
+
 TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   filter.addRule();
   filter.setEnabled(false);
