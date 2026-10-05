@@ -109,7 +109,8 @@ jobs:
             BRANCH="repeater-filter"
             BASE_REF="origin/dev"
           fi
-          # via env, not ${{ }}: input text must never become shell syntax
+          # via env, not an Actions expression: input text must never become
+          # shell syntax
           if [ -n "$BRANCH_INPUT" ]; then BRANCH="$BRANCH_INPUT"; fi
           # recorded so the release can name the exact revision it came from
           SHORT_SHA=$(git rev-parse --short HEAD)
