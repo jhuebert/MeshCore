@@ -28,9 +28,29 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #include "FilterTestHelpers.h"
+
+// The on-disk config path and the lazy-save delay, mirroring PacketFilter.cpp.
+static constexpr uint8_t CFG_VERSION = 6;
+static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
+static const char* CFG_FILE = "/filter_cfg";
+
+static std::vector<std::string> splitOnSpace(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ' ') { out.push_back(cur); cur.clear(); }
+    else cur += c;
+  }
+  out.push_back(cur);
+  return out;
+}
+
+
 
 // ============================================================
 // UNIT TESTS: TinyRegex (vendored tiny-regex-c + step budget)
@@ -342,7 +362,9 @@ TEST(PatternMatchValidation, LegacyPipePatternsKeepTheirUsableBranches) {
   EXPECT_TRUE(patternMatches("|A", "A"));
   EXPECT_FALSE(patternMatches("|A", "zz"));
   EXPECT_FALSE(patternMatches("", "anything"));   // empty pattern is never a wildcard
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  patternMatches("A||B", "A", &aborted);
+  EXPECT_FALSE(aborted);
 }
 
 TEST(PatternMatchValidation, OverLongPatternIsRejectedNotTruncated) {
@@ -350,9 +372,10 @@ TEST(PatternMatchValidation, OverLongPatternIsRejectedNotTruncated) {
   // the API must still refuse it instead of reading past its split buffer
   std::string over(FILTER_SENDER_PATTERN_LEN + FILTER_TEXT_PATTERN_LEN, 'a');
   EXPECT_EQ(why(over.c_str()), "");     // no wrapper reason: the caller's length check
-  EXPECT_FALSE(patternMatches(over.c_str(), "aa"));
-  EXPECT_FALSE(patternMatches(over.c_str(), over.c_str()));
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  EXPECT_FALSE(patternMatches(over.c_str(), "aa", &aborted));
+  EXPECT_FALSE(patternMatches(over.c_str(), over.c_str(), &aborted));
+  EXPECT_FALSE(aborted);
 }
 
 TEST(PatternMatchValidation, GroupedSpellingSplitsAtThePipe) {
@@ -385,12 +408,14 @@ TEST(PatternMatchNoAlternation, UnchangedDialectWithoutPipe) {
 
 TEST(PatternMatchBudget, AbortStopsEvaluationAndIsReported) {
   re_set_step_budget(10);
-  EXPECT_FALSE(patternMatches("a*a*a*a*a*b|a*a*a*a*a*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-  EXPECT_TRUE(patternAborted());
+  bool aborted = false;
+  EXPECT_FALSE(patternMatches("a*a*a*a*a*b|a*a*a*a*a*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &aborted));
+  EXPECT_TRUE(aborted);
 
-  // a cheap pattern afterwards clears the flag (as the engine does per call)
-  EXPECT_TRUE(patternMatches("abc|cde", "xxabcxx"));
-  EXPECT_FALSE(patternAborted());
+  // the flag is written per call, so a cheap pattern afterwards reports its own
+  // result (as the engine does per call)
+  EXPECT_TRUE(patternMatches("abc|cde", "xxabcxx", &aborted));
+  EXPECT_FALSE(aborted);
   re_set_step_budget(5000);   // restore the compiled-in default
 }
 
@@ -398,8 +423,9 @@ TEST(PatternMatchBudget, BudgetIsPerAlternative) {
   // each alternative gets the full budget, so a later branch can still match
   // after an expensive earlier one that ran out of patience
   re_set_step_budget(20);
-  EXPECT_TRUE(patternMatches("a*a*a*a*a*b|abc", "abc"));
-  EXPECT_FALSE(patternAborted());
+  bool aborted = true;
+  EXPECT_TRUE(patternMatches("a*a*a*a*a*b|abc", "abc", &aborted));
+  EXPECT_FALSE(aborted);
   re_set_step_budget(5000);
 }
 
@@ -574,7 +600,9 @@ TEST_F(FilterTest, LenInterval) {
   expectOk(filter, "add len=[180,*]");
   auto short_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
   auto edge = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 180);
-  auto long_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 200);
+  // the largest payload the packet buffer can hold; there is no 200-byte
+  // packet the firmware could process
+  auto long_pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, MAX_PACKET_PAYLOAD);
   EXPECT_EQ(filter.checkPacket(&short_pkt, 0, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.checkPacket(&edge, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.checkPacket(&long_pkt, 0, nullptr), FILTER_ACT_DROP);
@@ -620,6 +648,9 @@ TEST_F(FilterTest, HashSizePredicate) {
   expectOk(filter, "add hsize=2,3");
   auto h1 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
   auto h2 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 2, 2);
+  // hsize=4 is artificial: Packet::setPath rejects hash_size 4 as reserved for
+  // future use (Packet.cpp), so no such packet can arrive. This case only
+  // exercises the matcher's arithmetic — it is not on-air coverage.
   auto h4 = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 4, 2);
   EXPECT_EQ(filter.checkPacket(&h1, 0, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.checkPacket(&h2, 0, nullptr), FILTER_ACT_DROP);
@@ -699,6 +730,29 @@ TEST_F(FilterTest, PathNotMatchedOnDirectTraffic) {
   expectOk(filter, "add path=10");
   auto direct = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_GRP_TXT, 10, 1, 0);
   EXPECT_EQ(filter.checkPacket(&direct, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+// A recorded path is flood relay history. A routed-direct packet carries an
+// ITINERARY between two endpoints, and a TRACE path collects SNRs — neither is
+// relay history, so path bytes that would match a flood chain must not match.
+TEST_F(FilterTest, PathNeverMatchesRoutedDirectOrTrace) {
+  expectOk(filter, "add path=10");
+
+  auto direct = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(direct.path[0], 0x10);   // would match if route were ignored
+  EXPECT_EQ(filter.checkPacket(&direct, 0, nullptr), FILTER_ACT_ALLOW);
+
+  auto tdirect = makePacket(ROUTE_TYPE_TRANSPORT_DIRECT, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&tdirect, 0, nullptr), FILTER_ACT_ALLOW);
+
+  auto trace = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_TRACE, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&trace, 0, nullptr), FILTER_ACT_ALLOW);
+
+  // the flood equivalents still match — the predicate did not stop working
+  auto flood = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&flood, 0, nullptr), FILTER_ACT_DROP);
+  auto tflood = makePacket(ROUTE_TYPE_TRANSPORT_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 2);
+  EXPECT_EQ(filter.checkPacket(&tflood, 0, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, PathChainOutOfOrderNoMatch) {
@@ -845,6 +899,96 @@ TEST_F(FilterTest, NoColonMeansAllText) {
   uint8_t raw[] = { 0, 0, 0, 0, TXT_TYPE_PLAIN, 'B', 'E', 'A', 'C', 'O', 'N', '!' };
   EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
             FILTER_ACT_DROP);
+}
+
+// The decrypted block is zero-padded to the packet buffer: parsing must stop at
+// the first NUL, and must not manufacture an empty sender that `^$` can match.
+TEST_F(FilterTest, GroupTextParsingStopsAtFirstNul) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // "Alice: hello", then padding. A colon sitting in the padding must not split
+  // a second (empty) sender out of the text.
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  raw[4] = TXT_TYPE_PLAIN;
+  memcpy(raw + 5, "Alice: hello", 12);
+  raw[40] = ':';            // well past the first NUL: this is padding
+  raw[41] = 'Z';
+
+  expectOk(filter, "add sender=^Alice$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // the text really is "hello": the padding colon was not treated as a separator
+  filter.clearRules();
+  expectOk(filter, "add text=^hello$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+}
+
+TEST_F(FilterTest, MissingSenderFieldIsNotAnEmptySender) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // no colon at all: there is text but NO sender field, so `sender=^$` must not
+  // match an empty sender that was never there
+  expectOk(filter, "add sender=^$");
+  {
+    uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+    raw[4] = TXT_TYPE_PLAIN;
+    memcpy(raw + 5, "no sender here", 14);
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+              FILTER_ACT_ALLOW);
+  }
+
+  // a body that really is just ":" has an empty sender AND an empty text
+  filter.clearRules();
+  expectOk(filter, "add sender=^$");
+  expectOk(filter, "add text=^$");
+  {
+    uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+    raw[4] = TXT_TYPE_PLAIN;
+    raw[5] = ':';
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+              FILTER_ACT_DROP);
+  }
+}
+
+// The scratch sender buffer used to be 64 bytes: a longer name was truncated,
+// and everything past 63 bytes was invisible to sender= patterns.
+TEST_F(FilterTest, SenderBeyondSixtyFourBytesIsVisible) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  // 100 'a' then 10 'Z': the tail only exists past the old 64-byte buffer
+  std::string name(100, 'a');
+  name += std::string(10, 'Z');
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  raw[4] = TXT_TYPE_PLAIN;
+  std::string body = name + ": hi";
+  memcpy(raw + 5, body.c_str(), body.size());
+
+  expectOk(filter, "add sender=ZZZZZZZZZZ$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // a start-anchored pattern spans the WHOLE name, Z tail included
+  filter.clearRules();
+  expectOk(filter, "add sender=^a+Z+$");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+
+  // a name that is all 'a' does not satisfy the Z-anchored pattern
+  filter.clearRules();
+  expectOk(filter, "add sender=ZZZZZZZZZZ$");
+  {
+    uint8_t r2[MAX_PACKET_PAYLOAD] = {0};
+    r2[4] = TXT_TYPE_PLAIN;
+    std::string b2 = std::string(110, 'a') + ": hi";
+    memcpy(r2 + 5, b2.c_str(), b2.size());
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, r2, sizeof(r2), nullptr),
+              FILTER_ACT_ALLOW);
+  }
 }
 
 TEST_F(FilterTest, ShortPayloadParsesToEmpty) {
@@ -1077,19 +1221,30 @@ TEST_F(FilterTest, SearchChannelsByHashDisabledWhenFilterOff) {
 
 #include "FilterTestHelpers.h"
 
+// Emulate MyMesh::allowPacketForward(): the filter check, and — only when the
+// packet survives it — the commit at the successful end of the forwarding hook.
+// Checking alone no longer starts an advert's rate-limit window, so a limiter
+// test that only calls checkPacket() is not exercising the real path.
+static uint8_t forwardPacket(FilterRules& filter, const mesh::Packet& pkt, uint32_t now_millis,
+                             const RegionEntry* region = nullptr, uint32_t est_air_ms = 0) {
+  uint8_t action = filter.checkPacket(&pkt, now_millis, region, est_air_ms);
+  if (action != FILTER_ACT_DROP) filter.onForwardAllowed(&pkt, now_millis);
+  return action;
+}
+
 TEST_F(FilterTest, FirstAdvertRecordedRepeatDropped) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0xDE, 0xAD, 0xBE, 0xEF };
   auto pkt = makeAdvert(key);
 
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 
   // repeat flood advert within the 48h window (transport codes set to make a
   // distinct packet, same origin key)
   pkt.transport_codes[0] = 0x4242;
-  EXPECT_EQ(filter.checkPacket(&pkt, 5000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 5000), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);   // repeat not re-recorded
 }
@@ -1100,12 +1255,12 @@ TEST_F(FilterTest, DistinctOriginsTrackedIndependently) {
   uint8_t k2[4] = { 5, 6, 7, 8 };
   auto a1 = makeAdvert(k1);
   auto a2 = makeAdvert(k2)  ;
-  EXPECT_EQ(filter.checkPacket(&a1, 1000, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(filter.checkPacket(&a2, 1100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, a1, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, a2, 1100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 2);
 
   auto a1b = makeAdvert(k1);
-  EXPECT_EQ(filter.checkPacket(&a1b, 2000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, a1b, 2000, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
@@ -1114,12 +1269,12 @@ TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
   auto pkt = makeAdvert(key);
 
   uint32_t t0 = 1000;
-  EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
   // at exactly the window boundary the advert is allowed again...
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
   // ...and the window restarts from that moment
-  EXPECT_EQ(filter.checkPacket(&pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, TimingIsWrapSafe) {
@@ -1128,11 +1283,11 @@ TEST_F(FilterTest, TimingIsWrapSafe) {
   auto pkt = makeAdvert(key);
 
   uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
-  EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
   // now has wrapped past 0 to ~16s: still inside the 1h window
-  EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 16000, nullptr), FILTER_ACT_DROP);
   // wrapped and past the window: allowed, entry refreshed
-  EXPECT_EQ(filter.checkPacket(&pkt, 3600UL * 1000 + 16000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 3600UL * 1000 + 16000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
@@ -1146,14 +1301,14 @@ TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
     pkt.payload[ADV_KEY_OFFSETS[1]] = 0x55;
     pkt.payload[ADV_KEY_OFFSETS[2]] = (uint8_t)(i >> 8);
     pkt.payload[ADV_KEY_OFFSETS[3]] = (uint8_t)(i >> 16);
-    EXPECT_EQ(filter.checkPacket(&pkt, 1000 + i, nullptr), FILTER_ACT_ALLOW);
+    EXPECT_EQ(forwardPacket(filter, pkt, 1000 + i, nullptr), FILTER_ACT_ALLOW);
   }
   EXPECT_EQ(filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
 
   // origin 0 is the oldest: one more advert evicts it
   uint8_t extra[4] = { 0xAA, 0xBB, 0xCC, 0xDD };
   auto extra_pkt = makeAdvert(extra);
-  EXPECT_EQ(filter.checkPacket(&extra_pkt, 5000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, extra_pkt, 5000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), FILTER_ADVERT_CACHE_SIZE);
 
   // origin 0 has been evicted, so it is recorded fresh instead of dropped
@@ -1161,7 +1316,7 @@ TEST_F(FilterTest, RingCacheEvictsOldestOrigin) {
   pkt.payload[ADV_KEY_OFFSETS[1]] = 0x55;
   pkt.payload[ADV_KEY_OFFSETS[2]] = 0;
   pkt.payload[ADV_KEY_OFFSETS[3]] = 0;
-  EXPECT_EQ(filter.checkPacket(&pkt, 5100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 5100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 }
 
@@ -1169,9 +1324,9 @@ TEST_F(FilterTest, ClearEmptiesCacheButNotCounters) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 7, 7, 7, 7 };
   auto pkt = makeAdvert(key);
-  filter.checkPacket(&pkt, 1000, nullptr);
+  forwardPacket(filter, pkt, 1000, nullptr);
   pkt.transport_codes[0] = 1;
-  filter.checkPacket(&pkt, 2000, nullptr);
+  forwardPacket(filter, pkt, 2000, nullptr);
   ASSERT_GT(filter.getLimiterDrops(), 0u);
 
   filter.clearAdvertCache();
@@ -1180,7 +1335,7 @@ TEST_F(FilterTest, ClearEmptiesCacheButNotCounters) {
 
   // cleared cache: the origin is recorded again instead of dropped
   auto pkt2 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt2, 3000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt2, 3000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
@@ -1189,9 +1344,9 @@ TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 7, 7, 7, 7 };
   auto pkt = makeAdvert(key);
-  filter.checkPacket(&pkt, 1000, nullptr);
+  forwardPacket(filter, pkt, 1000, nullptr);
   pkt.transport_codes[0] = 1;
-  filter.checkPacket(&pkt, 2000, nullptr);
+  forwardPacket(filter, pkt, 2000, nullptr);
   ASSERT_EQ(filter.getLimiterDrops(), 1u);
 
   ASSERT_EQ(cli(filter, "ratelimit clear"), "OK - advert cache cleared");
@@ -1202,10 +1357,10 @@ TEST_F(FilterTest, RatelimitClearCliClearsCacheNotCounters) {
 TEST_F(FilterTest, RatelimitZeroIsOff) {
   uint8_t key[4] = { 3, 1, 4, 1 };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // nothing recorded while off
   pkt.transport_codes[0] = 2;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000, nullptr), FILTER_ACT_ALLOW);
 }
 
 TEST_F(FilterTest, OnlyFloodAdvertsAreLimited) {
@@ -1213,12 +1368,12 @@ TEST_F(FilterTest, OnlyFloodAdvertsAreLimited) {
   uint8_t key[4] = { 0x11, 0x22, 0x33, 0x44 };
   auto direct_adv = makePacket(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ADVERT, 64, 1, 0);
   for (int i = 0; i < 4; i++) direct_adv.payload[ADV_KEY_OFFSETS[i]] = key[i];
-  EXPECT_EQ(filter.checkPacket(&direct_adv, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, direct_adv, 1000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // direct adverts not recorded
 
   auto flood_txt = makeAdvert(key);
   flood_txt.header = (ROUTE_TYPE_FLOOD & PH_ROUTE_MASK) | (PAYLOAD_TYPE_GRP_TXT << PH_TYPE_SHIFT);
-  EXPECT_EQ(filter.checkPacket(&flood_txt, 1100, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(forwardPacket(filter, flood_txt, 1100, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // non-advert types not recorded
 }
 
@@ -1228,9 +1383,9 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0x0A, 0x0B, 0x0C, 0x0D };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000, nullptr), FILTER_ACT_FORWARD);
   pkt.transport_codes[0] = 5;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
 }
 
@@ -1245,33 +1400,674 @@ TEST_F(FilterTest, ForwardAdvertStillHitsLimiter) {
 
 #include "FilterTestHelpers.h"
 
-// /filter_cfg layout constants (mirrors PacketFilter.cpp: the v6 record is
-// the struct up to `hits` (u16 throttle grows the v4/v5 record by 4 bytes;
-// prob's byte sits in the v4 tail padding), so every older record is a
-// byte-identical prefix; the v3 record is the same struct with no `regions`
-// field, padded to uint32_t alignment; the lazy-save delay is 3000 ms)
-static constexpr size_t V6_RULE_BYTES = offsetof(FilterRule, hits);
-static constexpr size_t V5_RULE_BYTES = offsetof(FilterRule, throttle);
-static constexpr size_t V3_RULE_BYTES =
-    (offsetof(FilterRule, regions) + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
-static constexpr uint8_t CFG_VERSION = 6;
-static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
-static const char* CFG_FILE = "/filter_cfg";
+// The limiter's window means "relayed", not "received": a packet refused by the
+// stock forwarding checks after checkPacket() must not spend the origin's budget.
 
-// rebuild a saved blob as an old-format blob with `ver` in the header and
-// `old_bytes`-long rule records (a v6 record's leading bytes are a
-// byte-identical old record)
-static std::vector<uint8_t> transmuteRuleRecords(const std::vector<uint8_t>& blob,
-                                                 uint8_t ver, size_t old_bytes) {
-  std::vector<uint8_t> out(blob.begin(), blob.begin() + 7);   // header + ratelimit
-  out[0] = ver;
-  size_t nr = blob[2];
-  for (size_t i = 0; i < nr; i++) {
-    const uint8_t* rec = blob.data() + 7 + i * V6_RULE_BYTES;
-    out.insert(out.end(), rec, rec + old_bytes);
+TEST_F(FilterTest, RefusedAdvertDoesNotSpendTheOriginBudget) {
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x5A, 0x5B, 0x5C, 0x5D };
+  auto pkt = makeAdvert(key);
+
+  // checkPacket() passes, but the stock checks then refuse it (manual off, hop
+  // limit, unknown region, loop detect) so onForwardAllowed() never runs
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // nothing recorded
+
+  // the same origin must still be relayable later
+  pkt.transport_codes[0] = 1;
+  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+
+  // only once it is actually admitted does the window start
+  pkt.transport_codes[0] = 2;
+  EXPECT_EQ(forwardPacket(filter, pkt, 3000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);
+  pkt.transport_codes[0] = 3;
+  EXPECT_EQ(forwardPacket(filter, pkt, 4000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
+}
+
+TEST_F(FilterTest, RuleDropNeverCommitsAnAdvertWindow) {
+  filter.setAdvertRatelimit(48);
+  ASSERT_EQ(cli(filter, "add type=advert action=drop"), "OK - rule 0 added");
+  uint8_t key[4] = { 0x6A, 0x6B, 0x6C, 0x6D };
+  auto pkt = makeAdvert(key);
+
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);   // a rule drop is not a forward
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+}
+
+TEST_F(FilterTest, ForwardVerdictStillCommitsTheWindow) {
+  // action=forward is terminal for the rule list but the packet IS relayed, so
+  // the origin's window must start
+  filter.setAdvertRatelimit(48);
+  ASSERT_EQ(cli(filter, "add type=advert action=forward"), "OK - rule 0 added");
+  uint8_t key[4] = { 0x7A, 0x7B, 0x7C, 0x7D };
+  auto pkt = makeAdvert(key);
+
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_FORWARD);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);
+  pkt.transport_codes[0] = 9;
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getLimiterDrops(), 1u);
+}
+
+TEST_F(FilterTest, DisabledFilterKeepsNoAdvertHistory) {
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x8A, 0x8B, 0x8C, 0x8D };
+  auto pkt = makeAdvert(key);
+  filter.setEnabled(false);
+  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
+  filter.onForwardAllowed(&pkt, 1000);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+}
+
+TEST_F(FilterTest, CheckAloneRepeatedlyNeverSpendsTheBudget) {
+  // the exact bug: without a commit, every check passed and nothing was ever
+  // suppressed, so the limiter looked like it did nothing
+  filter.setAdvertRatelimit(48);
+  uint8_t key[4] = { 0x9A, 0x9B, 0x9C, 0x9D };
+  for (int i = 0; i < 5; i++) {
+    auto pkt = makeAdvert(key);
+    pkt.transport_codes[0] = (uint8_t)i;
+    EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_ALLOW);
   }
-  out.insert(out.end(), blob.begin() + 7 + nr * V6_RULE_BYTES, blob.end());   // channels
-  return out;
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+  EXPECT_EQ(filter.getAdvertCacheCount(), 0);
+}
+
+// A command the CLI does not understand, or a typo'd tail, must never look like
+// it worked. Silently ignoring the tail turns a mistake into a success reply.
+TEST_F(FilterTest, ExtraTokensAreRejectedBeforeAnythingChanges) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");   // so index checks pass
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  struct Case { const char* cmd; const char* usage; };
+  const Case cases[] = {
+    { "on junk",          "Err - usage: on" },
+    { "off junk",         "Err - usage: off" },
+    { "list junk",        "Err - usage: list" },
+    { "clear junk",       "Err - usage: clear" },
+    { "get 0 junk",       "Err - usage: get <idx>" },
+    { "enable 0 junk",    "Err - usage: enable|disable <idx>" },
+    { "del 0 junk",       "Err - usage: del <idx>" },
+    { "move 0 1 junk",    "Err - usage: move <from> <to>" },
+    { "ratelimit advert 48 junk", "Err - usage: ratelimit advert <hours>" },
+    { "ratelimit clear junk",     "Err - usage: ratelimit clear" },
+    { "stats junk",       "Err - usage: stats [reset]" },
+    { "chan list 0 junk", "Err - usage: chan list [<start-idx>]" },
+    { "chan add #x 00112233445566778899aabbccddeeff junk", "Err - usage: filter chan add <name> [<psk-hex>]" },
+    { "chan del Public junk",     "Err - usage: filter chan del <name>" },
+  };
+  for (const auto& c : cases) {
+    EXPECT_EQ(cli(filter, c.cmd), c.usage) << c.cmd;
+  }
+}
+
+TEST_F(FilterTest, RejectedTailsLeaveTheConfigUntouched) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.setEnabled(true);
+  filter.setAdvertRatelimit(48);
+  filter.clearAdvertCache();
+
+  // every one of these would have mutated something if the tail were ignored
+  EXPECT_EQ(cli(filter, "off junk").substr(0, 5), "Err -");
+  EXPECT_TRUE(filter.isEnabled());
+  EXPECT_EQ(cli(filter, "clear junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(cli(filter, "del 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(cli(filter, "move 0 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "ratelimit advert 0 junk").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getAdvertRatelimit(), 48);
+}
+
+TEST_F(FilterTest, RejectedChanTailsLeaveTheStoreUntouched) {
+  // a trailing word on a channel command is a typo, not something to ignore: the
+  // channel must neither be added nor deleted
+  EXPECT_EQ(cli(filter, "chan add #new 00112233445566778899aabbccddeeff junk"),
+            "Err - usage: filter chan add <name> [<psk-hex>]");
+  EXPECT_EQ(filter.findChannel("#new"), nullptr);
+  ASSERT_NE(filter.findChannel("Public"), nullptr);
+
+  EXPECT_EQ(cli(filter, "chan del Public junk"), "Err - usage: filter chan del <name>");
+  ASSERT_NE(filter.findChannel("Public"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);
+
+  // the same commands without the tail still work
+  ASSERT_EQ(cli(filter, "chan add #new 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  EXPECT_EQ(cli(filter, "chan del Public"), "OK - chan Public deleted");
+  EXPECT_EQ(filter.getNumChannels(), 1);
+}
+
+TEST_F(FilterTest, OversizedAndUnbalancedCommandsAreRefusedWhole) {
+  // a valid prefix plus an invalid tail must not be applied as the prefix
+  std::string long_cmd = "add sender=";
+  long_cmd += std::string(300, 'a');
+  EXPECT_EQ(cli(filter, long_cmd.c_str()), "Err - command too long");
+  EXPECT_EQ(filter.getNumRules(), 0);
+
+  EXPECT_EQ(cli(filter, "off \"unterminated"), "Err - unbalanced quotes");
+  EXPECT_TRUE(filter.isEnabled());   // nothing was applied
+
+  EXPECT_EQ(cli(filter, "chan add \"a b 00112233445566778899aabbccddeeff"),
+            "Err - unbalanced quotes");
+  EXPECT_EQ(filter.findChannel("a b 00112233445566778899aabbccddeeff"), nullptr);
+}
+
+TEST_F(FilterTest, StatsResetClearsCountersButKeepsRateState) {
+  filter.setAdvertRatelimit(48);
+  // bank an advert window first, with no rule in the way
+  uint8_t key[4] = { 0x11, 0x22, 0x33, 0x44 };
+  auto relayed = makeAdvert(key);
+  EXPECT_EQ(forwardPacket(filter, relayed, 1000), FILTER_ACT_ALLOW);
+  ASSERT_EQ(filter.getAdvertCacheCount(), 1);
+
+  // then bank a rule hit and some throttle state
+  ASSERT_EQ(cli(filter, "add type=advert throttle=60"), "OK - rule 0 added");
+  filter.getRule(0)->throttle_seen = true;    // spend the free pass
+  uint8_t other_key[4] = { 0x55, 0x66, 0x77, 0x88 };
+  auto dropped = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, dropped, 1000), FILTER_ACT_DROP);
+  filter.getRule(0)->throttle_pass = 5;   // a counter
+  ASSERT_GT(filter.getRule(0)->hits, 0u);
+
+  EXPECT_EQ(cli(filter, "stats reset"), "OK - filter stats reset");
+  EXPECT_EQ(filter.getRule(0)->hits, 0u);
+  EXPECT_EQ(filter.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+  // throttle_pass is a counter, so it goes with the rest...
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 0u);
+  // ... but the RATE state is not: a stats reset must never hand a throttled
+  // rule a free pass, which is what throttle_seen/throttle_last_ms carry
+  EXPECT_EQ(filter.getAdvertCacheCount(), 1);     // advert history is not a counter
+  EXPECT_EQ(filter.getAdvertRatelimit(), 48);
+  EXPECT_EQ(cli(filter, "stats").substr(0, 4), "lim:");
+  EXPECT_TRUE(filter.getRule(0)->throttle_seen);
+  // The invariant, stated behaviourally: throttle=N lets one match per N
+  // seconds slip PAST the rule; the rest are decided by it. Right after a reset
+  // the window is still open, so this match must be decided — a stats reset buys
+  // no extra slips.
+  auto within = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, within, 2000), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+
+  // once the window has genuinely passed, the next match is the one that slips
+  auto after = makeAdvert(other_key);
+  EXPECT_EQ(forwardPacket(filter, after, 62000), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+}
+
+TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
+  // fill the store with long names so the listing cannot fit in one reply
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    std::string name = "longchannel" + std::to_string(i);   // distinct, and long enough to overflow
+    std::string add = cli(filter, ("chan add " + name + " 00112233445566778899aabbccddeeff").c_str());
+    ASSERT_EQ(add.substr(0, 3), "OK ") << name << " -> " << add;
+  }
+  ASSERT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
+
+  std::string head = cli(filter, "chan list");
+  EXPECT_GT(head.size(), 0u);
+  size_t next_at = head.find("; next=");
+  ASSERT_NE(next_at, std::string::npos) << "a full store must say where to resume";
+
+  int start = atoi(head.substr(next_at + 7).c_str());
+  EXPECT_GT(start, 0);
+  EXPECT_LT(start, filter.getNumChannels());
+  // every visible entry is whole: the marker follows a complete "idx:name:hash"
+  EXPECT_EQ(head.find(":") != std::string::npos, true);
+
+  // the resumed listing starts at the index the marker named
+  std::string tail = cli(filter, ("chan list " + std::to_string(start)).c_str());
+  size_t p0 = tail.find(":");
+  ASSERT_NE(p0, std::string::npos);
+  EXPECT_EQ(atoi(tail.substr(0, p0).c_str()), start);
+
+  // together the two pages name every channel exactly once, in order, and never
+  // split an entry: each token is a whole "idx:name:hash"
+  std::vector<int> seen;
+  for (const std::string* page : { &head, &tail }) {
+    for (const std::string& tok : splitOnSpace(*page)) {
+      if (tok.empty() || !isdigit((unsigned char)tok[0])) continue;   // skip the "next=N" marker
+      // a whole entry is exactly "idx:name:hash": two colons, and no cut name
+      EXPECT_EQ(std::count(tok.begin(), tok.end(), ':'), 2) << "partial entry: " << tok;
+      int idx = atoi(tok.substr(0, tok.find(':')).c_str());
+      EXPECT_EQ(std::find(seen.begin(), seen.end(), idx), seen.end()) << "repeated index " << idx;
+      seen.push_back(idx);
+    }
+  }
+  ASSERT_EQ(seen.size(), (size_t)filter.getNumChannels());
+  for (int i = 0; i < filter.getNumChannels(); i++) EXPECT_EQ(seen[i], i) << "coverage gap at " << i;
+
+  // walking to the end eventually stops offering a continuation
+  std::string last = cli(filter, ("chan list " + std::to_string(filter.getNumChannels() - 1)).c_str());
+  EXPECT_EQ(last.find("; next="), std::string::npos);
+  // ... and past the end is an error, not an empty success
+  EXPECT_EQ(cli(filter, ("chan list " + std::to_string(filter.getNumChannels())).c_str()).substr(0, 5), "Err -");
+}
+
+TEST_F(FilterTest, ShortStoreListsWithoutAContinuation) {
+  // the bare listing keeps its old shape when everything fits
+  ASSERT_EQ(cli(filter, "chan add #one 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  std::string all = cli(filter, "chan list");
+  EXPECT_EQ(all.find("; next="), std::string::npos);
+  EXPECT_NE(all.find("0:Public"), std::string::npos);
+  EXPECT_NE(all.find("1:#one"), std::string::npos);
+}
+
+// ===================================================================
+// CONTENT VERDICT STASH LIFETIME
+// ===================================================================
+// checkContent() stashes a verdict for the packet being received, and
+// checkPacket() consumes it. The stash must never outlive that one receive
+// operation, or a verdict can be served to a completely unrelated packet that
+// later reuses the same buffer.
+
+TEST_F(FilterTest, PointerMismatchInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto other = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  const uint32_t after_content = filter.getRule(0)->hits;
+
+  // a DIFFERENT packet arrives and never gets a content scan of its own
+  EXPECT_EQ(forwardPacket(filter, other, 0, nullptr), FILTER_ACT_ALLOW);
+
+  // A must not be able to revive its stale stash: it is rescanned normally, and a
+  // content-only predicate has no content to match on this pass
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);   // not counted a second time
+}
+
+TEST_F(FilterTest, UnconsumedVerdictIsClearedByTheNextPacketScan) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  // no checkPacket() for pkt at all — it was dropped before the forwarding hook
+  const uint32_t after_content = filter.getRule(0)->hits;
+
+  // a brand new receive starts; the stash must not answer for it
+  auto advert = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 0);
+  EXPECT_EQ(forwardPacket(filter, advert, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);   // not revived for an unrelated packet
+}
+
+TEST_F(FilterTest, BracketingClearsAVerdictThatNeverReachesTheHook) {
+  // this is what MyMesh::onRecvPacket() does around one receive
+  auto runReceive = [&](mesh::Packet& pkt) {
+    filter.clearContentVerdict();
+    forwardPacket(filter, pkt, 0, nullptr);
+    filter.clearContentVerdict();
+  };
+
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  // content drop, then the forwarding hook is never reached (battery/loop/off)
+  filter.clearContentVerdict();
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  filter.clearContentVerdict();   // receive ends
+
+  // the same buffer address coming back with different content is rescanned
+  runReceive(pkt);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+}
+
+TEST_F(FilterTest, EnableToggleInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  const uint32_t after_content = filter.getRule(0)->hits;
+  filter.setEnabled(false);
+  filter.setEnabled(true);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_content);
+}
+
+TEST_F(FilterTest, RuleMutationInvalidatesAStashedVerdict) {
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  // remove the matching rule before the packet-level scan runs
+  ASSERT_EQ(cli(filter, "del 0"), "OK - rule 0 deleted");
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, ReloadInvalidatesAStashedVerdict) {
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+
+  filter.load(&fs);   // a reload supersedes the rule list
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+TEST_F(FilterTest, PairedContentAndPacketStillCountsExactlyOnce) {
+  // the whole point of the stash: within ONE receive, a content drop must be
+  // counted once, not twice, and must not be re-ordered
+  ASSERT_EQ(cli(filter, "add sender=^Alice$"), "OK - rule 0 added");
+  auto body = makeGroupText("Alice", "hi");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  filter.clearContentVerdict();
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr, 10), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr, 10), FILTER_ACT_DROP);
+  filter.clearContentVerdict();
+
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);          // counted once
+  EXPECT_EQ(filter.getAirSavedMs(), 10u);          // billed once
+  EXPECT_EQ(filter.getAirEvaluatedMs(), 10u);      // evaluated once
+}
+
+TEST_F(FilterTest, SamePointerNewPathAfterACompletedReceiveIsRescanned) {
+  // the packet hash excludes route/path, so only the receive bracketing and the
+  // pointer+hash guard stop a completed receive's verdict being reused
+  ASSERT_EQ(cli(filter, "add path=^10$"), "OK - rule 0 added");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 1, 1);   // one hop
+  auto chan = channelFromStore(filter, 0);
+  uint8_t body[] = { 0, 0, 0, 0, TXT_TYPE_PLAIN, 'h', 'i' };
+
+  filter.clearContentVerdict();
+  filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body, sizeof(body), nullptr);
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_DROP);
+  filter.clearContentVerdict();
+  const uint32_t after_first = filter.getRule(0)->hits;
+
+  // same buffer, same payload, but the path changed: the verdict for the first
+  // receive must not apply to the second
+  pkt.setPathHashSizeAndCount(1, 1);
+  pkt.path[0] = 0x20;
+  filter.clearContentVerdict();
+  EXPECT_EQ(forwardPacket(filter, pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, after_first);
+}
+
+// ===================================================================
+// STAGED SAVE / CRASH RECOVERY
+// ===================================================================
+// A save must never leave the only good configuration destroyed: the scratch
+// file is written and read back before the live one is touched, and the previous
+// good file is kept as a backup. At every point a reset can happen, a fresh load
+// must yield the complete old config or the complete new one — never a mixture.
+
+TEST_F(FilterTest, SaveLeavesNoScratchOrBackupOnAFreshDevice) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+
+  ASSERT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));   // promoted, not left behind
+  EXPECT_FALSE(fs.exists("/filter_cfg.bak"));   // nothing to back up yet
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, SecondSaveKeepsThePreviousConfigAsBackup) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);
+
+  ASSERT_TRUE(fs.exists(CFG_FILE));
+  ASSERT_TRUE(fs.exists("/filter_cfg.bak"));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));
+
+  // canonical is the new config, backup is the old one
+  FilterRules now;
+  now.begin(&fs);
+  EXPECT_EQ(now.getNumRules(), 2);
+
+  // swapping the canonical away leaves the backup loadable on its own
+  fs.files[CFG_FILE] = fs.files["/filter_cfg.bak"];
+  FilterRules from_bak;
+  from_bak.begin(&fs);
+  EXPECT_EQ(from_bak.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, LoadFallsBackToBackupWhenCanonicalIsCorrupt) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);   // now: canonical = 2 rules, backup = 1 rule
+
+  // corrupt the canonical beyond use: a bad header
+  fs.files[CFG_FILE][2] = 99;   // num_rules over capacity
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);   // the backup, whole
+}
+
+TEST_F(FilterTest, RecoveryFromBackupSchedulesARepairSave) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);
+
+  fs.remove(CFG_FILE);   // power loss during promotion: canonical gone, backup fine
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+
+  // the recovered-from-backup load must get a good canonical file back
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  restored.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_FALSE(fs.exists("/filter_cfg.tmp"));
+
+  // and a fresh boot now reads the repaired canonical
+  FilterRules after;
+  after.begin(&fs);
+  EXPECT_EQ(after.getNumRules(), 1);
+}
+
+TEST_F(FilterTest, OrphanScratchIsIgnoredOnBoot) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+
+  // an uncommitted scratch file is not a config: it must be ignored entirely
+  fs.files["/filter_cfg.tmp"] = fs.files[CFG_FILE];
+  fs.files["/filter_cfg.tmp"].push_back(0xFF);   // even a malformed one
+
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 1);   // the canonical, unaffected
+}
+
+TEST_F(FilterTest, InvalidCanonicalIsNotPromotedOverAValidBackup) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  filter.save(&fs);   // backup = 1 rule, canonical = 2 rules
+  std::vector<uint8_t> good_backup = fs.files["/filter_cfg.bak"];
+
+  fs.files[CFG_FILE][1] = 9;   // corrupt the canonical's header
+  ASSERT_EQ(cli(filter, "add hops=[1,2]"), "OK - rule 2 added");
+  filter.save(&fs);
+
+  // the valid backup must NOT have been replaced by the corrupt canonical...
+  EXPECT_EQ(fs.files["/filter_cfg.bak"].size(), good_backup.size());
+  EXPECT_EQ(memcmp(fs.files["/filter_cfg.bak"].data(), good_backup.data(), good_backup.size()), 0);
+  // ... and the new canonical is the good config we just wrote (3 rules)
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 3);
+}
+
+TEST_F(FilterTest, FailedScratchWriteKeepsTheOldConfigIntact) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+  NativeFS broken;
+  broken.files[CFG_FILE] = original;
+  broken.fail_write = true;      // the scratch write accepts nothing
+  filter.save(&broken);
+
+  // the good config is untouched, no scratch is left, nothing was promoted
+  EXPECT_EQ(broken.files[CFG_FILE].size(), original.size());
+  EXPECT_EQ(memcmp(broken.files[CFG_FILE].data(), original.data(), original.size()), 0);
+  EXPECT_FALSE(broken.exists("/filter_cfg.tmp"));
+  EXPECT_FALSE(broken.exists("/filter_cfg.bak"));
+
+  // the edit is still pending, so it lands once writing works again
+  filter.save(&fs);
+  FilterRules restored;
+  restored.begin(&fs);
+  EXPECT_EQ(restored.getNumRules(), 2);
+}
+
+TEST_F(FilterTest, FailedScratchOpenLeavesTheOldConfigIntact) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  NativeFS broken;
+  broken.files[CFG_FILE] = original;
+  broken.fail_open = true;
+  filter.save(&broken);
+  EXPECT_EQ(broken.write_open_attempts, 1u);   // tried once, gave up
+  EXPECT_EQ(broken.files[CFG_FILE].size(), original.size());
+  EXPECT_FALSE(broken.exists("/filter_cfg.bak"));
+}
+
+TEST_F(FilterTest, CorruptScratchReadbackIsNotPromoted) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  filter.save(&fs);
+  std::vector<uint8_t> original = fs.files[CFG_FILE];
+
+  ASSERT_EQ(cli(filter, "add type=txt"), "OK - rule 1 added");
+
+  // a store that accepts the bytes but truncates them models a power loss
+  // partway through: the readback must reject it and leave the old config alone
+  NativeFS torn;
+  torn.files[CFG_FILE] = original;
+  torn.truncate_to = 12;
+  filter.save(&torn);
+
+  EXPECT_EQ(torn.files[CFG_FILE].size(), original.size());
+  EXPECT_EQ(memcmp(torn.files[CFG_FILE].data(), original.data(), original.size()), 0);
+  EXPECT_FALSE(torn.exists("/filter_cfg.tmp"));
+}
+
+TEST_F(FilterTest, StatsAndRateStateStayRamOnlyAcrossAStagedSave) {
+  ASSERT_EQ(cli(filter, "add type=advert throttle=60"), "OK - rule 0 added");
+  filter.save(&fs);
+  FilterRule* r = filter.getRule(0);
+  r->hits = 7;
+  r->air_ms = 1234;
+  r->throttle_pass = 3;
+  filter.setAdvertRatelimit(12);
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->hits, 0u);          // never persisted
+  EXPECT_EQ(restored.getRule(0)->air_ms, 0u);
+  EXPECT_EQ(restored.getRule(0)->throttle_pass, 0u);
+  EXPECT_EQ(restored.getRule(0)->throttle, 60);      // config is persisted
+  EXPECT_EQ(restored.getAdvertRatelimit(), 12);
+}
+
+// ===================================================================
+// OLD-CONFIG BYTE FIXTURES — temporary, removed with the migration path
+// ===================================================================
+// These are the layouts older firmware actually wrote, written out as literal
+// byte values. They deliberately do NOT derive from FilterRule: the old
+// transmute helper built a v3/v4/v5 file by trimming a freshly saved v6 record,
+// so it moved with the struct and could never catch the struct changing under
+// an old config. The offsets below are historical facts. Delete this section
+// together with the v3..v6 branches in load().
+
+// One rule record of `bytes` length, carrying: enabled, drop, type=advert,
+// hops=[2,4], sender="Bot", text="hi", region=TestNorth, prob=50,
+// throttle=1000 s. Fields past `bytes` do not exist in that version, which is
+// the point.
+static std::vector<uint8_t> oldRuleRecord(size_t bytes) {
+  std::vector<uint8_t> rec(bytes, 0);
+  rec[0] = 1;                     // enabled
+  rec[1] = FILTER_ACT_DROP;       // action
+  rec[2] = FILTER_TYPE_ADVERT;    // type_mask
+  rec[4] = 2;                     // hops.lo
+  rec[6] = 4;                     // hops.hi
+  rec[8] = FILTER_IV_LO_INC | FILTER_IV_HI_INC;
+  memcpy(&rec[50], "Bot", 3);     // sender
+  memcpy(&rec[74], "hi", 2);      // text
+  if (bytes >= FILTER_RULE_V4_BYTES) {
+    memcpy(&rec[122], "TestNorth", 9);   // regions: absent in v3
+    rec[154] = 50;                       // prob
+  }
+  if (bytes >= FILTER_RULE_V6_BYTES) {
+    rec[156] = 0xE8;                     // throttle = 1000 s, little-endian
+    rec[157] = 0x03;
+  }
+  return rec;
+}
+
+// The provisioned Public channel: 16-byte well-known PSK, tag 0x11.
+static std::vector<uint8_t> oldChannelRecord() {
+  std::vector<uint8_t> ch(FILTER_CHAN_PERSIST_BYTES, 0);
+  const uint8_t psk[16] = { 0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+                            0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72 };
+  memcpy(&ch[0], "Public", 6);
+  memcpy(&ch[16], psk, sizeof(psk));
+  ch[48] = 16;    // secret_len
+  ch[49] = 0x11;  // sha256(psk)[0]: the 1-byte on-air tag
+  return ch;
+}
+
+// A complete config file: header(5) + ratelimit(2) + rule records + channels.
+static std::vector<uint8_t> oldCfgFile(uint8_t ver, size_t rule_bytes,
+                                       const std::vector<std::vector<uint8_t>>& chans,
+                                       uint16_t rl_hours = 0) {
+  std::vector<uint8_t> f;
+  f.push_back(ver);
+  f.push_back(1);                                  // enabled
+  f.push_back(1);                                  // num_rules
+  f.push_back((uint8_t)chans.size());              // num_channels
+  f.push_back(0);                                  // spare
+  f.push_back((uint8_t)(rl_hours & 0xFF));
+  f.push_back((uint8_t)(rl_hours >> 8));
+  const std::vector<uint8_t> rec = oldRuleRecord(rule_bytes);
+  f.insert(f.end(), rec.begin(), rec.end());
+  for (const auto& c : chans) f.insert(f.end(), c.begin(), c.end());
+  return f;
 }
 
 // ---------------------------------------------------------------- rule management
@@ -1425,22 +2221,8 @@ TEST_F(FilterTest, BeginProvisionsPublicChannelOnFreshNode) {
 // ---------------------------------------------------------------- version upgrades
 
 TEST_F(FilterTest, V3ConfigUpgradesToV4) {
-  // build a v3 store: one rule with hops=[2,4], one channel (Public)
-  filter.setAdvertRatelimit(7);
-  ASSERT_EQ(cli(filter, "add hops=[2,4]"), "OK - rule 0 added");
-  filter.save(&fs);
-
-  // transmute the v4 blob into a v3 blob: version byte 3, rule records stop
-  // before `regions`
-  auto& blob = fs.files[CFG_FILE];
-  ASSERT_GE(blob.size(), (size_t)(7 + V6_RULE_BYTES + sizeof(FilterChannel)));
-  std::vector<uint8_t> v3(7 + V3_RULE_BYTES + sizeof(FilterChannel));
-  memcpy(&v3[0], blob.data(), 5);
-  v3[0] = 3;                                        // version
-  memcpy(&v3[5], blob.data() + 5, 2);               // ratelimit
-  memcpy(&v3[7], blob.data() + 7, V3_RULE_BYTES);   // rule record, pre-regions
-  memcpy(&v3[7 + V3_RULE_BYTES], blob.data() + 7 + V6_RULE_BYTES, sizeof(FilterChannel));
-  blob = v3;
+  // a v3 store: one rule with hops=[2,4], one channel (Public), ratelimit 7
+  fs.files[CFG_FILE] = oldCfgFile(3, FILTER_RULE_V3_BYTES, { oldChannelRecord() }, 7);
 
   FilterRules upgraded;
   upgraded.begin(&fs);
@@ -1455,36 +2237,52 @@ TEST_F(FilterTest, V3ConfigUpgradesToV4) {
   EXPECT_EQ(upgraded.getAdvertRatelimit(), 7);
 }
 
-TEST_F(FilterTest, V5RecordMigratesWithThrottleZeroAndProbIntact) {
-  // a v5 record (156 B, ends where throttle begins) reads back byte-identical:
-  // prob keeps its byte while throttle — past the record's end — stays 0
-  // (= no limit); the dead padding byte before the record end must not leak
-  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
-  filter.save(&fs);
-  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 5, V5_RULE_BYTES);
-  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;   // dead tail byte, not guaranteed
-  fs.files[CFG_FILE] = blob;
+TEST_F(FilterTest, V6FixtureLoadsWithEverySettingIntact) {
+  fs.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() }, 7);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  ASSERT_EQ(restored.getNumChannels(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_TRUE(r->enabled);
+  EXPECT_EQ(r->action, FILTER_ACT_DROP);
+  EXPECT_EQ(r->type_mask, FILTER_TYPE_ADVERT);
+  EXPECT_STREQ(r->sender, "Bot");
+  EXPECT_STREQ(r->text, "hi");
+  EXPECT_STREQ(r->regions, "TestNorth");
+  EXPECT_EQ(r->prob, 50);
+  EXPECT_EQ(r->throttle, 1000);        // current version carries it
+  EXPECT_EQ(r->hits, 0u);              // stats are never persisted
+  EXPECT_EQ(restored.getAdvertRatelimit(), 7);
+  EXPECT_STREQ(restored.getChannel(0)->name, "Public");
+  EXPECT_EQ(restored.getChannel(0)->secret_len, 16);
+}
+
+TEST_F(FilterTest, V5FixtureKeepsProbAndRegionsWithThrottleZero) {
+  // v5 records end where `throttle` begins (156 B): throttle reads back as 0
+  // (= no limit) and the dead padding byte must not leak into it
+  std::vector<uint8_t> f = oldCfgFile(5, FILTER_RULE_V4_BYTES, { oldChannelRecord() });
+  f[7 + FILTER_RULE_V4_BYTES - 1] = 0xFF;   // dead tail byte, not guaranteed
+  fs.files[CFG_FILE] = f;
 
   FilterRules restored;
   restored.begin(&fs);
   ASSERT_EQ(restored.getNumRules(), 1);
   FilterRule* r = restored.getRule(0);
-  EXPECT_EQ(r->prob, 50);                  // v5 keeps prob (prob-zeroing regression)
+  EXPECT_EQ(r->prob, 50);                  // v5 keeps prob
   EXPECT_EQ(r->throttle, 0);
-  EXPECT_STREQ(r->regions, "TestNorth");   // region= survives (v3-wipe regression)
-  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+  EXPECT_STREQ(r->regions, "TestNorth");   // region= survives the v3 wipe
+  EXPECT_EQ(r->hits, 0u);
 }
 
-TEST_F(FilterTest, V4RecordKeepsRegionsAndZerosProb) {
-  // a v4 record is the same 156 B layout, but its prob byte is not
-  // format-guaranteed: it must read as 0, while the region= list must survive
-  // (the v3 record wipe applies to v3 records only)
-  ASSERT_EQ(cli(filter, "add type=advert region=TestNorth prob=50"), "OK - rule 0 added");
-  filter.save(&fs);
-  auto blob = transmuteRuleRecords(fs.files[CFG_FILE], 4, V5_RULE_BYTES);
-  blob[7 + offsetof(FilterRule, prob)] = 0xFF;       // old padding byte, not guaranteed
-  blob[7 + offsetof(FilterRule, prob) + 1] = 0xFF;
-  fs.files[CFG_FILE] = blob;
+TEST_F(FilterTest, V4FixtureZerosProbButKeepsRegions) {
+  // v4 shares the 156 B layout, but its prob byte is not format-guaranteed: it
+  // must read as 0, while the region list survives (the v3 wipe is v3-only)
+  std::vector<uint8_t> f = oldCfgFile(4, FILTER_RULE_V4_BYTES, { oldChannelRecord() });
+  f[7 + 154] = 0xFF;                       // old padding byte, not guaranteed
+  f[7 + 155] = 0xFF;
+  fs.files[CFG_FILE] = f;
 
   FilterRules restored;
   restored.begin(&fs);
@@ -1493,7 +2291,265 @@ TEST_F(FilterTest, V4RecordKeepsRegionsAndZerosProb) {
   EXPECT_EQ(r->prob, 0);                   // unset = always (100 %)
   EXPECT_EQ(r->throttle, 0);
   EXPECT_STREQ(r->regions, "TestNorth");   // not wiped
-  EXPECT_EQ(r->hits, 0u);                  // stats never persisted
+  EXPECT_EQ(r->hits, 0u);
+}
+
+TEST_F(FilterTest, V3FixtureWipesRegionsAndHasNoProbOrThrottle) {
+  // v3 records end where `regions` begins (124 B): the old trailing padding
+  // bytes get dragged into regions[0..1], so the whole field must be zeroed
+  std::vector<uint8_t> f = oldCfgFile(3, FILTER_RULE_V3_BYTES, { oldChannelRecord() });
+  f[7 + 122] = 0xFF;                       // padding that must NOT become a region
+  f[7 + 123] = 0xFF;
+  fs.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_STREQ(r->regions, "");            // wiped, not a garbage region
+  EXPECT_EQ(r->prob, 0);
+  EXPECT_EQ(r->throttle, 0);
+  EXPECT_STREQ(r->sender, "Bot");          // everything inside the record survives
+  EXPECT_STREQ(r->text, "hi");
+}
+
+// A config file is untrusted input: each of these records contains a field this
+// firmware could never have written, and none of them may become a live rule.
+// Rule-record byte offsets, in the frozen layout: path occupies 22..43 as
+// bytes[4][4] (22..37), len[4] (38..41), count (42), pos (43); hash_size_mask
+// is 44; chan_mask 46..47; chan_hash 48; chan_flags 49; sender 50; text 74;
+// regions 122; prob 154; throttle 156.
+TEST_F(FilterTest, MalformedRuleRecordsAreRejectedNotSanitised) {
+  struct Case { const char* what; size_t off; uint8_t val; };
+  const Case cases[] = {
+    { "enabled byte above 1",            0,   2 },
+    { "action neither drop/forward",     1,   0 },
+    { "undefined type_mask bit",         2,   0x80 },
+    { "undefined route_mask bit",        3,   0x80 },
+    { "undefined interval flag",         8,   0x20 },
+    { "path count beyond its slots",     42,  FILTER_PATH_HASH_SLOTS + 1 },
+    { "undefined path anchor",           43,  0x80 },
+    { "undefined hash_size_mask bit",    44,  0x80 },
+    { "undefined chan_flags bit",        49,  0x80 },
+    { "prob above 100",                  154, 200 },
+  };
+
+  for (const auto& c : cases) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    f[7 + c.off] = c.val;
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+
+    FilterRules restored;
+    restored.begin(&bad);
+    // the record is rejected, so the valid prefix is empty
+    EXPECT_EQ(restored.getNumRules(), 0) << c.what;
+  }
+}
+
+// A rejected rule record must not drag the channel records out of alignment:
+// sizes are fixed, so the records after it are still consumed and the channels
+// that follow a bad rule still load. Reading channels from the middle of a rule
+// record would adopt that rule's bytes as a channel.
+TEST_F(FilterTest, RejectedRuleRecordDoesNotShiftTheChannelRecords) {
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+  f[2] = 2;   // num_rules = 2
+  // the second rule record, placed where the header now says it is
+  const std::vector<uint8_t> rec2 = oldRuleRecord(FILTER_RULE_V6_BYTES);
+  f.insert(f.end() - FILTER_CHAN_PERSIST_BYTES, rec2.begin(), rec2.end());
+  f[7] = 2;   // rule 0's enabled byte: a value a bool could never hold
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);          // the bad record ends the rule list
+  ASSERT_EQ(restored.getNumChannels(), 1);        // ... and the channel still loads
+  EXPECT_STREQ(restored.getChannel(0)->name, "Public");
+  EXPECT_EQ(restored.getChannel(0)->secret_len, 16);
+}
+
+TEST_F(FilterTest, UnterminatedStoredStringRejectsTheRecord) {
+  // sender/text/regions are fixed-size char arrays; a record whose bytes fill
+  // one end to end has no NUL and would be read past its storage
+  for (size_t off : { (size_t)50, (size_t)74, (size_t)122 }) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    const size_t width = (off == 50) ? FILTER_SENDER_PATTERN_LEN
+                       : (off == 74) ? FILTER_TEXT_PATTERN_LEN : FILTER_REGION_LIST_LEN;
+    for (size_t i = 0; i < width; i++) f[7 + off + i] = 'x';
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 0) << "unterminated field at offset " << off;
+  }
+}
+
+TEST_F(FilterTest, MalformedChannelRecordIsRejected) {
+  {   // empty name: a slot no rule and no `chan del <name>` could ever reach
+    std::vector<uint8_t> ch = oldChannelRecord();
+    ch[0] = 0;
+    NativeFS bad;
+    bad.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { ch });
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumChannels(), 0);
+  }
+  {   // key length this firmware never writes
+    std::vector<uint8_t> ch = oldChannelRecord();
+    ch[48] = 17;
+    NativeFS bad;
+    bad.files[CFG_FILE] = oldCfgFile(6, FILTER_RULE_V6_BYTES, { ch });
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumChannels(), 0);
+  }
+}
+
+TEST_F(FilterTest, BadHeaderRejectsTheWholeFile) {
+  // the header describes the file's SHAPE: if it lies, we no longer know where
+  // the records are, so nothing is adopted rather than guessed at
+  struct Case { const char* what; size_t off; uint8_t val; };
+  const Case cases[] = {
+    { "enabled byte above 1",     1, 2 },
+    { "more rules than capacity", 2, FILTER_MAX_RULES + 1 },
+    { "more channels than capacity", 3, FILTER_MAX_CHANNELS + 1 },
+  };
+  for (const auto& c : cases) {
+    std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+    f[c.off] = c.val;
+    NativeFS bad;
+    bad.files[CFG_FILE] = f;
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 0) << c.what;
+    EXPECT_EQ(restored.getNumChannels(), 0) << c.what;
+  }
+
+  // a ratelimit window outside the documented range is refused too
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() }, 5);
+  f[5] = 0xFF; f[6] = 0x03;   // 1023 h, above the 720 h maximum
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);
+  EXPECT_EQ(restored.getAdvertRatelimit(), 0);
+}
+
+TEST_F(FilterTest, RuleReferencingAnAbsentChannelIsConfinedNotWidened) {
+  // a rule may name a channel the file did not store; the surviving mask must be
+  // confined to channels that exist, and must never widen into a catch-all
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
+  f[7 + 46] = 0xFF; f[7 + 47] = 0xFF;   // chan_mask: every bit
+  f[7 + 49] = FILTER_CHANFLG_MASK_SET;  // MASK_SET with channels that exist
+  NativeFS one;
+  one.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&one);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getNumChannels(), 1);
+  EXPECT_EQ(restored.getRule(0)->chan_mask, 0x01);   // only the stored channel
+
+  // ... and with no channel stored at all, MASK_SET + empty mask stays inert
+  std::vector<uint8_t> g = oldCfgFile(6, FILTER_RULE_V6_BYTES, {});
+  g[7 + 49] = FILTER_CHANFLG_MASK_SET;
+  NativeFS none;
+  none.files[CFG_FILE] = g;
+  FilterRules r2;
+  r2.begin(&none);
+  ASSERT_EQ(r2.getNumRules(), 1);
+  EXPECT_EQ(r2.getRule(0)->chan_mask, 0);
+  EXPECT_NE(r2.getRule(0)->chan_flags & FILTER_CHANFLG_MASK_SET, 0);   // still set, matches nothing
+}
+
+// A failed save must stay pending but back off: due() staying true on every
+// loop would reopen and truncate the file at firmware-loop speed.
+TEST_F(FilterTest, FailedSaveRetriesSlowlyNotEveryLoop) {
+  filter.addRule();
+  filter.markDirty();
+
+  NativeFS broken;
+  broken.fail_open = true;   // every open for writing fails
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  for (int i = 0; i < 100; i++) filter.loop(&broken);   // high loop frequency
+
+  // 100 loops in the same instant must NOT mean 100 open attempts: a failing
+  // filesystem used to be opened and truncated at firmware-loop speed
+  EXPECT_LE(broken.write_open_attempts, 1u);
+  EXPECT_FALSE(broken.exists(CFG_FILE));
+
+  // once the delay has passed again it tries again, and succeeds when it can
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+  EXPECT_GT(fs.files[CFG_FILE].size(), 0u);
+}
+
+TEST_F(FilterTest, FailedWriteKeepsTheEditPending) {
+  filter.addRule();
+  filter.markDirty();
+
+  NativeFS broken;
+  broken.fail_write = true;   // opens fine, accepts nothing
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+  filter.loop(&broken);
+  // a partial write must not be mistaken for a committed config
+  EXPECT_TRUE(broken.files[CFG_FILE].empty());
+
+  broken.fail_write = false;
+  g_mock_millis += CFG_SAVE_DELAY_MS;
+  filter.loop(&broken);
+  EXPECT_GT(broken.files[CFG_FILE].size(), 0u);
+}
+
+TEST_F(FilterTest, RetryDelaySurvivesAMillisWrap) {
+  // stamp an edit just before the 32-bit wrap, then let the delay elapse across
+  // it: the retry must still become due exactly once the delay has passed, and
+  // not before — the elapsed time has to be computed in 32 bits
+  filter.addRule();
+  g_mock_millis = 0xFFFFFF00u;   // ~256 ms before UINT32_MAX
+  filter.markDirty();            // the edit is stamped just before the wrap
+
+  g_mock_millis = 0xFFFFFFFFu;
+  filter.loop(&fs);              // 255 ms elapsed: still inside the delay
+  EXPECT_FALSE(fs.exists(CFG_FILE));
+
+  g_mock_millis += 1;            // wrapped to 0
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // 256 ms: still inside the delay
+
+  g_mock_millis += CFG_SAVE_DELAY_MS;     // now past it, measured across the wrap
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));
+}
+
+TEST_F(FilterTest, ReloadCancelsPendingEdits) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = CFG_SAVE_DELAY_MS;
+
+  filter.load(&fs);   // the file decides everything; a pending edit must not survive it
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // nothing resurrected a pre-load edit
+}
+
+TEST_F(FilterTest, DebounceAndWrapBoundaries) {
+  filter.addRule();
+  filter.markDirty();
+  g_mock_millis = 0;
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // 0 ms: inside the debounce
+
+  g_mock_millis = CFG_SAVE_DELAY_MS - 1;
+  filter.loop(&fs);
+  EXPECT_FALSE(fs.exists(CFG_FILE));   // one millisecond short
+
+  g_mock_millis += 1;
+  filter.loop(&fs);
+  EXPECT_TRUE(fs.exists(CFG_FILE));    // exactly the delay
 }
 
 TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
@@ -1515,7 +2571,19 @@ TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   }
 }
 
-TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
+TEST_F(FilterTest, LoadResetsStateTheFileCannotCarry) {
+  filter.setAdvertRatelimit(9);
+  filter.setEnabled(false);
+  filter.addRule();
+  fs.remove(CFG_FILE);   // nothing to load
+
+  filter.load(&fs);      // a reload must not inherit anything from before
+  EXPECT_EQ(filter.getAdvertRatelimit(), 0);   // was left at 9
+  EXPECT_TRUE(filter.isEnabled());             // was left off
+  EXPECT_EQ(filter.getNumRules(), 0);
+}
+
+TEST_F(FilterTest, TruncatedConfigAdoptsOnlyCompleteRecords) {
   filter.setAdvertRatelimit(3);
   filter.addRule();
   filter.addRule();
@@ -1524,30 +2592,47 @@ TEST_F(FilterTest, TruncatedConfigPartiallyIgnored) {
   // header promises 2 rules but the file stops after the first
   auto& blob = fs.files[CFG_FILE];
   blob[2] = 2;   // num_rules = 2
-  blob.resize(7 + V6_RULE_BYTES);   // cut after rule 0
+  blob.resize(7 + FILTER_RULE_V6_BYTES);   // cut after rule 0
 
   FilterRules restored;
   restored.begin(&fs);
-  EXPECT_EQ(restored.getNumRules(), 0);   // nothing half-loaded
+  // Rule 0 arrived whole, so it is kept; rule 1 never arrived, so there is no
+  // half-built second rule. Records are fixed-size, so the valid PREFIX is what
+  // loads — surviving rules keep their indices.
+  EXPECT_EQ(restored.getNumRules(), 1);
 }
 
-TEST_F(FilterTest, TruncatedConfigAllOrNothingAtEveryLength) {
-  // fuzz-lite: cut the saved blob at every byte offset; the loader must never
-  // half-load (rules/channels appear only when the whole file reads cleanly)
+TEST_F(FilterTest, TruncatedConfigNeverYieldsAHalfRecordAtAnyLength) {
+  // fuzz-lite: cut the saved blob at every byte offset. Whatever the length, the
+  // loader must adopt only records that fully arrived, in order, and never a
+  // partial one.
   filter.setAdvertRatelimit(5);
-  ASSERT_EQ(cli(filter, "add type=advert hops=[1,2] path=10>20"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "add type=advert hops=[1,2] path=10>20 prob=50"), "OK - rule 0 added");
   ASSERT_EQ(cli(filter, "chan add #x aabbccddeeff00112233445566778899").substr(0, 3), "OK ");
   filter.save(&fs);
   auto full = fs.files[CFG_FILE];
   ASSERT_GT(full.size(), (size_t)8);
+  const size_t HDR = 7, REC = FILTER_RULE_V6_BYTES, CHAN = FILTER_CHAN_PERSIST_BYTES;
 
   for (size_t len = 0; len < full.size(); len++) {
     NativeFS cut;
     cut.files[CFG_FILE] = std::vector<uint8_t>(full.begin(), full.begin() + len);
     FilterRules restored;
-    restored.begin(&cut);   // must not crash or half-load
-    EXPECT_EQ(restored.getNumRules(), 0) << "truncated at " << len;
-    EXPECT_EQ(restored.getNumChannels(), 0) << "truncated at " << len;
+    restored.begin(&cut);   // must not crash
+
+    // only whole records may appear, and only as a prefix of what was written
+    size_t want_rules = (len >= HDR + REC) ? 1 : 0;
+    size_t want_chans = (len > HDR + REC) ? std::min<size_t>((len - HDR - REC) / CHAN, 2) : 0;
+    EXPECT_EQ(restored.getNumRules(), want_rules) << "truncated at " << len;
+    EXPECT_EQ(restored.getNumChannels(), want_chans) << "truncated at " << len;
+
+    // an adopted record is a whole record, not a plausible-looking prefix
+    if (want_rules) {
+      const FilterRule* r = restored.getRule(0);
+      EXPECT_EQ(r->prob, 50) << "truncated at " << len;
+      EXPECT_EQ(r->hops.lo, 1) << "truncated at " << len;
+      EXPECT_EQ(r->path.count, 2) << "truncated at " << len;
+    }
   }
 
   // the full blob still loads intact
@@ -1597,6 +2682,7 @@ TEST_F(FilterTest, LoopSavesOnceWhenClean) {
 #include <string>
 
 #include "FilterTestHelpers.h"
+#include <SHA256.h>        // mockShaFinalizeCount(): packet-hash cost probe
 
 static const uint8_t PROB_KEY[4] = { 0x11, 0x22, 0x33, 0x44 };
 
@@ -1606,6 +2692,38 @@ static mesh::Packet probAdvert(int i) {
   mesh::Packet p = makeAdvert(PROB_KEY);
   p.payload[0] = (uint8_t)i;   // not one of the advert-limiter key offsets
   return p;
+}
+
+// A rule that cannot fail the roll must not pay for a packet hash: the hash is
+// computed by Packet::calculatePacketHash(), so the mock SHA's finalize counter
+// is the observable cost.
+TEST_F(FilterTest, ProbUnsetRuleDoesNotHashThePacket) {
+  ASSERT_EQ(cli(filter, "add type=advert"), "OK - rule 0 added");
+  auto pkt = probAdvert(7);
+
+  mockShaFinalizeCount() = 0;
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);   // matched and dropped
+  EXPECT_EQ(mockShaFinalizeCount(), 0u);
+
+  // a rule that always passes the gate is still free
+  filter.clearRules();
+  ASSERT_EQ(cli(filter, "add type=advert prob=100"), "OK - rule 0 added");
+  mockShaFinalizeCount() = 0;
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(mockShaFinalizeCount(), 0u);
+}
+
+TEST_F(FilterTest, ProbSetRuleHashesOncePerScan) {
+  // several nontrivial prob rules over one scan still share a single hash
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(cli(filter, "add type=advert prob=1"), "OK - rule " + std::to_string(i) + " added");
+  }
+  auto pkt = probAdvert(3);
+
+  mockShaFinalizeCount() = 0;
+  ASSERT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);
+  for (int i = 0; i < 3; i++) EXPECT_EQ(filter.getRule(i)->hits, 0u);
+  EXPECT_EQ(mockShaFinalizeCount(), 1u);   // exactly one: shared across the scan
 }
 
 TEST_F(FilterTest, ProbParseRejectsInvalid) {
@@ -1916,17 +3034,115 @@ TEST_F(FilterTest, ThrottleForwardShadowCountsExcess) {
 }
 
 TEST_F(FilterTest, ThrottleWrapAround) {
-  // unsigned-subtraction timing: correct verdicts across the millis() wrap
+  // The throttle window must use elapsed time across the millis() wrap.
   expectOk(filter, "add type=advert throttle=30");
   auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
 
   uint32_t t0 = 0xFFFFFFF0u;   // just before the 32-bit millis() wrap
   EXPECT_EQ(filter.checkPacket(&pkt, t0, nullptr), FILTER_ACT_ALLOW);   // free pass
-  // now has wrapped past 0 to ~16 s: 16.016 s elapsed, still over rate
+
+  // 16.016 s later, across the wrap: still inside the 30 s window.
   EXPECT_EQ(filter.checkPacket(&pkt, 16000, nullptr), FILTER_ACT_DROP);
-  // wrapped and past the 30 s window: the next pass
-  EXPECT_EQ(filter.checkPacket(&pkt, 30016, nullptr), FILTER_ACT_ALLOW);
+
+  // ~30 s of REAL time later (also after the wrap): now it is the one that slips
+  EXPECT_EQ(filter.checkPacket(&pkt, 46000, nullptr), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);
+}
+
+// Advance the filter's monotonic clock by `total_ms`, the way a real loop would.
+// uptimeMillis() folds one 32-bit wrap at a time, so an idle period longer than
+// that only counts correctly if the loop kept ticking through it — which in
+// firmware it does, since FilterRules::loop() runs unconditionally. A single jump
+// of more than one wrap is not representable and must not be asked for.
+static uint32_t advanceFilterClock(FilterRules& filter, uint32_t from, uint64_t total_ms) {
+  const uint64_t STEP = 0xF0000000ULL;   // ~15.6 days, comfortably under one wrap
+  uint32_t t = from;
+  uint64_t done = 0;
+  while (done + STEP <= total_ms) {
+    t += (uint32_t)STEP;
+    filter.uptimeMillis(t);
+    done += STEP;
+  }
+  t += (uint32_t)(total_ms - done);
+  filter.uptimeMillis(t);
+  return t;
+}
+
+TEST_F(FilterTest, LongIdleBeyondOneMillisWrapIsStillTimedCorrectly) {
+  // The case a 32-bit clock cannot express at all: a rule dormant for longer than
+  // one full millis cycle. Unsigned subtraction read 49.7 days + 1 s as 1 s, so
+  // the returning packet was wrongly rate-limited; the 64-bit accumulator sees the
+  // real elapsed time and lets the window lapse.
+  expectOk(filter, "add type=advert throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT, 64, 1, 2);
+
+  EXPECT_EQ(filter.checkPacket(&pkt, 0, nullptr), FILTER_ACT_ALLOW);   // free pass, stamps
+
+  const uint64_t fifty_days = 50ULL * 24 * 3600 * 1000ULL;
+  uint32_t t = advanceFilterClock(filter, 0, fifty_days);
+  EXPECT_EQ(filter.checkPacket(&pkt, t + 1000, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 2u);   // the window genuinely lapsed
+
+  // and the limiter agrees: an origin last relayed 50 days ago is not suppressed.
+  // The clock advances monotonically throughout, as millis() does.
+  filter.clearRules();   // the limiter is a separate concern from the throttle above
+  filter.setAdvertRatelimit(48);
+  t += 2000;   // continue from where the clock is
+  uint8_t key[4] = { 0xA1, 0xA2, 0xA3, 0xA4 };
+  auto advert = makeAdvert(key);
+  EXPECT_EQ(forwardPacket(filter, advert, t), FILTER_ACT_ALLOW);
+
+  t = advanceFilterClock(filter, t, fifty_days);   // 50 days of uptime, ticked
+  auto later = makeAdvert(key);
+  later.transport_codes[0] = 3;
+  EXPECT_EQ(forwardPacket(filter, later, t), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getLimiterDrops(), 0u);
+
+  // ... while inside the window it still suppresses, wrap or no wrap
+  auto soon = makeAdvert(key);
+  soon.transport_codes[0] = 4;
+  EXPECT_EQ(forwardPacket(filter, soon, t + 1000), FILTER_ACT_DROP);
+}
+
+// The content phase must read the same monotonic clock as the packet phase: a
+// raw millis() reading compares as a 32-bit wrap, so two messages 32 ms apart
+// would look 49.7 days apart and the throttled rule would hand out a free pass.
+TEST_F(FilterTest, ContentThrottleTimesRealElapsedTimeAcrossTheWrap) {
+  expectOk(filter, "add text=hello throttle=60");
+  auto body = makeGroupText("Alice", "hello");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, body.len);
+  auto chan = channelFromStore(filter, 0);
+
+  g_mock_millis = 0xfffffff0u;   // just before the 32-bit millis() wrap
+  ASSERT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_ALLOW);   // free pass
+
+  g_mock_millis = 16;   // 32 ms later, across the wrap: the window is not spent
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
+  EXPECT_EQ(filter.getRule(0)->throttle_pass, 1u);
+}
+
+// checkContent() evaluates packet-level rules too, so one rule's window can be
+// stamped by either phase. Across a wrap the two phases must still agree on how
+// much real time has passed.
+TEST_F(FilterTest, ThrottleWindowIsSharedByBothPhases) {
+  expectOk(filter, "add throttle=60");
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT);
+  auto body = makeGroupText("Alice", "hello");
+  auto chan = channelFromStore(filter, 0);
+
+  g_mock_millis = 0xfffffff0u;
+  ASSERT_EQ(filter.checkPacket(&pkt, g_mock_millis, nullptr), FILTER_ACT_ALLOW);   // free pass
+  g_mock_millis = 16;                    // 32 ms later, across the wrap
+  filter.uptimeMillis(g_mock_millis);    // the loop keeps the clock moving
+
+  // the content phase sees the window the packet phase started: 32 ms of real
+  // time has passed, so the rule still decides
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, body.data,
+                                body.len, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);
 }
 
 TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
@@ -1937,17 +3153,17 @@ TEST_F(FilterTest, ThrottleOnPacketRulesViaCheckPacket) {
   uint8_t key[4] = { 0x31, 0x32, 0x33, 0x34 };
 
   auto a1 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&a1, 0, nullptr), FILTER_ACT_ALLOW);   // free pass + first sighting
+  EXPECT_EQ(forwardPacket(filter, a1, 0), FILTER_ACT_ALLOW);   // free pass + first sighting
   EXPECT_EQ(filter.getAdvertCacheCount(), 1);
 
   auto a2 = makeAdvert(key);
   a2.payload[0] = 0x99;
-  EXPECT_EQ(filter.checkPacket(&a2, 5000, nullptr), FILTER_ACT_DROP);   // over rate: rule decides, limiter not reached
+  EXPECT_EQ(forwardPacket(filter, a2, 5000), FILTER_ACT_DROP);   // over rate: rule decides, limiter not reached
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getLimiterDrops(), 0u);
 
   auto a3 = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&a3, 10000, nullptr), FILTER_ACT_DROP);  // in budget: slips past, limiter drops the repeat
+  EXPECT_EQ(forwardPacket(filter, a3, 10000), FILTER_ACT_DROP);  // in budget: slips past, limiter drops the repeat
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
 }
@@ -2018,10 +3234,10 @@ TEST_F(FilterTest, AirSavedNotBilledForForwardAllowLimiterPass) {
   // window is dropped and billed (no rule attribution)
   expectOk(filter, "ratelimit advert 1");
   mesh::Packet first = makeAdvert(AIR_KEY);
-  ASSERT_EQ(filter.checkPacket(&first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
+  ASSERT_EQ(forwardPacket(filter, first, 0, nullptr, EST_AIR), FILTER_ACT_ALLOW);
   EXPECT_EQ(filter.getAirSavedMs(), 0u);
   mesh::Packet again = makeAdvert(AIR_KEY);
-  ASSERT_EQ(filter.checkPacket(&again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
+  ASSERT_EQ(forwardPacket(filter, again, 0, nullptr, EST_AIR), FILTER_ACT_DROP);
   EXPECT_EQ(filter.getAirSavedMs(), EST_AIR);
   EXPECT_EQ(filter.getAirEvaluatedMs(), 4 * EST_AIR);
   EXPECT_EQ(filter.getAirSavedPercent(), 25u);
@@ -2186,6 +3402,81 @@ TEST_F(FilterTest, AddTypePredicate) {
             FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA);
 }
 
+// A repeated list key REPLACES the earlier value (as every scalar key already
+// did); alternatives inside one value still OR.
+TEST_F(FilterTest, RepeatedListPredicateReplaces) {
+  ASSERT_EQ(cli(filter, "add type=advert,txt type=txt"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->type_mask, FILTER_TYPE_GRP_TXT);
+
+  ASSERT_EQ(cli(filter, "add hsize=1,2,3 hsize=4"), "OK - rule 1 added");
+  EXPECT_EQ(filter.getRule(1)->hash_size_mask, 1 << 3);
+
+  // 'any' is the wildcard and wins even beside named types, in one value or
+  // as a later replacement
+  ASSERT_EQ(cli(filter, "add type=advert,any"), "OK - rule 2 added");
+  EXPECT_EQ(filter.getRule(2)->type_mask, 0);
+  ASSERT_EQ(cli(filter, "add type=advert type=any"), "OK - rule 3 added");
+  EXPECT_EQ(filter.getRule(3)->type_mask, 0);
+  // ... and a following named type replaces the wildcard again
+  ASSERT_EQ(cli(filter, "add type=any type=data"), "OK - rule 4 added");
+  EXPECT_EQ(filter.getRule(4)->type_mask, FILTER_TYPE_GRP_DATA);
+
+  // unknown and empty elements are still refused, and leave nothing behind
+  EXPECT_EQ(cli(filter, "add type=advert type=bogus").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 5);
+  EXPECT_EQ(cli(filter, "add type=advert,type=").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 5);
+}
+
+TEST_F(FilterTest, RepeatedChanPredicateReplaces) {
+  ASSERT_EQ(cli(filter, "chan add #a 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_EQ(cli(filter, "chan add #b 00112233445566778899aabbccddee00").substr(0, 3), "OK ");
+
+  // the second chan= wins: only #b is in the mask
+  ASSERT_EQ(cli(filter, "add chan=#a chan=#b"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 1 << filter.indexOfChannel("#b"));
+
+  // either order, and chanhash= is a separate predicate that survives
+  ASSERT_EQ(cli(filter, "add chanhash=E6 chan=#a"), "OK - rule 1 added");
+  EXPECT_EQ(filter.getRule(1)->chan_mask, 1 << filter.indexOfChannel("#a"));
+  EXPECT_NE(filter.getRule(1)->chan_flags & FILTER_CHANFLG_HASH_SET, 0);
+  ASSERT_EQ(cli(filter, "add chan=#a chanhash=E6"), "OK - rule 2 added");
+  EXPECT_EQ(filter.getRule(2)->chan_mask, 1 << filter.indexOfChannel("#a"));
+  EXPECT_NE(filter.getRule(2)->chan_flags & FILTER_CHANFLG_HASH_SET, 0);
+}
+
+TEST_F(FilterTest, RepeatedPathPredicateReplacesWholesale) {
+  // replacing a long chain with a short one must leave no stale path bytes
+  // behind, so it must be indistinguishable from adding the short chain
+  // directly — including the rule digest, which covers the path bytes
+  ASSERT_EQ(cli(filter, "add path=^11223344>55667788$ path=^11$"), "OK - rule 0 added");
+  ASSERT_EQ(cli(filter, "add path=^11$"), "OK - rule 1 added");
+
+  // `filter list` prints "<idx><e|d><D|F><3 hex digest>" per rule after the header
+  std::string l = cli(filter, "list");
+  std::vector<std::string> toks;
+  for (const std::string& t : splitOnSpace(l.substr(l.find(':') + 1))) {
+    if (!t.empty()) toks.push_back(t);
+  }
+  ASSERT_EQ(toks.size(), 2u);
+  std::string d0 = toks[0].substr(toks[0].size() - 3);
+  std::string d1 = toks[1].substr(toks[1].size() - 3);
+  EXPECT_EQ(d0, d1);
+}
+
+TEST_F(FilterTest, FailedLaterValueRollsBackAutoProvisionedChan) {
+  EXPECT_EQ(cli(filter, "add chan=#keep chan=#drop type=bogus").substr(0, 5), "Err -");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  // both auto-provisioned names go: a failed add leaves no key behind
+  EXPECT_EQ(filter.findChannel("#keep"), nullptr);
+  EXPECT_EQ(filter.findChannel("#drop"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);   // only Public
+
+  // ... but a successful add may leave an earlier auto-provisioned name in place
+  ASSERT_EQ(cli(filter, "add chan=#keep chan=#drop").substr(0, 3), "OK ");
+  EXPECT_EQ(filter.getNumChannels(), 3);
+}
+
 TEST_F(FilterTest, AddRoutePredicate) {
   expectOk(filter, "add route=flood");
   EXPECT_EQ(filter.getRule(0)->route_mask, FILTER_ROUTE_FLOOD);
@@ -2259,6 +3550,19 @@ TEST_F(FilterTest, AddChanAutoProvisionsHashChannels) {
   EXPECT_EQ(filter.getRule(0)->chan_flags, FILTER_CHANFLG_MASK_SET);
 }
 
+TEST_F(FilterTest, AddRollsBackAutoProvisionedChannels) {
+  // a rejected later param must not leave a '#' key in the store: it would
+  // keep the repeater decrypting that channel
+  EXPECT_EQ(cli(filter, "add chan=#leaky type=wat"), "Err - unknown type 'wat'");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  EXPECT_EQ(filter.getNumChannels(), 1);            // only Public is left
+  EXPECT_EQ(filter.findChannel("#leaky"), nullptr);
+  // ...and a later successful add still provisions
+  expectOk(filter, "add chan=#fresh");
+  EXPECT_NE(filter.findChannel("#fresh"), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 2);
+}
+
 TEST_F(FilterTest, AddRegionPredicateCanonicalizesViaPrefix) {
   expectOk(filter, "add region=TestN");
   EXPECT_STREQ(filter.getRule(0)->regions, "TestNorth");   // prefix lookup
@@ -2325,7 +3629,9 @@ TEST_F(FilterTest, AddRejectsBadValues) {
     { "add path=zz", "Err - bad path spec" },          // not hex
     { "add path=A", "Err - bad path spec" },           // odd nibble
     { "add hsize=5", "Err - hsize values are 1..4" },
+    { "add hsize=2x", "Err - hsize values are 1..4" },   // atoi() would have read 2
     { "add chanhash=ABCD", "Err - chanhash must be 2 hex chars" },
+    { "add chanhash=11223344", "Err - chanhash must be 2 hex chars" },   // fits a path entry, not chanhash
     { "add chan=nosuchchan", "Err - unknown chan" },   // non-# names must exist
     { "add region=Nowhere", "Err - unknown region" },
     { "add action=ban", "Err - action must be drop|forward" },
@@ -2548,16 +3854,170 @@ TEST_F(FilterTest, ChanAddErrors) {
   EXPECT_EQ(cli(filter, "chan"), cli(filter, "chan list"));   // bare = list
   EXPECT_EQ(cli(filter, "chan add"), "Err - usage: filter chan add <name> [<psk-hex>]");
   EXPECT_EQ(cli(filter, "chan add Public"), "Err - channel exists");
-  EXPECT_EQ(cli(filter, "chan add #x deadbeef"), "Err - bad psk or store full");  // odd length
+  EXPECT_EQ(cli(filter, "chan add #x deadbeef"), "Err - psk must be 32 or 64 hex chars");  // odd length
   std::string long_name(FILTER_CHAN_NAME_LEN, 'n');
   EXPECT_EQ(cli(filter, ("chan add " + long_name).c_str()), "Err - name too long");
   EXPECT_EQ(cli(filter, "chan del nosuch"), "Err - unknown channel");
 }
 
 TEST_F(FilterTest, ChanAddRejectsBadPskLength) {
-  // psk must decode to exactly 16 or 32 bytes
-  EXPECT_EQ(cli(filter, "chan add bad1 0011"), "Err - bad psk or store full");
-  EXPECT_EQ(cli(filter, "chan add bad2 001122334455667788990011223344556677"), "Err - bad psk or store full");
+  // psk must be exactly 16 or 32 bytes of hex
+  EXPECT_EQ(cli(filter, "chan add bad1 0011"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad2 001122334455667788990011223344556677"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad3 00112233445566778899001122334455667788"), "Err - psk must be 32 or 64 hex chars");  // 33 bytes
+  EXPECT_EQ(cli(filter, "chan add bad4 0011223344556677889900112233445566778899aabb"), "Err - psk must be 32 or 64 hex chars");  // 19 bytes, odd
+  EXPECT_EQ(cli(filter, "chan add bad5 zz112233445566778899001122334455"), "Err - bad psk or store full");  // 32 chars, not hex
+  EXPECT_EQ(filter.getNumChannels(), 1);   // none of them stored anything
+}
+
+TEST_F(FilterTest, ChanAddKeepsStoreIntactAfterRejectedKey) {
+  // a rejected key must not have written anywhere: the live store is unchanged
+  // and the next unused slot is still pristine
+  ASSERT_EQ(cli(filter, "chan add keep 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  FilterChannel before = *filter.getChannel(0);
+  FilterChannel snapshot_keep = *filter.getChannel(1);
+
+  EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff0011"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_EQ(cli(filter, "chan add bad 00112233445566778899aabbccddeeff00"), "Err - psk must be 32 or 64 hex chars");
+
+  EXPECT_EQ(filter.getNumChannels(), 2);   // no new entry either way
+  EXPECT_EQ(memcmp(&before, filter.getChannel(0), sizeof(before)), 0);
+  EXPECT_EQ(filter.findChannel("bad"), nullptr);
+  // the slot the failed adds would have used is still empty
+  EXPECT_EQ(filter.getChannel(2)->name[0], 0);
+  EXPECT_EQ(memcmp(&snapshot_keep, filter.getChannel(1), sizeof(snapshot_keep)), 0);
+}
+
+TEST_F(FilterTest, ChanNameRejectsUnrepresentableChars) {
+  // a name has to survive a chan= list, so ',', '=', '"' and control chars are
+  // refused; an ordinary space is fine (quoted)
+  EXPECT_EQ(cli(filter, "chan add \"a,b\" 00112233445566778899aabbccddeeff"),
+            "Err - chan name must not contain , = \" or control chars");
+  EXPECT_EQ(cli(filter, "chan add \"a=b\" 00112233445566778899aabbccddeeff"),
+            "Err - chan name must not contain , = \" or control chars");
+  EXPECT_EQ(filter.getNumChannels(), 1);   // only Public
+
+  EXPECT_EQ(cli(filter, "chan add \"two words\" 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_NE(filter.findChannel("two words"), nullptr);
+}
+
+TEST_F(FilterTest, ChanNameValidationIsSharedByEveryCreationPath) {
+  // addChannel() is the single gate: the CLI, `filter add chan=#x`
+  // auto-provisioning and the direct API all refuse the same names
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  EXPECT_EQ(filter.addChannel("a,b", KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("a=b", KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("a\"b", KEY), nullptr);
+  std::string ctl = "a";
+  ctl += '\t';
+  ctl += "b";
+  EXPECT_EQ(filter.addChannel(ctl.c_str(), KEY), nullptr);
+  EXPECT_EQ(filter.addChannel("ctrl\x01", KEY), nullptr);
+  EXPECT_EQ(filter.getNumChannels(), 1);
+  // hashtag names go through the same gate
+  EXPECT_EQ(filter.addChannel("#a,b", NULL), nullptr);
+
+  // a space is allowed through every path
+  ASSERT_NE(filter.addChannel("a b", KEY), nullptr);
+  EXPECT_EQ(cli(filter, "add chan=\"a b\""), "OK - rule 0 added");
+}
+
+TEST_F(FilterTest, QuotedChanNameSurvivesRuleRoundTrip) {
+  ASSERT_EQ(cli(filter, "chan add \"two words\" 00112233445566778899aabbccddeeff").substr(0, 3), "OK ");
+  ASSERT_EQ(cli(filter, "add chan=\"two words\""), "OK - rule 0 added");
+  // the printed value is quoted, so nextToken keeps it one token
+  std::string got = cli(filter, "get 0");
+  EXPECT_NE(got.find("chan=\"two words\""), std::string::npos);
+  // and feeding it back is accepted (predicate snippet only)
+  EXPECT_EQ(cli(filter, "add chan=\"two words\""), "OK - rule 1 added");
+}
+
+// Hex-encode a key buffer (test-only helper for the collision fixtures).
+static std::string hexKey(const uint8_t* k, size_t n) {
+  std::string s;
+  char t[3];
+  for (size_t i = 0; i < n; i++) { snprintf(t, sizeof(t), "%02x", k[i]); s += t; }
+  return s;
+}
+
+// A DIFFERENT 16-byte key whose on-air tag (sha256(secret)[0]) is `tag`. The
+// tag is one byte wide, so such a key always exists and turns up within a few
+// hundred tries — the collision group below is real, not simulated.
+static std::string findKeyWithTag(uint8_t tag) {
+  uint8_t key[16];
+  for (uint32_t n = 0; n < 200000u; n++) {
+    memset(key, 0, sizeof(key));
+    key[0] = n & 0xff;
+    key[1] = (n >> 8) & 0xff;
+    uint8_t h[32];
+    mesh::Utils::sha256(h, sizeof(h), key, sizeof(key));
+    if (h[0] == tag) return hexKey(key, sizeof(key));
+  }
+  return "";
+}
+
+TEST_F(FilterTest, ChanAddNotesSharedHashKeys) {
+  // core tries at most four distinct keys per on-air tag (Mesh.cpp); an alias of
+  // an existing key is free, a second DISTINCT key is worth saying out loud
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  std::string first = cli(filter, (std::string("chan add one ") + KEY).c_str());
+  EXPECT_NE(first.find("OK - chan one h="), std::string::npos);
+  EXPECT_EQ(first.find("multiple keys"), std::string::npos);
+
+  // same key under another name = alias: still one key on the tag
+  std::string alias = cli(filter, (std::string("chan add two ") + KEY).c_str());
+  EXPECT_NE(alias.find("OK - chan two h="), std::string::npos);
+  EXPECT_EQ(alias.find("multiple keys"), std::string::npos);
+
+  // a different key that collides on the same one-byte tag
+  std::string other = findKeyWithTag(filter.findChannel("one")->hash);
+  ASSERT_FALSE(other.empty());
+  std::string collide = cli(filter, ("chan add three " + other).c_str());
+  EXPECT_NE(collide.find("OK - chan three h="), std::string::npos);
+  EXPECT_NE(collide.find("multiple keys on this hash; core tries 4"), std::string::npos);
+}
+
+TEST_F(FilterTest, SearchChannelsSkipsAliasKeys) {
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  ASSERT_EQ(cli(filter, (std::string("chan add base ") + KEY).c_str()).substr(0, 3), "OK ");
+  uint8_t tag = filter.findChannel("base")->hash;
+  uint8_t h[1] = { tag };
+
+  // four aliases of one key: core sees a single candidate, not four
+  for (int i = 0; i < 4; i++) {
+    ASSERT_EQ(cli(filter, ("chan add alias" + std::to_string(i) + " " + KEY).c_str()).substr(0, 3), "OK ");
+  }
+  mesh::GroupChannel dest[4];
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 4), 1);
+
+  // add a genuinely different channel sharing the tag: without deduplication it
+  // would consume a fifth slot that core never has, so it would never decrypt
+  std::string other = findKeyWithTag(tag);
+  ASSERT_FALSE(other.empty());
+  ASSERT_EQ(cli(filter, ("chan add other " + other).c_str()).substr(0, 3), "OK ");
+
+  int n = filter.searchChannelsByHash(h, dest, 4);
+  ASSERT_EQ(n, 2);   // the alias group plus the distinct key both still fit
+  bool found_other = false;
+  uint8_t other_secret[PUB_KEY_SIZE] = {0};
+  for (int i = 0; i < 16; i++) {
+    other_secret[i] = (uint8_t)strtoul(other.substr(i * 2, 2).c_str(), NULL, 16);
+  }
+  for (int i = 0; i < n; i++) if (memcmp(dest[i].secret, other_secret, PUB_KEY_SIZE) == 0) found_other = true;
+  EXPECT_TRUE(found_other);
+}
+
+TEST_F(FilterTest, SearchChannelsRespectsCapacityAndFilterOff) {
+  const char* KEY = "00112233445566778899aabbccddeeff";
+  for (int i = 0; i < 3; i++) {
+    ASSERT_EQ(cli(filter, ("chan add c" + std::to_string(i) + " " + KEY).c_str()).substr(0, 3), "OK ");
+  }
+  uint8_t h[1] = { filter.findChannel("c0")->hash };
+  mesh::GroupChannel dest[4];
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 0), 0);        // no capacity
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 1), 1);        // one slot: the alias group fits
+  filter.setEnabled(false);
+  EXPECT_EQ(filter.searchChannelsByHash(h, dest, 4), 0);        // filter off: stock behaviour
 }
 
 TEST_F(FilterTest, ChanStoreFull) {
@@ -2640,7 +4100,12 @@ TEST_F(FilterTest, RatelimitCommands) {
   EXPECT_EQ(cli(filter, "ratelimit advert -1"), "Err - hours must be 0..720 (0=off)");
   EXPECT_EQ(cli(filter, "ratelimit advert 0"), "OK - advert ratelimit 0h");
   EXPECT_EQ(filter.getAdvertRatelimit(), 0);
-  EXPECT_EQ(cli(filter, "ratelimit bogus"), "Err - usage: ratelimit advert <hours>|clear");
+  EXPECT_EQ(cli(filter, "ratelimit bogus"), "Err - usage: ratelimit [advert <hours>|clear]");
+  // a non-number must not be read as 0, which would silently turn the limiter off
+  EXPECT_EQ(cli(filter, "ratelimit advert abc"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(cli(filter, "ratelimit advert 12x"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(cli(filter, "ratelimit advert"), "Err - hours must be 0..720 (0=off)");
+  EXPECT_EQ(filter.getAdvertRatelimit(), 0);
 }
 
 // ---------------------------------------------------------------- resetStats
@@ -2853,10 +4318,10 @@ TEST_F(FilterTest, LimiterStillAppliesAfterForward) {
   filter.setAdvertRatelimit(48);
   uint8_t key[4] = { 0x21, 0x22, 0x23, 0x24 };
   auto pkt = makeAdvert(key);
-  EXPECT_EQ(filter.checkPacket(&pkt, 1000, nullptr), FILTER_ACT_FORWARD);
+  EXPECT_EQ(forwardPacket(filter, pkt, 1000), FILTER_ACT_FORWARD);
   EXPECT_EQ(filter.getRule(0)->hits, 1u);
   pkt.transport_codes[0] = 7;
-  EXPECT_EQ(filter.checkPacket(&pkt, 2000, nullptr), FILTER_ACT_DROP);   // limiter wins
+  EXPECT_EQ(forwardPacket(filter, pkt, 2000), FILTER_ACT_DROP);   // limiter wins
   EXPECT_EQ(filter.getLimiterDrops(), 1u);
   EXPECT_EQ(filter.getRule(0)->hits, 2u);   // one scan per received advert (single pass)
 }
@@ -3002,7 +4467,6 @@ TEST_F(FilterTest, MoveForwardAndBackward) {
   expectOk(filter, "add hops=22");
   expectOk(filter, "add hops=33");
   ASSERT_EQ(cli(filter, "move 0 2"), "OK - rule 0 moved to 2");   // rule ends up AT index 2
-  EXPECT_LE(strlen("OK - rule 15 moved to 15"), (size_t)160);   // remote-CLI reply discipline
   EXPECT_EQ(filter.getRule(0)->hops.lo, 22);
   EXPECT_EQ(filter.getRule(1)->hops.lo, 33);
   EXPECT_EQ(filter.getRule(2)->hops.lo, 11);

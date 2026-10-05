@@ -38,8 +38,12 @@ commit** — the guides are user-facing API documentation, not optional docs.
 
 **Code (`examples/simple_repeater/`):**
 - `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
-  `checkContent` decrypted-content single pass, verdict stash), advert rate
-  limiter, binary persistence (`load`/`save`, v3..v6), `filterCLI`.
+  `checkContent` decrypted-content single pass, verdict stash), binary
+  persistence (`load`/`save`, v3..v6), `filterCLI`.
+- `AdvertRateLimiter.h/.cpp` — the per-origin advert repeat window: cache,
+  counters, and the check/commit split (see the fork's rule-model note).
+- `PersistUtil.h` — the lazy dirty-save pattern, the per-platform file opens, and
+  the shared staged-save transaction; also the config-integrity note.
 - `PacketFilterConfig.h` — all capacity tunables (`FILTER_MAX_RULES`, ...),
   override via build flags; persistence-layout caveats noted inline.
 - `TinyRegex.h/.cpp` — vendored kokke/tiny-regex-c + step budget (see Hard
@@ -55,18 +59,26 @@ commit** — the guides are user-facing API documentation, not optional docs.
   dispatch, lazy-save loop).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
-**Tests:** `test/test_packet_filter/` (217 behavior-level cases: matching,
+**Tests:** `test/test_packet_filter/` (278 behavior-level cases: matching,
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
 PatternMatch) and `test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
 `NativeTestStubs.cpp`, `RegionMapStub.cpp`, `FilterTestHelpers.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` (host-native, no hardware); firmware via
-`sh build.sh build-firmware <target>` (`sh build.sh list`), the filter fork's
-flash target being `xiao_s3_wio`. `.github/workflows/filter-build.yml` builds
-release channels (dev → `repeater-filter`, stable → `repeater-filter-stable`);
-`sync-upstream.yml` merges upstream weekly. Upstream's own docs live in
-`docs/` (MeshCore protocol/CLI generally) — not fork-filter documentation.
+native_battery_gate` (host-native, no hardware), plus `-e
+native_packet_filter_san` / `-e native_battery_gate_san` for ASan+UBSan;
+firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
+`build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
+target being `Xiao_S3_WIO_repeater`. **Compile-check every filesystem
+family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
+`RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_repeater` — host-native
+tests cannot catch a platform-specific API difference, and one did (the nRF52
+file type has no default constructor).
+`.github/workflows/filter-build.yml` builds release channels (dev →
+`repeater-filter`, stable → `repeater-filter-stable`); `sync-upstream.yml` merges
+upstream weekly and promotes stable only on explicit dispatch. Upstream's own
+docs live in `docs/` (MeshCore protocol/CLI generally) — not fork-filter
+documentation.
 
 ## Branch model
 
@@ -85,6 +97,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/PacketFilter.h/.cpp`, `PacketFilterConfig.h`
 - `examples/simple_repeater/TinyRegex.h/.cpp`, `CliUtil.h`, `BatteryGate.h/.cpp`
 - `examples/simple_repeater/PatternMatch.h/.cpp`
+- `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
 - `FILTER.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
 
@@ -119,7 +132,11 @@ chars).
 CLI and filter semantics must work the way a user would guess without reading
 FILTER.md:
 
-- `filter get <idx>` output is valid `filter add` input (round-trip).
+- `filter get <idx>` is an **inspection** command: its reply shows the rule's
+  predicates plus counters, is truncated to the 160-byte transport, and is *not*
+  re-addable input (`add` rejects the `hits=`/`air=`/`pass=` metadata it prints).
+- `filter chan list [<start-idx>]` exists because a full store does not fit one
+  reply and `chan del` takes a name; a truncated listing ends with `next=N`.
 - Errors say what's wrong and what's accepted (e.g. `Err - chanhash must be 2
   hex chars`); usage lines enumerate the command surface.
 - Syntax reads like the concept: `[a,b]`-style intervals, comma lists, `*` =
@@ -151,6 +168,19 @@ FILTER.md:
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
   in 2026-10 (alternation) — a stored pattern containing an unescaped `|`
   previously matched a literal pipe.
+- **Config integrity is length-checked, not checksummed.** A truncated save is
+  detected on load; a torn write of exactly the right length is not. Deliberately
+  no record checksum (the on-disk format is frozen) and no sidecar file (a second
+  file is a second thing to go missing). A checksum belongs *in* the record, and
+  the record only changes with `FILTER_CFG_VERSION` — so when a v7 is needed
+  anyway, put it there, and every config written before it must still load.
+  Rationale: stops a later "improvement" from quietly weakening config
+  compatibility.
+- **Old-version migration is temporary.** v3..v6 loading is kept for now and is
+  expected to be dropped once the field has migrated. Keep that code path and its
+  byte fixtures contiguous and clearly delimited, so removing it is one excision
+  rather than a scavenger hunt. Rationale: stops the migration path accreting
+  more versions before anyone removes it.
 
 ## Hard invariants (do not break)
 
@@ -186,8 +216,8 @@ FILTER.md:
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
-- Pure refactors keep both suites green **unchanged** — the suite (217 filter
-  cases) is the safety net that proves no behavior slipped.
+- Pure refactors keep both suites green **unchanged** — the suites (278 filter,
+  44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
 ```
@@ -195,9 +225,20 @@ pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + 
 pio test -e native_battery_gate     # battery gate
 ```
 
-All green, and every touched line required. Touching firmware-hook or
-persistence code additionally warrants a compile check of the real target
-(e.g. `pio run -e xiao_s3_wio`).
+All green, and every touched line required — together with the full four-env
+run, since the generic envs are where a broken selection shows up:
+
+```
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate
+```
+
+Touching firmware-hook or persistence code additionally warrants compile checks
+of `Xiao_S3_WIO_repeater`, `RAK_4631_repeater`, `PicoW_repeater` and
+`wio-e5_repeater`. Note that PlatformIO does **not** track the
+force-included `test/test_packet_filter/NativeShim.h` as a dependency: after
+changing a struct it defines, clean the native envs (`pio run -e
+native_packet_filter -t clean`) or the stale objects will silently disagree
+with the new layout.
 
 ## Commit / PR discipline
 

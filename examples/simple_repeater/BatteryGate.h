@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #include <Mesh.h>
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
+#include "PersistUtil.h"
 
 // accepted threshold range, in millivolts
 #define BATT_MV_MIN  1
@@ -37,9 +38,14 @@ class BatteryGate {
   uint16_t resume_mV;         // resume when voltage rises to this (hysteresis)
   uint8_t low_count;          // consecutive low readings (debounce)
   uint32_t drops;             // packets gated while suspended (RAM-only)
-  unsigned long next_sample_at;
-  bool dirty;                 // needs save
-  unsigned long dirty_since;
+  // Sampling schedule: an explicit "sample next loop" flag plus the time of the
+  // last sample. A deadline stored as an absolute millis() value cannot tell a
+  // wrapped deadline from an unarmed timer, and 0 as a sentinel conflates the
+  // two. uint32_t (not unsigned long) so host tests model the MCU's 32-bit
+  // millis() wrap.
+  uint32_t last_sample_ms;
+  bool sample_pending;
+  LazySave save_flag;         // needs save, written back by loop()
 
 public:
   BatteryGate();
@@ -71,11 +77,15 @@ public:
   // take one reading and apply debounce + hysteresis
   void sample(mesh::MainBoard& board);
 
-  void markDirty() { dirty = true; dirty_since = millis(); }
+  void markDirty() { save_flag.markDirty(); }
 
   // persistence: thresholds and enabled flag only (never the suspended state)
   void load(FILESYSTEM* fs);
   void save(FILESYSTEM* fs);
+
+private:
+  // state of a fresh node, and the baseline load() resets to before reading
+  void resetToDefaults();
 };
 
 // CLI command handler: invoke with the command after "battery" (prefix

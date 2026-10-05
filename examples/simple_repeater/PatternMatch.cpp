@@ -15,9 +15,6 @@
   ((FILTER_SENDER_PATTERN_LEN > FILTER_TEXT_PATTERN_LEN) ? FILTER_SENDER_PATTERN_LEN \
                                                         : FILTER_TEXT_PATTERN_LEN)
 
-// budget abort flag of the last patternMatches() call
-static bool g_aborted = false;
-
 // Copy `pattern` into `buf` and terminate every top-level alternative in place,
 // so the alternatives can be walked as consecutive NUL-terminated strings.
 // Returns the alternative count (at least 1, empty branches included), or 0 if
@@ -70,8 +67,8 @@ bool patternValid(const char* pattern, char* err, size_t err_sz) {
   return true;
 }
 
-bool patternMatches(const char* pattern, const char* subject) {
-  g_aborted = false;
+bool patternMatches(const char* pattern, const char* subject, bool* aborted) {
+  if (aborted) *aborted = false;
   char buf[PATTERN_SPLIT_MAX];
   int alts = splitAlternatives(pattern, buf, sizeof(buf));
   if (alts == 0) return false;   // pattern cannot split: never matches
@@ -87,12 +84,11 @@ bool patternMatches(const char* pattern, const char* subject) {
     if (compiled == NULL) continue;
     int matchlength;
     int idx = re_matchp(compiled, subject, &matchlength);
-    if (re_budget_exhausted()) { g_aborted = true; return false; }   // fail-open
+    if (re_budget_exhausted()) {   // fail-open
+      if (aborted) *aborted = true;
+      return false;
+    }
     if (idx >= 0) return true;
   }
   return false;
-}
-
-bool patternAborted(void) {
-  return g_aborted;
 }

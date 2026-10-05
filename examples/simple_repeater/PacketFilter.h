@@ -31,6 +31,8 @@
 #include <helpers/RegionMap.h>       // RegionEntry (region= predicate)
 #include "PacketFilterConfig.h"
 #include "PatternMatch.h"
+#include "PersistUtil.h"
+#include "AdvertRateLimiter.h"
 
 // actions
 #define FILTER_ACT_ALLOW     0
@@ -125,7 +127,8 @@ struct FilterRule {
                            // is never persisted (persist ends at offsetof(hits))
   // RAM-only throttle state — never persisted (persist ends at offsetof(hits));
   // travels with the rule on move/del, like hits
-  uint32_t throttle_last_ms; // millis() stamp of the last within-budget pass
+  uint64_t throttle_last_ms; // stamp of the last within-budget pass, on this
+                            // repeater's 64-bit monotonic clock (never persisted)
   uint32_t throttle_pass;    // within-budget passes (slipped past the rule)
   bool     throttle_seen;    // a pass has been stamped (first match = free pass)
 };
@@ -141,13 +144,51 @@ static_assert(offsetof(FilterRule, throttle) ==
               "FilterRule::throttle must start where the v4/v5 record ended");
 static_assert(offsetof(FilterRule, hits) == offsetof(FilterRule, throttle) + 4,
               "u16 throttle + 2 reserved bytes must fill the gap before hits");
+// FILTER_PATH_HASH_SLOTS sizes FilterRule::path, so it moves every field after
+// it and a config saved by one build would not load in another. Name the knob
+// that was raised here, rather than failing on the record invariant it broke.
+static_assert(FILTER_PATH_HASH_SLOTS == 4,
+              "FilterRule::path size is in the persisted record: this needs a "
+              "FILTER_CFG_VERSION bump and migration code in load()");
 
-struct AdvertSeenEntry {      // RAM-only; cleared on reboot
-  uint8_t  pub_key_prefix[4]; // 4 pubkey bytes sampled at fixed offsets (see
-                              // advertRatelimitDrop); collision odds ~0.001%
-                              // per 256 distinct nodes, vanity-robust; worst
-                              // case is one falsely suppressed advert/window
-  uint32_t first_seen_millis; // by this repeater's own monotonic clock
+// On-disk rule record sizes, in BYTES, frozen as literals.
+//
+// These used to be derived from offsetof(FilterRule, ...). That was a trap: the
+// moment a field moved, every historical size silently changed too, and a config
+// written by an older firmware would load as something it never was — with no
+// compile error and no test failure to explain it. A format is a promise to
+// bytes that already exist in the field, so the historical sizes are numbers,
+// not expressions.
+#define FILTER_RULE_V3_BYTES  124   // ends where `regions` began, padded to uint32_t
+#define FILTER_RULE_V4_BYTES  156   // v4 and v5 share one size: ends where `throttle` begins
+#define FILTER_RULE_V6_BYTES  160   // current: ends where the RAM-only `hits` counter begins
+#define FILTER_CHAN_PERSIST_BYTES  50
+
+// The frozen sizes must still describe THIS struct. These asserts are the
+// tripwire: a new or moved field in the persisted prefix makes one of them fail,
+// which is the moment to bump FILTER_CFG_VERSION and add migration code in
+// load() — never to edit the frozen numbers to match.
+static_assert(offsetof(FilterRule, throttle) == FILTER_RULE_V4_BYTES,
+              "v4/v5 record size is frozen at 156 B; the live struct no longer matches");
+static_assert(offsetof(FilterRule, hits) == FILTER_RULE_V6_BYTES,
+              "v6 record size is frozen at 160 B; the live struct no longer matches");
+static_assert(sizeof(FilterChannel) == FILTER_CHAN_PERSIST_BYTES,
+              "channel record size is frozen at 50 B; the live struct no longer matches");
+
+// One packet hash per scan, computed on first use. The prob roll and the
+// content-verdict stash guard both need Packet::calculatePacketHash(), a SHA-256
+// over the payload; hashing per prob-enabled rule made a list of prob rules pay
+// one hash per matching rule on every packet.
+class PacketHashCache {
+  const mesh::Packet* pkt;
+  uint8_t hash[MAX_HASH_SIZE];
+  bool valid;
+public:
+  explicit PacketHashCache(const mesh::Packet* p) : pkt(p), valid(false) { memset(hash, 0, sizeof(hash)); }
+  const uint8_t* get() {
+    if (!valid) { pkt->calculatePacketHash(hash); valid = true; }
+    return hash;
+  }
 };
 
 class FilterRules {
@@ -155,11 +196,13 @@ class FilterRules {
   int num_rules;
   FilterChannel channels[FILTER_MAX_CHANNELS];
   int num_channels;
-  AdvertSeenEntry advert_cache[FILTER_ADVERT_CACHE_SIZE];
-  int advert_cache_count;     // number of used entries (0..FILTER_ADVERT_CACHE_SIZE)
-  int advert_cache_head;      // ring head (oldest entry) once the cache is full
-  uint16_t ratelimit_hours;   // per-node advert repeat window; 0 = off
-  uint32_t limiter_drops;     // adverts dropped by the rate limiter
+  AdvertRateLimiter limiter;   // per-node advert repeat window
+  // A 64-bit monotonic clock folded from the 32-bit millis(). Unsigned
+  // subtraction handles exactly one wrap: it cannot tell 49.7 days + 1 s from
+  // 1 s, so a repeater left up long enough would spuriously rate-limit a rule or
+  // an origin the moment it returned. RAM-only; nothing here is persisted.
+  uint64_t uptime_ms;
+  uint32_t last_millis;
   uint32_t budget_aborts;     // regex evaluations aborted on step-budget exhaustion
   uint64_t air_saved_ms;      // estimated TX airtime (ms) saved by rule + limiter drops
   uint64_t air_evaluated_ms;  // estimated TX airtime (ms) evaluated; both counters RAM-only
@@ -169,14 +212,28 @@ class FilterRules {
     uint8_t verdict;          // FILTER_ACT_* (allow included)
   } content_verdict;
   bool enabled;
-  bool dirty;                 // needs save
-  unsigned long dirty_since;
+  LazySave save_flag;         // needs save, written back by loop()
 
 public:
   FilterRules();
 
   void begin(FILESYSTEM* fs);      // load persisted config, pre-provision Public channel
   void loop(FILESYSTEM* fs);       // lazy dirty-flag save (same pattern as ClientACL)
+
+  // Forget any content verdict stashed for the packet currently being received.
+  // MyMesh::onRecvPacket() brackets one receive with this so a verdict can never
+  // outlive the operation that produced it; checkPacket() also consumes it.
+  void clearContentVerdict() { content_verdict.pkt = NULL; }
+
+  // Fold the 32-bit millis() into the 64-bit accumulator and return it. Safe to
+  // call as often as the loop runs — each call adds the time since the previous
+  // one, and equal readings add zero — which is what lets loop() guarantee the
+  // wrap is noticed even when no packet arrives.
+  uint64_t uptimeMillis(uint32_t now_millis) {
+    uptime_ms += (uint32_t)(now_millis - last_millis);
+    last_millis = now_millis;
+    return uptime_ms;
+  }
 
   bool isEnabled() const { return enabled; }
   void setEnabled(bool on);
@@ -193,6 +250,9 @@ public:
   int getNumChannels() const { return num_channels; }
   FilterChannel* getChannel(int idx) { return &channels[idx]; }
   FilterChannel* findChannel(const char* name);
+  // index of a stored channel, or -1; the store is dense, so the index is also
+  // the bit a rule's chan_mask uses
+  int indexOfChannel(const char* name) const;
   // addChannel: psk_hex required for non-'#' names; NULL/empty for '#name'
   // derives secret = sha256(name)[0..15] per the companion protocol.
   FilterChannel* addChannel(const char* name, const char* psk_hex);
@@ -210,6 +270,11 @@ public:
   uint8_t checkPacket(const mesh::Packet* pkt, uint32_t now_millis, const RegionEntry* region,
                       uint32_t est_air_ms = 0);
 
+  // Commit a forwarding decision that actually succeeded: starts an advert's
+  // rate-limit window. Called from the end of allowPacketForward(), never from
+  // the check, so the window means "relayed", not "received".
+  void onForwardAllowed(const mesh::Packet* pkt, uint32_t now_millis);
+
   // Single-pass evaluation of the ENTIRE rule list on a decrypted group
   // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
   // sender / text), in listed order; first enabled match decides (first match
@@ -223,13 +288,16 @@ public:
   // supply keyed-channel candidates for core's group decryption
   int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
 
-  // advert rate limiter
-  void setAdvertRatelimit(uint16_t hours);
-  uint16_t getAdvertRatelimit() const { return ratelimit_hours; }
-  void clearAdvertCache();
-  int getAdvertCacheCount() const { return advert_cache_count; }
-  void markDirty() { dirty = true; dirty_since = millis(); }
-  uint32_t getLimiterDrops() const { return limiter_drops; }
+  // advert rate limiter (state lives in AdvertRateLimiter)
+  void setAdvertRatelimit(uint16_t hours) { limiter.setHours(hours); markDirty(); }
+  uint16_t getAdvertRatelimit() const { return limiter.getHours(); }
+  void clearAdvertCache() { limiter.clearCache(); }
+  int getAdvertCacheCount() const { return limiter.getCacheCount(); }
+  // Any rule or channel mutation: the config is changing, so a verdict stashed
+  // under the old rules must not be honoured afterwards. markDirty() is the one
+  // place every mutation already passes through.
+  void markDirty() { clearContentVerdict(); save_flag.markDirty(); }
+  uint32_t getLimiterDrops() const { return limiter.getDrops(); }
   uint32_t getBudgetAborts() const { return budget_aborts; }
   uint64_t getAirSavedMs() const { return air_saved_ms; }   // airtime not relayed (drops)
   uint64_t getAirEvaluatedMs() const { return air_evaluated_ms; }
@@ -243,8 +311,14 @@ public:
   void save(FILESYSTEM* fs);
 
 private:
-  // per-node advert repeat window; returns true if the advert must be dropped
-  bool advertRatelimitDrop(const mesh::Packet* pkt, uint32_t now_millis);
+  // state of a fresh node, and the baseline load() resets to before reading
+  void resetToDefaults();
+  // Airtime telemetry, both RAM-only. `billEvaluated` counts a packet that was
+  // looked at exactly once per packet — checkPacket() bills every packet it
+  // scans, except one checkContent() already dropped and billed there.
+  // `billSaved` counts airtime a drop or a limiter drop will not spend.
+  void billEvaluated(uint32_t est_air_ms) { air_evaluated_ms += est_air_ms; }
+  void billSaved(uint32_t est_air_ms) { air_saved_ms += est_air_ms; }
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob
@@ -252,7 +326,7 @@ private:
   // the saved airtime, and store its action in `out`. Returns false when a
   // gate slips the packet past the rule (evaluation continues with the next
   // rule, exactly as on a failed predicate).
-  bool decideMatch(FilterRule* r, const mesh::Packet* pkt, uint32_t now_millis,
+  bool decideMatch(FilterRule* r, PacketHashCache& pkt_hash, uint64_t now_millis,
                    uint32_t est_air_ms, uint8_t& out);
 };
 

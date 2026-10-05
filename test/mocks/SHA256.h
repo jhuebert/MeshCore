@@ -8,6 +8,15 @@
 // distinguishable results for packets with different payloads.
 #include <string.h>
 
+// Test-only instrumentation: number of finalize() calls, so a test can assert
+// that a decision path did (or did not) hash a packet. An inline function
+// holding the counter gives every native environment one shared instance
+// without needing a definition in each build.
+inline uint32_t& mockShaFinalizeCount() {
+  static uint32_t n = 0;
+  return n;
+}
+
 class SHA256 {
   uint8_t _state[32];
   size_t _len;
@@ -25,6 +34,7 @@ public:
   }
 
   void finalize(uint8_t* hash, size_t hashLen) {
+    mockShaFinalizeCount()++;
     for (size_t i = 0; i < hashLen; i++) {
       hash[i] = _state[i % 32];
     }

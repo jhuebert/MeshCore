@@ -60,7 +60,7 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: filter-build-${{ inputs.channel }}
@@ -78,12 +78,14 @@ jobs:
       release_title: ${{ steps.version.outputs.release_title }}
       firmware_version: ${{ steps.version.outputs.firmware_version }}
       changes_section: ${{ steps.version.outputs.changes_section }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
 
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
           # empty branch input = the channel's own branch
+          # the ref is an expression evaluated by Actions, never shell text
           ref: ${{ inputs.branch != '' && inputs.branch || (inputs.channel == 'stable' && 'repeater-filter-stable' || 'repeater-filter') }}
           fetch-depth: 0
 
@@ -92,6 +94,7 @@ jobs:
         env:
           CHANNEL: ${{ inputs.channel }}
           FORCE_BUILD: ${{ inputs.force_build }}
+          BRANCH_INPUT: ${{ inputs.branch }}
         run: |
           set -euo pipefail
           case "$CHANNEL" in
@@ -106,7 +109,9 @@ jobs:
             BRANCH="repeater-filter"
             BASE_REF="origin/dev"
           fi
-          [ -n "${{ inputs.branch }}" ] && BRANCH="${{ inputs.branch }}"
+          # via env, not ${{ }}: input text must never become shell syntax
+          if [ -n "$BRANCH_INPUT" ]; then BRANCH="$BRANCH_INPUT"; fi
+          # recorded so the release can name the exact revision it came from
           SHORT_SHA=$(git rev-parse --short HEAD)
 
           # upstream base: last companion-v* tag reachable from HEAD, X.Y.Z only
@@ -137,16 +142,25 @@ jobs:
             RELEASE_TAG="filter-${UPSTREAM_VERSION}${RN_SUFFIX}"
             DISPLAY_VERSION="${UPSTREAM_VERSION}${RN_SUFFIX}"
             RELEASE_TITLE="Filter Firmware ${DISPLAY_VERSION} (stable)"
-            FIRMWARE_VERSION="${UPSTREAM_VERSION}-filter-${SHORT_SHA}"
+            # build.sh appends -<short sha> itself
+            FIRMWARE_VERSION="${UPSTREAM_VERSION}-filter"
           else
-            # previous dev tag = latest filter-*-dev.* tag (new scheme only)
-            PREV_TAG=$(git tag --list 'filter-*-dev.*' | sort -V | tail -1 || true)
-            # counter = existing tags for this base + 1 (resets on new base)
-            N=$(( $(git tag --list "filter-${UPSTREAM_VERSION}-dev.*" | wc -l) + 1 ))
+            # previous dev tag = latest filter-*-dev.* tag (new scheme only).
+            # Scoped to the channel's own tags, so an unrelated stable release
+            # cannot mask a dev change (or vice versa).
+            PREV_TAG=$(git tag --list 'filter-*-dev.*' \
+                       | sort -V | tail -1 || true)
+            # counter = highest existing suffix for this base + 1. Counting the
+            # tags (count + 1) collides when one was deleted or a gap exists,
+            # and a duplicate tag fails the release.
+            MAXN=$(git tag --list "filter-${UPSTREAM_VERSION}-dev.*" \
+                   | sed -n 's/.*\.\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1 || true)
+            N=$(( ${MAXN:-0} + 1 ))
             RELEASE_TAG="filter-${UPSTREAM_VERSION}-dev.${N}"
             DISPLAY_VERSION="${UPSTREAM_VERSION}-dev.${N}"
             RELEASE_TITLE="Filter Firmware ${DISPLAY_VERSION}"
-            FIRMWARE_VERSION="${UPSTREAM_VERSION}-dev.${N}-filter-${SHORT_SHA}"
+            # build.sh appends -<short sha> itself
+            FIRMWARE_VERSION="${UPSTREAM_VERSION}-dev.${N}-filter"
           fi
 
           # ---- gate: should this channel build at all? ----
@@ -176,10 +190,12 @@ jobs:
             # build when any commit since the channel's last release touches
             # code (dev channel counts upstream commits too; stable excludes
             # upstream history so only cherry-picked filter commits count)
+            # merges INCLUDED: a merge commit can carry a hand-resolved conflict,
+            # which is a real code change that --no-merges would hide
             if [ "$CHANNEL" = stable ]; then
-              COMMITS=$(git rev-list "$RANGE" --no-merges --not "$BASE_REF")
+              COMMITS=$(git rev-list "$RANGE" --not "$BASE_REF")
             else
-              COMMITS=$(git rev-list "$RANGE" --no-merges)
+              COMMITS=$(git rev-list "$RANGE")
             fi
             for c in $COMMITS; do
               CODE=0
@@ -202,7 +218,7 @@ jobs:
           # filter-only commits since the previous release of this channel
           # (--not <upstream base> subtracts everything reachable from upstream)
           CHANGES_FILE=$(mktemp)
-          for c in $(git rev-list "$RANGE" --no-merges --not "$BASE_REF"); do
+          for c in $(git rev-list "$RANGE" --not "$BASE_REF"); do
             SUBJECT=$(git log -1 --format=%s "$c")
             DOCS_ONLY=1
             while IFS= read -r p; do
@@ -243,10 +259,18 @@ jobs:
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
           echo "firmware_version=$FIRMWARE_VERSION" >> "$GITHUB_OUTPUT"
+          # the exact revision everything below was derived from and built at
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           {
-            echo "changes_section<<CHANGES_EOF"
+            # generated delimiter: a commit subject containing a fixed
+            # CHANGES_EOF line would truncate the output block
+            DELIM="CHANGES_EOF_$(git rev-parse --short HEAD)_RANDOM"
+            while grep -qF "$DELIM" "$CHANGES_FILE" 2>/dev/null; do
+              DELIM="${DELIM}X"
+            done
+            echo "changes_section<<$DELIM"
             cat "$CHANGES_FILE"
-            echo "CHANGES_EOF"
+            echo "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
   validate-targets:
@@ -261,7 +285,9 @@ jobs:
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.version.outputs.branch }}
+          # the revision the release names, not the branch tip: the target list
+          # must describe the same tree the firmware is built from
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
@@ -270,16 +296,19 @@ jobs:
         id: validate
         env:
           TARGETS_INPUT: ${{ inputs.targets }}
+          FIRMWARE_TARGETS: ${{ vars.FIRMWARE_TARGETS }}
         run: |
           # resolve targets: explicit input, else FIRMWARE_TARGETS repo variable
-          TARGETS="${TARGETS_INPUT:-${{ vars.FIRMWARE_TARGETS }}}"
+          # (both via env: an input containing a quote must stay data)
+          TARGETS="${TARGETS_INPUT:-$FIRMWARE_TARGETS}"
           if [ -z "$TARGETS" ]; then
             echo "No targets: set the FIRMWARE_TARGETS repo variable or pass the 'targets' input" >&2
             exit 1
           fi
 
           # known targets come from platformio.ini via build.sh
-          sh build.sh list > /tmp/known-targets.txt
+          # build.sh uses bash arrays; /bin/sh is not a contract
+          bash build.sh list > /tmp/known-targets.txt
 
           # warn and skip unknown names instead of failing: a target can be
           # valid on the dev branch but not yet on stable's upstream base
@@ -307,8 +336,10 @@ jobs:
     needs: [version, validate-targets]
     if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # a board that fails to build shouldn't block the release; it's just omitted
-    continue-on-error: true
+    # Dev publishes what built, and every omission is visible in the per-target
+    # manifests shipped with the release. Stable does NOT: a stable release is
+    # what users install, so any requested board failing must block it.
+    continue-on-error: ${{ inputs.channel != 'stable' }}
     strategy:
       matrix:
         target: ${{ fromJson(needs.validate-targets.outputs.targets) }}
@@ -318,15 +349,49 @@ jobs:
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ needs.version.outputs.branch }}
+          # pinned, like the target list: if the branch moved after version
+          # selection, the manifest, the release body and the tag would all name
+          # a revision this job never built
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
 
+      - name: Clear stale artifacts
+        # a previous run's output must never be mistaken for this run's
+        run: rm -rf out
+
       - name: Build Firmware
         env:
           FIRMWARE_VERSION: ${{ needs.version.outputs.firmware_version }}
-        run: /usr/bin/env bash build.sh build-firmware ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+        run: /usr/bin/env bash build.sh build-firmware "$TARGET"
+
+      - name: Write build manifest
+        # a per-target record of what was actually produced, so a release can
+        # never imply coverage it does not have
+        env:
+          TARGET: ${{ matrix.target }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          # built outside out/ so the glob below cannot see the manifest itself:
+          # the redirect would create it before the listing ran, and it would
+          # record its own (still-being-written) sha256
+          {
+            echo "target: $TARGET"
+            echo "source_sha: $SOURCE_SHA"
+            echo "channel: $CHANNEL"
+            echo "status: built"
+            echo "artifacts:"
+            for f in out/*; do
+              [ -f "$f" ] || continue
+              echo "  - $(basename "$f")  sha256=$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+          } > manifest-$TARGET.txt
+          mv manifest-$TARGET.txt "out/manifest-$TARGET.txt"
+          cat "out/manifest-$TARGET.txt"
 
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v7
@@ -335,12 +400,16 @@ jobs:
           # from colliding in the shared artifact store
           name: "firmware-${{ inputs.channel }}-${{ matrix.target }}"
           path: out
+          if-no-files-found: error
 
   release:
     name: Create Release
     needs: [version, validate-targets, build]
     if: inputs.create_release && needs.version.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    # only this job writes; build and test jobs stay at contents: read
+    permissions:
+      contents: write
     steps:
 
       - name: Download All Artifacts
@@ -349,6 +418,47 @@ jobs:
           pattern: "firmware-${{ inputs.channel }}-*"
           merge-multiple: true
           path: out
+
+      - name: Move manifests out of the release assets
+        # the manifests describe the release; they are not part of it
+        run: |
+          set -euo pipefail
+          mkdir -p .manifests
+          mv out/manifest-*.txt .manifests/ 2>/dev/null || true
+
+      - name: Summarise what actually built
+        id: manifest
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          # Every build writes a manifest naming its target, the source SHA and
+          # the files it produced. Collecting them here means a dev release that
+          # published only some boards says so, loudly, instead of implying the
+          # whole list was covered. They are read from where the previous step
+          # moved them: the asset directory no longer holds them.
+          SUMMARY=""
+          COUNT=0
+          for m in .manifests/manifest-*.txt; do
+            [ -f "$m" ] || continue
+            COUNT=$((COUNT + 1))
+            TARGET=$(sed -n 's/^target: //p' "$m")
+            SUMMARY="${SUMMARY}- \`${TARGET}\`\n"
+          done
+          if [ "$COUNT" = 0 ]; then
+            BODY="_No build manifests were produced._"
+          else
+            # %b, not the bare format: SUMMARY starts with "-", which printf
+            # would otherwise read as an option and refuse. The header joins the
+            # same expansion, so the list below it is real newlines rather than
+            # literal "\n" text on the heading line.
+            BODY="### Boards in this release$(printf '\n\n%b' "$SUMMARY")"
+          fi
+          {
+            echo "summary<<MANIFEST_EOF"
+            echo "$BODY"
+            echo "MANIFEST_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
@@ -359,6 +469,11 @@ jobs:
           prerelease: ${{ inputs.channel != 'stable' }}
           make_latest: ${{ inputs.channel == 'stable' && 'true' || 'false' }}
           generate_release_notes: true
-          body: ${{ needs.version.outputs.changes_section }}
+          body: |
+            Built from commit `${{ needs.version.outputs.source_sha }}`.
+
+            ${{ needs.version.outputs.changes_section }}
+
+            ${{ steps.manifest.outputs.summary }}
           files: out/*
-          target_commitish: ${{ needs.version.outputs.branch }}
+          target_commitish: ${{ needs.version.outputs.source_sha }}
