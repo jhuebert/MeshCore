@@ -1672,7 +1672,6 @@ TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
       seen.push_back(idx);
     }
   }
-  for (size_t pi = 0; pi < pages.size(); pi++) printf("PAGE %zu: [%s]\n", pi, pages[pi].c_str());
   ASSERT_EQ(seen.size(), (size_t)filter.getNumChannels());
   for (int i = 0; i < filter.getNumChannels(); i++) EXPECT_EQ(seen[i], i) << "coverage gap at " << i;
 
@@ -2520,6 +2519,15 @@ TEST_F(FilterTest, V7CrcDetectsCorruptedRecords) {
   }
 }
 
+// patch one byte of rule 0's v7 record and re-attach a valid CRC-16 over the
+// payload, so the byte's own check is exercised without the CRC masking it
+static void patchRule0Byte(std::vector<uint8_t>& f, size_t off, uint8_t v) {
+  f[7 + off] = v;
+  uint16_t crc = crc16_ccitt(&f[7], FILTER_RULE_V7_PAYLOAD);
+  f[7 + 188] = (uint8_t)(crc & 0xFF);
+  f[7 + 189] = (uint8_t)(crc >> 8);
+}
+
 // The pad byte 187 is format-guaranteed zero in v7: with a VALID CRC a nonzero
 // pad byte must still be refused (the CRC is over the payload including it,
 // so recompute one to isolate the pad check from the CRC check).
@@ -2527,10 +2535,7 @@ TEST_F(FilterTest, V7RejectsNonzeroPadByte) {
   expectOk(filter, "add type=advert");
   filter.save(&fs);
   std::vector<uint8_t> f = fs.files[CFG_FILE];
-  f[7 + 187] = 1;
-  uint16_t crc = crc16_ccitt(&f[7], FILTER_RULE_V7_PAYLOAD);
-  f[7 + 188] = (uint8_t)(crc & 0xFF);
-  f[7 + 189] = (uint8_t)(crc >> 8);
+  patchRule0Byte(f, 187, 1);
   NativeFS bad;
   bad.files[CFG_FILE] = f;
   FilterRules restored;
@@ -2544,10 +2549,7 @@ TEST_F(FilterTest, V7RejectsUndefinedHighTypeBits) {
   expectOk(filter, "add type=advert");
   filter.save(&fs);
   std::vector<uint8_t> f = fs.files[CFG_FILE];
-  f[7 + 186] = 0x70;
-  uint16_t crc = crc16_ccitt(&f[7], FILTER_RULE_V7_PAYLOAD);
-  f[7 + 188] = (uint8_t)(crc & 0xFF);
-  f[7 + 189] = (uint8_t)(crc >> 8);
+  patchRule0Byte(f, 186, 0x70);
   NativeFS bad;
   bad.files[CFG_FILE] = f;
   FilterRules restored;
