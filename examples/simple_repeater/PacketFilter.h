@@ -40,10 +40,17 @@
 #define FILTER_ACT_FORWARD   2   // value 2 = the old logonly byte; configs
                                  // load identically across the rename
 
-// payload-type mask bits (indexed by mesh::Packet payload type, 4 bits)
+// payload-type mask bits (indexed by mesh::Packet payload type, 4 bits).
+// All types a rule can name, low byte first: the filter sees every packet the
+// repeater would relay, so these are naming/visibility only.
+#define FILTER_TYPE_REQ      (1 << PAYLOAD_TYPE_REQ)
+#define FILTER_TYPE_RESPONSE (1 << PAYLOAD_TYPE_RESPONSE)
+#define FILTER_TYPE_TXT_MSG  (1 << PAYLOAD_TYPE_TXT_MSG)
+#define FILTER_TYPE_ACK      (1 << PAYLOAD_TYPE_ACK)
 #define FILTER_TYPE_ADVERT  (1 << PAYLOAD_TYPE_ADVERT)
 #define FILTER_TYPE_GRP_TXT (1 << PAYLOAD_TYPE_GRP_TXT)
 #define FILTER_TYPE_GRP_DATA (1 << PAYLOAD_TYPE_GRP_DATA)
+#define FILTER_TYPE_ANON_REQ (1 << PAYLOAD_TYPE_ANON_REQ)
 
 // route_mask bits
 #define FILTER_ROUTE_FLOOD   0x01

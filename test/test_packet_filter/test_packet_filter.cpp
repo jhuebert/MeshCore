@@ -506,6 +506,29 @@ TEST_F(FilterTest, TypePredicate) {
   EXPECT_EQ(filter.checkPacket(&dat, 0, nullptr), FILTER_ACT_ALLOW);
 }
 
+// The encrypted payload types are nameable too. They are envelope-only (see
+// GenericPredicatesCoverNonAdvertTypes for why the repeater sees them at all),
+// so packet-level predicates decide them.
+TEST_F(FilterTest, TypePredicateMatchesEncryptedPayloadTypes) {
+  expectOk(filter, "add type=req,response,msg,ack,anonreq");
+  EXPECT_EQ(filter.getRule(0)->type_mask,
+            FILTER_TYPE_REQ | FILTER_TYPE_RESPONSE | FILTER_TYPE_TXT_MSG |
+                FILTER_TYPE_ACK | FILTER_TYPE_ANON_REQ);
+  auto req = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_REQ);
+  auto resp = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_RESPONSE);
+  auto msg = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_TXT_MSG);
+  auto ack = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ACK);
+  auto anon = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ANON_REQ);
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
+  EXPECT_EQ(filter.checkPacket(&req, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&resp, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&msg, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&ack, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&anon, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 5u);
+}
+
 // ---------------------------------------------------------------- route=
 
 TEST_F(FilterTest, RoutePredicate) {
@@ -2161,6 +2184,17 @@ TEST_F(FilterTest, StatsAreNeverPersisted) {
   EXPECT_EQ(restored.getRule(0)->hits, 0u);   // hits live in RAM only
 }
 
+TEST_F(FilterTest, NewPayloadTypesRoundTrip) {
+  expectOk(filter, "add type=req,anonreq,msg");
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->type_mask,
+            FILTER_TYPE_REQ | FILTER_TYPE_ANON_REQ | FILTER_TYPE_TXT_MSG);
+}
+
 TEST_F(FilterTest, ThrottleV6RoundTrip) {
   expectOk(filter, "add type=advert throttle=60");
   expectOk(filter, "add type=advert throttle=65535");
@@ -2324,7 +2358,8 @@ TEST_F(FilterTest, MalformedRuleRecordsAreRejectedNotSanitised) {
   const Case cases[] = {
     { "enabled byte above 1",            0,   2 },
     { "action neither drop/forward",     1,   0 },
-    { "undefined type_mask bit",         2,   0x80 },
+    // (type_mask has no undefined bit left in its byte: every payload type
+    // 0x00..0x07 is nameable; the unreachable high bits live in a v7 field)
     { "undefined route_mask bit",        3,   0x80 },
     { "undefined interval flag",         8,   0x20 },
     { "path count beyond its slots",     42,  FILTER_PATH_HASH_SLOTS + 1 },
@@ -3402,6 +3437,25 @@ TEST_F(FilterTest, AddTypePredicate) {
             FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA);
 }
 
+TEST_F(FilterTest, AddTypePredicateNewPayloadTypes) {
+  ASSERT_EQ(cli(filter, "add type=req,anonreq"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->type_mask, FILTER_TYPE_REQ | FILTER_TYPE_ANON_REQ);
+  expectOk(filter, "add type=msg");
+  EXPECT_EQ(filter.getRule(1)->type_mask, FILTER_TYPE_TXT_MSG);
+  std::string g = cli(filter, "get 1");
+  EXPECT_NE(g.find(" type=msg"), std::string::npos);
+}
+
+// The original three names render first, in their historical order and
+// position, so replies for rules written before payload-type expansion stay
+// byte-identical; the newer names follow in payload-type order.
+TEST_F(FilterTest, TypeRenderOrderKeepsOldNamesFirst) {
+  expectOk(filter, "add type=advert,txt,data");
+  EXPECT_NE(cli(filter, "get 0").find(" type=advert,txt,data"), std::string::npos);
+  expectOk(filter, "add type=data,anonreq,advert,req");
+  EXPECT_NE(cli(filter, "get 1").find(" type=advert,data,req,anonreq"), std::string::npos);
+}
+
 // A repeated list key REPLACES the earlier value (as every scalar key already
 // did); alternatives inside one value still OR.
 TEST_F(FilterTest, RepeatedListPredicateReplaces) {
@@ -3426,6 +3480,26 @@ TEST_F(FilterTest, RepeatedListPredicateReplaces) {
   EXPECT_EQ(filter.getNumRules(), 5);
   EXPECT_EQ(cli(filter, "add type=advert,type=").substr(0, 5), "Err -");
   EXPECT_EQ(filter.getNumRules(), 5);
+}
+
+// sender=/text=/chan= can only ever be decided on decrypted group traffic: a
+// rule narrowed to envelope-only types would sit deferred forever, so the add
+// is refused wholesale instead of accepting a rule that can never fire.
+TEST_F(FilterTest, ContentGuardRejectsTypesThatNeverDecrypt) {
+  EXPECT_EQ(cli(filter, "add type=advert sender=^Bot$"),
+            "Err - sender=/text=/chan= only match group traffic");
+  EXPECT_EQ(cli(filter, "add type=req,anonreq text=hi"),
+            "Err - sender=/text=/chan= only match group traffic");
+  // chan= auto-provisions before the guard fires: the rollback removes it again
+  EXPECT_EQ(cli(filter, "add type=msg chan=#x"),
+            "Err - sender=/text=/chan= only match group traffic");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  EXPECT_EQ(filter.findChannel("#x"), nullptr);
+  // a group type — or no type= at all, or the wildcard — keeps working
+  expectOk(filter, "add type=txt sender=^Bot$");
+  expectOk(filter, "add type=advert,txt chan=#x");
+  expectOk(filter, "add sender=^Bot$");
+  expectOk(filter, "add type=any sender=^Bot$");
 }
 
 TEST_F(FilterTest, RepeatedChanPredicateReplaces) {
@@ -3689,7 +3763,7 @@ TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
   // every predicate set, throttle= at max width: the get line overflows the
   // reply buffer and truncates per radd's order — the counters are echoed
   // last, so the tail (air=) is cut first
-  ASSERT_EQ(cli(filter, "add type=advert route=flood hops=1 len=1 snr=0 path=^10$ "
+  ASSERT_EQ(cli(filter, "add type=txt route=flood hops=1 len=1 snr=0 path=^10$ "
                         "hsize=1 chan=#t chanhash=AA region=TestNorth sender=\"^X\" "
                         "text=\"^y\" prob=50 throttle=65535"),
             "OK - rule 0 added");
