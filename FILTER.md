@@ -243,6 +243,8 @@ filter ratelimit               # show current window and cache usage
 Use this on a well-connected repeater to stop re-flooding everyone's periodic
 adverts while still passing each node's advert once per window so it stays
 reachable through you. The window can be 0 (off) to 720 hours; 0 turns it off.
+The window edge is minute-granular: an advert can be re-admitted up to a
+minute before the full N hours have elapsed.
 
 ## Command reference
 

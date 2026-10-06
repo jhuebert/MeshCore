@@ -33,7 +33,7 @@ int AdvertRateLimiter::findOrigin(const mesh::Packet* pkt) const {
   return -1;
 }
 
-void AdvertRateLimiter::storeOrigin(const mesh::Packet* pkt, uint64_t now_millis) {
+void AdvertRateLimiter::storeOrigin(const mesh::Packet* pkt, uint32_t now_min) {
   AdvertSeenEntry* e;
   if (cache_count < FILTER_ADVERT_CACHE_SIZE) {
     e = &cache[cache_count++];
@@ -42,25 +42,27 @@ void AdvertRateLimiter::storeOrigin(const mesh::Packet* pkt, uint64_t now_millis
     cache_head = (cache_head + 1) % FILTER_ADVERT_CACHE_SIZE;
   }
   for (int i = 0; i < 4; i++) e->pub_key_prefix[i] = pkt->payload[KEY_OFFSETS[i]];
-  e->first_seen_millis = now_millis;
+  e->first_seen_minutes = now_min;
 }
 
 bool AdvertRateLimiter::wouldDrop(const mesh::Packet* pkt, uint64_t now_millis) {
   if (hours == 0) return false;   // limiter off: nothing is ever suppressed
-  const uint64_t window_ms = (uint64_t)hours * 3600ULL * 1000ULL;
+  const uint32_t now_min = now_millis / 60000ULL;   // minutes since boot
+  const uint32_t window_min = (uint32_t)hours * 60;
   const int idx = findOrigin(pkt);
   // not relayed in this window, or the window has expired: let it through. The
   // stamp is refreshed on admission (recordForward), not here.
   if (idx < 0) return false;
-  if (now_millis >= cache[idx].first_seen_millis &&
-      now_millis - cache[idx].first_seen_millis >= window_ms) return false;
+  if (now_min >= cache[idx].first_seen_minutes &&
+      now_min - cache[idx].first_seen_minutes >= window_min) return false;
   drops++;
   return true;   // too soon: suppress the repeat
 }
 
 void AdvertRateLimiter::recordForward(const mesh::Packet* pkt, uint64_t now_millis) {
   if (hours == 0) return;   // limiter off: keep no history at all
+  const uint32_t now_min = now_millis / 60000ULL;
   const int idx = findOrigin(pkt);
-  if (idx >= 0) cache[idx].first_seen_millis = now_millis;   // refresh the window
-  else storeOrigin(pkt, now_millis);
+  if (idx >= 0) cache[idx].first_seen_minutes = now_min;   // refresh the window
+  else storeOrigin(pkt, now_min);
 }
