@@ -1447,12 +1447,13 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
       return;
     }
   }
+  const uint16_t type_all = ruleTypeMask(r);
   // sender=/text=/chan= can only ever be decided on decrypted group traffic;
   // a rule narrowed to other payload types would sit deferred forever and
   // never match (the packet-level phase skips content rules). Fire only when
   // the user explicitly named types: an unset type= stays a wildcard.
-  if (contentPredicates(r) != FILTER_CONTENT_NONE && ruleTypeMask(r) != 0 &&
-      !(ruleTypeMask(r) & (FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA))) {
+  if (contentPredicates(r) != FILTER_CONTENT_NONE && type_all != 0 &&
+      !(type_all & (FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA))) {
     strcpy(reply, "Err - sender=/text=/chan= only match group traffic");
     rollbackAdd(filter, idx, chans_before);
     return;
@@ -1480,11 +1481,12 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
        r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
-  if (r->type_mask || r->type_mask_hi) {
+  const uint16_t type_all = ruleTypeMask(r);
+  if (type_all) {
     radd(&out, &remain, " type=");
     const char* sep = "";
     for (unsigned i = 0; i < FILTER_TYPE_NAME_COUNT; i++) {
-      if (ruleTypeMask(r) & (1 << FILTER_TYPE_NAMES[i].type)) {
+      if (type_all & (1 << FILTER_TYPE_NAMES[i].type)) {
         radd(&out, &remain, "%s%s", sep, FILTER_TYPE_NAMES[i].name);
         sep = ",";
       }
