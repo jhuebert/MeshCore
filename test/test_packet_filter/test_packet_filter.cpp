@@ -1293,11 +1293,13 @@ TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
 
   uint32_t t0 = 1000;
   EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
-  // at exactly the window boundary the advert is allowed again...
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
+  // stamps are minute-granular (see AdvertRateLimiter.h), so the window edge
+  // can open up to a minute early; 59 min in is still firmly inside
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 59UL * 60000, nullptr), FILTER_ACT_DROP);
+  // past the boundary the advert is allowed again...
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 61UL * 60000, nullptr), FILTER_ACT_ALLOW);
   // ...and the window restarts from that moment
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 61UL * 60000 + 500, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, TimingIsWrapSafe) {
