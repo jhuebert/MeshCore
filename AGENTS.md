@@ -39,7 +39,7 @@ commit** — the guides are user-facing API documentation, not optional docs.
 **Code (`examples/simple_repeater/`):**
 - `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
   `checkContent` decrypted-content single pass, verdict stash), binary
-  persistence (`load`/`save`, v3..v6), `filterCLI`.
+  persistence (`load`/`save`, v3..v7 stepwise migration), `filterCLI`.
 - `AdvertRateLimiter.h/.cpp` — the per-origin advert repeat window: cache,
   counters, and the check/commit split (see the fork's rule-model note).
 - `PersistUtil.h` — the lazy dirty-save pattern, the per-platform file opens, and
@@ -59,7 +59,7 @@ commit** — the guides are user-facing API documentation, not optional docs.
   dispatch, lazy-save loop).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
-**Tests:** `test/test_packet_filter/` (278 behavior-level cases: matching,
+**Tests:** `test/test_packet_filter/` (294 behavior-level cases: matching,
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
 PatternMatch) and `test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
 `NativeTestStubs.cpp`, `RegionMapStub.cpp`, `FilterTestHelpers.h`.
@@ -153,10 +153,10 @@ FILTER.md:
   byte-identical prefix of the new one — the `static_assert` rule below) or it
   ships migration code in `load()` plus a `FILTER_CFG_VERSION` bump. Within
   reason: layouts older than the versions whose record code is kept in
-  `load()` (currently v3..v6) were already discarded by design and need no
-  migration. Every version bump must keep older configs loading — add tests
-  for the upgrade path (roundtrip + old-version fixtures, as the persistence
-  tests already do).
+  `load()` (currently v3..v6, migrated stepwise to v7) were already discarded
+  by design and need no migration. Every version bump must keep older configs
+  loading — add tests for the upgrade path (roundtrip + old-version fixtures,
+  as the persistence tests already do).
 - **CLI surface is compatibility too.** Never break existing command syntax,
   reply formats, or index semantics (0-based, shifting on delete).
 - **Behavioral invariants are compatibility.** First-match-wins ordering,
@@ -168,19 +168,21 @@ FILTER.md:
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
   in 2026-10 (alternation) — a stored pattern containing an unescaped `|`
   previously matched a literal pipe.
-- **Config integrity is length-checked, not checksummed.** A truncated save is
-  detected on load; a torn write of exactly the right length is not. Deliberately
-  no record checksum (the on-disk format is frozen) and no sidecar file (a second
-  file is a second thing to go missing). A checksum belongs *in* the record, and
-  the record only changes with `FILTER_CFG_VERSION` — so when a v7 is needed
-  anyway, put it there, and every config written before it must still load.
-  Rationale: stops a later "improvement" from quietly weakening config
-  compatibility.
-- **Old-version migration is temporary.** v3..v6 loading is kept for now and is
-  expected to be dropped once the field has migrated. Keep that code path and its
-  byte fixtures contiguous and clearly delimited, so removing it is one excision
-  rather than a scavenger hunt. Rationale: stops the migration path accreting
-  more versions before anyone removes it.
+- **Config integrity is checked per record where the format allows it.** A
+  truncated save is detected on load; a torn write of exactly the right length
+  is caught only by a record checksum. Since the 2026-10 v7 bump, each rule
+  record carries a CRC-16 over its payload (crc16_ccitt in PersistUtil.h);
+  older records cannot, so they stay length-checked — a checksum rides a
+  version bump, never a patch. Channel records and the battery config keep
+  the length-only story until their own layout change adds one. No sidecar
+  file (a second file is a second thing to go missing). Rationale: stops a
+  later "improvement" from quietly weakening config compatibility.
+- **Old-version migration is temporary.** v3..v6 loading is kept for now and
+  is expected to be dropped once the field has migrated. The migration chain
+  is one named step function per version pair (`migrateV3ToV4` …
+  `migrateV6ToV7` in PacketFilter.cpp), kept contiguous — never skip a middle
+  step in code. Removing a version later is one excision: delete its step
+  function, raise the floor in `rule_bytes_for()`, delete its fixtures.
 
 ## Hard invariants (do not break)
 
@@ -216,7 +218,7 @@ FILTER.md:
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
-- Pure refactors keep both suites green **unchanged** — the suites (278 filter,
+- Pure refactors keep both suites green **unchanged** — the suites (294 filter,
   44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
