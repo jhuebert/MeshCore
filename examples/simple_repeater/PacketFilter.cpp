@@ -31,14 +31,14 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t c
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
-#define FILTER_CFG_VERSION     6   // v6: throttle= rate gate (record grows 4 B:
-                                   // u16 throttle + 2 reserved pad bytes); the
-                                   // v4/v5 record is a byte-identical prefix
-                                   // ending at offsetof(throttle) and reads back
-                                   // with throttle == 0 (= no limit)
+#define FILTER_CFG_VERSION     7   // v7: all payload types typeable (type_mask_hi
+                                   // joins the record), capacity growth (32 rules /
+                                   // channels, wider patterns, u32 chan_mask) and a
+                                   // per-record CRC-16; record grows 160 -> 190 B
+                                   // (188 B payload + 2 B CRC). Older records load
+                                   // through the stepwise migration chain below.
 // Rule and channel record sizes live in PacketFilter.h, frozen as literals
 // alongside the static_asserts that tie them to the live struct.
-#define FILTER_RULE_PERSIST_BYTES  FILTER_RULE_V6_BYTES   // config fields only; stats excluded
 
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
@@ -55,6 +55,11 @@ static const struct { const char* name; uint8_t type; } FILTER_TYPE_NAMES[] = {
   { "msg",       PAYLOAD_TYPE_TXT_MSG },
   { "ack",       PAYLOAD_TYPE_ACK },
   { "anonreq",   PAYLOAD_TYPE_ANON_REQ },
+  { "path",      PAYLOAD_TYPE_PATH },
+  { "trace",     PAYLOAD_TYPE_TRACE },
+  { "multipart", PAYLOAD_TYPE_MULTIPART },
+  { "control",   PAYLOAD_TYPE_CONTROL },
+  { "raw",       PAYLOAD_TYPE_RAW_CUSTOM },
 };
 #define FILTER_TYPE_NAME_COUNT (sizeof(FILTER_TYPE_NAMES) / sizeof(FILTER_TYPE_NAMES[0]))
 
@@ -245,8 +250,8 @@ void FilterRules::delChannel(int idx) {
   // remap rule masks so they keep pointing at the same channels
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
-    uint16_t lo = r->chan_mask & (uint16_t)((1 << idx) - 1);
-    uint16_t hi = (uint16_t)(r->chan_mask >> (idx + 1)) << idx;
+    uint32_t lo = r->chan_mask & (uint32_t)((1u << idx) - 1);
+    uint32_t hi = (r->chan_mask >> (idx + 1)) << idx;
     r->chan_mask = lo | hi;
   }
   markDirty();
@@ -448,10 +453,17 @@ static bool regionListContains(const char* list, const char* name) {
   return false;
 }
 
+// A rule's payload-type predicate as one mask over the raw 4-bit type:
+// type_mask carries bits 0..7, type_mask_hi bits 8..15.
+static uint16_t ruleTypeMask(const FilterRule* r) {
+  return (uint16_t)r->type_mask | ((uint16_t)r->type_mask_hi << 8);
+}
+
 // Evaluate the packet-level predicates of one rule (shared by both phases).
 static bool ruleMatchesPacket(const FilterRule* r, const mesh::Packet* pkt, uint8_t payload_type,
                               const RegionEntry* region) {
-  if (r->type_mask != 0 && !(r->type_mask & (1 << payload_type))) return false;
+  uint16_t type_all = ruleTypeMask(r);
+  if (type_all != 0 && !(type_all & (1 << payload_type))) return false;
 
   if (r->route_mask != 0) {
     uint8_t bit = pkt->isRouteFlood() ? FILTER_ROUTE_FLOOD : FILTER_ROUTE_DIRECT;
@@ -590,7 +602,7 @@ static void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t
 // is one of the store entries named by the rule's bitmask.
 bool FilterRules::channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const {
   for (int i = 0; i < num_channels; i++) {
-    if (!(r->chan_mask & (1 << i))) continue;
+    if (!(r->chan_mask & (1u << i))) continue;
     if (memcmp(channels[i].secret, channel.secret, sizeof(channel.secret)) == 0) return true;
   }
   return false;
@@ -652,12 +664,85 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 }
 
 // ---------------------------------------------------------------- persistence
-// Binary format (version 6): header + config-only rule records + raw channel
-// structs. Rule records are the FilterRule struct up to (excluding) `hits` —
-// stats are memory-only and never touch the file. All struct members are
-// fixed-size arrays/scalars (no pointers) and structs are memset(0) before use,
-// so a raw write/read is deterministic on a given platform; the version byte
-// guards against layout drift.
+// Binary format (version 7): header + config-only rule records + raw channel
+// structs. Rule records are the FilterRule struct up to (excluding) `hits`
+// plus a 2-byte CRC-16 over those payload bytes — stats are memory-only and
+// never touch the file. All struct members are fixed-size arrays/scalars (no
+// pointers) and structs are memset(0) before use, so a raw write/read is
+// deterministic on a given platform; the version byte guards against layout
+// drift.
+
+// Stepwise record migration: one named function per version pair, applied in
+// order until the record is v7-shaped. No direct vN->v7 shortcuts. Each step
+// is small and independently excisable — retiring a version later is deleting
+// its function + its fixtures + raising the floor in rule_bytes_for(), never
+// a scavenger hunt. Called on the raw record bytes before conversion.
+
+// v3 (124 B): ends where `regions` begins, rounded to 124. Zero from there
+// through the v4 record end so regions/prob read back as unset rather than as
+// the old record's trailing padding.
+static void migrateV3ToV4(uint8_t* rec) {
+  memset(&rec[122], 0, FILTER_RULE_V4_BYTES - 122);
+}
+
+// v4 (156 B): same size as v5. Its prob byte was tail padding, not
+// format-guaranteed, so a v4 record must read back with prob == 0.
+static void migrateV4ToV5(uint8_t* rec) {
+  rec[154] = 0;
+}
+
+// v5 (156 B): has no throttle; zero the 4 bytes v6 adds so the reserved tail
+// is deterministic.
+static void migrateV5ToV6(uint8_t* rec) {
+  memset(&rec[156], 0, FILTER_RULE_V6_BYTES - FILTER_RULE_V4_BYTES);
+}
+
+// v6 (160 B): full layout break — v7 widened chan_mask to 32 bits, grew the
+// sender/text patterns, and appended type_mask_hi. Field-by-field relocation
+// (offset map in the implementation plan); type_mask_hi and the pad byte stay
+// zero: no v6 record could have stored them.
+static void migrateV6ToV7(uint8_t* rec) {
+  uint8_t old[FILTER_RULE_V6_BYTES];
+  memcpy(old, rec, sizeof(old));
+  memset(rec, 0, FILTER_RULE_V7_PAYLOAD);
+  memcpy(rec, old, 46);                        // hdr + intervals + path + hash_size_mask
+  rec[48] = old[46];                           // chan_mask u16 -> u32, zero-extended
+  rec[49] = old[47];
+  rec[52] = old[48];                           // chan_hash
+  rec[53] = old[49];                           // chan_flags
+  memcpy(&rec[54], &old[50], 24);              // sender[24] -> [32]
+  memcpy(&rec[86], &old[74], 48);              // text[48] -> [64]
+  memcpy(&rec[150], &old[122], 32);            // regions[32]
+  rec[182] = old[154];                         // prob
+  rec[184] = old[156];                         // throttle u16
+  rec[185] = old[157];
+  // rec[186] (type_mask_hi) and rec[187] (pad) stay zero
+}
+
+static void (*const RULE_MIGRATIONS[])(uint8_t*) = {
+  migrateV3ToV4, migrateV4ToV5, migrateV5ToV6, migrateV6ToV7
+};
+
+// Rule-record size on disk for one config version. Frozen literals only.
+static size_t rule_bytes_for(uint8_t ver) {
+  if (ver >= 7) return FILTER_RULE_V7_BYTES;
+  if (ver >= 6) return FILTER_RULE_V6_BYTES;
+  if (ver >= 4) return FILTER_RULE_V4_BYTES;
+  return FILTER_RULE_V3_BYTES;
+}
+
+// Pre-migration check for the one validity property that depends on a pre-v7
+// record's OWN field widths: sender/text/regions sit at the same offsets in
+// v3..v6, and a string that did not terminate inside its old storage was never
+// writable by that firmware. Migrating would mask it (the zero-filled
+// extension terminates the copy), so refuse the record up front; validRule()
+// re-checks everything else on the migrated record.
+static bool oldStringsTerminate(uint8_t ver, const uint8_t* rec) {
+  if (memchr(&rec[50], 0, 24) == NULL) return false;    // sender[24]
+  if (memchr(&rec[74], 0, 48) == NULL) return false;    // text[48]
+  if (ver >= 4 && memchr(&rec[122], 0, 32) == NULL) return false;   // regions[32]
+  return true;
+}
 
 // A config file is untrusted input, not a serialized live C++ object: these
 // bytes came off a flash filesystem and may be truncated, stale, or hand-made.
@@ -670,10 +755,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // — quietly losing a predicate is worse than not having the rule at all.
 static bool validRule(const FilterRule* r) {
   if (r->action != FILTER_ACT_DROP && r->action != FILTER_ACT_FORWARD) return false;
-  const uint16_t type_bits = FILTER_TYPE_REQ | FILTER_TYPE_RESPONSE | FILTER_TYPE_TXT_MSG |
-                             FILTER_TYPE_ACK | FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT |
-                             FILTER_TYPE_GRP_DATA | FILTER_TYPE_ANON_REQ;
-  if ((uint16_t)r->type_mask & ~type_bits) return false;
+  if (ruleTypeMask(r) & ~FILTER_TYPE_MASK_ALL) return false;
   if (r->route_mask & ~(FILTER_ROUTE_FLOOD | FILTER_ROUTE_DIRECT)) return false;
 
   // interval predicates: known flag bits, and an endpoint pair that is not
@@ -757,9 +839,7 @@ static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* ch
 
   uint8_t nr = hdr[1];
   uint8_t nc = hdr[2];
-  size_t rule_bytes = (ver >= 6) ? FILTER_RULE_V6_BYTES
-                    : (ver >= 4) ? FILTER_RULE_V4_BYTES
-                                 : FILTER_RULE_V3_BYTES;
+  size_t rule_bytes = rule_bytes_for(ver);
   uint16_t rl_hours;
   if (file.read((uint8_t*)&rl_hours, 2) != 2) return false;
   if (rl_hours > FILTER_ADVERT_HOURS_MAX) return false;   // not a window we write
@@ -773,25 +853,29 @@ static bool parseConfigFile(File& file, FilterRule* rules_out, FilterChannel* ch
   bool bad_rule = false;
   bool truncated = false;
   for (int i = 0; i < nr; i++) {
-    uint8_t raw[FILTER_RULE_V6_BYTES];
+    uint8_t raw[FILTER_RULE_V7_BYTES] = { 0 };   // migration zero-fills what a
+                                                 // shorter record lacks
     if (file.read(raw, rule_bytes) != rule_bytes) { truncated = true; break; }   // truncated
     if (bad_rule) continue;
     // `enabled` is a bool, so a persisted byte it could never hold is
     // unrepresentable in the converted field and cannot be range-checked there —
     // it has to be refused while it is still just bytes.
     if (raw[0] > 1) { bad_rule = true; continue; }
+    if (ver < 7) {
+      if (!oldStringsTerminate(ver, raw)) { bad_rule = true; continue; }
+      // one named step per version pair, all the way to v7 shape
+      for (uint8_t v = ver; v < 7; v++) RULE_MIGRATIONS[v - 3](raw);
+    } else {
+      // v7 integrity: the pad byte is format-guaranteed zero, and the CRC-16
+      // closes the record. A mismatch is a torn/corrupted record: reject it
+      // (bad_rule), never salvage it.
+      if (raw[187] != 0) { bad_rule = true; continue; }
+      uint16_t stored_crc = (uint16_t)(raw[188] | ((uint16_t)raw[189] << 8));
+      if (crc16_ccitt(raw, FILTER_RULE_V7_PAYLOAD) != stored_crc) { bad_rule = true; continue; }
+    }
     FilterRule probe;
     memset(&probe, 0, sizeof(probe));   // RAM-only stats/state stay zero
-    memcpy(&probe, raw, rule_bytes);
-    if (ver < 5) {
-      // pre-v5 record: the prob byte (v4 tail padding) is not format-guaranteed
-      probe.prob = 0;
-    }
-    if (rule_bytes == FILTER_RULE_V3_BYTES) {
-      // v3 record: the read drags the old record's trailing padding bytes into
-      // regions[0..1], so zero the whole regions field (predicate unset)
-      memset(probe.regions, 0, sizeof(probe.regions));
-    }
+    memcpy(&probe, raw, FILTER_RULE_V7_PAYLOAD);
     if (!validRule(&probe)) { bad_rule = true; continue; }
     if (rules_out) rules_out[i] = probe;
     out_nr++;
@@ -834,7 +918,15 @@ static bool filterWriteFile(File& f, void* ctx) {
   uint16_t rl_hours = filter.getAdvertRatelimit();
   if (f.write((uint8_t*)&rl_hours, 2) != 2) return false;
   for (int i = 0; i < filter.getNumRules(); i++) {
-    if (f.write((const uint8_t*)filter.getRule(i), FILTER_RULE_PERSIST_BYTES) != FILTER_RULE_PERSIST_BYTES) return false;
+    // one v7 record: payload bytes 0..187 (pad byte forced to its
+    // format-guaranteed zero) followed by the CRC-16 over the payload
+    uint8_t rec[FILTER_RULE_V7_BYTES];
+    memcpy(rec, filter.getRule(i), FILTER_RULE_V7_PAYLOAD);
+    rec[187] = 0;
+    uint16_t crc = crc16_ccitt(rec, FILTER_RULE_V7_PAYLOAD);
+    rec[188] = (uint8_t)(crc & 0xFF);
+    rec[189] = (uint8_t)(crc >> 8);
+    if (f.write(rec, FILTER_RULE_V7_BYTES) != FILTER_RULE_V7_BYTES) return false;
   }
   for (int i = 0; i < filter.getNumChannels(); i++) {
     if (f.write((const uint8_t*)filter.getChannel(i), FILTER_CHAN_PERSIST_BYTES) != FILTER_CHAN_PERSIST_BYTES) return false;
@@ -886,8 +978,8 @@ void FilterRules::load(FILESYSTEM* fs) {
     // its mask is confined to the channels that exist: MASK_SET with no bits is
     // the documented inert rule, never a catch-all
     for (int i = 0; i < num_rules; i++) {
-      uint16_t keep = 0;
-      for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1 << c)) keep |= (1 << c);
+      uint32_t keep = 0;
+      for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1u << c)) keep |= (1u << c);
       rules[i].chan_mask = keep;
     }
   } else {
@@ -1069,7 +1161,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   if (strcmp(key, "chan") == 0) {
     char names[80];
     if (!cliCopyCommand(names, sizeof(names), val)) { strcpy(reply, "Err - chan list too long"); return false; }
-    uint16_t mask = 0;
+    uint32_t mask = 0;
     char* np = names;
     char* nm;
     while ((nm = strsep(&np, ",")) != NULL) {
@@ -1087,7 +1179,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
         }
         return false;
       }
-      mask |= (1 << idx);
+      mask |= (1u << idx);
     }
     // a repeated chan= replaces the earlier list rather than accumulating it;
     // chanhash= is a separate predicate and its flag is left alone
@@ -1123,7 +1215,8 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     }
     // a repeated type= replaces the earlier one. Alternatives inside ONE value
     // still OR, because that is how the list reads.
-    r->type_mask = any ? 0 : (uint8_t)mask;
+    r->type_mask = any ? 0 : (uint8_t)(mask & 0xFF);
+    r->type_mask_hi = any ? 0 : (uint8_t)(mask >> 8);
     return true;
   }
   if (strcmp(key, "route") == 0) {
@@ -1268,12 +1361,12 @@ static void cliChanList(FilterRules& filter, int start, char* reply) {
 
   // pass 2: re-list with room held back for the continuation marker
   out = reply;
-  remain = CLI_REPLY_MAX - 14;   // "; next=NNN" and the NUL
+  remain = CLI_REPLY_MAX;   // includes room held back for "; next=NN" + NUL
   i = start;
   for (; i < n; i++) {
     auto ch = filter.getChannel(i);
     snprintf(entry, sizeof(entry), "%s%d:%s:%02X", (i > start) ? " " : "", i, ch->name, ch->hash);
-    if ((int)strlen(entry) >= remain) break;
+    if ((int)(strlen(entry) + 10) >= remain) break;   // keep room for the marker
     radd(&out, &remain, "%s", entry);
   }
   radd(&out, &remain, "; next=%d", i);   // resume here
@@ -1358,8 +1451,8 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
   // a rule narrowed to other payload types would sit deferred forever and
   // never match (the packet-level phase skips content rules). Fire only when
   // the user explicitly named types: an unset type= stays a wildcard.
-  if (contentPredicates(r) != FILTER_CONTENT_NONE && r->type_mask != 0 &&
-      !(r->type_mask & (FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA))) {
+  if (contentPredicates(r) != FILTER_CONTENT_NONE && ruleTypeMask(r) != 0 &&
+      !(ruleTypeMask(r) & (FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA))) {
     strcpy(reply, "Err - sender=/text=/chan= only match group traffic");
     rollbackAdd(filter, idx, chans_before);
     return;
@@ -1387,11 +1480,11 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
        r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
-  if (r->type_mask) {
+  if (r->type_mask || r->type_mask_hi) {
     radd(&out, &remain, " type=");
     const char* sep = "";
     for (unsigned i = 0; i < FILTER_TYPE_NAME_COUNT; i++) {
-      if (r->type_mask & (1 << FILTER_TYPE_NAMES[i].type)) {
+      if (ruleTypeMask(r) & (1 << FILTER_TYPE_NAMES[i].type)) {
         radd(&out, &remain, "%s%s", sep, FILTER_TYPE_NAMES[i].name);
         sep = ",";
       }
@@ -1424,12 +1517,12 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
     // Names can no longer contain a comma, so the list stays unambiguous.
     bool quote = false;
     for (int c = 0; c < filter.getNumChannels(); c++) {
-      if ((r->chan_mask & (1 << c)) && strchr(filter.getChannel(c)->name, ' ')) quote = true;
+      if ((r->chan_mask & (1u << c)) && strchr(filter.getChannel(c)->name, ' ')) quote = true;
     }
     radd(&out, &remain, " chan=%s", quote ? "\"" : "");
     const char* sep = "";
     for (int c = 0; c < filter.getNumChannels(); c++) {
-      if (r->chan_mask & (1 << c)) { radd(&out, &remain, "%s%s", sep, filter.getChannel(c)->name); sep = ","; }
+      if (r->chan_mask & (1u << c)) { radd(&out, &remain, "%s%s", sep, filter.getChannel(c)->name); sep = ","; }
     }
     radd(&out, &remain, "%s", quote ? "\"" : "");
   }

@@ -43,13 +43,28 @@ public:
   void reset() { dirty = false; dirty_since = 0; }
 };
 
-// Config integrity is length-checked, not checksummed: a truncated file is
+// Config integrity is length-checked at the file level: a truncated file is
 // detected on load, but a torn write that happens to be exactly the right
-// length is not. That is deliberate — no record checksum, because the on-disk
-// format is frozen, and no sidecar file, because a second file is a second
-// thing to go missing. A checksum belongs in the record, and the record can only
-// change when the config version does: when a v7 is needed anyway, put it
-// there. Every config this firmware writes must keep loading without one.
+// length is not. A record checksum can only be added when the record layout
+// changes (see the fork invariant in AGENTS.md) — the filter's config v7 did
+// exactly that, so each rule record there carries a CRC-16 over its payload.
+// Channel records and every other config keep the length-only story until
+// their own layout change adds one. No sidecar file: a second file is a second
+// thing to go missing.
+
+// CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final xor.
+// Bitwise and table-free — config records are tiny and flash is scarcer than
+// cycles here. First user: the filter's v7 rule record, over its payload bytes.
+inline uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t b = 0; b < 8; b++) {
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+  }
+  return crc;
+}
 
 // Open for reading, whatever the platform's default mode is.
 inline File fsOpenRead(FILESYSTEM* fs, const char* name) {
