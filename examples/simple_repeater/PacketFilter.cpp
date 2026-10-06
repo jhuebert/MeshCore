@@ -42,6 +42,22 @@ static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t c
 
 #define FILTER_ADVERT_HOURS_MAX 720          // ~30 days; millis() wraps at ~49.7 days
 
+// The user-facing type= names, in the order `filter get` renders them: the
+// original three stay first so rules written before payload-type expansion
+// keep byte-identical replies, the rest follow payload-type order. One table
+// is the single authority for both the parser and the renderer.
+static const struct { const char* name; uint8_t type; } FILTER_TYPE_NAMES[] = {
+  { "advert",    PAYLOAD_TYPE_ADVERT },
+  { "txt",       PAYLOAD_TYPE_GRP_TXT },
+  { "data",      PAYLOAD_TYPE_GRP_DATA },
+  { "req",       PAYLOAD_TYPE_REQ },
+  { "response",  PAYLOAD_TYPE_RESPONSE },
+  { "msg",       PAYLOAD_TYPE_TXT_MSG },
+  { "ack",       PAYLOAD_TYPE_ACK },
+  { "anonreq",   PAYLOAD_TYPE_ANON_REQ },
+};
+#define FILTER_TYPE_NAME_COUNT (sizeof(FILTER_TYPE_NAMES) / sizeof(FILTER_TYPE_NAMES[0]))
+
 // ---------------------------------------------------------------- initialization
 
 // The state a node starts in, and the state load() must return to before it
@@ -654,8 +670,10 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
 // — quietly losing a predicate is worse than not having the rule at all.
 static bool validRule(const FilterRule* r) {
   if (r->action != FILTER_ACT_DROP && r->action != FILTER_ACT_FORWARD) return false;
-  const uint8_t type_bits = FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA;
-  if (r->type_mask & ~type_bits) return false;
+  const uint16_t type_bits = FILTER_TYPE_REQ | FILTER_TYPE_RESPONSE | FILTER_TYPE_TXT_MSG |
+                             FILTER_TYPE_ACK | FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT |
+                             FILTER_TYPE_GRP_DATA | FILTER_TYPE_ANON_REQ;
+  if ((uint16_t)r->type_mask & ~type_bits) return false;
   if (r->route_mask & ~(FILTER_ROUTE_FLOOD | FILTER_ROUTE_DIRECT)) return false;
 
   // interval predicates: known flag bits, and an endpoint pair that is not
@@ -1087,22 +1105,25 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     return true;
   }
   if (strcmp(key, "type") == 0) {
-    char vals[24];
+    char vals[80];   // room for the whole name list, comma-separated
     if (!cliCopyCommand(vals, sizeof(vals), val)) { strcpy(reply, "Err - bad type"); return false; }
-    uint8_t mask = 0;
+    uint16_t mask = 0;
     bool any = false;
     char* vp = vals;
     char* t;
     while ((t = strsep(&vp, ",")) != NULL) {
-      if (strcmp(t, "advert") == 0) mask |= FILTER_TYPE_ADVERT;
-      else if (strcmp(t, "txt") == 0) mask |= FILTER_TYPE_GRP_TXT;
-      else if (strcmp(t, "data") == 0) mask |= FILTER_TYPE_GRP_DATA;
-      else if (strcmp(t, "any") == 0) any = true;   // wildcard: wins even beside names
-      else { snprintf(reply, CLI_REPLY_MAX, "Err - unknown type '%s'", t); return false; }
+      if (strcmp(t, "any") == 0) { any = true; continue; }   // wildcard: wins even beside names
+      unsigned i;
+      for (i = 0; i < FILTER_TYPE_NAME_COUNT && strcmp(t, FILTER_TYPE_NAMES[i].name) != 0; i++) {}
+      if (i == FILTER_TYPE_NAME_COUNT) {
+        snprintf(reply, CLI_REPLY_MAX, "Err - unknown type '%s'", t);
+        return false;
+      }
+      mask |= (1 << FILTER_TYPE_NAMES[i].type);
     }
     // a repeated type= replaces the earlier one. Alternatives inside ONE value
     // still OR, because that is how the list reads.
-    r->type_mask = any ? 0 : mask;
+    r->type_mask = any ? 0 : (uint8_t)mask;
     return true;
   }
   if (strcmp(key, "route") == 0) {
@@ -1333,6 +1354,16 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
       return;
     }
   }
+  // sender=/text=/chan= can only ever be decided on decrypted group traffic;
+  // a rule narrowed to other payload types would sit deferred forever and
+  // never match (the packet-level phase skips content rules). Fire only when
+  // the user explicitly named types: an unset type= stays a wildcard.
+  if (contentPredicates(r) != FILTER_CONTENT_NONE && r->type_mask != 0 &&
+      !(r->type_mask & (FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA))) {
+    strcpy(reply, "Err - sender=/text=/chan= only match group traffic");
+    rollbackAdd(filter, idx, chans_before);
+    return;
+  }
   snprintf(reply, CLI_REPLY_MAX, "OK - rule %d added", idx);
 }
 
@@ -1359,9 +1390,12 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (r->type_mask) {
     radd(&out, &remain, " type=");
     const char* sep = "";
-    if (r->type_mask & FILTER_TYPE_ADVERT) { radd(&out, &remain, "%sadvert", sep); sep = ","; }
-    if (r->type_mask & FILTER_TYPE_GRP_TXT) { radd(&out, &remain, "%stxt", sep); sep = ","; }
-    if (r->type_mask & FILTER_TYPE_GRP_DATA) { radd(&out, &remain, "%sdata", sep); sep = ","; }
+    for (unsigned i = 0; i < FILTER_TYPE_NAME_COUNT; i++) {
+      if (r->type_mask & (1 << FILTER_TYPE_NAMES[i].type)) {
+        radd(&out, &remain, "%s%s", sep, FILTER_TYPE_NAMES[i].name);
+        sep = ",";
+      }
+    }
   }
   if (r->route_mask) radd(&out, &remain, " route=%s",
                           (r->route_mask & FILTER_ROUTE_FLOOD) ? "flood" : "direct");

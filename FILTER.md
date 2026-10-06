@@ -450,9 +450,30 @@ first (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)).
 | `filter add type=txt` | Group text on any channel, without needing its key |
 | `filter add type=data route=flood` | Group data AND flood route |
 | `filter add type=txt,data snr=[*,-8.5]` | (Group text OR group data) AND weak signal |
+| `filter add type=req` | Requests (`REQ` packets) |
+| `filter add type=response` | Responses to requests |
+| `filter add type=anonreq` | Anonymous requests |
+| `filter add type=msg` | Direct (1:1) text messages |
+| `filter add type=ack` | ACK packets |
+| `filter add type=req,anonreq` | Either request kind |
 
-An advert does not match `type=txt,data`. To cover all packet types, omit
-`type` entirely.
+Names can be comma-combined, `type=any` (or omitting `type` entirely) covers
+every packet type, and an advert does not match `type=txt,data`.
+
+#### Encrypted payload types
+
+Most payloads the repeater relays are **encrypted end-to-end**, so a rule can
+only see the envelope: `req`, `response`, `anonreq` and `msg` packets carry no
+readable sender or text. `sender=`, `text=` and `chan=` cannot match them —
+the repeater rejects such a rule outright (`Err - sender=/text=/chan= only
+match group traffic`) instead of accepting one that could never fire.
+Envelope predicates — `type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`,
+`region` — all work normally on these types.
+
+A note on visibility: the filter only sees traffic this repeater would relay.
+Direct-routed ACKs, answered requests and delivered messages are consumed by
+the endpoints and never reach a repeater, so `type=ack` mostly sees flood
+ACKs — the ones re-broadcast across the mesh.
 
 ### `route`
 
