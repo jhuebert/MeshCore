@@ -11,8 +11,7 @@ access to the repeater is required.
 **Quick navigation:** [Quick start](#quick-start) ·
 [Common setups](#common-setups) ·
 [Command reference](#command-reference) ·
-[Writing sender/text patterns](#writing-sendertext-patterns) ·
-Fleet management (see [FLEET.md](./FLEET.md))
+[Writing sender/text patterns](#writing-sendertext-patterns)
 
 ---
 
@@ -793,19 +792,6 @@ await mc.commands.send_cmd(rep, "filter stats", dst_type=2)
 This is the normal management path for a repeater on a tower — the serial port
 is only needed for initial flashing and emergencies.
 
-## Fleet management
-
-Fleet management — one PSK-backed channel per repeater, script delivery by
-tags, acknowledgements and scheduled (`!at`) jobs — is a standalone feature
-with its own top-level `fleet` command and its own `/fleet_cfg` config file;
-it no longer rides a filter rule. It is a purely passive observer of decrypted
-group text: it works with `filter off`, it works while the battery gate has
-suspended forwarding, and filter rule changes can never break fleet script
-delivery.
-
-→ Full guide, including setup, the script format, recipes and the security
-model: **[FLEET.md](./FLEET.md)**
-
 ## Limits and good-to-knows
 
 | Limit | Value |
@@ -825,10 +811,7 @@ model: **[FLEET.md](./FLEET.md)**
   28 of 31 characters) and `text=` about eight. Need more? Add a second rule, or
   use one broader alternative such as `^Bot`.
 - Rules, channels, and settings survive reboots. Counters and the advert cache
-  do not — they start fresh after every reboot. Fleet job keys, pending
-  acknowledgements and armed `!at` scripts are RAM-only the same way, which is
-  what makes re-sent fleet jobs run again (see
-  [FLEET.md](./FLEET.md#idempotency-at-most-once-per-key-per-boot)).
+  do not — they start fresh after every reboot.
 - An edit is written to flash about **3 seconds** after you make it (a burst of
   commands costs one write, not one each). Power the repeater off within that
   window and that edit is lost — everything before it is safe.
@@ -920,10 +903,7 @@ this section if you write firmware or tooling that touches the file.
 - **Downgrading firmware is a reset.** A file written by a newer firmware
   carries a version byte this firmware rejects, so the whole file is discarded
   and the repeater starts from defaults (rules can be re-added or re-flashed
-  forward). Filter configs written by the fleet-era firmware are byte-identical
-  to pre-fleet ones (no `action=cli` ever ships again), so a filter-config
-  downgrade is always safe; a `/fleet_cfg` file is simply ignored by older
-  firmware.
+  forward).
 
 ## Writing sender/text patterns
 

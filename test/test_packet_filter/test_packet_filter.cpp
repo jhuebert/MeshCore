@@ -4,7 +4,7 @@
 // shim and stub notes.
 //
 // Sections: TinyRegex, PatternMatch, packet-level matching, content rules,
-// advert rate limiter, cli scripts, management/persistence, and the filter CLI.
+// advert rate limiter, management/persistence, and the filter CLI.
 //
 // Coverage map (2026-09-13 host-native gap analysis; on-air semantics mirrored
 // from the Phase-4 raw-packet suites):
@@ -4864,10 +4864,6 @@ TEST_F(FilterTest, MoveChangesVerdicts) {
   ASSERT_EQ(cli(filter, "move 0 1"), "OK - rule 0 moved to 1");   // drop now first
   EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_DROP);
 }
-
-// UNIT TESTS: action=cli rule model (validation, display, persistence)
-// ============================================================
-
 
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
