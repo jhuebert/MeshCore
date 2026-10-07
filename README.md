@@ -37,20 +37,22 @@ flapping, and the admin can check voltage and tune thresholds over the mesh.
 ### 🛰️ Fleet management (remote CLI scripts)
 
 Broadcast CLI jobs to a whole fleet of repeaters through one private keyed
-channel. A filter rule with `action=cli` forwards a group text message like
-normal traffic **and** executes its text as a small script — deferred, and at
-most once per job key per boot. Every admin command works remotely: radio
-settings, filter rules, node names, reboots. Re-send jobs freely to catch
-nodes that were offline; duplicates are ignored automatically, and the sender
-name or a tag in the job key can address sub-fleets (by location, board type,
-or rollout stage).
+channel. Set once per repeater (`fleet chan set` + tags + `fleet on`), a group
+text message on that channel executes as a small script — deferred, and at
+most once per job key per boot — on every repeater whose tags the job targets.
+Every admin command works remotely: radio settings, filter rules, node names,
+reboots. Re-send jobs freely to catch nodes that were offline; duplicates are
+ignored automatically; tags address sub-fleets (by location, board type, or
+rollout stage) and `!ack` makes nodes answer in-channel.
 
 The channel key is the credential: holding the PSK is equivalent to
 serial-console access on every member, so PSK hygiene is the whole security
-model.
+model. The feature supersedes the battery gate — fleet jobs run, and
+fleet-channel traffic relays, even while a low battery has suspended
+forwarding.
 
-→ Full guide, including recipes, the two-phase cutover pattern, and the
-security model: **[CLI.md](./CLI.md)**
+→ Full guide, including recipes, the two-phase and scheduled-cutover
+patterns, and the security model: **[FLEET.md](./FLEET.md)**
 
 ## Why run this instead of stock repeater firmware?
 
@@ -83,4 +85,4 @@ Prebuilt binaries for all supported boards are on the
 
 Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI, and
-[CLI.md](./CLI.md) if you are running a fleet.
+[FLEET.md](./FLEET.md) if you are running a fleet.

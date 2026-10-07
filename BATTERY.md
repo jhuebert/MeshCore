@@ -47,6 +47,15 @@ is refusing to relay it — it is accounted as a battery drop at forwarding
 admission instead, once, the same as any other packet. Traffic already queued for
 transmission is not cancelled by suspending.
 
+**Exception — the fleet channel.** Fleet-channel traffic, scripts and
+acknowledgements are exempt from suspension: fleet-channel group packets relay
+(they are never counted as battery drops — the exemption is a one-byte channel
+hash compare on the still-encrypted packet), queued fleet scripts run while
+suspended, and `!ack` replies are still sent. A node in trouble is exactly the
+node you need to reach; whether to spend battery on a response is the
+operator's `!ack` choice, not the gate's. See [FLEET.md](./FLEET.md#battery-supersession).
+Every other packet is gated exactly as described here.
+
 While suspended, `allowPacketForward()` rejects every packet — flood, direct,
 and group content alike. Everything the node originates on its own behalf
 (CLI replies, status responses, adverts) is unaffected.
@@ -58,6 +67,7 @@ and group content alike. Everything the node originates on its own behalf
   status reply's "is disabled" flag reports only the manual state.
 - **Packet filter**: independent. `filter on/off` governs rule matching; the
   battery gate governs forwarding as a whole. Both may be active.
+- **Fleet channel**: exempt by design — see the exception above.
 - **CLI access**: unaffected — replies are originated, not forwarded. You can
   always log in and look.
 
