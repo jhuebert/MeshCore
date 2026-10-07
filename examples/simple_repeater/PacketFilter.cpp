@@ -579,9 +579,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
     if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !has_sender || !regexMatches(r->sender, sender))) continue;
     if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !has_text || !regexMatches(r->text, text))) continue;
-    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) {
-      break;   // first match wins
-    }
+    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) break;   // first match wins
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
@@ -724,7 +722,6 @@ static bool validRule(const FilterRule* r) {
   if (memchr(r->regions, 0, sizeof(r->regions)) == NULL) return false;
 
   if (r->prob > 100) return false;                       // 0 = unset = 100 %
-
   return true;
 }
 
@@ -1402,8 +1399,7 @@ static void cliList(FilterRules& filter, char* reply) {
   for (int i = 0; i < filter.getNumRules(); i++) {
     auto r = filter.getRule(i);
     radd(&out, &remain, " %d%c%c%03X", i, r->enabled ? 'e' : 'd',
-         r->action == FILTER_ACT_DROP ? 'D' : 'F',
-         ruleDigest(r) & 0xFFF);
+         r->action == FILTER_ACT_DROP ? 'D' : 'F', ruleDigest(r) & 0xFFF);
   }
 }
 
