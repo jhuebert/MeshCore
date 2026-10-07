@@ -4958,6 +4958,286 @@ TEST_F(FilterTest, CliRuleGoesInertWhenItsPskChannelIsDeleted) {
   EXPECT_EQ(filter.getRule(0)->chan_mask, 0);
 }
 
+// UNIT TESTS: CliScriptRunner — parsing, queue, seen ring, deferral
+// ============================================================
+
+// deliver a group text on a stored channel and return the checkContent verdict
+static uint8_t deliverCliText(FilterRules& filter, const char* chan_name, const char* sender,
+                              const char* text) {
+  mesh::Packet pkt;
+  return contentCheck(filter, pkt, chan_name, sender, text);
+}
+
+// drain everything queued through `rec`; returns the number of lines executed
+static size_t drainScripts(FilterRules& filter, CliExecRecorder& rec) {
+  const size_t before = rec.lines.size();
+  while (filter.runCliScripts(&CliExecRecorder::exec, &rec)) {}
+  return rec.lines.size() - before;
+}
+
+TEST_F(FilterTest, ScriptWithoutIdMarkerNeverRuns) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  // no !id line: not a script — but the message is still forwarded
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "set radio 869.650,62.5,9,5"),
+            FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  EXPECT_EQ(filter.getScripts().getNoId(), 1u);
+  EXPECT_FALSE(filter.getScripts().keySeen("job1"));
+}
+
+TEST_F(FilterTest, ScriptWithSenderPrefixRuns) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice",
+                           "!id job1\nset radio 869.650,62.5,9,5\nset name a:b"),
+            FILTER_ACT_CLI);
+  EXPECT_EQ(filter.getRule(0)->hits, 1u);   // counts a hit like forward
+  ASSERT_EQ(drainScripts(filter, cli_rec), 2u);
+  EXPECT_EQ(cli_rec.lines[0].first, "job1");
+  EXPECT_EQ(cli_rec.lines[0].second, "set radio 869.650,62.5,9,5");
+  // only the first colon splits the sender: a colon inside a command survives
+  EXPECT_EQ(cli_rec.lines[1].second, "set name a:b");
+}
+
+TEST_F(FilterTest, ScriptAsRawBodyRuns) {
+  // a message with no "<sender>: " prefix: the whole body is the script
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  uint32_t ts = 12345;
+  memcpy(raw, &ts, 4);
+  raw[4] = TXT_TYPE_PLAIN;
+  memcpy(raw + 5, "!id job2\nreset", 14);
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 5 + 14);
+  auto chan = channelFromStore(filter, filter.indexOfChannel("ops"));
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, 5 + 14, nullptr),
+            FILTER_ACT_CLI);
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(cli_rec.lines[0].first, "job2");
+  EXPECT_EQ(cli_rec.lines[0].second, "reset");
+}
+
+TEST_F(FilterTest, ScriptCommentsAndBlankLinesSkipped) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice",
+                 "!id job3\n\n# a comment line\nset a 1\n#another\nset b 2");
+  ASSERT_EQ(drainScripts(filter, cli_rec), 2u);
+  EXPECT_EQ(cli_rec.lines[0].second, "set a 1");
+  EXPECT_EQ(cli_rec.lines[1].second, "set b 2");
+}
+
+TEST_F(FilterTest, ScriptCrlfTolerated) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job4\r\nset x 1\r\n");
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(cli_rec.lines[0].first, "job4");
+  EXPECT_EQ(cli_rec.lines[0].second, "set x 1");
+}
+
+TEST_F(FilterTest, ScriptUnknownDirectiveRefusesWholeScript) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job5\n!frobnicate 1\nreset"),
+            FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  EXPECT_EQ(filter.getScripts().getRefused(), 1u);
+  // refused scripts are never marked: a corrected re-send still reaches it
+  EXPECT_FALSE(filter.getScripts().keySeen("job5"));
+  deliverCliText(filter, "ops", "alice", "!id job5\nreset");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+TEST_F(FilterTest, ScriptOverlongLineSkippedRunContinues) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  // sent as a raw body (no sender prefix): a 184-byte payload leaves room for
+  // a 160-byte line plus the directive and one short command
+  std::string long_cmd(160, 'x');
+  std::string text = "!id job6\n" + long_cmd + "\nset ok 1";
+  ASSERT_LE(text.size(), MAX_PACKET_PAYLOAD - 5);
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  uint32_t ts = 12345;
+  memcpy(raw, &ts, 4);
+  raw[4] = TXT_TYPE_PLAIN;
+  memcpy(raw + 5, text.c_str(), text.size());
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 5 + text.size());
+  auto chan = channelFromStore(filter, filter.indexOfChannel("ops"));
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, 5 + text.size(), nullptr),
+            FILTER_ACT_CLI);
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(cli_rec.lines.back().second, "set ok 1");
+  EXPECT_EQ(filter.getScripts().getBadLines(), 1u);
+}
+
+TEST_F(FilterTest, ScriptKeyValidation) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id \nreset"), FILTER_ACT_CLI);
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id has space\nreset"), FILTER_ACT_CLI);
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id a+bad\nreset"), FILTER_ACT_CLI);
+  std::string long_key(FILTER_CLI_KEY_LEN + 1, 'k');
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", ("!id " + long_key + "\nreset").c_str()),
+            FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  EXPECT_EQ(filter.getScripts().getRefused(), 4u);
+  // a valid key with every accepted character class goes through
+  deliverCliText(filter, "ops", "alice", "!id Ok.Key_1-x\nreset");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+TEST_F(FilterTest, ScriptRunsOnlyAfterContentScanReturns) {
+  // deferral: a script that mutates the rule list is queued by the
+  // checkContent() scan but only handed to the executor afterwards, so the
+  // scan never iterates a list that is being changed under it
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job8\nfilter del 0"), FILTER_ACT_CLI);
+  ASSERT_EQ(filter.getNumRules(), 1);   // untouched while the scan was iterating
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(cli_rec.lines.back().second, "filter del 0");   // handed over intact
+  EXPECT_EQ(filter.getNumRules(), 1);   // (the recorder does not execute it; the
+}                                       // firmware hook runs it via handleCommand)
+
+TEST_F(FilterTest, ScriptQueueFullRefusesWithoutMarking) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job-a\nset a 1");
+  deliverCliText(filter, "ops", "alice", "!id job-b\nset b 1");
+  deliverCliText(filter, "ops", "alice", "!id job-c\nset c 1");   // queue is full (depth 2)
+  EXPECT_EQ(filter.getScripts().getRefused(), 1u);
+  EXPECT_EQ(filter.getScripts().getSeenCount(), 2);   // job-c was NOT marked
+  ASSERT_EQ(drainScripts(filter, cli_rec), 2u);
+  EXPECT_EQ(cli_rec.lines[0].second, "set a 1");   // FIFO
+  EXPECT_EQ(cli_rec.lines[1].second, "set b 1");
+  // the refused job still gets its turn on a re-send
+  deliverCliText(filter, "ops", "alice", "!id job-c\nset c 1");
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(cli_rec.lines[2].second, "set c 1");
+}
+
+TEST_F(FilterTest, ScriptSameKeyNoopsButStillForwards) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job9\nreset"), FILTER_ACT_CLI);
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  // re-send: still forwarded (the rule still matches), but no second run
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job9\nreset"), FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  EXPECT_EQ(filter.getScripts().getDup(), 1u);
+}
+
+TEST_F(FilterTest, ScriptDuplicateDeliveryBeforeDrainRunsOnce) {
+  // duplicate flood deliveries of one job: marked at enqueue, so only one
+  // queued copy exists even before anything has executed
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job10\nset a 1");
+  deliverCliText(filter, "ops", "alice", "!id job10\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+TEST_F(FilterTest, ScriptForgetRearmsKey) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job11\nset a 1");
+  drainScripts(filter, cli_rec);
+  EXPECT_TRUE(filter.getScripts().forgetKey("job11"));
+  EXPECT_FALSE(filter.getScripts().forgetKey("job11"));   // already forgotten
+  deliverCliText(filter, "ops", "alice", "!id job11\nset a 1");
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);   // the deliberate re-run lever
+}
+
+TEST_F(FilterTest, ScriptForgetAllClearsSeenTable) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job-a\nset a 1");
+  deliverCliText(filter, "ops", "alice", "!id job-b\nset b 1");
+  drainScripts(filter, cli_rec);
+  EXPECT_EQ(filter.getScripts().getSeenCount(), 2);
+  filter.getScripts().forgetAll();
+  EXPECT_EQ(filter.getScripts().getSeenCount(), 0);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  deliverCliText(filter, "ops", "alice", "!id job-a\nset a 1");
+  deliverCliText(filter, "ops", "alice", "!id job-b\nset b 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 2u);   // both re-armed
+}
+
+TEST_F(FilterTest, ScriptRebootForgetsSeenKeys) {
+  // the seen table is RAM-only: after save+load (a reboot in the field) a
+  // known key runs again — that is the documented reboot semantics
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job12\nset a 1");
+  drainScripts(filter, cli_rec);
+  filter.save(&fs);
+  filter.load(&fs);
+  ASSERT_EQ(filter.getNumRules(), 1);   // the cli rule itself survives
+  deliverCliText(filter, "ops", "alice", "!id job12\nset a 1");
+  ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+TEST_F(FilterTest, ScriptSeenRingEvictsOldest) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  char text[64];
+  for (int i = 0; i < FILTER_CLI_SEEN_SIZE + 1; i++) {
+    snprintf(text, sizeof(text), "!id job-%02d\nset a 1", i);
+    deliverCliText(filter, "ops", "alice", text);
+    ASSERT_EQ(drainScripts(filter, cli_rec), 1u);
+  }
+  EXPECT_EQ(filter.getScripts().getSeenCount(), FILTER_CLI_SEEN_SIZE);
+  // the 33rd key evicted the oldest: job-00 re-runs...
+  deliverCliText(filter, "ops", "alice", "!id job-00\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+  // ...and each successful re-mark evicts the next-oldest survivor in turn:
+  // job-00's re-mark evicts job-01, so job-01 re-runs, while job-03 (still in
+  // the ring) keeps deduping
+  deliverCliText(filter, "ops", "alice", "!id job-00\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  deliverCliText(filter, "ops", "alice", "!id job-01\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+  deliverCliText(filter, "ops", "alice", "!id job-03\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  EXPECT_EQ(filter.getScripts().getDup(), 2u);
+}
+
+TEST_F(FilterTest, ScriptTextSelectorTargetsGroups) {
+  // fleet selection by tag in the !id key: a global selector takes -all-
+  // jobs only; a XIAO selector accepts both tags (pattern alternation)
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli text=\"^!id .*-all-.*\"");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id 26-all-radio\nset a 1"), FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id 26-xiao-radio\nset a 1"),
+            FILTER_ACT_ALLOW);   // not this group: no run, and no enqueue
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+
+  ASSERT_EQ(cli(filter, "del 0"), "OK - rule 0 deleted");
+  ASSERT_EQ(cli(filter, "add chan=ops action=cli text=\"^!id .*-all-.*|^!id .*-xiao-.*\""),
+            "OK - rule 0 added (cli: PSK holder = admin)");
+  deliverCliText(filter, "ops", "alice", "!id 26-xiao-radio\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+TEST_F(FilterTest, ScriptNonInterferenceFilterOffAndDropRules) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops sender=^bob");   // plain drop, listed first
+  expectOk(filter, "add chan=ops action=cli");
+  // filter off: nothing is scanned, nothing enqueued
+  ASSERT_EQ(cli(filter, "off"), "OK - filter off");
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job13\nset a 1"), FILTER_ACT_ALLOW);
+  ASSERT_EQ(cli(filter, "on"), "OK - filter on");
+  // first match wins: bob's script hits the drop rule, never the cli rule
+  EXPECT_EQ(deliverCliText(filter, "ops", "bob", "!id job13\nset a 1"), FILTER_ACT_DROP);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 0u);
+  // alice still reaches the cli rule
+  EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job14\nset a 1"), FILTER_ACT_CLI);
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
