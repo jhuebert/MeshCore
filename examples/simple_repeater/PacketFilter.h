@@ -362,12 +362,6 @@ private:
   void billSaved(uint32_t est_air_ms) { air_saved_ms += est_air_ms; }
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
-  // A cli rule must never execute scripts on a '#'-named channel: such names
-  // derive their key from the public channel name, which authenticates nobody.
-  // When no surviving channel of the rule is PSK-backed (e.g. its private
-  // channel was deleted), clear the mask — MASK_SET with no bits is the
-  // documented inert rule, and the record stays savable.
-  void confineCliRule(FilterRule* r);
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob
   // roll and the throttle gate; when the rule decides, record the hit, bill
   // the saved airtime, and store its action in `out`. Returns false when a
