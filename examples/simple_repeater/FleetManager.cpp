@@ -279,16 +279,18 @@ bool FleetManager::checkForward(const mesh::Packet* packet) {
 // ---------------------------------------------------------------- channels
 
 int FleetManager::appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[],
-                                      int max_matches) {
+                                      int max_matches, int filled) {
   if (!enabled || psk_len == 0) return 0;
+  if (filled >= max_matches) return 0;
   if (chan_hash != hash[0]) return 0;
   // the filter store may hold the same PSK: handing core the same secret twice
-  // would burn one of its few candidate slots
-  for (int i = 0; i < max_matches; i++) {
+  // would burn one of its few candidate slots. Only the filled prefix of dest
+  // is initialised (core's caller passes raw stack), so only it is compared.
+  for (int i = 0; i < filled; i++) {
     if (memcmp(dest[i].secret, psk, sizeof(psk)) == 0) return 0;
   }
-  dest[0].hash[0] = chan_hash;
-  memcpy(dest[0].secret, psk, sizeof(dest[0].secret));
+  dest[filled].hash[0] = chan_hash;
+  memcpy(dest[filled].secret, psk, sizeof(dest[filled].secret));
   return 1;
 }
 

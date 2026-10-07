@@ -473,7 +473,7 @@ int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channel
   // merge: the filter's keyed-channel store plus the fleet channel (the same
   // PSK in both is skipped by the fleet side; any matching key decrypts)
   int n = filter.searchChannelsByHash(hash, channels, max_matches);
-  if (n < max_matches) n += fleet.appendChannelByHash(hash, channels + n, max_matches - n);
+  if (n < max_matches) n += fleet.appendChannelByHash(hash, channels, max_matches, n);
   return n;
 }
 
