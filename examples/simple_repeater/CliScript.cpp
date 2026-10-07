@@ -194,7 +194,8 @@ CliEnqueue CliScriptRunner::parse(const char* text, CliScriptMeta* meta) {
   return CLI_ENQUEUE_OK;
 }
 
-CliEnqueue CliScriptRunner::enqueue(const char* text) {
+CliEnqueue CliScriptRunner::enqueue(const char* text, const uint8_t* chan_secret,
+                                    uint8_t chan_hash) {
   CliScriptMeta meta;
   CliEnqueue rc = parse(text, &meta);
   if (rc == CLI_ENQUEUE_NO_ID) { noid++; return rc; }
@@ -208,35 +209,34 @@ CliEnqueue CliScriptRunner::enqueue(const char* text) {
   // buffer is zero-filled first so reads past the string (a resume offset one
   // past the final line) always find a terminator, never stale slot bytes.
   CliPendingScript* slot = &pending[pending_count++];
-  memset(slot->text, 0, sizeof(slot->text));
+  memset(slot, 0, sizeof(*slot));
   memcpy(slot->text, text, strlen(text) + 1);
   strcpy(slot->key, meta.key);   // validated by validKey()
   slot->ack = meta.ack;
   slot->body_off = meta.body_off;
-  slot->sleeping = false;
-  slot->sleep_until = 0;
-  slot->ran_count = 0;
-  slot->last_reply[0] = 0;
-  slot->first_err[0] = 0;
+  if (chan_secret != NULL) {
+    memcpy(slot->chan_secret, chan_secret, sizeof(slot->chan_secret));
+    slot->chan_hash = chan_hash;
+  }
   markSeen(hash);
   return CLI_ENQUEUE_OK;
 }
 
 bool CliScriptRunner::enqueueValidated(const char* text, const char* key, uint8_t ack,
-                                       uint16_t body_off) {
+                                       uint16_t body_off, const uint8_t* chan_secret,
+                                       uint8_t chan_hash) {
   if (pending_count >= FLEET_CLI_QUEUE_DEPTH) return false;
   if (strlen(key) > FLEET_CLI_KEY_LEN) return false;   // defensive; callers pass parsed keys
   CliPendingScript* slot = &pending[pending_count++];
-  memset(slot->text, 0, sizeof(slot->text));
+  memset(slot, 0, sizeof(*slot));
   memcpy(slot->text, text, strlen(text) + 1);
   strcpy(slot->key, key);
   slot->ack = ack;
   slot->body_off = body_off;
-  slot->sleeping = false;
-  slot->sleep_until = 0;
-  slot->ran_count = 0;
-  slot->last_reply[0] = 0;
-  slot->first_err[0] = 0;
+  if (chan_secret != NULL) {
+    memcpy(slot->chan_secret, chan_secret, sizeof(slot->chan_secret));
+    slot->chan_hash = chan_hash;
+  }
   return true;
 }
 
@@ -319,6 +319,8 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
     copySummary(out->summary, summary);
     out->ack = slot->ack;
     out->error = error;
+    memcpy(out->chan_secret, slot->chan_secret, sizeof(out->chan_secret));
+    out->chan_hash = slot->chan_hash;
   }
 
   pending_count--;
