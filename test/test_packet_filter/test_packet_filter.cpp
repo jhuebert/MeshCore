@@ -4732,7 +4732,7 @@ TEST_F(FilterTest, StashClearedOnNewSequence) {
 // ---------------------------------------------------------------- rename (logonly -> forward)
 
 TEST_F(FilterTest, LogonlyKeywordRejected) {
-  EXPECT_EQ(cli(filter, "add sender=x action=logonly"), "Err - action must be drop|forward");
+  EXPECT_EQ(cli(filter, "add sender=x action=logonly"), "Err - action must be drop|forward|cli");
   EXPECT_EQ(filter.getNumRules(), 0);   // rolled back, no half rule
 }
 
@@ -4863,6 +4863,99 @@ TEST_F(FilterTest, MoveChangesVerdicts) {
   EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_FORWARD);
   ASSERT_EQ(cli(filter, "move 0 1"), "OK - rule 0 moved to 1");   // drop now first
   EXPECT_EQ(contentCheck(filter, pkt, "#foo", "Alice", "hi"), FILTER_ACT_DROP);
+}
+
+// UNIT TESTS: action=cli rule model (validation, display, persistence)
+// ============================================================
+
+// add a private (PSK-backed) channel and return its store index
+static int addPrivateChan(FilterRules& filter, const char* name) {
+  std::string cmd = std::string("chan add ") + name + " 00112233445566778899aabbccddeeff";
+  expectOk(filter, cmd.c_str());
+  int idx = filter.indexOfChannel(name);
+  EXPECT_GE(idx, 0);
+  return idx;
+}
+
+TEST_F(FilterTest, CliRuleRequiresChannel) {
+  ASSERT_EQ(cli(filter, "add action=cli"), "Err - action=cli needs chan=<private channel>");
+  ASSERT_EQ(cli(filter, "add chanhash=AB action=cli"),
+            "Err - action=cli needs chan=<private channel>");   // bare air hash is not a keyed channel
+  ASSERT_EQ(cli(filter, "add chan=#ops action=cli"),
+            "Err - action=cli needs chan=<private channel>");   // '#'-names authenticate nobody
+  EXPECT_EQ(filter.getNumChannels(), 1);   // the auto-provisioned '#ops' was rolled back
+}
+
+TEST_F(FilterTest, CliRuleAcceptsPskChannelAmongHashChannels) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops,#ops2 action=cli");
+  EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_CLI);
+}
+
+TEST_F(FilterTest, CliRuleRejectsProbAndThrottle) {
+  addPrivateChan(filter, "ops");
+  ASSERT_EQ(cli(filter, "add chan=ops action=cli prob=50"),
+            "Err - action=cli takes no prob/throttle");
+  ASSERT_EQ(cli(filter, "add prob=50 chan=ops action=cli"),
+            "Err - action=cli takes no prob/throttle");   // gate given before the action
+  ASSERT_EQ(cli(filter, "add chan=ops action=cli throttle=60"),
+            "Err - action=cli takes no prob/throttle");
+  EXPECT_EQ(filter.getNumRules(), 0);   // every rejected add was rolled back
+}
+
+TEST_F(FilterTest, CliRuleRejectsNonTxtType) {
+  addPrivateChan(filter, "ops");
+  ASSERT_EQ(cli(filter, "add chan=ops type=data action=cli"),
+            "Err - action=cli runs group text only");
+  ASSERT_EQ(cli(filter, "add chan=ops action=cli type=advert"),
+            "Err - action=cli runs group text only");   // type= after the action
+  ASSERT_EQ(cli(filter, "add chan=ops type=txt,data action=cli"),
+            "Err - action=cli runs group text only");
+  EXPECT_EQ(filter.getNumRules(), 0);
+}
+
+TEST_F(FilterTest, CliRuleForcesTxtTypeAndDisplaysCli) {
+  addPrivateChan(filter, "ops");
+  ASSERT_EQ(cli(filter, "add chan=ops action=cli"), "OK - rule 0 added (cli: PSK holder = admin)");
+  auto r = filter.getRule(0);
+  EXPECT_EQ(r->action, FILTER_ACT_CLI);
+  EXPECT_EQ(r->type_mask, FILTER_TYPE_GRP_TXT);   // omitted type= is forced to txt
+  EXPECT_EQ(r->type_mask_hi, 0);
+  std::string listing = cli(filter, "list");
+  ASSERT_EQ(listing.substr(0, 9), "on 1/32: ");
+  EXPECT_EQ(listing[11], 'C');   // action letter in the "0eC4A2" token
+  std::string detail = cli(filter, "get 0");
+  EXPECT_EQ(detail.substr(0, 9), "r0 en cli");
+  EXPECT_NE(detail.find("type=txt"), std::string::npos);
+}
+
+TEST_F(FilterTest, CliRuleRoundtripsThroughSaveLoad) {
+  // validRule() must accept the new action value, or a saved cli rule would
+  // truncate the rule list on the next boot
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  filter.save(&fs);
+  filter.load(&fs);
+  ASSERT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_CLI);
+  EXPECT_EQ(filter.getRule(0)->type_mask, FILTER_TYPE_GRP_TXT);
+}
+
+TEST_F(FilterTest, CliRuleGoesInertWhenItsPskChannelIsDeleted) {
+  // chan=ops,#ops2: deleting the PSK channel must not leave the rule executing
+  // scripts on the '#'-named (derived-key, public) channel
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops,#ops2 action=cli");
+  ASSERT_EQ(cli(filter, "chan del ops"), "OK - chan ops deleted");
+  mesh::Packet pkt;
+  EXPECT_EQ(contentCheck(filter, pkt, "#ops2", "Alice", "!id k1\nreset"),
+            FILTER_ACT_ALLOW);   // inert: no PSK-backed channel left in the mask
+  // the inert record is still savable (MASK_SET with no bits, not a wildcard)
+  filter.save(&fs);
+  filter.load(&fs);
+  ASSERT_EQ(filter.getNumRules(), 1);
+  EXPECT_EQ(filter.getRule(0)->action, FILTER_ACT_CLI);
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 0);
 }
 
 int main(int argc, char **argv) {
