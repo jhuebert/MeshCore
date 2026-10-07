@@ -251,7 +251,9 @@ void FilterRules::delChannel(int idx) {
   for (int i = 0; i < num_rules; i++) {
     FilterRule* r = &rules[i];
     uint32_t lo = r->chan_mask & (uint32_t)((1u << idx) - 1);
-    uint32_t hi = (r->chan_mask >> (idx + 1)) << idx;
+    // a full store deletes at idx == FILTER_MAX_CHANNELS - 1: nothing sits
+    // above it, and chan_mask >> 32 would be an undefined shift
+    uint32_t hi = (idx + 1 < FILTER_MAX_CHANNELS) ? ((r->chan_mask >> (idx + 1)) << idx) : 0;
     r->chan_mask = lo | hi;
   }
   markDirty();
