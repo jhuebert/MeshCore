@@ -432,11 +432,12 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
-  // Fleet-channel packets bypass the battery gate (short-circuit order matters:
-  // a fleet packet never reaches checkForward(), so it is never counted as a
-  // battery drop and relays even while suspended); every other packet is the
-  // gate's to count and gate exactly as before.
-  if (!fleet.checkForward(packet) && !battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
+  // Fleet-channel packets bypass the battery gate (fleet.checkForward returns
+  // false for them, which short-circuits before the gate is consulted, so a
+  // fleet packet is never counted as a battery drop and relays even while
+  // suspended); every other packet is the gate's to count and gate exactly
+  // as before.
+  if (fleet.checkForward(packet) && !battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
   if (filter.checkPacket(packet, millis(), recv_pkt_region, _radio->getEstAirtimeFor(packet->getRawLength())) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
