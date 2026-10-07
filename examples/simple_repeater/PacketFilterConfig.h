@@ -54,24 +54,4 @@
   #define FILTER_PATH_HASH_SLOTS 4     // path chain hashes per rule (4 B each)
 #endif
 
-// The following are RAM-only capacities (CliScriptRunner state): changing them
-// moves no persisted layout, so unlike the rule-model knobs above they need no
-// static_assert and no FILTER_CFG_VERSION bump.
-#ifndef FILTER_CLI_KEY_LEN
-  #define FILTER_CLI_KEY_LEN 32        // !id key token max length (validated, then hashed)
-#endif
-
-#ifndef FILTER_CLI_SEEN_SIZE
-  #define FILTER_CLI_SEEN_SIZE 32      // seen-key hash ring entries (8 B each)
-#endif
-
-#ifndef FILTER_CLI_QUEUE_DEPTH
-  #define FILTER_CLI_QUEUE_DEPTH 2     // pending scripts; enqueue refuses when full
-#endif
-
-#ifndef FILTER_CLI_LINE_MAX
-  #define FILTER_CLI_LINE_MAX 160      // script lines at least this long are skipped:
-                                       // the serial CLI's own command buffer is this size
-#endif
-
 #endif // _PACKET_FILTER_CONFIG_H
