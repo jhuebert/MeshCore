@@ -7,27 +7,6 @@
 #include <inttypes.h>
 #include <helpers/TxtDataHelpers.h>
 
-static int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
-// Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
-// `capacity` is the caller's output buffer: an over-long or odd-length input is
-// refused before any byte is written, so a rejected key can never partially
-// overwrite a live slot.
-static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capacity) {
-  if ((in_len & 1) != 0 || in_len / 2 > capacity) return 0;
-  for (size_t i = 0; i < in_len; i += 2) {
-    int hi = hexVal(in[i]), lo = hexVal(in[i + 1]);
-    if (hi < 0 || lo < 0) return 0;
-    out[i / 2] = (uint8_t)((hi << 4) | lo);
-  }
-  return (int)(in_len / 2);
-}
-
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
@@ -78,7 +57,6 @@ void FilterRules::resetToDefaults() {
   uptime_ms = 0;
   last_millis = millis();   // the accumulator starts from the boot clock
   limiter.reset();
-  cli_scripts.reset();   // queued scripts and seen keys die with the rule state they came from
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
@@ -229,7 +207,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
     // exactly 16 or 32 bytes of hex; anything else is refused before decoding
     size_t hex_len = strlen(psk_hex);
     if (hex_len != 32 && hex_len != 64) return NULL;
-    int len = filterDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
+    int len = cliDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
     if (len != 16 && len != 32) return NULL;
     candidate.secret_len = len;
   }
@@ -256,22 +234,8 @@ void FilterRules::delChannel(int idx) {
     // above it, and chan_mask >> 32 would be an undefined shift
     uint32_t hi = (idx + 1 < FILTER_MAX_CHANNELS) ? ((r->chan_mask >> (idx + 1)) << idx) : 0;
     r->chan_mask = lo | hi;
-    confineCliRule(r);   // a cli rule left with '#' channels only must go inert
   }
   markDirty();
-}
-
-// A cli rule must never execute scripts on a '#'-named channel: such names
-// derive their key from the public channel name, which authenticates nobody.
-// When no surviving channel of the rule is PSK-backed (e.g. its private channel
-// was deleted), clear the mask — MASK_SET with no bits is the documented inert
-// rule, and the record stays savable.
-void FilterRules::confineCliRule(FilterRule* r) {
-  if (r->action != FILTER_ACT_CLI) return;
-  for (int c = 0; c < num_channels; c++) {
-    if ((r->chan_mask & (1u << c)) && channels[c].name[0] != '#') return;
-  }
-  r->chan_mask = 0;
 }
 
 int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches) {
@@ -564,57 +528,6 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
 
 // ---------------------------------------------------------------- content rules
 
-// Split a decrypted group-text body into "<sender>: <text>". Content is
-// sender-controlled, so parse defensively and bounded by len (never strlen()).
-// The decrypted block is zero-padded to the packet buffer, so the visible field
-// ends at the first NUL — parsing past it would invent a colon (and an empty
-// sender) out of padding. `has_text`/`has_sender` report which fields were
-// really present, so a caller can tell "no sender field" from "empty text".
-static void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t sender_sz,
-                           char* text, size_t text_sz, bool* has_text, bool* has_sender) {
-  sender[0] = 0;
-  text[0] = 0;
-  *has_text = false;
-  *has_sender = false;
-  if (len < 5) return;   // too short for ts(4) + txt_type(1)
-
-  const uint8_t* p = data + 5;
-  // bounded to the first NUL within the decrypted body: everything after it is
-  // padding, not content
-  size_t n = 0;
-  const uint8_t* term = (const uint8_t*)memchr(p, 0, len - 5);
-  if (term != NULL) n = (size_t)(term - p);
-  else n = len - 5;
-
-  const uint8_t* colon = NULL;
-  for (size_t i = 0; i < n; i++) {
-    if (p[i] == ':') { colon = &p[i]; break; }
-  }
-
-  if (colon == NULL) {   // no sender extractable; whole remainder is text
-    *has_text = true;
-    size_t cpy = n < text_sz - 1 ? n : text_sz - 1;
-    memcpy(text, p, cpy);
-    text[cpy] = 0;
-    return;
-  }
-
-  size_t slen = (size_t)(colon - p);
-  while (slen > 0 && (p[slen - 1] == ' ' || p[slen - 1] == '\t')) slen--;   // trim trailing spaces/tabs
-  size_t cpy = slen < sender_sz - 1 ? slen : sender_sz - 1;
-  memcpy(sender, p, cpy);
-  sender[cpy] = 0;
-  *has_sender = true;
-
-  const uint8_t* tp = colon + 1;
-  size_t tlen = n - (size_t)(tp - p);
-  while (tlen > 0 && (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n')) { tp++; tlen--; }
-  *has_text = true;
-  cpy = tlen < text_sz - 1 ? tlen : text_sz - 1;
-  memcpy(text, tp, cpy);
-  text[cpy] = 0;
-}
-
 // A rule's keyed-channel predicate matches if the delivered (MAC-proven) channel
 // is one of the store entries named by the rule's bitmask.
 bool FilterRules::channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const {
@@ -666,17 +579,7 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
     if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !has_sender || !regexMatches(r->sender, sender))) continue;
     if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !has_text || !regexMatches(r->text, text))) continue;
-    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) {
-      // A cli verdict forwards like `forward` AND queues the message text for
-      // deferred execution (MyMesh::loop drains it outside the receive
-      // bracket, so scripts may safely run `filter ...` commands). Marking at
-      // enqueue makes duplicate flood deliveries and re-sends no-ops; a
-      // refused script is never marked, so a re-send still reaches it.
-      // parsed: a cli rule is txt-only by validation, so `text` is always the
-      // parsed message text here.
-      if (parsed && verdict == FILTER_ACT_CLI) cli_scripts.enqueue(text);
-      break;   // first match wins
-    }
+    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) break;   // first match wins
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().
@@ -781,8 +684,7 @@ static bool oldStringsTerminate(uint8_t ver, const uint8_t* rec) {
 // because matching is first-match-wins that changes which rule decides a packet
 // — quietly losing a predicate is worse than not having the rule at all.
 static bool validRule(const FilterRule* r) {
-  if (r->action != FILTER_ACT_DROP && r->action != FILTER_ACT_FORWARD &&
-      r->action != FILTER_ACT_CLI) return false;
+  if (r->action != FILTER_ACT_DROP && r->action != FILTER_ACT_FORWARD) return false;
   if (ruleTypeMask(r) & ~FILTER_TYPE_MASK_ALL) return false;
   if (r->route_mask & ~(FILTER_ROUTE_FLOOD | FILTER_ROUTE_DIRECT)) return false;
 
@@ -820,14 +722,6 @@ static bool validRule(const FilterRule* r) {
   if (memchr(r->regions, 0, sizeof(r->regions)) == NULL) return false;
 
   if (r->prob > 100) return false;                       // 0 = unset = 100 %
-
-  // action=cli constraints, the same refusals `filter add` enforces: a record
-  // breaking them was not written by this firmware
-  if (r->action == FILTER_ACT_CLI) {
-    if (ruleTypeMask(r) != FILTER_TYPE_GRP_TXT) return false;       // group text only
-    if (!(r->chan_flags & FILTER_CHANFLG_MASK_SET)) return false;   // needs a named channel
-    if (r->prob != 0 || r->throttle != 0) return false;             // no gates
-  }
   return true;
 }
 
@@ -1017,7 +911,6 @@ void FilterRules::load(FILESYSTEM* fs) {
       uint32_t keep = 0;
       for (int c = 0; c < num_channels; c++) if (rules[i].chan_mask & (1u << c)) keep |= (1u << c);
       rules[i].chan_mask = keep;
-      confineCliRule(&rules[i]);   // a cli rule on '#' channels only is inert, not public
     }
   } else {
     file.close();
@@ -1134,7 +1027,7 @@ static void formatInterval(const Interval& iv, char* dest, size_t sz, IvUnit uni
 static bool parseHexHash(const char* s, uint8_t* out, size_t max_bytes, uint8_t* out_len) {
   size_t n = strlen(s);
   if (n < 2 || n > 8 || (n & 1) || n / 2 > max_bytes) return false;
-  if (!filterDecodeHex(s, n, out, max_bytes)) return false;
+  if (!cliDecodeHex(s, n, out, max_bytes)) return false;
   *out_len = (uint8_t)(n / 2);
   return true;
 }
@@ -1252,10 +1145,6 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
     }
     // a repeated type= replaces the earlier one. Alternatives inside ONE value
     // still OR, because that is how the list reads.
-    if (r->action == FILTER_ACT_CLI && mask != FILTER_TYPE_GRP_TXT) {
-      strcpy(reply, "Err - action=cli runs group text only");
-      return false;
-    }
     r->type_mask = any ? 0 : (uint8_t)(mask & 0xFF);
     r->type_mask_hi = any ? 0 : (uint8_t)(mask >> 8);
     return true;
@@ -1331,19 +1220,7 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
   if (strcmp(key, "action") == 0) {
     if (strcmp(val, "drop") == 0) r->action = FILTER_ACT_DROP;
     else if (strcmp(val, "forward") == 0) r->action = FILTER_ACT_FORWARD;
-    else if (strcmp(val, "cli") == 0) {
-      // Scripts are group text: a type= given earlier must already be txt-only,
-      // an omitted one is forced to txt (a later non-txt type= is rejected by
-      // the type= branch while the action is cli).
-      const uint16_t type_all = ruleTypeMask(r);
-      if (type_all == 0) r->type_mask = FILTER_TYPE_GRP_TXT;
-      else if (type_all != FILTER_TYPE_GRP_TXT) {
-        strcpy(reply, "Err - action=cli runs group text only");
-        return false;
-      }
-      r->action = FILTER_ACT_CLI;
-    }
-    else { strcpy(reply, "Err - action must be drop|forward|cli"); return false; }
+    else { strcpy(reply, "Err - action must be drop|forward"); return false; }
     return true;
   }
   if (strcmp(key, "prob") == 0) {
@@ -1511,29 +1388,6 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
     rollbackAdd(filter, idx, chans_before);
     return;
   }
-  if (r->action == FILTER_ACT_CLI) {
-    // Gates decide whether a rule decides: a throttled fleet would fragment
-    // (each node has its own clock state) and prob= would be all-or-none
-    // fleet-wide, so cli takes neither.
-    if (r->prob != 0 || r->throttle != 0) {
-      strcpy(reply, "Err - action=cli takes no prob/throttle");
-      rollbackAdd(filter, idx, chans_before);
-      return;
-    }
-    // The rule needs at least one named PSK-backed channel: '#' names derive
-    // their key from the public channel name, which authenticates nobody.
-    bool psk_chan = false;
-    for (int c = 0; c < filter.getNumChannels(); c++) {
-      if ((r->chan_mask & (1u << c)) && filter.getChannel(c)->name[0] != '#') { psk_chan = true; break; }
-    }
-    if (!(r->chan_flags & FILTER_CHANFLG_MASK_SET) || !psk_chan) {
-      strcpy(reply, "Err - action=cli needs chan=<private channel>");
-      rollbackAdd(filter, idx, chans_before);
-      return;
-    }
-    snprintf(reply, CLI_REPLY_MAX, "OK - rule %d added (cli: PSK holder = admin)", idx);
-    return;
-  }
   snprintf(reply, CLI_REPLY_MAX, "OK - rule %d added", idx);
 }
 
@@ -1545,8 +1399,7 @@ static void cliList(FilterRules& filter, char* reply) {
   for (int i = 0; i < filter.getNumRules(); i++) {
     auto r = filter.getRule(i);
     radd(&out, &remain, " %d%c%c%03X", i, r->enabled ? 'e' : 'd',
-         r->action == FILTER_ACT_DROP ? 'D' : r->action == FILTER_ACT_CLI ? 'C' : 'F',
-         ruleDigest(r) & 0xFFF);
+         r->action == FILTER_ACT_DROP ? 'D' : 'F', ruleDigest(r) & 0xFFF);
   }
 }
 
@@ -1556,7 +1409,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   char* out = reply;
   int remain = CLI_REPLY_MAX;
   radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
-       r->action == FILTER_ACT_DROP ? "drop" : r->action == FILTER_ACT_CLI ? "cli" : "forward");
+       r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
   const uint16_t type_all = ruleTypeMask(r);
   if (type_all) {
@@ -1643,48 +1496,7 @@ static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
   return true;
 }
 
-#define FILTER_USAGE "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|cli|stats"
-
-// `filter cli ...` — remote CLI script status and the seen-table levers. The
-// runner is exposed through FilterRules::getScripts(); hashes stay internal:
-// every lookup and reply names the key string the operator chose.
-static void cliCli(FilterRules& filter, char* params, char* reply) {
-  char* p = params;
-  char* sub = nextToken(&p);
-  if (sub == NULL) {
-    auto& s = filter.getScripts();
-    snprintf(reply, CLI_REPLY_MAX,
-             "scripts ran:%lu dup:%lu noid:%lu refused:%lu badline:%lu; pending %d/%d; seen %d/%d",
-             (unsigned long)s.getRan(), (unsigned long)s.getDup(), (unsigned long)s.getNoId(),
-             (unsigned long)s.getRefused(), (unsigned long)s.getBadLines(),
-             s.getPendingCount(), FILTER_CLI_QUEUE_DEPTH, s.getSeenCount(), FILTER_CLI_SEEN_SIZE);
-  } else if (strcmp(sub, "seen") == 0) {
-    char* key = nextToken(&p);
-    if (key == NULL) {
-      if (!cliNoExtra(p, reply, "Err - usage: cli seen [<key>]")) return;
-      snprintf(reply, CLI_REPLY_MAX, "seen %d/%d", filter.getScripts().getSeenCount(),
-               FILTER_CLI_SEEN_SIZE);
-    } else {
-      if (!cliNoExtra(p, reply, "Err - usage: cli seen [<key>]")) return;
-      if (filter.getScripts().keySeen(key)) snprintf(reply, CLI_REPLY_MAX, "OK - key %s seen", key);
-      else snprintf(reply, CLI_REPLY_MAX, "Err - key %s not seen", key);
-    }
-  } else if (strcmp(sub, "forget") == 0) {
-    char* key = nextToken(&p);
-    if (key == NULL) { strcpy(reply, "Err - usage: cli forget <key>|all"); return; }
-    if (!cliNoExtra(p, reply, "Err - usage: cli forget <key>|all")) return;
-    if (strcmp(key, "all") == 0) {
-      filter.getScripts().forgetAll();
-      strcpy(reply, "OK - seen table cleared");
-    } else if (filter.getScripts().forgetKey(key)) {
-      strcpy(reply, "OK - key forgotten");
-    } else {
-      strcpy(reply, "Err - key not seen");
-    }
-  } else {
-    strcpy(reply, "Err - usage: cli [seen [<key>]|forget <key>|all]");
-  }
-}
+#define FILTER_USAGE "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats"
 
 void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions) {
   // An oversized command is refused whole rather than acted on as a prefix, and
@@ -1794,8 +1606,6 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
     } else {
       strcpy(reply, "Err - usage: ratelimit [advert <hours>|clear]");
     }
-  } else if (strcmp(cmd, "cli") == 0) {
-    cliCli(filter, p, reply);
   } else if (strcmp(cmd, "stats") == 0) {
     char* sub = nextToken(&p);
     if (sub == NULL) {

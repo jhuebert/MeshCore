@@ -118,23 +118,12 @@ inline void expectOk(FilterRules& filter, const char* command) {
   ASSERT_EQ(reply.substr(0, 3), "OK ") << command;
 }
 
-// Records the (key, line) pairs a CliScriptRunner run executed, with a canned
-// reply. Lives on the FilterTest fixture so script tests can share it.
-struct CliExecRecorder {
-  std::vector<std::pair<std::string, std::string>> lines;
-  static void exec(void* ctx, const char* key, char* line, char* reply) {
-    static_cast<CliExecRecorder*>(ctx)->lines.emplace_back(key, line);
-    strcpy(reply, "OK");
-  }
-};
-
 // Shared fixture: fresh filter with the persisted Public channel provisioned
 // and no rules.
 class FilterTest : public ::testing::Test {
 protected:
   NativeFS fs;
   FilterRules filter;
-  CliExecRecorder cli_rec;
 
   void SetUp() override {
     g_mock_millis = 0;

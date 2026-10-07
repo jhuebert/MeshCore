@@ -16,6 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Hex digit value: 0..15, or -1 when the character is not a hex digit.
+inline int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
 // split the next space-separated token off in place; spaces inside double
 // quotes stay part of the token and the quote characters themselves are
 // stripped (callers taking regex values reject an odd quote count for a
@@ -94,6 +102,88 @@ inline void radd(char** out, int* remain, const char* fmt, ...) {
   if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
   *out += n;
   *remain -= n;
+}
+
+// A "token" charset shared by !id job keys (CliScript) and fleet tags
+// (FleetManager): 1..max_len chars of [A-Za-z0-9._-]. One validator, so the key
+// grammar and the tag grammar can never drift apart — a tag is the same kind
+// of string a job key is.
+inline bool cliValidToken(const char* s, size_t max_len) {
+  size_t n = strlen(s);
+  if (n == 0 || n > max_len) return false;
+  for (const char* c = s; *c; c++) {
+    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+          (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '-')) return false;
+  }
+  return true;
+}
+
+// Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
+// `capacity` is the caller's output buffer: an over-long or odd-length input is
+// refused before any byte is written, so a rejected key can never partially
+// overwrite a live slot. Returns the decoded byte count, or 0 on any refusal.
+inline int cliDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capacity) {
+  if ((in_len & 1) != 0 || in_len / 2 > capacity) return 0;
+  for (size_t i = 0; i < in_len; i += 2) {
+    int hi = hexNibble(in[i]), lo = hexNibble(in[i + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return (int)(in_len / 2);
+}
+
+// Split a decrypted group-text body into "<sender>: <text>". Content is
+// sender-controlled, so parse defensively and bounded by len (never strlen()).
+// The decrypted block is zero-padded to the packet buffer, so the visible field
+// ends at the first NUL — parsing past it would invent a colon (and an empty
+// sender) out of padding. `has_text`/`has_sender` report which fields were
+// really present, so a caller can tell "no sender field" from "empty text".
+// Shared by the filter's text= selectors and the fleet manager's script
+// intake: the definition of "what a message's sender and text are" must live
+// in one place, or the two would see different bodies for the same message.
+inline void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t sender_sz,
+                           char* text, size_t text_sz, bool* has_text, bool* has_sender) {
+  sender[0] = 0;
+  text[0] = 0;
+  *has_text = false;
+  *has_sender = false;
+  if (len < 5) return;   // too short for ts(4) + txt_type(1)
+
+  const uint8_t* p = data + 5;
+  // bounded to the first NUL within the decrypted body: everything after it is
+  // padding, not content
+  size_t n = 0;
+  const uint8_t* term = (const uint8_t*)memchr(p, 0, len - 5);
+  if (term != NULL) n = (size_t)(term - p);
+  else n = len - 5;
+
+  const uint8_t* colon = NULL;
+  for (size_t i = 0; i < n; i++) {
+    if (p[i] == ':') { colon = &p[i]; break; }
+  }
+
+  if (colon == NULL) {   // no sender extractable; whole remainder is text
+    *has_text = true;
+    size_t cpy = n < text_sz - 1 ? n : text_sz - 1;
+    memcpy(text, p, cpy);
+    text[cpy] = 0;
+    return;
+  }
+
+  size_t slen = (size_t)(colon - p);
+  while (slen > 0 && (p[slen - 1] == ' ' || p[slen - 1] == '\t')) slen--;   // trim trailing spaces/tabs
+  size_t cpy = slen < sender_sz - 1 ? slen : sender_sz - 1;
+  memcpy(sender, p, cpy);
+  sender[cpy] = 0;
+  *has_sender = true;
+
+  const uint8_t* tp = colon + 1;
+  size_t tlen = n - (size_t)(tp - p);
+  while (tlen > 0 && (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n')) { tp++; tlen--; }
+  *has_text = true;
+  cpy = tlen < text_sz - 1 ? tlen : text_sz - 1;
+  memcpy(text, tp, cpy);
+  text[cpy] = 0;
 }
 
 // Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
