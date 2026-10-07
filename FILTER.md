@@ -11,7 +11,8 @@ access to the repeater is required.
 **Quick navigation:** [Quick start](#quick-start) ·
 [Common setups](#common-setups) ·
 [Command reference](#command-reference) ·
-[Writing sender/text patterns](#writing-sendertext-patterns)
+[Writing sender/text patterns](#writing-sendertext-patterns) ·
+[Fleet management](#fleet-management-over-a-channel) (details in [CLI.md](./CLI.md))
 
 ---
 
@@ -132,7 +133,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `text` | pattern | Message text in group text |
 | `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
 | `throttle` | seconds, `1..65535` | Rate gate: the rule decides only the matches that exceed one per N seconds; one per N seconds slips past (see [throttle examples](#throttle)) |
-| `action` | `drop` (default) or `forward` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)). Upgrading from firmware that called this `logonly`: such rules now read as `forward` — the stored value is unchanged, only the keyword and display moved. The *rule ordering* around them is not identical on old firmware (see [Upgrading from earlier firmware](#upgrading-from-earlier-firmware)) |
+| `action` | `drop` (default), `forward` or `cli` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)), `cli` forwards it **and** runs its text as a deferred CLI script — a fleet management channel (see [CLI.md](./CLI.md)). Upgrading from firmware that called this `logonly`: such rules now read as `forward` — the stored value is unchanged, only the keyword and display moved. The *rule ordering* around them is not identical on old firmware (see [Upgrading from earlier firmware](#upgrading-from-earlier-firmware)) |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
 message is decrypted. Everything else is checked before forwarding and works on
@@ -270,6 +271,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
 | `filter ratelimit advert <hours>` | Set the window (0–720 h; 0 = off) |
 | `filter ratelimit clear` | Empty the advert cache |
+| `filter cli`, `filter cli seen [<key>]`, `filter cli forget <key>` / `all` | Status, seen-check and re-arm levers for the `action=cli` script machinery (see [CLI.md](./CLI.md#command-reference)) |
 | `filter stats` | Per-rule hit counters, limiter/abort counters, and total saved airtime with percentage (see below) |
 | anything else | Usage line listing the commands |
 
@@ -283,7 +285,7 @@ Notes:
   0eDBE9
   │││└─ 3 hex digits: digest of the rule's content (changes whenever
   │││     any part of the rule changes; identical rules always match)
-  ││└─── D = drop, F = forward
+  ││└─── D = drop, F = forward, C = cli (script action)
   │└──── e = enabled, d = disabled
   └────── rule index (0-based position)
   ```
@@ -792,6 +794,31 @@ await mc.commands.send_cmd(rep, "filter stats", dst_type=2)
 This is the normal management path for a repeater on a tower — the serial port
 is only needed for initial flashing and emergencies.
 
+## Fleet management over a channel
+
+A filter rule with `action=cli` turns a **private** keyed channel into a fleet
+management channel: a group text message on that channel is relayed like any
+`forward` rule would relay it, **and** its text is executed as a small CLI
+script — deferred, and at most once per job key per boot — on every repeater
+carrying the rule. One broadcast message configures a whole fleet, with no
+serial cable and no per-node logins.
+
+**Possession of the channel PSK is full admin access** — equivalent to
+serial-console access on every member. `sender=` and `text=` conditions narrow
+*which* messages run; they are not authentication.
+
+The rule refuses `'#'`-named channels (their key is derived from the public
+name, so they authenticate nobody), is forced to group text only, and takes no
+`prob=`/`throttle=`. Use `filter cli` for the script counters, `filter cli
+seen <key>` to check whether a job ran here, and `filter cli forget <key>` to
+re-arm one.
+
+Because the details — script format, idempotency, the two-phase cutover
+pattern, target groups, recipes, troubleshooting — are fleet operations more
+than packet filtering, they live in their own guide:
+
+→ Full guide, including recipes and the security model: **[CLI.md](./CLI.md)**
+
 ## Limits and good-to-knows
 
 | Limit | Value |
@@ -811,7 +838,9 @@ is only needed for initial flashing and emergencies.
   28 of 31 characters) and `text=` about eight. Need more? Add a second rule, or
   use one broader alternative such as `^Bot`.
 - Rules, channels, and settings survive reboots. Counters and the advert cache
-  do not — they start fresh after every reboot.
+  do not — they start fresh after every reboot. The job-key memory of CLI-script
+  rules is RAM-only the same way, which is what makes re-sent scripts run again
+  (see [CLI.md](./CLI.md)).
 - An edit is written to flash about **3 seconds** after you make it (a burst of
   commands costs one write, not one each). Power the repeater off within that
   window and that edit is lost — everything before it is safe.
@@ -903,7 +932,12 @@ this section if you write firmware or tooling that touches the file.
 - **Downgrading firmware is a reset.** A file written by a newer firmware
   carries a version byte this firmware rejects, so the whole file is discarded
   and the repeater starts from defaults (rules can be re-added or re-flashed
-  forward).
+  forward). The version byte did **not** change when `action=cli` was added:
+  firmware from before the feature still accepts the file but treats a `cli`
+  record as invalid, which **ends the rule list at that point** — rules stored
+  after a `cli` rule are lost on the next save. Keep `cli` rules last in the
+  list if you might roll firmware back; a downgrade removes the feature anyway
+  (see [CLI.md](./CLI.md) for what `action=cli` is).
 
 ## Writing sender/text patterns
 

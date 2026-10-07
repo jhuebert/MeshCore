@@ -8,8 +8,10 @@
 // decides the packet's verdict (first match wins). Unspecified predicate =
 // wildcard. On top of the predicates, prob= and throttle= are match gates: a
 // rule whose predicates match still only decides a packet its gates admit
-// (see probDecides/throttleDecides). Actions: drop (enforce) and forward
-// (terminal: stop the list, count the hit, let the packet through).
+// (see probDecides/throttleDecides). Actions: drop (enforce), forward
+// (terminal: stop the list, count the hit, let the packet through) and cli
+// (forward plus queue the message text as a CLI script, executed deferred —
+// see CliScript.h).
 //
 // For a decrypted group packet the whole rule list — packet-level and content
 // predicates alike — is evaluated once in checkContent() (called from
@@ -33,12 +35,16 @@
 #include "PatternMatch.h"
 #include "PersistUtil.h"
 #include "AdvertRateLimiter.h"
+#include "CliScript.h"
 
 // actions
 #define FILTER_ACT_ALLOW     0
 #define FILTER_ACT_DROP      1
 #define FILTER_ACT_FORWARD   2   // value 2 = the old logonly byte; configs
                                  // load identically across the rename
+#define FILTER_ACT_CLI       3   // forward + enqueue the message text as a
+                                 // deferred CLI script (CliScriptRunner); rides
+                                 // the existing action byte, no record growth
 
 // payload-type mask bits (indexed by mesh::Packet payload type, 4 bits).
 // All types a rule can name, low byte first: the filter sees every packet the
@@ -108,7 +114,7 @@ struct Interval {
 
 struct FilterRule {
   bool     enabled;
-  uint8_t  action;        // FILTER_ACT_DROP | FILTER_ACT_FORWARD
+  uint8_t  action;        // FILTER_ACT_DROP | FILTER_ACT_FORWARD | FILTER_ACT_CLI
   uint8_t  type_mask;     // bits 0..7 by payload type (see FILTER_TYPE_*); 0 = any
   uint8_t  route_mask;    // FILTER_ROUTE_* bits; 0 = any
   Interval hops;          // flood path length (getPathHashCount)
@@ -224,6 +230,7 @@ class FilterRules {
   FilterChannel channels[FILTER_MAX_CHANNELS];
   int num_channels;
   AdvertRateLimiter limiter;   // per-node advert repeat window
+  CliScriptRunner cli_scripts;   // remote CLI scripts queued by action=cli rules
   // A 64-bit monotonic clock folded from the 32-bit millis(). Unsigned
   // subtraction handles exactly one wrap: it cannot tell 49.7 days + 1 s from
   // 1 s, so a repeater left up long enough would spuriously rate-limit a rule or
@@ -305,8 +312,10 @@ public:
   // Single-pass evaluation of the ENTIRE rule list on a decrypted group
   // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
   // sender / text), in listed order; first enabled match decides (first match
-  // wins) and its verdict — allow, forward or drop — is stashed for
-  // checkPacket(). Caller drops the packet if this returns FILTER_ACT_DROP.
+  // wins) and its verdict — allow, forward, cli or drop — is stashed for
+  // checkPacket(). A cli verdict additionally queues the message text as a
+  // deferred CLI script (CliScriptRunner); the caller only special-cases DROP.
+  // Caller drops the packet if this returns FILTER_ACT_DROP.
   // `est_air_ms`: see checkPacket().
   uint8_t checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
                        const uint8_t* data, size_t len, const RegionEntry* region,
@@ -320,6 +329,11 @@ public:
   uint16_t getAdvertRatelimit() const { return limiter.getHours(); }
   void clearAdvertCache() { limiter.clearCache(); }
   int getAdvertCacheCount() const { return limiter.getCacheCount(); }
+  // remote CLI scripts (state lives in CliScriptRunner): thin forwards, like
+  // the limiter's — no duplicated logic. runCliScripts returns whether a
+  // script was drained, so the caller can loop until the queue is empty.
+  bool runCliScripts(CliExecFn fn, void* ctx) { return cli_scripts.run(fn, ctx); }
+  CliScriptRunner& getScripts() { return cli_scripts; }
   // Any rule or channel mutation: the config is changing, so a verdict stashed
   // under the old rules must not be honoured afterwards. markDirty() is the one
   // place every mutation already passes through.
@@ -348,6 +362,12 @@ private:
   void billSaved(uint32_t est_air_ms) { air_saved_ms += est_air_ms; }
   bool regexMatches(const char* pattern, const char* subject);
   bool channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const;
+  // A cli rule must never execute scripts on a '#'-named channel: such names
+  // derive their key from the public channel name, which authenticates nobody.
+  // When no surviving channel of the rule is PSK-backed (e.g. its private
+  // channel was deleted), clear the mask — MASK_SET with no bits is the
+  // documented inert rule, and the record stays savable.
+  void confineCliRule(FilterRule* r);
   // match gates + commit, shared by checkPacket()/checkContent(): run the prob
   // roll and the throttle gate; when the rule decides, record the hit, bill
   // the saved airtime, and store its action in `out`. Returns false when a

@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream automatically (synced weekly) and adds two repeater-focused
+It tracks upstream automatically (synced weekly) and adds three repeater-focused
 capabilities on top of stock firmware. Everything else — supported boards,
 clients, protocols, build system — is identical to upstream; see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
@@ -34,6 +34,24 @@ flapping, and the admin can check voltage and tune thresholds over the mesh.
 
 → Full guide: **[BATTERY.md](./BATTERY.md)**
 
+### 🛰️ Fleet management (remote CLI scripts)
+
+Broadcast CLI jobs to a whole fleet of repeaters through one private keyed
+channel. A filter rule with `action=cli` forwards a group text message like
+normal traffic **and** executes its text as a small script — deferred, and at
+most once per job key per boot. Every admin command works remotely: radio
+settings, filter rules, node names, reboots. Re-send jobs freely to catch
+nodes that were offline; duplicates are ignored automatically, and the sender
+name or a tag in the job key can address sub-fleets (by location, board type,
+or rollout stage).
+
+The channel key is the credential: holding the PSK is equivalent to
+serial-console access on every member, so PSK hygiene is the whole security
+model.
+
+→ Full guide, including recipes, the two-phase cutover pattern, and the
+security model: **[CLI.md](./CLI.md)**
+
 ## Why run this instead of stock repeater firmware?
 
 Stock repeaters forward everything they hear, until the battery dies. This
@@ -48,6 +66,10 @@ fork is for operators who want policy and resilience at the node:
   other hardware needed.
 - **Solar / off-grid sites** — the node goes quiet *while it can still answer
   you*, instead of disappearing dark, and wakes itself when there's sun again.
+- **Fleet operators** — run several repeaters (a region, a club's network, a
+  set of towers) and push settings to all of them with one broadcast message
+  instead of one admin session each: radio preset cutovers, advert hygiene,
+  filter policy, rollouts and rollbacks.
 
 ## Getting the firmware
 
@@ -60,4 +82,5 @@ Prebuilt binaries for all supported boards are on the
 | stable | `repeater-filter-stable` | upstream `main` releases | `filter-v*` |
 
 Flash as you would stock firmware, then follow
-[FILTER.md](./FILTER.md) to set your first rules over the CLI.
+[FILTER.md](./FILTER.md) to set your first rules over the CLI, and
+[CLI.md](./CLI.md) if you are running a fleet.
