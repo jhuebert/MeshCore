@@ -1138,6 +1138,24 @@ TEST_F(FleetHooksTest, AppendChannelByHash) {
   EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4, 0), 0);
 }
 
+TEST_F(FleetHooksTest, LoadPreservesDeviceServices) {
+  // MyMesh wires the device services in just before fleet.begin(fs): a
+  // load-time resetToDefaults() must not wipe them (wiring, not state)
+  flushSave();   // a persisted config exists
+  FleetManager loaded;
+  loaded.setClock(HookEnv::timeFn, &env);
+  loaded.begin(&fs);   // load() runs resetToDefaults()
+  // observable through the scheduled path: with the clock wired, an !at job
+  // within the stale window is admitted and fires on the next pass; a wiped
+  // clock would read as unset and refuse it
+  GroupTextPayload p = makeGroupText("alice", "!id k1\n!at 1800000000\nreset");
+  loaded.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  EXPECT_EQ(loaded.getSchedCount(), 1);   // clock survived load: job admitted
+  loaded.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.rec.lines.size(), (size_t)1);   // dequeued by the wired clock
+  EXPECT_EQ(env.rec.lines[0], "reset");
+}
+
 // ------------------------------------------------------------------ CLI
 
 TEST_F(FleetHooksTest, StatusLine) {
