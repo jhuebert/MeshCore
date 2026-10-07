@@ -121,10 +121,12 @@ class FleetManager {
   LazySave save_flag;        // needs save, written back by loop()
 
   // device services (see typedefs above); NULL = unset: the clock counts as
-  // unset for !at admission, and replies are sent without jitter
-  FleetTimeFn time_fn;       void* time_ctx;
-  FleetJitterFn jitter_fn;   void* jitter_ctx;
-  FleetSendFn send_fn;       void* send_ctx;
+  // unset for !at admission, and replies are sent without jitter. Wiring,
+  // not state: MyMesh::begin() sets them just before load(), so they get
+  // in-class initializers and resetToDefaults() must never touch them.
+  FleetTimeFn time_fn = NULL;       void* time_ctx = NULL;
+  FleetJitterFn jitter_fn = NULL;   void* jitter_ctx = NULL;
+  FleetSendFn send_fn = NULL;       void* send_ctx = NULL;
 
 public:
   FleetManager();

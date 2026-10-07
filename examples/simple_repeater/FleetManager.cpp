@@ -24,9 +24,9 @@ void FleetManager::resetToDefaults() {
   reply_count = 0;
   offered = 0;
   matched = 0;
-  time_fn = NULL; time_ctx = NULL;
-  jitter_fn = NULL; jitter_ctx = NULL;
-  send_fn = NULL; send_ctx = NULL;
+  // device services are deliberately NOT reset here: they are wiring (set by
+  // MyMesh::begin() before load()), not config state — they have in-class
+  // initializers and survive every resetToDefaults()/load() call
 }
 
 FleetManager::FleetManager() {

@@ -81,7 +81,7 @@ commit** — the guides are user-facing API documentation, not optional docs.
 
 **Tests:** `test/test_packet_filter/` (295 behavior-level cases: matching,
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
-PatternMatch), `test/test_fleet/` (81 cases: runner grammar, tag targeting,
+PatternMatch), `test/test_fleet/` (82 cases: runner grammar, tag targeting,
 acknowledgements, scheduling, persistence, CLI surface, the battery
 exemption contract) and `test/test_battery_gate/`. Test-only shims:
 `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
@@ -250,7 +250,7 @@ FILTER.md:
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
 - Pure refactors keep both suites green **unchanged** — the suites (295 filter,
-  81 fleet, 44 battery) are the safety net that proves no behavior slipped.
+  82 fleet, 44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
 ```
