@@ -4,7 +4,7 @@
 // shim and stub notes.
 //
 // Sections: TinyRegex, PatternMatch, packet-level matching, content rules,
-// advert rate limiter, management/persistence, and the filter CLI.
+// advert rate limiter, cli scripts, management/persistence, and the filter CLI.
 //
 // Coverage map (2026-09-13 host-native gap analysis; on-air semantics mirrored
 // from the Phase-4 raw-packet suites):

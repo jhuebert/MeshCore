@@ -40,6 +40,9 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
   `checkContent` decrypted-content single pass, verdict stash), binary
   persistence (`load`/`save`, v3..v7 stepwise migration), `filterCLI`.
+- `CliScript.h/.cpp` — the `action=cli` remote-script runner: `!id` parse,
+  2-slot pending queue, the seen-key hash ring, and the run callback that
+  MyMesh drives (see the behavioral-invariants note).
 - `AdvertRateLimiter.h/.cpp` — the per-origin advert repeat window: cache,
   counters, and the check/commit split (see the fork's rule-model note).
 - `PersistUtil.h` — the lazy dirty-save pattern, the per-platform file opens, and
@@ -56,12 +59,12 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
-  dispatch, lazy-save loop).
+  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
-**Tests:** `test/test_packet_filter/` (295 behavior-level cases: matching,
-content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
-PatternMatch) and `test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
+**Tests:** `test/test_packet_filter/` (323 behavior-level cases: matching,
+content rules, limiter, cli scripts, persistence upgrades, CLI surface,
+TinyRegex, PatternMatch) and `test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
 `NativeTestStubs.cpp`, `RegionMapStub.cpp`, `FilterTestHelpers.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
@@ -97,6 +100,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/PacketFilter.h/.cpp`, `PacketFilterConfig.h`
 - `examples/simple_repeater/TinyRegex.h/.cpp`, `CliUtil.h`, `BatteryGate.h/.cpp`
 - `examples/simple_repeater/PatternMatch.h/.cpp`
+- `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
 - `FILTER.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
@@ -162,7 +166,11 @@ FILTER.md:
 - **Behavioral invariants are compatibility.** First-match-wins ordering,
   prob-before-throttle, stats semantics (hits travel with the rule on
   move/del; a stats reset never grants a throttle free pass) are observable
-  behavior. Changing them is a breaking decision, not a refactor side effect.
+  behavior. So is the action=cli model: a `!id` job key runs at most once per
+  boot (marked at enqueue, RAM-only seen ring), cli rules are txt-only,
+  chan-required and gate-free, a cli rule left with `'#'` channels only is
+  inert, and the script execution is deferred out of the receive path.
+  Changing them is a breaking decision, not a refactor side effect.
 - **New pattern syntax must not silently change the meaning of an
   already-storable pattern.** If it would, either ship an escape (`\|`) or
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
@@ -218,7 +226,7 @@ FILTER.md:
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
-- Pure refactors keep both suites green **unchanged** — the suites (295 filter,
+- Pure refactors keep both suites green **unchanged** — the suites (323 filter,
   44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
