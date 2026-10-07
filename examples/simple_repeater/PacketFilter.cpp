@@ -543,57 +543,6 @@ uint8_t FilterRules::checkPacket(const mesh::Packet* pkt, uint32_t now_millis, c
 
 // ---------------------------------------------------------------- content rules
 
-// Split a decrypted group-text body into "<sender>: <text>". Content is
-// sender-controlled, so parse defensively and bounded by len (never strlen()).
-// The decrypted block is zero-padded to the packet buffer, so the visible field
-// ends at the first NUL — parsing past it would invent a colon (and an empty
-// sender) out of padding. `has_text`/`has_sender` report which fields were
-// really present, so a caller can tell "no sender field" from "empty text".
-static void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t sender_sz,
-                           char* text, size_t text_sz, bool* has_text, bool* has_sender) {
-  sender[0] = 0;
-  text[0] = 0;
-  *has_text = false;
-  *has_sender = false;
-  if (len < 5) return;   // too short for ts(4) + txt_type(1)
-
-  const uint8_t* p = data + 5;
-  // bounded to the first NUL within the decrypted body: everything after it is
-  // padding, not content
-  size_t n = 0;
-  const uint8_t* term = (const uint8_t*)memchr(p, 0, len - 5);
-  if (term != NULL) n = (size_t)(term - p);
-  else n = len - 5;
-
-  const uint8_t* colon = NULL;
-  for (size_t i = 0; i < n; i++) {
-    if (p[i] == ':') { colon = &p[i]; break; }
-  }
-
-  if (colon == NULL) {   // no sender extractable; whole remainder is text
-    *has_text = true;
-    size_t cpy = n < text_sz - 1 ? n : text_sz - 1;
-    memcpy(text, p, cpy);
-    text[cpy] = 0;
-    return;
-  }
-
-  size_t slen = (size_t)(colon - p);
-  while (slen > 0 && (p[slen - 1] == ' ' || p[slen - 1] == '\t')) slen--;   // trim trailing spaces/tabs
-  size_t cpy = slen < sender_sz - 1 ? slen : sender_sz - 1;
-  memcpy(sender, p, cpy);
-  sender[cpy] = 0;
-  *has_sender = true;
-
-  const uint8_t* tp = colon + 1;
-  size_t tlen = n - (size_t)(tp - p);
-  while (tlen > 0 && (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n')) { tp++; tlen--; }
-  *has_text = true;
-  cpy = tlen < text_sz - 1 ? tlen : text_sz - 1;
-  memcpy(text, tp, cpy);
-  text[cpy] = 0;
-}
-
 // A rule's keyed-channel predicate matches if the delivered (MAC-proven) channel
 // is one of the store entries named by the rule's bitmask.
 bool FilterRules::channelMatchesStore(const FilterRule* r, const mesh::GroupChannel& channel) const {
