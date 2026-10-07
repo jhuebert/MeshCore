@@ -1643,7 +1643,48 @@ static bool cliRuleIdx(FilterRules& filter, char* arg, int& idx, char* reply) {
   return true;
 }
 
-#define FILTER_USAGE "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats"
+#define FILTER_USAGE "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|cli|stats"
+
+// `filter cli ...` — remote CLI script status and the seen-table levers. The
+// runner is exposed through FilterRules::getScripts(); hashes stay internal:
+// every lookup and reply names the key string the operator chose.
+static void cliCli(FilterRules& filter, char* params, char* reply) {
+  char* p = params;
+  char* sub = nextToken(&p);
+  if (sub == NULL) {
+    auto& s = filter.getScripts();
+    snprintf(reply, CLI_REPLY_MAX,
+             "scripts ran:%lu dup:%lu noid:%lu refused:%lu badline:%lu; pending %d/%d; seen %d/%d",
+             (unsigned long)s.getRan(), (unsigned long)s.getDup(), (unsigned long)s.getNoId(),
+             (unsigned long)s.getRefused(), (unsigned long)s.getBadLines(),
+             s.getPendingCount(), FILTER_CLI_QUEUE_DEPTH, s.getSeenCount(), FILTER_CLI_SEEN_SIZE);
+  } else if (strcmp(sub, "seen") == 0) {
+    char* key = nextToken(&p);
+    if (key == NULL) {
+      if (!cliNoExtra(p, reply, "Err - usage: cli seen [<key>]")) return;
+      snprintf(reply, CLI_REPLY_MAX, "seen %d/%d", filter.getScripts().getSeenCount(),
+               FILTER_CLI_SEEN_SIZE);
+    } else {
+      if (!cliNoExtra(p, reply, "Err - usage: cli seen [<key>]")) return;
+      if (filter.getScripts().keySeen(key)) snprintf(reply, CLI_REPLY_MAX, "OK - key %s seen", key);
+      else snprintf(reply, CLI_REPLY_MAX, "Err - key %s not seen", key);
+    }
+  } else if (strcmp(sub, "forget") == 0) {
+    char* key = nextToken(&p);
+    if (key == NULL) { strcpy(reply, "Err - usage: cli forget <key>|all"); return; }
+    if (!cliNoExtra(p, reply, "Err - usage: cli forget <key>|all")) return;
+    if (strcmp(key, "all") == 0) {
+      filter.getScripts().forgetAll();
+      strcpy(reply, "OK - seen table cleared");
+    } else if (filter.getScripts().forgetKey(key)) {
+      strcpy(reply, "OK - key forgotten");
+    } else {
+      strcpy(reply, "Err - key not seen");
+    }
+  } else {
+    strcpy(reply, "Err - usage: cli [seen [<key>]|forget <key>|all]");
+  }
+}
 
 void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap* regions) {
   // An oversized command is refused whole rather than acted on as a prefix, and
@@ -1753,6 +1794,8 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
     } else {
       strcpy(reply, "Err - usage: ratelimit [advert <hours>|clear]");
     }
+  } else if (strcmp(cmd, "cli") == 0) {
+    cliCli(filter, p, reply);
   } else if (strcmp(cmd, "stats") == 0) {
     char* sub = nextToken(&p);
     if (sub == NULL) {
