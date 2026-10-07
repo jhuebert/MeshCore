@@ -1011,12 +1011,18 @@ static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   memset(&chan, 0, sizeof(chan));
   chan.hash[0] = chan_hash;
   memcpy(chan.secret, chan_secret, sizeof(chan.secret));
+  // on-air group text payload is [ts(4)][txt_type(1)]"<name>: <body>"; receivers
+  // read the header before the text (BaseChatMesh::onGroupDataRecv), so an ack
+  // composed without it parses as an unsupported txt_type and is dropped
   // "<name>: " + body must fit one packet's data limit (168 B): bound the
   // composition so a long name truncates the tail rather than refusing the send
-  char msg[FLEET_REPLY_DATA_MAX + 1];
-  snprintf(msg, sizeof(msg), "%s: %s", m->getNodeName(), body);
-  mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan,
-                                             (const uint8_t*)msg, strlen(msg));
+  uint8_t msg[FLEET_REPLY_DATA_MAX + 1];
+  uint32_t ts = m->getRTCClock()->getCurrentTime();
+  memcpy(msg, &ts, 4);
+  msg[4] = 0;   // TXT_TYPE_PLAIN
+  snprintf((char*)&msg[5], sizeof(msg) - 5, "%s: %s", m->getNodeName(), body);
+  mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg,
+                                             5 + strlen((char*)&msg[5]));
   if (pkt) m->sendFlood(pkt);   // flood is the only reply route: group texts carry no pubkey
 }
 
