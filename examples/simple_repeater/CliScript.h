@@ -60,7 +60,7 @@ class CliScriptRunner {
   uint64_t seen[FILTER_CLI_SEEN_SIZE];   // job-key hashes, ring of the last N this boot
   int seen_count;
   int seen_head;                          // ring head (oldest entry) once full
-  // counters (RAM-only telemetry, reset by resetStats()-style boots only)
+  // counters (RAM-only telemetry; reset by reset(), i.e. every boot)
   uint32_t ran;       // scripts executed
   uint32_t dup;       // enqueues refused: key already seen
   uint32_t noid;      // enqueues refused: no !id marker
