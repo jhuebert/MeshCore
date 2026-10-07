@@ -889,19 +889,18 @@ void FilterRules::load(FILESYSTEM* fs) {
   File file = fsOpenRead(fs, path);
   if (!file) return;
 
-  FilterRule loaded[FILTER_MAX_RULES];
-  memset(loaded, 0, sizeof(loaded));   // RAM-only stats/state stay zero
-  FilterChannel loaded_ch[FILTER_MAX_CHANNELS];
-  memset(loaded_ch, 0, sizeof(loaded_ch));
+  // Parse straight into the member stores: 32 rules + 32 channels of scratch
+  // copies need ~8.5 KB of stack in this frame, which overflowed the 8 KB
+  // Arduino loop stack on ESP32 and crash-looped the boot. resetToDefaults()
+  // above already zeroed the members (RAM-only stats included), and a failed
+  // parse below puts the whole store back into that same state.
   bool en = true;
   uint8_t nr = 0, nc = 0;
   uint16_t rl = 0;
-  if (parseConfigFile(file, loaded, loaded_ch, en, nr, nc, rl)) {
+  if (parseConfigFile(file, rules, channels, en, nr, nc, rl)) {
     file.close();
     enabled = en;
     limiter.setHours(rl);
-    if (nr > 0) memcpy(rules, loaded, nr * sizeof(FilterRule));
-    if (nc > 0) memcpy(channels, loaded_ch, nc * sizeof(FilterChannel));
     num_rules = nr;
     num_channels = nc;
     // a rule whose chan_mask named a channel we did not adopt still counts, but
@@ -914,6 +913,7 @@ void FilterRules::load(FILESYSTEM* fs) {
     }
   } else {
     file.close();
+    resetToDefaults();   // a partial parse must not leave half a store behind
   }
 
   // Loaded from the backup, so the canonical file is missing or unusable: get a
