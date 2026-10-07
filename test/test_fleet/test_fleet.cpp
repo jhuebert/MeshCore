@@ -1111,20 +1111,31 @@ TEST_F(FleetHooksTest, CheckForwardExemptsOnlyFleetChannelGroupPackets) {
 TEST_F(FleetHooksTest, AppendChannelByHash) {
   mesh::GroupChannel dest[4];
   memset(dest, 0, sizeof(dest));
-  // hash match: the fleet channel is offered, deduped against what the filter
-  // store already handed over
+  // hash match: the fleet channel is offered, deduped against the entries the
+  // filter store already handed over (the filled prefix)
   uint8_t hash[1] = { chan.hash[0] };
   memcpy(dest[0].secret, chan.secret, PUB_KEY_SIZE);
-  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 0);   // same secret already present
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4, 1), 0);   // same secret already present
   memset(dest, 0, sizeof(dest));
-  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 1);
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4, 0), 1);
   EXPECT_EQ(dest[0].hash[0], chan.hash[0]);
   EXPECT_EQ(memcmp(dest[0].secret, chan.secret, PUB_KEY_SIZE), 0);
+  // a different secret with the same hash is appended at dest[filled], after
+  // the filter's entries — never over them
+  mesh::GroupChannel mixed[4];
+  memset(mixed, 0, sizeof(mixed));
+  memset(mixed[0].secret, 0xEE, PUB_KEY_SIZE);
+  EXPECT_EQ(fleet.appendChannelByHash(hash, mixed, 4, 1), 1);
+  EXPECT_EQ(mixed[1].hash[0], chan.hash[0]);
+  EXPECT_EQ(memcmp(mixed[1].secret, chan.secret, PUB_KEY_SIZE), 0);
+  EXPECT_EQ(mixed[0].secret[0], 0xEE);   // the earlier entry is untouched
+  // store full: nothing offered
+  EXPECT_EQ(fleet.appendChannelByHash(hash, mixed, 4, 4), 0);
   // no hash match, or hooks idle: nothing offered
   uint8_t other_hash[1] = { (uint8_t)(chan.hash[0] ^ 0xFF) };
-  EXPECT_EQ(fleet.appendChannelByHash(other_hash, dest, 4), 0);
+  EXPECT_EQ(fleet.appendChannelByHash(other_hash, dest, 4, 0), 0);
   fleet.setEnabled(false);
-  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 0);
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4, 0), 0);
 }
 
 // ------------------------------------------------------------------ CLI

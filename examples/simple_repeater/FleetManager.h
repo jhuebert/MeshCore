@@ -195,10 +195,13 @@ public:
   void runScripts(CliExecFn fn, void* exec_ctx);
 
   // Keyed-channel supply for the core's group decryption: offers the fleet
-  // channel when its hash matches, skipping a secret already in `dest` (the
-  // filter store may hold the same PSK; a duplicate would burn one of core's
-  // few candidate slots). Returns how many entries were appended.
-  int appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
+  // channel when its hash matches, skipping a secret already in the `filled`
+  // leading entries of `dest` (the filter store may hold the same PSK; a
+  // duplicate would burn one of core's few candidate slots — and only that
+  // prefix is initialised, core hands over raw stack for the rest). Appends
+  // at dest[filled]; returns how many entries were appended.
+  int appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches,
+                          int filled);
 
   void markDirty() { save_flag.markDirty(); }
 
