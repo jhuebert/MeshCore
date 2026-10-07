@@ -1326,6 +1326,17 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   }
 }
 
+// Executor for remote CLI scripts queued by action=cli filter rules (see
+// CliScript.h): each line runs through handleCommand(0, ...) — serial-privilege
+// dispatch, sender_timestamp = 0 — and both the line and its reply are logged
+// in the serial CLI's style, so an operator at the console sees exactly what
+// ran. `key` is the job's !id key string from the queued script itself.
+static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
+  ((MyMesh*)ctx)->handleCommand(0, line, reply);
+  Serial.printf("cli[%s] %s\n", key, line);
+  if (reply[0]) Serial.printf("  -> %s\n", reply);
+}
+
 void MyMesh::loop() {
 #ifdef WITH_BRIDGE
   bridge.loop();
@@ -1372,6 +1383,12 @@ void MyMesh::loop() {
 
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
+
+  // Remote CLI scripts (action=cli rules): drain one queued script per loop,
+  // after mesh::Mesh::loop() and outside the receive bracket that produced it —
+  // never while the filter is evaluating a packet. handleCommand(0, ...) gives
+  // a script line the same dispatch and privilege as the serial console.
+  filter.runCliScripts(execCliLine, this);
 
   // update uptime
   uint32_t now = millis();
