@@ -25,8 +25,14 @@ struct AdvertSeenEntry {      // RAM-only; cleared on reboot
                               // odds ~0.001% per 256 distinct nodes,
                               // vanity-robust; worst case is one falsely
                               // suppressed advert/window
-  uint64_t first_seen_millis; // on this repeater's own 64-bit monotonic clock
+  uint32_t first_seen_minutes; // minutes since boot on this repeater's own
+                               // monotonic clock (uptime millis / 60000);
+                               // minute granularity rounds the window edge by
+                               // <1 min, and uint32 minutes never wraps —
+                               // keeps the entry at 8 bytes, half the cost of
+                               // a millis stamp
 };
+static_assert(sizeof(AdvertSeenEntry) == 8, "advert cache entry must stay 8 bytes");
 
 class AdvertRateLimiter {
   AdvertSeenEntry cache[FILTER_ADVERT_CACHE_SIZE];
@@ -71,7 +77,7 @@ private:
   // index of the cache slot holding this origin's 4-byte key, or -1
   int findOrigin(const mesh::Packet* pkt) const;
   // store this origin at `now`, evicting the oldest entry if the cache is full
-  void storeOrigin(const mesh::Packet* pkt, uint64_t now_millis);
+  void storeOrigin(const mesh::Packet* pkt, uint32_t now_min);
 };
 
 #endif // _ADVERT_RATE_LIMITER_H

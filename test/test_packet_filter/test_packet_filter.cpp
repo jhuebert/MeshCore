@@ -35,7 +35,7 @@
 #include "FilterTestHelpers.h"
 
 // The on-disk config path and the lazy-save delay, mirroring PacketFilter.cpp.
-static constexpr uint8_t CFG_VERSION = 6;
+static constexpr uint8_t CFG_VERSION = 7;
 static constexpr unsigned long CFG_SAVE_DELAY_MS = 3000;
 static const char* CFG_FILE = "/filter_cfg";
 
@@ -504,6 +504,29 @@ TEST_F(FilterTest, TypePredicate) {
   EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.checkPacket(&txt, 0, nullptr), FILTER_ACT_DROP);
   EXPECT_EQ(filter.checkPacket(&dat, 0, nullptr), FILTER_ACT_ALLOW);
+}
+
+// The encrypted payload types are nameable too. They are envelope-only (see
+// GenericPredicatesCoverNonAdvertTypes for why the repeater sees them at all),
+// so packet-level predicates decide them.
+TEST_F(FilterTest, TypePredicateMatchesEncryptedPayloadTypes) {
+  expectOk(filter, "add type=req,response,msg,ack,anonreq");
+  EXPECT_EQ(filter.getRule(0)->type_mask,
+            FILTER_TYPE_REQ | FILTER_TYPE_RESPONSE | FILTER_TYPE_TXT_MSG |
+                FILTER_TYPE_ACK | FILTER_TYPE_ANON_REQ);
+  auto req = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_REQ);
+  auto resp = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_RESPONSE);
+  auto msg = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_TXT_MSG);
+  auto ack = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ACK);
+  auto anon = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ANON_REQ);
+  auto adv = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
+  EXPECT_EQ(filter.checkPacket(&req, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&resp, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&msg, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&ack, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&anon, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&adv, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 5u);
 }
 
 // ---------------------------------------------------------------- route=
@@ -1270,11 +1293,13 @@ TEST_F(FilterTest, WindowExpiryAllowsAndRefreshes) {
 
   uint32_t t0 = 1000;
   EXPECT_EQ(forwardPacket(filter, pkt, t0, nullptr), FILTER_ACT_ALLOW);
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 - 1, nullptr), FILTER_ACT_DROP);
-  // at exactly the window boundary the advert is allowed again...
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000, nullptr), FILTER_ACT_ALLOW);
+  // stamps are minute-granular (see AdvertRateLimiter.h), so the window edge
+  // can open up to a minute early; 59 min in is still firmly inside
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 59UL * 60000, nullptr), FILTER_ACT_DROP);
+  // past the boundary the advert is allowed again...
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 61UL * 60000, nullptr), FILTER_ACT_ALLOW);
   // ...and the window restarts from that moment
-  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 3600UL * 1000 + 500, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(forwardPacket(filter, pkt, t0 + 61UL * 60000 + 500, nullptr), FILTER_ACT_DROP);
 }
 
 TEST_F(FilterTest, TimingIsWrapSafe) {
@@ -1608,6 +1633,9 @@ TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
   }
   ASSERT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
 
+  // walk the paginated listing to completion: with a store of 32 the listing
+  // can span several replies, so keep following the `next=N` markers until the
+  // end, collecting pages
   std::string head = cli(filter, "chan list");
   EXPECT_GT(head.size(), 0u);
   size_t next_at = head.find("; next=");
@@ -1619,17 +1647,23 @@ TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
   // every visible entry is whole: the marker follows a complete "idx:name:hash"
   EXPECT_EQ(head.find(":") != std::string::npos, true);
 
-  // the resumed listing starts at the index the marker named
-  std::string tail = cli(filter, ("chan list " + std::to_string(start)).c_str());
-  size_t p0 = tail.find(":");
-  ASSERT_NE(p0, std::string::npos);
-  EXPECT_EQ(atoi(tail.substr(0, p0).c_str()), start);
-
-  // together the two pages name every channel exactly once, in order, and never
-  // split an entry: each token is a whole "idx:name:hash"
+  // every page starts at the index the previous marker named, until the store
+  // is exhausted and no more continuation is offered
   std::vector<int> seen;
-  for (const std::string* page : { &head, &tail }) {
-    for (const std::string& tok : splitOnSpace(*page)) {
+  std::vector<std::string> pages{ head };
+  std::string page = head;
+  while (true) {
+    size_t nxt = page.find("; next=");
+    if (nxt == std::string::npos) break;
+    int resume = atoi(page.substr(nxt + 7).c_str());
+    page = cli(filter, ("chan list " + std::to_string(resume)).c_str());
+    pages.push_back(page);
+    ASSERT_LT(pages.size(), (size_t)20) << "pagination never terminates";
+  }
+  // together the pages name every channel exactly once, in order, and never
+  // split an entry: each token is a whole "idx:name:hash"
+  for (const std::string& p : pages) {
+    for (const std::string& tok : splitOnSpace(p)) {
       if (tok.empty() || !isdigit((unsigned char)tok[0])) continue;   // skip the "next=N" marker
       // a whole entry is exactly "idx:name:hash": two colons, and no cut name
       EXPECT_EQ(std::count(tok.begin(), tok.end(), ':'), 2) << "partial entry: " << tok;
@@ -1641,10 +1675,9 @@ TEST_F(FilterTest, ChanListContinuesWhereItWasCut) {
   ASSERT_EQ(seen.size(), (size_t)filter.getNumChannels());
   for (int i = 0; i < filter.getNumChannels(); i++) EXPECT_EQ(seen[i], i) << "coverage gap at " << i;
 
-  // walking to the end eventually stops offering a continuation
-  std::string last = cli(filter, ("chan list " + std::to_string(filter.getNumChannels() - 1)).c_str());
+  // the last page offered no continuation, and past the end is an error
+  std::string last = pages.back();
   EXPECT_EQ(last.find("; next="), std::string::npos);
-  // ... and past the end is an error, not an empty success
   EXPECT_EQ(cli(filter, ("chan list " + std::to_string(filter.getNumChannels())).c_str()).substr(0, 5), "Err -");
 }
 
@@ -2161,6 +2194,17 @@ TEST_F(FilterTest, StatsAreNeverPersisted) {
   EXPECT_EQ(restored.getRule(0)->hits, 0u);   // hits live in RAM only
 }
 
+TEST_F(FilterTest, NewPayloadTypesRoundTrip) {
+  expectOk(filter, "add type=req,anonreq,msg");
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->type_mask,
+            FILTER_TYPE_REQ | FILTER_TYPE_ANON_REQ | FILTER_TYPE_TXT_MSG);
+}
+
 TEST_F(FilterTest, ThrottleV6RoundTrip) {
   expectOk(filter, "add type=advert throttle=60");
   expectOk(filter, "add type=advert throttle=65535");
@@ -2313,6 +2357,206 @@ TEST_F(FilterTest, V3FixtureWipesRegionsAndHasNoProbOrThrottle) {
   EXPECT_STREQ(r->text, "hi");
 }
 
+// ---------------------------------------------------------------- v7: capacity, high types, CRC
+
+static std::vector<uint8_t> namedChannelRecord(const char* name) {
+  std::vector<uint8_t> ch(FILTER_CHAN_PERSIST_BYTES, 0);
+  memcpy(&ch[0], name, strlen(name));
+  memset(&ch[16], 0xAB, 16);
+  ch[48] = 16;    // secret_len
+  ch[49] = 0x22;  // on-air tag
+  return ch;
+}
+
+TEST_F(FilterTest, V6RuleRelocatesIntoV7) {
+  // a v6 rule exercising every relocated field: chan_mask must arrive
+  // zero-extended into the u32 field (bit 8 must stay bit 8), and
+  // sender/text/regions/prob/throttle must land at their new offsets
+  std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES,
+      { oldChannelRecord(), namedChannelRecord("c1"), namedChannelRecord("c2"),
+        namedChannelRecord("c3"), namedChannelRecord("c4"), namedChannelRecord("c5"),
+        namedChannelRecord("c6"), namedChannelRecord("c7"), namedChannelRecord("c8") });
+  f[7 + 46] = 0x05;                        // chan_mask u16: bits 0, 2 and 8
+  f[7 + 47] = 0x01;
+  fs.files[CFG_FILE] = f;
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  ASSERT_EQ(restored.getNumChannels(), 9);
+  FilterRule* r = restored.getRule(0);
+  EXPECT_EQ(r->chan_mask, 0x0105u);        // zero-extended, not shifted
+  EXPECT_EQ(r->type_mask, FILTER_TYPE_ADVERT);
+  EXPECT_EQ(r->type_mask_hi, 0);
+  EXPECT_STREQ(r->sender, "Bot");
+  EXPECT_STREQ(r->text, "hi");
+  EXPECT_STREQ(r->regions, "TestNorth");
+  EXPECT_EQ(r->prob, 50);
+  EXPECT_EQ(r->throttle, 1000);
+}
+
+TEST_F(FilterTest, HighPayloadTypesRoundTripAndMatch) {
+  ASSERT_EQ(cli(filter, "add type=path,trace,multipart,control,raw"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->type_mask, 0);
+  // the hi byte holds bits 8..15, i.e. the high half of the 16-bit mask
+  EXPECT_EQ(filter.getRule(0)->type_mask_hi,
+            (FILTER_TYPE_PATH | FILTER_TYPE_TRACE | FILTER_TYPE_MULTIPART |
+             FILTER_TYPE_CONTROL | FILTER_TYPE_RAW) >> 8);
+  EXPECT_NE(cli(filter, "get 0").find(" type=path,trace,multipart,control,raw"), std::string::npos);
+
+  auto p = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_PATH);
+  auto t = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_TRACE);
+  auto m = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_MULTIPART);
+  auto c = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_CONTROL);
+  auto raw = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_RAW_CUSTOM);
+  auto txt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT);
+  EXPECT_EQ(filter.checkPacket(&p, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&t, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&m, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&c, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&raw, 0, nullptr), FILTER_ACT_DROP);
+  EXPECT_EQ(filter.checkPacket(&txt, 0, nullptr), FILTER_ACT_ALLOW);
+  EXPECT_EQ(filter.getRule(0)->hits, 5u);
+
+  filter.save(&fs);
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 1);
+  EXPECT_EQ(restored.getRule(0)->type_mask, 0);
+  EXPECT_EQ(restored.getRule(0)->type_mask_hi,
+            (FILTER_TYPE_PATH | FILTER_TYPE_TRACE | FILTER_TYPE_MULTIPART |
+             FILTER_TYPE_CONTROL | FILTER_TYPE_RAW) >> 8);
+}
+
+TEST_F(FilterTest, V7CapacityRoundTrip) {
+  // fill the channel store: Public + 31 more
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    ASSERT_EQ(cli(filter, ("chan add #c" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
+  }
+  EXPECT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
+
+  // a rule pointing at channel #c20 exercises chan_mask bits above 16
+  ASSERT_EQ(cli(filter, "add chan=#c20"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 1u << filter.indexOfChannel("#c20"));
+  for (int i = 1; i < FILTER_MAX_RULES; i++) {
+    ASSERT_EQ(cli(filter, "add type=advert").substr(0, 3), "OK ");
+  }
+  EXPECT_EQ(cli(filter, "add type=advert"), "Err - rule list full");
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), FILTER_MAX_RULES);
+  ASSERT_EQ(restored.getNumChannels(), FILTER_MAX_CHANNELS);
+  EXPECT_EQ(restored.getRule(0)->chan_mask, 1u << restored.indexOfChannel("#c20"));
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  int idx = restored.indexOfChannel("#c20");
+  EXPECT_EQ(restored.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(restored, idx),
+                                  nullptr, 0, nullptr),
+            FILTER_ACT_DROP);   // still matches the same named channel
+}
+
+TEST_F(FilterTest, V7PatternLengthsRoundTrip) {
+  // patterns long enough to fill the widened storage, spelled with character
+  // classes so they stay within the vendored engine's 30-symbol budget; one
+  // more character is refused at the storage check
+  std::string s31;
+  while (s31.size() + 3 <= 31) s31 += "[a]";
+  s31 += "a";                     // 31 chars
+  // 19 classes (2 class-buffer bytes each, 39 < 40) + 2 escapes + 2 literals:
+  // 63 chars within the engine's symbol and class-buffer budgets
+  std::string t63;
+  while (t63.size() + 3 <= 57) t63 += "[b]";
+  t63 += "\\d\\dab";               // 63 chars total
+  std::string s32 = s31 + "a", t64 = t63 + "b";
+  ASSERT_EQ(cli(filter, ("add sender=" + s31).c_str()).substr(0, 3), "OK ");
+  EXPECT_EQ(cli(filter, ("add sender=" + s32).c_str()).substr(0, 4), "Err ");
+  ASSERT_EQ(cli(filter, ("add text=" + t63).c_str()).substr(0, 3), "OK ");
+  EXPECT_EQ(cli(filter, ("add text=" + t64).c_str()).substr(0, 4), "Err ");
+  filter.save(&fs);
+
+  FilterRules restored;
+  restored.begin(&fs);
+  ASSERT_EQ(restored.getNumRules(), 2);
+  EXPECT_STREQ(restored.getRule(0)->sender, s31.c_str());
+  EXPECT_STREQ(restored.getRule(1)->text, t63.c_str());
+}
+
+TEST_F(FilterTest, V7CrcDetectsCorruptedRecords) {
+  expectOk(filter, "add type=advert");
+  expectOk(filter, "add type=txt");
+  filter.save(&fs);
+  const size_t R0 = 7, R1 = 7 + FILTER_RULE_V7_BYTES;
+
+  // flip one payload byte of rule 1: the CRC fails, the rule list ends there,
+  // and the valid prefix (rule 0) still loads
+  {
+    NativeFS bad;
+    bad.files[CFG_FILE] = fs.files[CFG_FILE];
+    bad.files[CFG_FILE][R1 + 2] ^= 0x01;
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 1);
+    EXPECT_EQ(restored.getRule(0)->type_mask, FILTER_TYPE_ADVERT);
+  }
+  // flipping a CRC byte is caught the same way
+  {
+    NativeFS bad;
+    bad.files[CFG_FILE] = fs.files[CFG_FILE];
+    bad.files[CFG_FILE][R1 + FILTER_RULE_V7_PAYLOAD] ^= 0xFF;
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 1);
+  }
+  // corrupting rule 0 ends the list before anything loads
+  {
+    NativeFS bad;
+    bad.files[CFG_FILE] = fs.files[CFG_FILE];
+    bad.files[CFG_FILE][R0 + 100] ^= 0xFF;
+    FilterRules restored;
+    restored.begin(&bad);
+    EXPECT_EQ(restored.getNumRules(), 0);
+  }
+}
+
+// patch one byte of rule 0's v7 record and re-attach a valid CRC-16 over the
+// payload, so the byte's own check is exercised without the CRC masking it
+static void patchRule0Byte(std::vector<uint8_t>& f, size_t off, uint8_t v) {
+  f[7 + off] = v;
+  uint16_t crc = crc16_ccitt(&f[7], FILTER_RULE_V7_PAYLOAD);
+  f[7 + 188] = (uint8_t)(crc & 0xFF);
+  f[7 + 189] = (uint8_t)(crc >> 8);
+}
+
+// The pad byte 187 is format-guaranteed zero in v7: with a VALID CRC a nonzero
+// pad byte must still be refused (the CRC is over the payload including it,
+// so recompute one to isolate the pad check from the CRC check).
+TEST_F(FilterTest, V7RejectsNonzeroPadByte) {
+  expectOk(filter, "add type=advert");
+  filter.save(&fs);
+  std::vector<uint8_t> f = fs.files[CFG_FILE];
+  patchRule0Byte(f, 187, 1);
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);
+}
+
+TEST_F(FilterTest, V7RejectsUndefinedHighTypeBits) {
+  // bits 12..14 are undefined in Packet.h: even with a valid CRC the record
+  // must be refused
+  expectOk(filter, "add type=advert");
+  filter.save(&fs);
+  std::vector<uint8_t> f = fs.files[CFG_FILE];
+  patchRule0Byte(f, 186, 0x70);
+  NativeFS bad;
+  bad.files[CFG_FILE] = f;
+  FilterRules restored;
+  restored.begin(&bad);
+  EXPECT_EQ(restored.getNumRules(), 0);
+}
+
 // A config file is untrusted input: each of these records contains a field this
 // firmware could never have written, and none of them may become a live rule.
 // Rule-record byte offsets, in the frozen layout: path occupies 22..43 as
@@ -2324,7 +2568,8 @@ TEST_F(FilterTest, MalformedRuleRecordsAreRejectedNotSanitised) {
   const Case cases[] = {
     { "enabled byte above 1",            0,   2 },
     { "action neither drop/forward",     1,   0 },
-    { "undefined type_mask bit",         2,   0x80 },
+    // (type_mask has no undefined bit left in its byte: every payload type
+    // 0x00..0x07 is nameable; the unreachable high bits live in a v7 field)
     { "undefined route_mask bit",        3,   0x80 },
     { "undefined interval flag",         8,   0x20 },
     { "path count beyond its slots",     42,  FILTER_PATH_HASH_SLOTS + 1 },
@@ -2371,11 +2616,14 @@ TEST_F(FilterTest, RejectedRuleRecordDoesNotShiftTheChannelRecords) {
 
 TEST_F(FilterTest, UnterminatedStoredStringRejectsTheRecord) {
   // sender/text/regions are fixed-size char arrays; a record whose bytes fill
-  // one end to end has no NUL and would be read past its storage
+  // one end to end has no NUL and would be read past its storage. This is a
+  // v6-era fixture, so the widths are the v6 ones (migration must not mask a
+  // string the old firmware could never have written).
   for (size_t off : { (size_t)50, (size_t)74, (size_t)122 }) {
     std::vector<uint8_t> f = oldCfgFile(6, FILTER_RULE_V6_BYTES, { oldChannelRecord() });
-    const size_t width = (off == 50) ? FILTER_SENDER_PATTERN_LEN
-                       : (off == 74) ? FILTER_TEXT_PATTERN_LEN : FILTER_REGION_LIST_LEN;
+    const size_t width = (off == 50) ? 24   // v6 sender[24]
+                       : (off == 74) ? 48   // v6 text[48]
+                                     : 32;  // regions[32], unchanged since v4
     for (size_t i = 0; i < width; i++) f[7 + off + i] = 'x';
     NativeFS bad;
     bad.files[CFG_FILE] = f;
@@ -2558,9 +2806,9 @@ TEST_F(FilterTest, UnknownConfigVersionDiscarded) {
   filter.save(&fs);
   auto full = fs.files[CFG_FILE];
 
-  // accepted window is 3..6: a future v7 (downgrade guard) and the long-dead
+  // accepted window is 3..7: a future v8 (downgrade guard) and the long-dead
   // v0/v2 are discarded, and the node starts with defaults
-  for (uint8_t ver : { 0, 2, 7, 9 }) {
+  for (uint8_t ver : { 0, 2, 8, 9 }) {
     fs.files[CFG_FILE] = full;
     fs.files[CFG_FILE][0] = ver;
 
@@ -2592,7 +2840,7 @@ TEST_F(FilterTest, TruncatedConfigAdoptsOnlyCompleteRecords) {
   // header promises 2 rules but the file stops after the first
   auto& blob = fs.files[CFG_FILE];
   blob[2] = 2;   // num_rules = 2
-  blob.resize(7 + FILTER_RULE_V6_BYTES);   // cut after rule 0
+  blob.resize(7 + FILTER_RULE_V7_BYTES);   // cut after rule 0
 
   FilterRules restored;
   restored.begin(&fs);
@@ -2612,7 +2860,7 @@ TEST_F(FilterTest, TruncatedConfigNeverYieldsAHalfRecordAtAnyLength) {
   filter.save(&fs);
   auto full = fs.files[CFG_FILE];
   ASSERT_GT(full.size(), (size_t)8);
-  const size_t HDR = 7, REC = FILTER_RULE_V6_BYTES, CHAN = FILTER_CHAN_PERSIST_BYTES;
+  const size_t HDR = 7, REC = FILTER_RULE_V7_BYTES, CHAN = FILTER_CHAN_PERSIST_BYTES;
 
   for (size_t len = 0; len < full.size(); len++) {
     NativeFS cut;
@@ -3377,7 +3625,7 @@ TEST_F(FilterTest, AirSavedShownInCli) {
 // ---------------------------------------------------------------- status / on / off
 
 TEST_F(FilterTest, StatusLineFormat) {
-  EXPECT_EQ(cli(filter, ""), "on; rules 0/16; chans 1/16; ratelimit advert 0h; cache 0/256; limiter 0; aborted 0");
+  EXPECT_EQ(cli(filter, ""), "on; rules 0/32; chans 1/32; ratelimit advert 0h; cache 0/512; limiter 0; aborted 0");
 }
 
 TEST_F(FilterTest, OnOffTogglesAndKeepsConfig) {
@@ -3400,6 +3648,25 @@ TEST_F(FilterTest, AddTypePredicate) {
   ASSERT_EQ(cli(filter, "add type=advert,txt,data"), "OK - rule 0 added");
   EXPECT_EQ(filter.getRule(0)->type_mask,
             FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | FILTER_TYPE_GRP_DATA);
+}
+
+TEST_F(FilterTest, AddTypePredicateNewPayloadTypes) {
+  ASSERT_EQ(cli(filter, "add type=req,anonreq"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->type_mask, FILTER_TYPE_REQ | FILTER_TYPE_ANON_REQ);
+  expectOk(filter, "add type=msg");
+  EXPECT_EQ(filter.getRule(1)->type_mask, FILTER_TYPE_TXT_MSG);
+  std::string g = cli(filter, "get 1");
+  EXPECT_NE(g.find(" type=msg"), std::string::npos);
+}
+
+// The original three names render first, in their historical order and
+// position, so replies for rules written before payload-type expansion stay
+// byte-identical; the newer names follow in payload-type order.
+TEST_F(FilterTest, TypeRenderOrderKeepsOldNamesFirst) {
+  expectOk(filter, "add type=advert,txt,data");
+  EXPECT_NE(cli(filter, "get 0").find(" type=advert,txt,data"), std::string::npos);
+  expectOk(filter, "add type=data,anonreq,advert,req");
+  EXPECT_NE(cli(filter, "get 1").find(" type=advert,data,req,anonreq"), std::string::npos);
 }
 
 // A repeated list key REPLACES the earlier value (as every scalar key already
@@ -3426,6 +3693,26 @@ TEST_F(FilterTest, RepeatedListPredicateReplaces) {
   EXPECT_EQ(filter.getNumRules(), 5);
   EXPECT_EQ(cli(filter, "add type=advert,type=").substr(0, 5), "Err -");
   EXPECT_EQ(filter.getNumRules(), 5);
+}
+
+// sender=/text=/chan= can only ever be decided on decrypted group traffic: a
+// rule narrowed to envelope-only types would sit deferred forever, so the add
+// is refused wholesale instead of accepting a rule that can never fire.
+TEST_F(FilterTest, ContentGuardRejectsTypesThatNeverDecrypt) {
+  EXPECT_EQ(cli(filter, "add type=advert sender=^Bot$"),
+            "Err - sender=/text=/chan= only match group traffic");
+  EXPECT_EQ(cli(filter, "add type=req,anonreq text=hi"),
+            "Err - sender=/text=/chan= only match group traffic");
+  // chan= auto-provisions before the guard fires: the rollback removes it again
+  EXPECT_EQ(cli(filter, "add type=msg chan=#x"),
+            "Err - sender=/text=/chan= only match group traffic");
+  EXPECT_EQ(filter.getNumRules(), 0);
+  EXPECT_EQ(filter.findChannel("#x"), nullptr);
+  // a group type — or no type= at all, or the wildcard — keeps working
+  expectOk(filter, "add type=txt sender=^Bot$");
+  expectOk(filter, "add type=advert,txt chan=#x");
+  expectOk(filter, "add sender=^Bot$");
+  expectOk(filter, "add type=any sender=^Bot$");
 }
 
 TEST_F(FilterTest, RepeatedChanPredicateReplaces) {
@@ -3689,7 +3976,7 @@ TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
   // every predicate set, throttle= at max width: the get line overflows the
   // reply buffer and truncates per radd's order — the counters are echoed
   // last, so the tail (air=) is cut first
-  ASSERT_EQ(cli(filter, "add type=advert route=flood hops=1 len=1 snr=0 path=^10$ "
+  ASSERT_EQ(cli(filter, "add type=txt route=flood hops=1 len=1 snr=0 path=^10$ "
                         "hsize=1 chan=#t chanhash=AA region=TestNorth sender=\"^X\" "
                         "text=\"^y\" prob=50 throttle=65535"),
             "OK - rule 0 added");
@@ -3832,7 +4119,7 @@ TEST_F(FilterTest, ListAndStatsOutput) {
   expectOk(filter, "add type=advert");
   filter.getRule(0)->hits = 3;
   std::string list = cli(filter, "list");
-  EXPECT_EQ(list.find("on 1/16: 0eD"), 0);   // enabled + Drop digest line
+  EXPECT_EQ(list.find("on 1/32: 0eD"), 0);   // enabled + Drop digest line
 
   std::string stats = cli(filter, "stats");
   EXPECT_EQ(stats.find("lim:0 abort:0 air:0:0%; hits: 0:3"), 0);
@@ -4063,6 +4350,31 @@ TEST_F(FilterTest, ChanDelRemapsRuleMasks) {
             FILTER_ACT_DROP);
 }
 
+TEST_F(FilterTest, ChanDelRemapsMasksAtTheWidenedStoreEdge) {
+  // chan_mask is 32 bits wide and the store can hold 32 channels: deleting the
+  // LAST channel of a full store shifts by idx+1 == 32, which must yield no
+  // "bits above" contribution at all (a naive chan_mask >> 32 is undefined)
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    ASSERT_EQ(cli(filter, ("chan add #c" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
+  }
+  ASSERT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
+  int last = filter.indexOfChannel("#c30");
+  int first = filter.indexOfChannel("Public");
+  ASSERT_EQ(last, FILTER_MAX_CHANNELS - 1);
+  ASSERT_EQ(first, 0);
+  ASSERT_EQ(cli(filter, "add chan=Public,#c30"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, (1u << first) | (1u << last));
+
+  ASSERT_EQ(cli(filter, "chan del #c30"), "OK - chan #c30 deleted");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 1u << first);   // exactly Public, nothing above
+
+  // behaviourally: the rule still matches the surviving named channel
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10);
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, first),
+                                nullptr, 0, nullptr),
+            FILTER_ACT_DROP);
+}
+
 TEST_F(FilterTest, ChanListStaysWithinReplyBuffer) {
   // real CLI reply buffers are 160 B (serial/ethernet reply[160]; mesh path is
   // &temp[5] of temp[166] — CliUtil.h caps radd() at CLI_REPLY_MAX for this);
@@ -4093,7 +4405,7 @@ TEST_F(FilterTest, ChanListCompactFormat) {
 // ---------------------------------------------------------------- ratelimit commands
 
 TEST_F(FilterTest, RatelimitCommands) {
-  EXPECT_EQ(cli(filter, "ratelimit"), "ratelimit advert 0h; cache 0/256");
+  EXPECT_EQ(cli(filter, "ratelimit"), "ratelimit advert 0h; cache 0/512");
   EXPECT_EQ(cli(filter, "ratelimit advert 48"), "OK - advert ratelimit 48h");
   EXPECT_EQ(filter.getAdvertRatelimit(), 48);
   EXPECT_EQ(cli(filter, "ratelimit advert 721"), "Err - hours must be 0..720 (0=off)");
@@ -4456,7 +4768,7 @@ TEST_F(FilterTest, LegacyByteLoadsAsForward) {
 TEST_F(FilterTest, ListAndGetShowForward) {
   expectOk(filter, "add sender=^Alice action=forward");
   std::string list = cli(filter, "list");
-  EXPECT_EQ(list.find("on 1/16: 0eF"), 0);   // F = forward, no L anymore
+  EXPECT_EQ(list.find("on 1/32: 0eF"), 0);   // F = forward, no L anymore
   EXPECT_EQ(cli(filter, "get 0").find("r0 en forward"), 0);
 }
 

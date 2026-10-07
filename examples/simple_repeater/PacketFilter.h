@@ -40,10 +40,30 @@
 #define FILTER_ACT_FORWARD   2   // value 2 = the old logonly byte; configs
                                  // load identically across the rename
 
-// payload-type mask bits (indexed by mesh::Packet payload type, 4 bits)
+// payload-type mask bits (indexed by mesh::Packet payload type, 4 bits).
+// All types a rule can name, low byte first: the filter sees every packet the
+// repeater would relay, so these are naming/visibility only.
+#define FILTER_TYPE_REQ      (1 << PAYLOAD_TYPE_REQ)
+#define FILTER_TYPE_RESPONSE (1 << PAYLOAD_TYPE_RESPONSE)
+#define FILTER_TYPE_TXT_MSG  (1 << PAYLOAD_TYPE_TXT_MSG)
+#define FILTER_TYPE_ACK      (1 << PAYLOAD_TYPE_ACK)
 #define FILTER_TYPE_ADVERT  (1 << PAYLOAD_TYPE_ADVERT)
 #define FILTER_TYPE_GRP_TXT (1 << PAYLOAD_TYPE_GRP_TXT)
 #define FILTER_TYPE_GRP_DATA (1 << PAYLOAD_TYPE_GRP_DATA)
+#define FILTER_TYPE_ANON_REQ (1 << PAYLOAD_TYPE_ANON_REQ)
+#define FILTER_TYPE_PATH      (1 << PAYLOAD_TYPE_PATH)
+#define FILTER_TYPE_TRACE     (1 << PAYLOAD_TYPE_TRACE)
+#define FILTER_TYPE_MULTIPART (1 << PAYLOAD_TYPE_MULTIPART)
+#define FILTER_TYPE_CONTROL   (1 << PAYLOAD_TYPE_CONTROL)
+#define FILTER_TYPE_RAW       (1 << PAYLOAD_TYPE_RAW_CUSTOM)
+
+// Every bit a rule may carry: payload types 0x00..0x0B and 0x0F are defined in
+// Packet.h; bits 12..14 are not, so validRule() refuses them everywhere.
+#define FILTER_TYPE_MASK_ALL (FILTER_TYPE_REQ | FILTER_TYPE_RESPONSE | FILTER_TYPE_TXT_MSG | \
+                              FILTER_TYPE_ACK | FILTER_TYPE_ADVERT | FILTER_TYPE_GRP_TXT | \
+                              FILTER_TYPE_GRP_DATA | FILTER_TYPE_ANON_REQ | FILTER_TYPE_PATH | \
+                              FILTER_TYPE_TRACE | FILTER_TYPE_MULTIPART | FILTER_TYPE_CONTROL | \
+                              FILTER_TYPE_RAW)
 
 // route_mask bits
 #define FILTER_ROUTE_FLOOD   0x01
@@ -69,8 +89,8 @@
 // is unchanged: absent LO_INC/HI_INC still means exclusive).
 #define FILTER_IV_SET     0x10   // predicate is set (both endpoints exclusive)
 
-#if FILTER_MAX_CHANNELS > 16
-  #error "FILTER_MAX_CHANNELS > 16 needs a wider FilterRule::chan_mask"
+#if FILTER_MAX_CHANNELS > 32
+  #error "FILTER_MAX_CHANNELS > 32 needs a wider FilterRule::chan_mask"
 #endif
 
 struct FilterChannel {                  // keyed channel store
@@ -89,7 +109,7 @@ struct Interval {
 struct FilterRule {
   bool     enabled;
   uint8_t  action;        // FILTER_ACT_DROP | FILTER_ACT_FORWARD
-  uint8_t  type_mask;     // bits by payload type (see FILTER_TYPE_*); 0 = any
+  uint8_t  type_mask;     // bits 0..7 by payload type (see FILTER_TYPE_*); 0 = any
   uint8_t  route_mask;    // FILTER_ROUTE_* bits; 0 = any
   Interval hops;          // flood path length (getPathHashCount)
   Interval len;           // payload length
@@ -101,7 +121,7 @@ struct FilterRule {
     uint8_t pos;          // FILTER_PATH_* ; anchor position
   } path;
   uint8_t  hash_size_mask; // bit0..3 = path hash size 1..4; 0 = any
-  uint16_t chan_mask;      // keyed channels by stored name; bitmask over the
+  uint32_t chan_mask;      // keyed channels by stored name; bitmask over the
                            // FILTER_MAX_CHANNELS store; 0 = unset (deferred to
                            // onGroupDataRecv, identity proven by MAC decrypt)
   uint8_t  chan_hash;      // 1-byte air hash (chanhash=XX); valid only w/ flag
@@ -116,11 +136,15 @@ struct FilterRule {
                            // back with prob == 0)
   uint16_t throttle;       // rate gate: the rule decides only matches over one
                            // per N seconds (1..65535 s); 0 = unset = no limit.
-                           // v6 record growth: the v4/v5 record ends exactly at
-                           // offsetof(throttle) (byte-identical prefix)
-  // the 2 bytes before hits are RESERVED tail padding (like prob's old v4
-  // padding): written raw and not format-guaranteed in v6 files, so a future
-  // field placed there must be forced to 0 when read from a v6-or-older record
+                           // (Historical: the v4/v5 record ended exactly where
+                           // this field begins, which is why it sits here.)
+  uint8_t  type_mask_hi;   // payload-type bits 8..15 (see FILTER_TYPE_*); 0 =
+                           // any there. Sits in the 2 bytes v6 records left as
+                           // unguaranteed tail padding before `hits`: v7 owns
+                           // them now, one field plus one reserved byte.
+  // byte 187 (the last before `hits`) is padding, format-guaranteed ZERO in
+  // v7: the writer forces it and the reader refuses a v7 record that has it
+  // set, so a future field can take the byte the way type_mask_hi took 186
   uint32_t hits;           // match counter (forward/drop telemetry + validation)
   uint32_t air_ms;         // estimated on-air time (ms) billed by this rule's
                            // DROP decisions; RAM-only stat, after `hits` so it
@@ -133,17 +157,20 @@ struct FilterRule {
   bool     throttle_seen;    // a pass has been stamped (first match = free pass)
 };
 
-// v4/v5 records must stay byte-identical prefixes of a v6 record: throttle
-// starts exactly where the old record ended (offsetof(hits) under v5 layout),
-// and the 2 bytes before hits are reserved tail padding (throttle is u16). A
-// build-time override of FILTER_REGION_LIST_LEN that breaks either invariant
-// would silently corrupt config upgrades; refuse to build.
-static_assert(offsetof(FilterRule, throttle) ==
-                  ((offsetof(FilterRule, regions) + FILTER_REGION_LIST_LEN +
-                    alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1)),
-              "FilterRule::throttle must start where the v4/v5 record ended");
-static_assert(offsetof(FilterRule, hits) == offsetof(FilterRule, throttle) + 4,
-              "u16 throttle + 2 reserved bytes must fill the gap before hits");
+// The v7 record layout is frozen: the persisted payload (struct bytes 0..187)
+// ends where the RAM-only `hits` counter begins, and a 2-byte CRC-16 closes the
+// 190-byte record on disk. type_mask_hi took the first of the 2 bytes v6 left
+// as unguaranteed tail padding. A build-time override of FILTER_REGION_LIST_LEN,
+// FILTER_SENDER_PATTERN_LEN, FILTER_TEXT_PATTERN_LEN or FILTER_PATH_HASH_SLOTS
+// that moves any of the pinned fields would silently corrupt config upgrades;
+// refuse to build. (Earlier layouts: v4/v5 ended at offsetof(throttle), v3 at
+// 124 B; their records are migrated stepwise in load(), never re-derived.)
+static_assert(offsetof(FilterRule, throttle) == 184,
+              "FilterRule::throttle must stay at 184 (v7 record layout)");
+static_assert(offsetof(FilterRule, type_mask_hi) == 186,
+              "FilterRule::type_mask_hi must stay at 186 (v7 record layout)");
+static_assert(offsetof(FilterRule, hits) == 188,
+              "FilterRule::hits must stay at 188: the v7 payload is frozen at 188 B");
 // FILTER_PATH_HASH_SLOTS sizes FilterRule::path, so it moves every field after
 // it and a config saved by one build would not load in another. Name the knob
 // that was raised here, rather than failing on the record invariant it broke.
@@ -161,17 +188,17 @@ static_assert(FILTER_PATH_HASH_SLOTS == 4,
 // not expressions.
 #define FILTER_RULE_V3_BYTES  124   // ends where `regions` began, padded to uint32_t
 #define FILTER_RULE_V4_BYTES  156   // v4 and v5 share one size: ends where `throttle` begins
-#define FILTER_RULE_V6_BYTES  160   // current: ends where the RAM-only `hits` counter begins
+#define FILTER_RULE_V6_BYTES  160   // v6: ends where the RAM-only `hits` counter begins
+#define FILTER_RULE_V7_PAYLOAD 188  // v7: struct bytes 0..187 (same rule as v6's 160)
+#define FILTER_RULE_V7_BYTES  190   // v7 rule record on disk: payload + 2 B CRC-16
 #define FILTER_CHAN_PERSIST_BYTES  50
 
 // The frozen sizes must still describe THIS struct. These asserts are the
 // tripwire: a new or moved field in the persisted prefix makes one of them fail,
 // which is the moment to bump FILTER_CFG_VERSION and add migration code in
 // load() — never to edit the frozen numbers to match.
-static_assert(offsetof(FilterRule, throttle) == FILTER_RULE_V4_BYTES,
-              "v4/v5 record size is frozen at 156 B; the live struct no longer matches");
-static_assert(offsetof(FilterRule, hits) == FILTER_RULE_V6_BYTES,
-              "v6 record size is frozen at 160 B; the live struct no longer matches");
+static_assert(offsetof(FilterRule, hits) == FILTER_RULE_V7_PAYLOAD,
+              "v7 payload size is frozen at 188 B; the live struct no longer matches");
 static_assert(sizeof(FilterChannel) == FILTER_CHAN_PERSIST_BYTES,
               "channel record size is frozen at 50 B; the live struct no longer matches");
 

@@ -193,7 +193,7 @@ Content rules match against the repeater's store of named channels:
   stored key — a strong identity check. By contrast, `chanhash=` matches a
   1-byte tag carried on-air, which other channels can collide with; use it only
   when you don't have (or want) the channel's key.
-- The store holds at most 16 channels. If it fills up, `filter chan list`
+- The store holds at most 32 channels. If it fills up, `filter chan list`
   shows what's stored and `filter chan del <name>` frees a slot.
 
 ### Sender and text
@@ -243,6 +243,8 @@ filter ratelimit               # show current window and cache usage
 Use this on a well-connected repeater to stop re-flooding everyone's periodic
 adverts while still passing each node's advert once per window so it stays
 reachable through you. The window can be 0 (off) to 720 hours; 0 turns it off.
+The window edge is minute-granular: an advert can be re-admitted up to a
+minute before the full N hours have elapsed.
 
 ## Command reference
 
@@ -251,10 +253,10 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 | Command | Effect |
 |---|---|
-| `filter` | Status line, e.g. `on; rules 1/16; chans 2/16; ratelimit advert 0h; cache 0/256; limiter 0; aborted 0` — filter on/off, rules used out of 16, channels stored out of 16, advert rate-limit window and cache fill, limiter and regex-abort counters |
+| `filter` | Status line, e.g. `on; rules 1/32; chans 2/32; ratelimit advert 0h; cache 0/512; limiter 0; aborted 0` — filter on/off, rules used out of 32, channels stored out of 32, advert rate-limit window and cache fill, limiter and regex-abort counters |
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
-| `filter list` | One line per rule, e.g. `on 1/16: 0eDBE9` — see below for how to read it |
+| `filter list` | One line per rule, e.g. `on 1/32: 0eDBE9` — see below for how to read it |
 | `filter stats` | Totals: limiter drops, regex aborts, airtime saved, and a per-rule hit count |
 | `filter stats reset` | Zero the counters above (per-rule hits, airtime saved, limiter drops, regex aborts). Rate state is **not** reset: a throttled rule gets no free pass, and advert history is kept |
 | `filter get <idx>` | Full detail of one rule, including its `throttle=`/`pass=` rate gate, hit count and saved-airtime stat |
@@ -274,7 +276,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 Notes:
 
 - **Reading `filter list` output.** The line starts with the filter state and
-  rule count (`on 1/16` = on, 1 rule of max 16), followed by one token per
+  rule count (`on 1/32` = on, 1 rule of max 32), followed by one token per
   rule. Each token packs four facts:
 
   ```text
@@ -450,9 +452,37 @@ first (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)).
 | `filter add type=txt` | Group text on any channel, without needing its key |
 | `filter add type=data route=flood` | Group data AND flood route |
 | `filter add type=txt,data snr=[*,-8.5]` | (Group text OR group data) AND weak signal |
+| `filter add type=req` | Requests (`REQ` packets) |
+| `filter add type=response` | Responses to requests |
+| `filter add type=anonreq` | Anonymous requests |
+| `filter add type=msg` | Direct (1:1) text messages |
+| `filter add type=ack` | ACK packets |
+| `filter add type=req,anonreq` | Either request kind |
+| `filter add type=path` | Returned-path packets |
+| `filter add type=trace` | Path-trace packets |
+| `filter add type=control` | Control/discovery packets |
+| `filter add type=raw` | Raw custom packets (application-defined payloads) |
+| `filter add type=multipart` | Packets that are one part of a multi-packet set |
 
-An advert does not match `type=txt,data`. To cover all packet types, omit
-`type` entirely.
+Names can be comma-combined, `type=any` (or omitting `type` entirely) covers
+every packet type, and an advert does not match `type=txt,data`.
+
+#### Encrypted payload types
+
+Most payloads the repeater relays are **encrypted end-to-end**, so a rule can
+only see the envelope: `req`, `response`, `anonreq` and `msg` packets carry no
+readable sender or text. `sender=`, `text=` and `chan=` cannot match them —
+the repeater rejects such a rule outright (`Err - sender=/text=/chan= only
+match group traffic`) instead of accepting one that could never fire.
+Envelope predicates — `type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`,
+`region` — all work normally on these types.
+
+A note on visibility: the filter only sees traffic this repeater would relay.
+Direct-routed ACKs, answered requests and delivered messages are consumed by
+the endpoints and never reach a repeater, so `type=ack` mostly sees flood
+ACKs — the ones re-broadcast across the mesh. Similarly, a TRACE that reached
+its destination and a zero-hop CONTROL are consumed locally, so rules of
+those types mostly see *relayed* trace/control traffic.
 
 ### `route`
 
@@ -766,10 +796,10 @@ is only needed for initial flashing and emergencies.
 
 | Limit | Value |
 |---|---|
-| Rules | 16 |
-| Channels in the store | 16 (names up to 15 characters) |
-| Sender pattern length | 23 characters |
-| Text pattern length | 47 characters |
+| Rules | 32 |
+| Channels in the store | 32 (names up to 15 characters) |
+| Sender pattern length | 31 characters |
+| Text pattern length | 63 characters |
 | Alternatives per pattern | 8 (`\|`-separated) |
 | Advert rate-limit window | 0–720 hours (0 = off) |
 | CLI reply length | short (~160 bytes) — use `filter get <idx>` for detail |
@@ -777,9 +807,9 @@ is only needed for initial flashing and emergencies.
 - Overly long or complex patterns are **rejected with an error**, not silently
   shortened. Keep patterns short and specific.
 - Pattern lengths count the **whole** pattern, every `|` and anchor included:
-  `sender=` fits about three short exact names (`^Alice$|^Bob$|^Carol$` is 21 of
-  23 characters) and `text=` about six. Need more? Add a second rule, or use
-  one broader alternative such as `^Bot`.
+  `sender=` fits about four short exact names (`^Alice$|^Bob$|^Carol$|^Dan$` is
+  28 of 31 characters) and `text=` about eight. Need more? Add a second rule, or
+  use one broader alternative such as `^Bot`.
 - Rules, channels, and settings survive reboots. Counters and the advert cache
   do not — they start fresh after every reboot.
 - An edit is written to flash about **3 seconds** after you make it (a burst of
@@ -849,6 +879,31 @@ is only needed for initial flashing and emergencies.
   while you still have serial access. A rule exception here is about the
   *relay path*, not about authorising the login: nothing in this filter makes a
   management packet authenticated.
+
+## Config file format (for firmware forks and tooling)
+
+The rule and channel config is one binary file, `/filter_cfg`, written lazily
+through a staged save (scratch → readback → backup → promote). You only need
+this section if you write firmware or tooling that touches the file.
+
+- **Version 7** (the header's first byte) stores: 5 header bytes (version,
+  enabled, rule count, channel count, spare), a 2-byte advert ratelimit
+  window, then one fixed-size record per rule, then one per channel.
+- Each rule record is **190 bytes**: 188 bytes of fields, then a 2-byte
+  **CRC-16/CCITT-FALSE** (poly 0x1021, init 0xFFFF, little-endian) over the
+  188 payload bytes. A record whose CRC fails is rejected, and the rule list
+  simply ends at that point — the valid prefix still loads, and later rules
+  keep their indices. Byte 187 of the payload is reserved padding and must be
+  zero.
+- Channel records are 50 bytes with no CRC; their integrity is covered by the
+  bounds-checked header, fixed record lengths and the staged-save readback.
+- **Older configs keep loading.** Records from v3, v4, v5 and v6 are migrated
+  one version at a time (v3→v4→…→v7) on load, with the same outcomes those
+  versions always produced; the next save rewrites everything as v7 with CRCs.
+- **Downgrading firmware is a reset.** A file written by a newer firmware
+  carries a version byte this firmware rejects, so the whole file is discarded
+  and the repeater starts from defaults (rules can be re-added or re-flashed
+  forward).
 
 ## Writing sender/text patterns
 
