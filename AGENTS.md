@@ -28,8 +28,13 @@ should not need to explore beyond them before making a change.
   (`type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`, `chan`, `chanhash`,
   `region`, `sender`, `text`, `prob`, `throttle`, `action`), full command
   reference, TinyRegex syntax + limits, real-world setups, quoting/sending
-  notes, troubleshooting. First stop for any CLI-semantics or
-  least-surprise question.
+  notes, troubleshooting; ends with a brief pointer to the fleet feature.
+  First stop for any CLI-semantics or least-surprise question.
+- `CLI.md` — remote CLI scripts / fleet management user manual: the
+  `action=cli` trust model, script format (`!id`), per-boot idempotency,
+  the `filter cli` command reference, two-phase cutovers, target groups,
+  recipes, troubleshooting and limits. First stop for anything about the
+  script feature itself.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
 
@@ -103,7 +108,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
-- `FILTER.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
+- `FILTER.md`, `CLI.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
 — a reviewer should see a handful of lines, not a fork interleaved into
