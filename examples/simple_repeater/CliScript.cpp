@@ -34,15 +34,10 @@ public:
   }
 };
 
-// a job key is 1..FILTER_CLI_KEY_LEN chars of [A-Za-z0-9._-]
+// a job key is 1..FILTER_CLI_KEY_LEN chars of [A-Za-z0-9._-] (shared validator:
+// fleet tags use the same charset via CliUtil.h)
 static bool validKey(const char* key) {
-  size_t n = strlen(key);
-  if (n == 0 || n > FILTER_CLI_KEY_LEN) return false;
-  for (const char* c = key; *c; c++) {
-    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
-          (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '-')) return false;
-  }
-  return true;
+  return cliValidToken(key, FILTER_CLI_KEY_LEN);
 }
 
 CliEnqueue CliScriptRunner::enqueue(const char* text) {

@@ -7,27 +7,6 @@
 #include <inttypes.h>
 #include <helpers/TxtDataHelpers.h>
 
-static int hexVal(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
-// Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
-// `capacity` is the caller's output buffer: an over-long or odd-length input is
-// refused before any byte is written, so a rejected key can never partially
-// overwrite a live slot.
-static int filterDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capacity) {
-  if ((in_len & 1) != 0 || in_len / 2 > capacity) return 0;
-  for (size_t i = 0; i < in_len; i += 2) {
-    int hi = hexVal(in[i]), lo = hexVal(in[i + 1]);
-    if (hi < 0 || lo < 0) return 0;
-    out[i / 2] = (uint8_t)((hi << 4) | lo);
-  }
-  return (int)(in_len / 2);
-}
-
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
 #define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
@@ -229,7 +208,7 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
     // exactly 16 or 32 bytes of hex; anything else is refused before decoding
     size_t hex_len = strlen(psk_hex);
     if (hex_len != 32 && hex_len != 64) return NULL;
-    int len = filterDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
+    int len = cliDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
     if (len != 16 && len != 32) return NULL;
     candidate.secret_len = len;
   }
@@ -1134,7 +1113,7 @@ static void formatInterval(const Interval& iv, char* dest, size_t sz, IvUnit uni
 static bool parseHexHash(const char* s, uint8_t* out, size_t max_bytes, uint8_t* out_len) {
   size_t n = strlen(s);
   if (n < 2 || n > 8 || (n & 1) || n / 2 > max_bytes) return false;
-  if (!filterDecodeHex(s, n, out, max_bytes)) return false;
+  if (!cliDecodeHex(s, n, out, max_bytes)) return false;
   *out_len = (uint8_t)(n / 2);
   return true;
 }

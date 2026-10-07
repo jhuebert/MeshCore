@@ -16,6 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Hex digit value: 0..15, or -1 when the character is not a hex digit.
+inline int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
 // split the next space-separated token off in place; spaces inside double
 // quotes stay part of the token and the quote characters themselves are
 // stripped (callers taking regex values reject an odd quote count for a
@@ -94,6 +102,34 @@ inline void radd(char** out, int* remain, const char* fmt, ...) {
   if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
   *out += n;
   *remain -= n;
+}
+
+// A "token" charset shared by !id job keys (CliScript) and fleet tags
+// (FleetManager): 1..max_len chars of [A-Za-z0-9._-]. One validator, so the key
+// grammar and the tag grammar can never drift apart — a tag is the same kind
+// of string a job key is.
+inline bool cliValidToken(const char* s, size_t max_len) {
+  size_t n = strlen(s);
+  if (n == 0 || n > max_len) return false;
+  for (const char* c = s; *c; c++) {
+    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+          (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '-')) return false;
+  }
+  return true;
+}
+
+// Hex decoder for PSK entry (16/32-byte keys); PSKs are shared/entered as hex.
+// `capacity` is the caller's output buffer: an over-long or odd-length input is
+// refused before any byte is written, so a rejected key can never partially
+// overwrite a live slot. Returns the decoded byte count, or 0 on any refusal.
+inline int cliDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capacity) {
+  if ((in_len & 1) != 0 || in_len / 2 > capacity) return 0;
+  for (size_t i = 0; i < in_len; i += 2) {
+    int hi = hexNibble(in[i]), lo = hexNibble(in[i + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return (int)(in_len / 2);
 }
 
 // Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
