@@ -89,15 +89,19 @@ static bool parseTagsList(const char* rest, CliScriptMeta* meta) {
 
 // "!at <unix-ts>": exactly 10 digits — a unix epoch second in UTC, like every
 // unix timestamp. A 10-digit value above UINT32_MAX (RTCClock's range) is
-// malformed here, not merely in the future. The runner stays clock-free: stale
-// and clock-unset refusals are FleetManager's, which owns the RTC.
+// malformed here, not merely in the future. The value is accumulated by hand:
+// strtoul would clamp on the platforms whose unsigned long is 32-bit and turn
+// an out-of-range epoch into 0xFFFFFFFF instead of refusing it. The runner
+// stays clock-free: stale and clock-unset refusals are FleetManager's, which
+// owns the RTC.
 static bool parseAtValue(const char* rest, uint32_t* out_epoch) {
   if (strlen(rest) != 10) return false;
+  uint64_t v = 0;
   for (const char* c = rest; *c; c++) {
     if (*c < '0' || *c > '9') return false;
+    v = v * 10 + (uint64_t)(*c - '0');
   }
-  unsigned long v = strtoul(rest, NULL, 10);
-  if (v > 0xFFFFFFFFUL) return false;
+  if (v > 0xFFFFFFFFULL) return false;
   *out_epoch = (uint32_t)v;
   return true;
 }
@@ -273,7 +277,7 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
       if (!directiveIs(line, "!delay") || !parseDelayValue(directiveRest(line, "!delay"), &ms)) {
         continue;   // cannot happen after parse(); skip rather than wedge the slot
       }
-      char* nxt = lines.restPos();   // the line after the directive, untermined
+      char* nxt = lines.restPos();   // the line after the directive, unterminated
       if (nxt != NULL) {
         slot->body_off = (uint16_t)(nxt - slot->text);
       } else {
