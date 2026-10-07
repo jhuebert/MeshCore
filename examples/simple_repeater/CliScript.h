@@ -98,6 +98,7 @@ public:
 
   // seen-ring queries for the `filter cli` namespace
   int getSeenCount() const { return seen_count; }
+  int getPendingCount() const { return pending_count; }
   bool keySeen(const char* key) const;
   // the deliberate re-run lever: forget one key (false if it was not seen)
   bool forgetKey(const char* key);

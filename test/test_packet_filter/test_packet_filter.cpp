@@ -3639,7 +3639,7 @@ TEST_F(FilterTest, OnOffTogglesAndKeepsConfig) {
 
 TEST_F(FilterTest, UnknownSubcommandPrintsUsage) {
   EXPECT_EQ(cli(filter, "bogus"),
-            "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|stats");
+            "Err - usage: on|off|add|list|get|enable|disable|move|del|clear|chan|ratelimit|cli|stats");
 }
 
 // ---------------------------------------------------------------- filter add: valid parsing
@@ -5236,6 +5236,46 @@ TEST_F(FilterTest, ScriptNonInterferenceFilterOffAndDropRules) {
   // alice still reaches the cli rule
   EXPECT_EQ(deliverCliText(filter, "ops", "alice", "!id job14\nset a 1"), FILTER_ACT_CLI);
   EXPECT_EQ(drainScripts(filter, cli_rec), 1u);
+}
+
+// UNIT TESTS: filter cli — status, seen lookup, forget
+// ============================================================
+
+TEST_F(FilterTest, CliCommandUsageAndEmptyStatus) {
+  EXPECT_EQ(cli(filter, "cli"),
+            "scripts ran:0 dup:0 noid:0 refused:0 badline:0; pending 0/2; seen 0/32");
+  EXPECT_EQ(cli(filter, "cli bogus"), "Err - usage: cli [seen [<key>]|forget <key>|all]");
+  EXPECT_EQ(cli(filter, "cli seen x y"), "Err - usage: cli seen [<key>]");
+  EXPECT_EQ(cli(filter, "cli forget"), "Err - usage: cli forget <key>|all");
+  EXPECT_NE(cli(filter, "bogus").find("|cli"), std::string::npos);   // usage line lists the command
+}
+
+TEST_F(FilterTest, CliCommandCounters) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "set radio 1,2,3,4");      // no !id
+  deliverCliText(filter, "ops", "alice", "!id job-a\nset a 1");     // runs
+  drainScripts(filter, cli_rec);
+  deliverCliText(filter, "ops", "alice", "!id job-a\nset a 1");     // dup
+  deliverCliText(filter, "ops", "alice", "!id job-b\nset b 1");     // queue holds 1
+  EXPECT_EQ(cli(filter, "cli"),
+            "scripts ran:1 dup:1 noid:1 refused:0 badline:0; pending 1/2; seen 2/32");
+}
+
+TEST_F(FilterTest, CliSeenAndForgetReplies) {
+  addPrivateChan(filter, "ops");
+  expectOk(filter, "add chan=ops action=cli");
+  deliverCliText(filter, "ops", "alice", "!id job-x\nset a 1");
+  drainScripts(filter, cli_rec);
+  EXPECT_EQ(cli(filter, "cli seen"), "seen 1/32");
+  EXPECT_EQ(cli(filter, "cli seen job-x"), "OK - key job-x seen");
+  EXPECT_EQ(cli(filter, "cli seen job-y"), "Err - key job-y not seen");
+  EXPECT_EQ(cli(filter, "cli forget job-y"), "Err - key not seen");
+  EXPECT_EQ(cli(filter, "cli forget job-x"), "OK - key forgotten");
+  deliverCliText(filter, "ops", "alice", "!id job-x\nset a 1");
+  EXPECT_EQ(drainScripts(filter, cli_rec), 1u);   // forgotten: runs again
+  EXPECT_EQ(cli(filter, "cli forget all"), "OK - seen table cleared");
+  EXPECT_EQ(cli(filter, "cli seen"), "seen 0/32");
 }
 
 int main(int argc, char **argv) {
