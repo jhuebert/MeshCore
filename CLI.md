@@ -14,8 +14,10 @@ configures a whole fleet, with no serial cable and no per-node logins.
 Every repeater that stores a `cli` rule becomes a fleet member. A message like
 
 ```text
-alice: !id 2026-06-12-preset2-cfg
-set radio 869.650,62.5,9,5
+!id 2026-06-12-preset2-cfg
+set txdelay 2
+set direct.txdelay 2
+set rxdelay 3
 ```
 
 is **forwarded** (flood carries it to every repeater in range of the sender)
@@ -46,7 +48,7 @@ that channel:
 
 ```text
 !id first-job
-set name FLEET-7
+set path.hash.mode 1
 ```
 
 Check it landed:
@@ -82,7 +84,7 @@ The script is the **text of an ordinary group text message** — exactly the
 field `text=` matches, so companions that auto-prepend `name: ` work unchanged.
 
 ```text
-alice: !id <key>
+!id <key>
 <command line 1>
 <command line 2>
 ```
