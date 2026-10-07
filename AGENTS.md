@@ -249,6 +249,15 @@ FILTER.md:
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
+- **Stack is a boot-breaking constraint the suites cannot see.** `setup()`/
+  `loop()` run in a hard-capped 4 KB FreeRTOS task on nRF52 and an 8 KB
+  `loopTask` on ESP32, and a big scratch array in boot- or loop-path code
+  crash-loops every repeater flashed with the release (2026-10: ~8.5 KB of
+  scratch in `FilterRules::load()` did exactly that). Measure frames with
+  `PLATFORMIO_BUILD_FLAGS=-fstack-usage pio run -e <env>` before committing
+  large local arrays; `filter-build.yml` fails any release target whose
+  `src/`/`examples/` code holds a frame >= 2 KB — keep new frames well
+  under it.
 - Pure refactors keep both suites green **unchanged** — the suites (295 filter,
   82 fleet, 44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
