@@ -132,6 +132,60 @@ inline int cliDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capa
   return (int)(in_len / 2);
 }
 
+// Split a decrypted group-text body into "<sender>: <text>". Content is
+// sender-controlled, so parse defensively and bounded by len (never strlen()).
+// The decrypted block is zero-padded to the packet buffer, so the visible field
+// ends at the first NUL — parsing past it would invent a colon (and an empty
+// sender) out of padding. `has_text`/`has_sender` report which fields were
+// really present, so a caller can tell "no sender field" from "empty text".
+// Shared by the filter's text= selectors and the fleet manager's script
+// intake: the definition of "what a message's sender and text are" must live
+// in one place, or the two would see different bodies for the same message.
+inline void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t sender_sz,
+                           char* text, size_t text_sz, bool* has_text, bool* has_sender) {
+  sender[0] = 0;
+  text[0] = 0;
+  *has_text = false;
+  *has_sender = false;
+  if (len < 5) return;   // too short for ts(4) + txt_type(1)
+
+  const uint8_t* p = data + 5;
+  // bounded to the first NUL within the decrypted body: everything after it is
+  // padding, not content
+  size_t n = 0;
+  const uint8_t* term = (const uint8_t*)memchr(p, 0, len - 5);
+  if (term != NULL) n = (size_t)(term - p);
+  else n = len - 5;
+
+  const uint8_t* colon = NULL;
+  for (size_t i = 0; i < n; i++) {
+    if (p[i] == ':') { colon = &p[i]; break; }
+  }
+
+  if (colon == NULL) {   // no sender extractable; whole remainder is text
+    *has_text = true;
+    size_t cpy = n < text_sz - 1 ? n : text_sz - 1;
+    memcpy(text, p, cpy);
+    text[cpy] = 0;
+    return;
+  }
+
+  size_t slen = (size_t)(colon - p);
+  while (slen > 0 && (p[slen - 1] == ' ' || p[slen - 1] == '\t')) slen--;   // trim trailing spaces/tabs
+  size_t cpy = slen < sender_sz - 1 ? slen : sender_sz - 1;
+  memcpy(sender, p, cpy);
+  sender[cpy] = 0;
+  *has_sender = true;
+
+  const uint8_t* tp = colon + 1;
+  size_t tlen = n - (size_t)(tp - p);
+  while (tlen > 0 && (*tp == ' ' || *tp == '\t' || *tp == '\r' || *tp == '\n')) { tp++; tlen--; }
+  *has_text = true;
+  cpy = tlen < text_sz - 1 ? tlen : text_sz - 1;
+  memcpy(text, tp, cpy);
+  text[cpy] = 0;
+}
+
 // Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
 // byte ("12x", "0x10"), an empty token and an out-of-range value are all
 // refused. Callers keep their own error wording, which is why this only
