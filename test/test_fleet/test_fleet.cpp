@@ -9,8 +9,15 @@
 
 #include <Arduino.h>        // g_mock_millis (NativeShim.h is force-included)
 #include "CliScript.h"
+#include <helpers/TxtDataHelpers.h>   // TXT_TYPE_PLAIN
 #include "FleetManager.h"
 #include "CliUtil.h"
+
+// a 32-byte PSK whose bytes are 0x00..0x1F, as hex (shared by all fixtures)
+static std::string psk32hex() {
+  return "000102030405060708090A0B0C0D0E0F"
+         "101112131415161718191A1B1C1D1E1F";
+}
 
 // ------------------------------------------------------------------ fixture
 
@@ -26,12 +33,6 @@ struct FleetTest : public ::testing::Test {
   void flushSave() {
     g_mock_millis += LAZY_SAVE_DELAY_MS + 1;
     fleet.loop(&fs);
-  }
-
-  // a 32-byte PSK whose bytes are 0x00..0x1F, as hex
-  static std::string psk32hex() {
-    return "000102030405060708090A0B0C0D0E0F"
-           "101112131415161718191A1B1C1D1E1F";
   }
 };
 
@@ -713,13 +714,515 @@ TEST_F(RunnerTest, MarkKeySeenAndEnqueueValidated) {
   EXPECT_EQ(runner.getDup(), (uint32_t)0);  // the caller counts, not the runner
   CliScriptMeta meta;
   ASSERT_EQ(CliScriptRunner::parse("!id k1\n!ack\nset a", &meta), CLI_ENQUEUE_OK);
-  ASSERT_TRUE(runner.enqueueValidated("!id k1\n!ack\nset a", meta.key, meta.ack, meta.body_off));
+  ASSERT_TRUE(runner.enqueueValidated("!id k1\n!ack\nset a", meta.key, meta.ack,
+                                      meta.body_off, NULL, 0));
   EXPECT_EQ(runner.getPendingCount(), 1);
   CliRunResult out = finish();
   EXPECT_STREQ(out.summary, "OK - done: set a");   // single command: its actual reply
   EXPECT_EQ(out.ack, CLI_ACK_ALWAYS);
   // execution starts at the command body: directives never reach the callback
   ASSERT_EQ(rec.lines.size(), (size_t)1);
+}
+
+// Run a fleet CLI command and return the reply (canary-checked, like the
+// filter suite's helper).
+static std::string cli(FleetManager& fleet, const char* command) {
+  static const uint8_t CANARY = 0xA5;
+  uint8_t raw[CLI_REPLY_MAX + 1];
+  memset(raw, CANARY, sizeof(raw));
+  char* reply = (char*)raw;
+  reply[0] = 0;
+  fleetCLI(fleet, command, reply);
+  EXPECT_EQ(raw[CLI_REPLY_MAX], CANARY) << "reply overran " << CLI_REPLY_MAX << " bytes: " << command;
+  EXPECT_NE(memchr(reply, 0, CLI_REPLY_MAX), nullptr)
+      << "reply not NUL-terminated in " << CLI_REPLY_MAX << " bytes: " << command;
+  return std::string(reply);
+}
+
+// ------------------------------------------------------------------ hooks
+//
+// FleetManager::onGroupData + runScripts + fleetCLI, driven exactly as
+// MyMesh drives them.
+
+// GRP_TXT decrypted payload: ts(4) | txt_type(1) | "<sender>: <text>" (same
+// shape the packet-filter suite builds)
+struct GroupTextPayload {
+  uint8_t data[MAX_PACKET_PAYLOAD];
+  size_t len;
+};
+
+static GroupTextPayload makeGroupText(const char* sender, const char* text) {
+  GroupTextPayload p;
+  memset(&p, 0, sizeof(p));
+  uint32_t ts = 12345;
+  memcpy(p.data, &ts, 4);
+  p.data[4] = TXT_TYPE_PLAIN;
+  size_t off = 5;
+  size_t slen = strlen(sender);
+  memcpy(&p.data[off], sender, slen);
+  off += slen;
+  p.data[off++] = ':';
+  if (text[0]) p.data[off++] = ' ';
+  size_t tlen = strlen(text);
+  memcpy(&p.data[off], text, tlen);
+  off += tlen;
+  p.len = off;
+  return p;
+}
+
+// what the send callback saw
+struct SentReply {
+  uint8_t secret[PUB_KEY_SIZE];
+  uint8_t hash;
+  std::string body;
+};
+
+// injected device services, recording what they were given
+struct HookEnv {
+  std::vector<SentReply> sent;
+  uint32_t clock_now = 1800000000UL;   // a fixed epoch above the clock floor
+  uint32_t jitter = 12345;
+  uint32_t last_window = 0;
+  ExecRecorder rec;
+
+  static uint32_t timeFn(void* ctx) { return ((HookEnv*)ctx)->clock_now; }
+  static uint32_t jitterFn(void* ctx, uint32_t window) {
+    auto* e = (HookEnv*)ctx;
+    e->last_window = window;
+    return e->jitter;
+  }
+  static void sendFn(void* ctx, const uint8_t* secret, uint8_t hash, const char* body) {
+    auto* e = (HookEnv*)ctx;
+    SentReply r;
+    r.hash = hash;
+    r.body = body;
+    memcpy(r.secret, secret, PUB_KEY_SIZE);
+    e->sent.push_back(r);
+  }
+};
+
+struct FleetHooksTest : public ::testing::Test {
+  NativeFS fs;
+  FleetManager fleet;
+  HookEnv env;
+  mesh::GroupChannel chan;   // the fleet channel as core would deliver it
+
+  void SetUp() override {
+    g_mock_millis = 1000;
+    ASSERT_TRUE(fleet.setChannel(psk32hex().c_str()));
+    ASSERT_TRUE(fleet.addTag("xiao"));
+    fleet.setEnabled(true);
+    memset(&chan, 0, sizeof(chan));
+    uint8_t secret[32];
+    cliDecodeHex(psk32hex().c_str(), 64, secret, sizeof(secret));
+    memcpy(chan.secret, secret, sizeof(chan.secret));
+    chan.hash[0] = fleet.getChanHash();
+    fleet.setClock(HookEnv::timeFn, &env);
+    fleet.setJitter(HookEnv::jitterFn, &env);
+    fleet.setSender(HookEnv::sendFn, &env);
+  }
+  void TearDown() override { g_mock_millis = 0; }
+
+  void deliver(const char* text) {
+    GroupTextPayload p = makeGroupText("alice", text);
+    fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  }
+  // one runScripts pass, mirroring MyMesh::loop()
+  bool pass() { fleet.runScripts(ExecRecorder::fn, &env.rec); return env.rec.lines.size() > 0; }
+  void flushSave() {
+    g_mock_millis += LAZY_SAVE_DELAY_MS + 1;
+    fleet.loop(&fs);
+  }
+};
+
+TEST_F(FleetHooksTest, HookInertWhenDisabledOrChannelless) {
+  fleet.setEnabled(false);
+  deliver("!id k1\nset a");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+  fleet.setEnabled(true);
+  fleet.clearChannel();
+  deliver("!id k1\nset a");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+  EXPECT_EQ(fleet.getTagCount(), 1);   // config preserved while idle
+}
+
+TEST_F(FleetHooksTest, OtherChannelAndNonTxtIgnored) {
+  mesh::GroupChannel other = chan;
+  other.secret[0] ^= 0xFF;
+  GroupTextPayload p = makeGroupText("alice", "!id k1\nset a");
+  fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, other, p.data, p.len);
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+  fleet.onGroupData(PAYLOAD_TYPE_GRP_DATA, chan, p.data, p.len);
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+}
+
+TEST_F(FleetHooksTest, ChatIsNotAScript) {
+  deliver("hello from alice");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+  EXPECT_EQ(fleet.getScripts().getNoId(), (uint32_t)0);   // parse is pure: no counter
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+}
+
+TEST_F(FleetHooksTest, BroadcastRunsRegardlessOfTags) {
+  deliver("!id k1\nset a");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)1);
+  EXPECT_EQ(fleet.getMatched(), (uint32_t)1);
+  ASSERT_TRUE(pass());
+  ASSERT_EQ(env.rec.lines.size(), (size_t)1);
+  EXPECT_EQ(env.rec.lines[0], "set a");
+}
+
+TEST_F(FleetHooksTest, TagMatchRunsNoMatchSkipped) {
+  deliver("!id k1\n!tags xiao\nset a");
+  EXPECT_EQ(fleet.getMatched(), (uint32_t)1);
+  ASSERT_TRUE(pass());
+  ASSERT_EQ(env.rec.lines.size(), (size_t)1);
+
+  deliver("!id k2\n!tags roof\nset a");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)2);
+  EXPECT_EQ(fleet.getMatched(), (uint32_t)1);   // unchanged: no match, no enqueue
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+  EXPECT_FALSE(fleet.getScripts().keySeen("k2"));   // unmarked: a later re-send after
+                                                    // `fleet tag add roof` still works
+}
+
+TEST_F(FleetHooksTest, ExecutionIsDeferredOutOfTheReceivePath) {
+  deliver("!id k1\nset a");
+  EXPECT_EQ(env.rec.lines.size(), (size_t)0);   // nothing ran in the hook
+  // one drain = one execution
+  ASSERT_TRUE(pass());
+  ASSERT_TRUE(pass());   // second pass has nothing to do
+  EXPECT_EQ(env.rec.lines.size(), (size_t)1);
+}
+
+TEST_F(FleetHooksTest, ReplyNeverRuns) {
+  // a reply is group text on the fleet channel: it must never parse as a script
+  GroupTextPayload p = makeGroupText("xiao", "k1 ran 2 ok");   // sender + key prefix, no '!'
+  fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+}
+
+TEST_F(FleetHooksTest, AckAlwaysRepliesJitteredInChannel) {
+  deliver("!id k1\n!ack\nfilter stats");
+  ASSERT_TRUE(pass());   // runs, schedules the ack
+  EXPECT_EQ(fleet.getReplyCount(), 1);
+  EXPECT_EQ(env.sent.size(), (size_t)0);   // deadline (1000 + 12345) not passed
+
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // due: sends the reply
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].body, "k1 OK - done: filter stats");
+  EXPECT_EQ(env.sent[0].hash, chan.hash[0]);
+  EXPECT_EQ(memcmp(env.sent[0].secret, chan.secret, PUB_KEY_SIZE), 0);
+  EXPECT_EQ(fleet.getReplyCount(), 0);
+  // the jitter window came from the (default) config
+  EXPECT_EQ(env.last_window, (uint32_t)FLEET_REPLY_WINDOW_MS);
+}
+
+TEST_F(FleetHooksTest, AckErrSilentOnSuccessRepliesOnError) {
+  deliver("!id k1\n!ack err\nset a");
+  ASSERT_TRUE(pass());   // all OK: silence means success
+  EXPECT_EQ(fleet.getReplyCount(), 0);
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+
+  deliver("!id k2\n!ack err\nset a\nset b");
+  env.rec.fail_next = true;   // "set a" fails
+  ASSERT_TRUE(pass());
+  EXPECT_EQ(fleet.getReplyCount(), 1);
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].body, "k2 ran 2; err: Err - injected failure");
+}
+
+TEST_F(FleetHooksTest, NoAckDirectiveStaysSilent) {
+  deliver("!id k1\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+}
+
+TEST_F(FleetHooksTest, ReplyGoesToChannelOfArrival) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  // the config changes before the reply is due: the captured channel is used
+  const char* other = "ffffffffffffffffffffffffffffffff";
+  ASSERT_TRUE(fleet.setChannel(other));
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(memcmp(env.sent[0].secret, chan.secret, PUB_KEY_SIZE), 0);
+  EXPECT_EQ(env.sent[0].hash, chan.hash[0]);
+}
+
+TEST_F(FleetHooksTest, ReplyStoreFullDropsAndCounts) {
+  deliver("!id k1\n!ack\nset a");
+  deliver("!id k2\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  ASSERT_TRUE(pass());
+  EXPECT_EQ(fleet.getReplyCount(), FLEET_REPLY_STORE);
+  uint32_t refused_before = fleet.getScripts().getRefused();
+  deliver("!id k3\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  EXPECT_EQ(fleet.getReplyCount(), FLEET_REPLY_STORE);   // third ack dropped
+  EXPECT_EQ(fleet.getScripts().getRefused(), refused_before + 1);
+}
+
+TEST_F(FleetHooksTest, ReplyWindowFromConfig) {
+  ASSERT_EQ(cli(fleet, "reply 90"), "OK - reply window 90s");
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  EXPECT_EQ(env.last_window, (uint32_t)90000);
+}
+
+TEST_F(FleetHooksTest, AtStaleRefused) {
+  char script[64];
+  snprintf(script, sizeof(script), "!id k1\n!at %u\nreset", (unsigned)(env.clock_now - FLEET_AT_STALE_SECS - 1));
+  deliver(script);
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)1);
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)1);
+  EXPECT_FALSE(fleet.getScripts().keySeen("k1"));   // refused: not marked
+  // within the grace it is admitted (and fires immediately, being already due)
+  snprintf(script, sizeof(script), "!id k2\n!at %u\nreset", (unsigned)(env.clock_now - FLEET_AT_STALE_SECS));
+  deliver(script);
+  EXPECT_EQ(fleet.getSchedCount(), 1);
+  ASSERT_TRUE(pass());
+  ASSERT_EQ(env.rec.lines.size(), (size_t)1);
+}
+
+TEST_F(FleetHooksTest, AtClockFloorRefused) {
+  env.clock_now = FLEET_AT_CLOCK_FLOOR - 1;   // RTC unset
+  deliver("!id k1\n!at 2000000000\nreset");
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)1);
+}
+
+TEST_F(FleetHooksTest, AtFutureArmedFiresWhenRtcPasses) {
+  deliver("!id k1\n!at 1800000600\nreset");   // env.clock_now + 600
+  EXPECT_EQ(fleet.getSchedCount(), 1);
+  EXPECT_TRUE(fleet.getScripts().keySeen("k1"));   // marked at admission
+  EXPECT_EQ(env.rec.lines.size(), (size_t)0);      // not yet
+  pass();
+  EXPECT_EQ(env.rec.lines.size(), (size_t)0);      // still armed
+
+  env.clock_now = 1800000600;
+  ASSERT_TRUE(pass());
+  ASSERT_EQ(env.rec.lines.size(), (size_t)1);
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+}
+
+TEST_F(FleetHooksTest, AtScheduledAckRepliesAfterExecution) {
+  deliver("!id k1\n!at 1800000600\n!ack\nfilter stats");
+  pass();   // armed only: nothing runs, nothing acks
+  EXPECT_EQ(env.rec.lines.size(), (size_t)0);
+  EXPECT_EQ(fleet.getReplyCount(), 0);
+  env.clock_now = 1800000600;
+  ASSERT_TRUE(pass());   // fires, then the ack is scheduled
+  EXPECT_EQ(fleet.getReplyCount(), 1);
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].body, "k1 OK - done: filter stats");
+}
+
+TEST_F(FleetHooksTest, AtDupAndStoreFull) {
+  deliver("!id k1\n!at 1800000600\nreset");
+  deliver("!id k2\n!at 1800000601\nreset");
+  EXPECT_EQ(fleet.getSchedCount(), 2);
+  // a re-sent job is a no-op, counted as a dup
+  uint32_t dup_before = fleet.getScripts().getDup();
+  deliver("!id k1\n!at 1800000600\nreset");
+  EXPECT_EQ(fleet.getSchedCount(), 2);
+  EXPECT_EQ(fleet.getScripts().getDup(), dup_before + 1);
+  // the store is full: a third job is refused, key not marked
+  uint32_t refused_before = fleet.getScripts().getRefused();
+  deliver("!id k3\n!at 1800000602\nreset");
+  EXPECT_EQ(fleet.getSchedCount(), 2);
+  EXPECT_EQ(fleet.getScripts().getRefused(), refused_before + 1);
+  EXPECT_FALSE(fleet.getScripts().keySeen("k3"));
+}
+
+TEST_F(FleetHooksTest, ScheduledWaitsForRunQueueSpace) {
+  deliver("!id s1\nset a\nset c\n!delay 5000");
+  deliver("!id s2\nset a");   // queued behind the sleeper
+  deliver("!id at1\n!at 1800000600\nset b");
+  EXPECT_EQ(fleet.getSchedCount(), 1);
+  env.clock_now = 1800000600;
+  // the run queue is full: the due script keeps waiting in the store
+  ASSERT_TRUE(pass());   // s1 runs its command, arms the delay
+  EXPECT_EQ(fleet.getSchedCount(), 1);
+  pass();   // s1 sleeping: nothing drains, sched still blocked
+  g_mock_millis += 5000;
+  ASSERT_TRUE(pass());   // s1 resumes and finishes, freeing its slot
+  EXPECT_EQ(fleet.getSchedCount(), 1);   // at1 moves on the next pass, behind s2
+  ASSERT_TRUE(pass());   // s2 (queued ahead of the scheduled script) runs
+  ASSERT_TRUE(pass());   // at1, now at the queue head, runs
+  ASSERT_EQ(env.rec.lines.size(), (size_t)4);   // s1's two lines + s2's + at1's
+  EXPECT_EQ(env.rec.lines[3], "set b");
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+}
+
+TEST_F(FleetHooksTest, ScheduledAndRepliesAreRamOnly) {
+  deliver("!id k1\n!at 1800000600\n!ack\nset a");
+  ASSERT_TRUE(fleet.addTag("siteA"));
+  flushSave();
+  FleetManager loaded;
+  loaded.begin(&fs);   // a reboot: config loads, armed jobs and acks do not
+  EXPECT_TRUE(loaded.isEnabled());
+  EXPECT_EQ(loaded.getTagCount(), 2);
+  EXPECT_EQ(loaded.getSchedCount(), 0);
+  EXPECT_EQ(loaded.getReplyCount(), 0);
+  EXPECT_FALSE(loaded.getScripts().keySeen("k1"));   // seen ring fresh too
+}
+
+TEST_F(FleetHooksTest, CheckForwardExemptsOnlyFleetChannelGroupPackets) {
+  auto makePkt = [&](uint8_t type, uint8_t first_payload_byte) {
+    mesh::Packet p;
+    memset(&p, 0, sizeof(p));
+    p.header = (type << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD;
+    p.payload[0] = first_payload_byte;
+    p.payload_len = 20;
+    return p;
+  };
+  // fleet-channel group traffic (GRP_TXT and GRP_DATA): exempt from the gate
+  mesh::Packet txt = makePkt(PAYLOAD_TYPE_GRP_TXT, chan.hash[0]);
+  mesh::Packet data = makePkt(PAYLOAD_TYPE_GRP_DATA, chan.hash[0]);
+  mesh::Packet other_chan = makePkt(PAYLOAD_TYPE_GRP_TXT, chan.hash[0] ^ 0xFF);
+  mesh::Packet advert = makePkt(PAYLOAD_TYPE_ADVERT, chan.hash[0]);
+  mesh::Packet txtmsg = makePkt(PAYLOAD_TYPE_TXT_MSG, chan.hash[0]);
+  EXPECT_FALSE(fleet.checkForward(&txt));
+  EXPECT_FALSE(fleet.checkForward(&data));
+  // everything else defers to the gate ("true = let the battery gate decide")
+  EXPECT_TRUE(fleet.checkForward(&other_chan));
+  EXPECT_TRUE(fleet.checkForward(&advert));
+  EXPECT_TRUE(fleet.checkForward(&txtmsg));
+  // hooks idle: the gate decides for everything
+  fleet.setEnabled(false);
+  EXPECT_TRUE(fleet.checkForward(&txt));
+  fleet.setEnabled(true);
+  fleet.clearChannel();
+  EXPECT_TRUE(fleet.checkForward(&txt));
+}
+
+TEST_F(FleetHooksTest, AppendChannelByHash) {
+  mesh::GroupChannel dest[4];
+  memset(dest, 0, sizeof(dest));
+  // hash match: the fleet channel is offered, deduped against what the filter
+  // store already handed over
+  uint8_t hash[1] = { chan.hash[0] };
+  memcpy(dest[0].secret, chan.secret, PUB_KEY_SIZE);
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 0);   // same secret already present
+  memset(dest, 0, sizeof(dest));
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 1);
+  EXPECT_EQ(dest[0].hash[0], chan.hash[0]);
+  EXPECT_EQ(memcmp(dest[0].secret, chan.secret, PUB_KEY_SIZE), 0);
+  // no hash match, or hooks idle: nothing offered
+  uint8_t other_hash[1] = { (uint8_t)(chan.hash[0] ^ 0xFF) };
+  EXPECT_EQ(fleet.appendChannelByHash(other_hash, dest, 4), 0);
+  fleet.setEnabled(false);
+  EXPECT_EQ(fleet.appendChannelByHash(hash, dest, 4), 0);
+}
+
+// ------------------------------------------------------------------ CLI
+
+TEST_F(FleetHooksTest, StatusLine) {
+  std::string r = cli(fleet, "");
+  EXPECT_EQ(r.substr(0, 3), "on,");
+  EXPECT_NE(r.find("chan h="), std::string::npos);
+  EXPECT_NE(r.find("tags 1/8"), std::string::npos);
+  EXPECT_NE(r.find("scripts ran:0 dup:0 noid:0 refused:0"), std::string::npos);
+  EXPECT_NE(r.find("pending 0/2"), std::string::npos);
+  EXPECT_NE(r.find("sched 0/2"), std::string::npos);
+  EXPECT_NE(r.find("seen 0/32"), std::string::npos);
+  EXPECT_NE(r.find("ackq 0/2"), std::string::npos);
+  // the psk is never echoed
+  EXPECT_EQ(r.find("00010203"), std::string::npos);
+}
+
+TEST_F(FleetHooksTest, OnOffReplies) {
+  EXPECT_EQ(cli(fleet, "off"), "OK - fleet off");
+  EXPECT_EQ(cli(fleet, "off junk"), "Err - usage: on|off|chan|tag|reply|seen|forget");
+  EXPECT_FALSE(fleet.isEnabled());
+  EXPECT_EQ(cli(fleet, "on"), "OK - fleet on");
+  EXPECT_TRUE(fleet.isEnabled());
+}
+
+TEST_F(FleetHooksTest, ChanCommands) {
+  // bad psk refused, previous kept
+  EXPECT_EQ(cli(fleet, "chan set ff"), "Err - psk must be 32 or 64 hex chars");
+  EXPECT_TRUE(fleet.hasChannel());
+  // a valid set replaces and reports the derived hash, never the psk
+  uint8_t secret[16];
+  cliDecodeHex("ffffffffffffffffffffffffffffffff", 32, secret, sizeof(secret));
+  uint8_t digest[32];
+  mesh::Utils::sha256(digest, sizeof(digest), secret, sizeof(secret));
+  char want[80];
+  snprintf(want, sizeof(want), "OK - fleet channel set h=%02X (PSK holder = admin)", digest[0]);
+  EXPECT_EQ(cli(fleet, "chan set ffffffffffffffffffffffffffffffff"), std::string(want));
+  EXPECT_EQ(cli(fleet, "chan set ffffffffffffffffffffffffffffffff junk"),
+            "Err - usage: chan set <psk-hex>|clear");
+  EXPECT_EQ(cli(fleet, "chan"), "Err - usage: chan set <psk-hex>|clear");
+  // cleared: receipt stops, status shows chan -
+  EXPECT_EQ(cli(fleet, "chan clear"), "OK - fleet channel cleared");
+  EXPECT_EQ(cli(fleet, "chan clear junk"), "Err - usage: chan set <psk-hex>|clear");
+  EXPECT_FALSE(fleet.hasChannel());
+  std::string r = cli(fleet, "");
+  EXPECT_NE(r.find("chan -"), std::string::npos);
+}
+
+TEST_F(FleetHooksTest, TagCommands) {
+  EXPECT_EQ(cli(fleet, "tag add roof"), "OK - tag roof added (2/8)");
+  EXPECT_EQ(cli(fleet, "tag add roof"), "OK - tag roof already set (2/8)");
+  EXPECT_EQ(cli(fleet, "tag add no*wild"),
+            "Err - tag must be 1..16 chars of [A-Za-z0-9._-]");
+  EXPECT_EQ(cli(fleet, "tag add"), "Err - usage: tag add <tag>|del <tag>|list|clear");
+  EXPECT_EQ(cli(fleet, "tag del roof"), "OK - tag roof deleted");
+  EXPECT_EQ(cli(fleet, "tag del roof"), "Err - tag roof not set");
+  EXPECT_EQ(cli(fleet, "tag list"), "tags: xiao");
+  EXPECT_EQ(cli(fleet, "tag add"), "Err - usage: tag add <tag>|del <tag>|list|clear");
+  EXPECT_EQ(cli(fleet, "tag"), "tags: xiao");   // bare `tag` lists, like bare `fleet`
+  EXPECT_EQ(cli(fleet, "tag bogus"), "Err - usage: tag add <tag>|del <tag>|list|clear");
+  fleet.clearTags();
+  EXPECT_EQ(cli(fleet, "tag list"), "tags: (none) - broadcast scripts only");
+  EXPECT_EQ(cli(fleet, "tag clear"), "OK - tags cleared");
+  for (int i = 0; i < FLEET_MAX_TAGS; i++) {
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "tag add t%d", i);
+    ASSERT_EQ(cli(fleet, cmd).substr(0, 3), "OK ");
+  }
+  EXPECT_EQ(cli(fleet, "tag add onemore"), "Err - tag store full (8/8)");
+}
+
+TEST_F(FleetHooksTest, ReplyWindowCommands) {
+  EXPECT_EQ(cli(fleet, "reply"), "reply window 60s");
+  EXPECT_EQ(cli(fleet, "reply 90"), "OK - reply window 90s");
+  EXPECT_EQ(fleet.getReplyWindowMs(), (uint32_t)90000);
+  EXPECT_EQ(cli(fleet, "reply"), "reply window 90s");
+  EXPECT_EQ(cli(fleet, "reply 0"), "Err - reply window must be 1..600 seconds");
+  EXPECT_EQ(cli(fleet, "reply 601"), "Err - reply window must be 1..600 seconds");
+  EXPECT_EQ(cli(fleet, "reply 90 junk"), "Err - usage: reply [<secs>]");
+  EXPECT_EQ(fleet.getReplyWindowMs(), (uint32_t)90000);
+  EXPECT_EQ(cli(fleet, "reply 600"), "OK - reply window 600s");
+}
+
+TEST_F(FleetHooksTest, SeenForgetCommands) {
+  deliver("!id k1\nset a");   // marks the key at enqueue
+  EXPECT_EQ(cli(fleet, "seen"), "seen 1/32");
+  EXPECT_EQ(cli(fleet, "seen k1"), "OK - key k1 seen");
+  EXPECT_EQ(cli(fleet, "seen nope"), "Err - key nope not seen");
+  EXPECT_EQ(cli(fleet, "seen k1 junk"), "Err - usage: seen [<key>]");
+  EXPECT_EQ(cli(fleet, "forget k1"), "OK - key forgotten");
+  EXPECT_EQ(cli(fleet, "forget k1"), "Err - key not seen");
+  EXPECT_EQ(cli(fleet, "forget"), "Err - usage: forget <key>|all");
+  EXPECT_EQ(cli(fleet, "forget all"), "OK - seen table cleared");
+}
+
+TEST_F(FleetHooksTest, UsageLines) {
+  EXPECT_EQ(cli(fleet, "bogus"), "Err - usage: on|off|chan|tag|reply|seen|forget");
 }
 
 int main(int argc, char **argv) {

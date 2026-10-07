@@ -28,6 +28,18 @@
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
 #include "FleetConfig.h"
 #include "PersistUtil.h"
+#include "CliScript.h"
+
+// Injected device services, so FleetManager stays host-testable. MyMesh wires
+// them in begin(); the native tests stub them.
+//   clock: unix epoch seconds (the node RTC)
+//   jitter: a uniform random value in [0, window) for ack reply scheduling
+//   sender: sends `body` as a plain group text (txt_type 0x00) on the captured
+//           channel, with the repeater's own name as the sender
+typedef uint32_t (*FleetTimeFn)(void* ctx);
+typedef uint32_t (*FleetJitterFn)(void* ctx, uint32_t window);
+typedef void (*FleetSendFn)(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
+                            const char* body);
 
 // ---------------------------------------------------------------- /fleet_cfg
 
@@ -73,7 +85,46 @@ class FleetManager {
   char tags[FLEET_MAX_TAGS][FLEET_TAG_LEN + 1];
   int tag_count;
   uint32_t reply_window_ms;  // !ack reply jitter window (default 60 s)
+  CliScriptRunner runner;    // script queue + seen ring + counters
+
+  // armed !at scripts (RAM-only, FLEET_SCHED_STORE entries): a reboot forgets
+  // them — re-send the job; the sync-verify-schedule recipe re-arms cheaply
+  struct FleetSched {
+    char text[MAX_PACKET_PAYLOAD + 1];
+    char key[FLEET_CLI_KEY_LEN + 1];
+    uint8_t ack;
+    uint16_t body_off;                   // command-body offset from the parse
+    uint8_t chan_secret[PUB_KEY_SIZE];   // captured channel of arrival
+    uint8_t chan_hash;
+    uint32_t due_epoch;                  // unix seconds UTC
+  };
+  FleetSched sched[FLEET_SCHED_STORE];
+  int sched_count;
+
+  // pending acknowledgements (RAM-only, FLEET_REPLY_STORE entries): summary +
+  // captured channel move here when a script finishes, and the reply is sent
+  // once its jitter deadline passes
+  struct FleetReply {
+    char key[FLEET_CLI_KEY_LEN + 1];
+    char summary[FLEET_REPLY_SUMMARY_LEN];
+    uint8_t chan_secret[PUB_KEY_SIZE];
+    uint8_t chan_hash;
+    uint32_t deadline_ms;                // absolute millis(); wrap-safe compare
+  };
+  FleetReply replies[FLEET_REPLY_STORE];
+  int reply_count;
+
+  // RAM-only telemetry: scripts offered/matched on the fleet channel
+  uint32_t offered;
+  uint32_t matched;
+
   LazySave save_flag;        // needs save, written back by loop()
+
+  // device services (see typedefs above); NULL = unset: the clock counts as
+  // unset for !at admission, and replies are sent without jitter
+  FleetTimeFn time_fn;       void* time_ctx;
+  FleetJitterFn jitter_fn;   void* jitter_ctx;
+  FleetSendFn send_fn;       void* send_ctx;
 
 public:
   FleetManager();
@@ -109,6 +160,46 @@ public:
   uint32_t getReplyWindowMs() const { return reply_window_ms; }
   void setReplyWindowMs(uint32_t ms);
 
+  // the script runner (queue + seen ring): thin forwards for the CLI, like
+  // the filter's limiter accessors
+  CliScriptRunner& getScripts() { return runner; }
+  uint32_t getOffered() const { return offered; }
+  uint32_t getMatched() const { return matched; }
+  int getSchedCount() const { return sched_count; }
+  int getReplyCount() const { return reply_count; }
+
+  // device service wiring (MyMesh::begin); see the typedefs above
+  void setClock(FleetTimeFn fn, void* ctx) { time_fn = fn; time_ctx = ctx; }
+  void setJitter(FleetJitterFn fn, void* ctx) { jitter_fn = fn; jitter_ctx = ctx; }
+  void setSender(FleetSendFn fn, void* ctx) { send_fn = fn; send_ctx = ctx; }
+
+  // Receive-side hook: called from MyMesh::onGroupDataRecv() BEFORE the
+  // battery gate's early return, so scripts still arrive while forwarding is
+  // suspended (§ fleet supersedes the gate). Parses the message, matches tags,
+  // and queues/admits the script — nothing executes here.
+  void onGroupData(uint8_t type, const mesh::GroupChannel& channel,
+                   const uint8_t* data, size_t len);
+
+  // Relay-side hook (MyMesh::allowPacketForward): returns true — meaning "let
+  // the battery gate decide", not "allow" — except for GRP_TXT/GRP_DATA
+  // packets whose first payload byte (the on-air channel hash, read while the
+  // packet is still encrypted) equals the fleet channel's hash. Those return
+  // false so the gate is never consulted: fleet traffic relays while
+  // suspended, and is never counted as a battery drop.
+  bool checkForward(const mesh::Packet* packet);
+
+  // Main-loop drain, called from MyMesh::loop() after mesh::Mesh::loop():
+  // moves due scheduled scripts into the run queue, works one queued script
+  // through fn (same cadence as the old filter drain), and sends
+  // acknowledgements whose jitter deadline has passed.
+  void runScripts(CliExecFn fn, void* exec_ctx);
+
+  // Keyed-channel supply for the core's group decryption: offers the fleet
+  // channel when its hash matches, skipping a secret already in `dest` (the
+  // filter store may hold the same PSK; a duplicate would burn one of core's
+  // few candidate slots). Returns how many entries were appended.
+  int appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[], int max_matches);
+
   void markDirty() { save_flag.markDirty(); }
 
   // persistence
@@ -118,6 +209,12 @@ public:
 private:
   // state of a fresh node, and the baseline load() resets to before reading
   void resetToDefaults();
+  // scheduled-script admission (staleness, clock floor, store capacity) and
+  // the acknowledgement machinery behind runScripts()
+  void admitScheduled(const char* text, const CliScriptMeta& meta,
+                      const mesh::GroupChannel& chan);
+  void scheduleAckIfNeeded(const CliRunResult& res);
+  void sendDueReplies();
 };
 
 // CLI command handler: invoke with the command after "fleet" (prefix removed).

@@ -91,11 +91,16 @@ struct CliRunResult {
                                           // "ran N; err: <first failing reply>"
   uint8_t ack;                            // CliAckMode of the finished script
   bool error;                             // at least one command line replied "Err ..."
+  uint8_t chan_secret[PUB_KEY_SIZE];      // the captured channel, echoed back
+  uint8_t chan_hash;
 };
 
 // One queued script: the full message text plus the key string, which is only
 // kept so execution logs can name the job (the seen ring stores the hash).
-// The run-state fields make the runner resumable across `!delay` pauses
+// `chan_*` is caller-supplied capture the runner never interprets: the channel
+// the script arrived on, echoed back in CliRunResult when the script finishes
+// so a reply goes back there even if the fleet config changes in between. The
+// run-state fields make the runner resumable across `!delay` pauses
 // (FleetManager calls run() once per loop pass).
 struct CliPendingScript {
   char text[MAX_PACKET_PAYLOAD + 1];   // NUL-terminated message text
@@ -105,6 +110,8 @@ struct CliPendingScript {
   bool sleeping;                       // paused on a !delay
   uint32_t sleep_until;                // millis() deadline; wrap-safe via the
                                        // signed-difference comparison in run()
+  uint8_t chan_secret[PUB_KEY_SIZE];   // captured channel (zero-padded secret)
+  uint8_t chan_hash;                   // its 1-byte on-air hash
   // reply-summary accumulation, updated as lines execute
   uint16_t ran_count;                  // command lines executed so far
   char last_reply[FLEET_REPLY_SUMMARY_LEN];   // reply of the most recent line
@@ -153,9 +160,12 @@ public:
   // stripped by parseGroupText) and queue it. Marks the key hash at enqueue,
   // so duplicate flood deliveries and re-sends alike no-op; a refused script
   // is never marked, so a re-send still reaches it. Never executes anything.
-  // (Re-parses internally: one authoritative parser, and the parse cost of a
-  // 184-byte message is noise next to the radio.)
-  CliEnqueue enqueue(const char* text);
+  // `chan_secret`/`chan_hash` capture the channel of arrival for the echo-back
+  // (NULL/0 when the caller needs no capture). (Re-parses internally: one
+  // authoritative parser, and the parse cost of a 184-byte message is noise
+  // next to the radio.)
+  CliEnqueue enqueue(const char* text, const uint8_t* chan_secret = NULL,
+                     uint8_t chan_hash = 0);
 
   // Queue an already-parsed script (a scheduled script firing) without
   // touching the seen ring — its key was marked when the job was first
@@ -163,7 +173,8 @@ public:
   // job with, so execution starts at the command body, not the directives.
   // Returns false when the queue is full; the caller keeps the script and
   // retries.
-  bool enqueueValidated(const char* text, const char* key, uint8_t ack, uint16_t body_off);
+  bool enqueueValidated(const char* text, const char* key, uint8_t ack, uint16_t body_off,
+                        const uint8_t* chan_secret, uint8_t chan_hash);
 
   // Mark a key seen without queueing (the manager admits scheduled scripts to
   // its own store). Returns false — without marking — when the key was already
@@ -186,6 +197,12 @@ public:
   // the deliberate re-run lever: forget one key (false if it was not seen)
   bool forgetKey(const char* key);
   void forgetAll();
+
+  // counter notes for refusals that happen outside the runner but are still
+  // script refusals (the manager's scheduled-store admission), so the
+  // status-line counters tell one story
+  void noteDup() { dup++; }
+  void noteRefused() { refused++; }
 
   // counters
   uint32_t getRan() const { return ran; }

@@ -432,7 +432,11 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
-  if (!battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
+  // Fleet-channel packets bypass the battery gate (short-circuit order matters:
+  // a fleet packet never reaches checkForward(), so it is never counted as a
+  // battery drop and relays even while suspended); every other packet is the
+  // gate's to count and gate exactly as before.
+  if (!fleet.checkForward(packet) && !battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
   if (filter.checkPacket(packet, millis(), recv_pkt_region, _radio->getEstAirtimeFor(packet->getRawLength())) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
@@ -465,10 +469,20 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
 }
 
 int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
-  return filter.searchChannelsByHash(hash, channels, max_matches);
+  // merge: the filter's keyed-channel store plus the fleet channel (the same
+  // PSK in both is skipped by the fleet side; any matching key decrypts)
+  int n = filter.searchChannelsByHash(hash, channels, max_matches);
+  if (n < max_matches) n += fleet.appendChannelByHash(hash, channels + n, max_matches - n);
+  return n;
 }
 
 void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  // The fleet hook sits ABOVE the battery gate's early return, deliberately:
+  // fleet management must work when the battery is low — a node in trouble is
+  // exactly the node you need to reach. Scripts enqueue and run while
+  // suspension would otherwise skip the whole receive handler.
+  fleet.onGroupData(type, channel, data, len);
+
   // The battery gate outranks the filter. Without this, decryptable group traffic
   // runs the content rules and banks hits/airtime while a suspended repeater is
   // refusing to relay it, whereas an undecryptable packet of the same shape is
@@ -972,6 +986,37 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   memset(default_scope.key, 0, sizeof(default_scope.key));
 }
 
+// Device services for the fleet manager, injected at begin(): the node RTC,
+// the core RNG (for ack reply jitter) and the group-text send primitive.
+static uint32_t fleetClock(void* ctx) {
+  return ((MyMesh*)ctx)->getRTCClock()->getCurrentTime();
+}
+
+static uint32_t fleetJitter(void* ctx, uint32_t window) {
+  return ((MyMesh*)ctx)->getRNG()->nextInt(0, window);
+}
+
+// Send one acknowledgement as a plain group text (txt_type 0x00) on the
+// captured channel, with the repeater's own name as the sender — companions
+// and other fleet members see an ordinary "<name>: <text>" message. The body
+// starts with the job key (charset [A-Za-z0-9._-], never '!'), so no fleet
+// member can ever parse a reply as a script.
+static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
+                           const char* body) {
+  MyMesh* m = (MyMesh*)ctx;
+  mesh::GroupChannel chan;
+  memset(&chan, 0, sizeof(chan));
+  chan.hash[0] = chan_hash;
+  memcpy(chan.secret, chan_secret, sizeof(chan.secret));
+  // "<name>: " + body must fit one packet's data limit (168 B): bound the
+  // composition so a long name truncates the tail rather than refusing the send
+  char msg[FLEET_REPLY_DATA_MAX + 1];
+  snprintf(msg, sizeof(msg), "%s: %s", m->getNodeName(), body);
+  mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan,
+                                             (const uint8_t*)msg, strlen(msg));
+  if (pkt) m->sendFlood(pkt);   // flood is the only reply route: group texts carry no pubkey
+}
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
@@ -980,6 +1025,10 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   filter.begin(fs);
   battGate.begin(fs);
+  fleet.setClock(fleetClock, this);
+  fleet.setJitter(fleetJitter, this);
+  fleet.setSender(fleetReplySend, this);
+  fleet.begin(fs);
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -1321,12 +1370,16 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 7;
     while (*sub == ' ') sub++;
     batteryCLI(battGate, board, sub, reply);
+  } else if (memcmp(command, "fleet", 5) == 0 && (command[5] == ' ' || command[5] == 0)) {
+    const char* sub = command + 5;
+    while (*sub == ' ') sub++;
+    fleetCLI(fleet, sub, reply);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }
 
-// Executor for remote CLI scripts queued by action=cli filter rules (see
+// Executor for remote CLI scripts queued by the fleet manager (see
 // CliScript.h): each line runs through handleCommand(0, ...) — serial-privilege
 // dispatch, sender_timestamp = 0 — and both the line and its reply are logged
 // in the serial CLI's style, so an operator at the console sees exactly what
@@ -1384,11 +1437,12 @@ void MyMesh::loop() {
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
 
-  // Remote CLI scripts (action=cli rules): drain one queued script per loop,
-  // after mesh::Mesh::loop() and outside the receive bracket that produced it —
-  // never while the filter is evaluating a packet. handleCommand(0, ...) gives
-  // a script line the same dispatch and privilege as the serial console.
-  filter.runCliScripts(execCliLine, this);
+  // fleet config save + script drain (one per pass, after mesh::Mesh::loop()
+  // and outside the receive bracket that produced it — never while the filter
+  // is evaluating a packet; handleCommand(0, ...) gives a script line the same
+  // dispatch and privilege as the serial console). Also sends due ack replies.
+  fleet.loop(_fs);
+  fleet.runScripts(execCliLine, this);
 
   // update uptime
   uint32_t now = millis();

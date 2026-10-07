@@ -93,4 +93,9 @@
 // a longer summary is truncated at build time, never split across packets.
 #define FLEET_REPLY_SUMMARY_LEN 100
 
+// The data limit one group datagram can carry (createGroupDatagram refuses
+// more): MAX_PACKET_PAYLOAD (184) - 1 B channel hash - 15 B cipher padding.
+// Acknowledgement messages are composed inside this bound.
+#define FLEET_REPLY_DATA_MAX 168
+
 #endif // _FLEET_CONFIG_H
