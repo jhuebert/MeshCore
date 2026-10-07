@@ -30,11 +30,12 @@ should not need to explore beyond them before making a change.
   reference, TinyRegex syntax + limits, real-world setups, quoting/sending
   notes, troubleshooting; ends with a brief pointer to the fleet feature.
   First stop for any CLI-semantics or least-surprise question.
-- `CLI.md` — remote CLI scripts / fleet management user manual: the
-  `action=cli` trust model, script format (`!id`), per-boot idempotency,
-  the `filter cli` command reference, two-phase cutovers, target groups,
-  recipes, troubleshooting and limits. First stop for anything about the
-  script feature itself.
+- `FLEET.md` — the fleet management user manual: the `fleet chan set` +
+  `fleet tag add` setup, script format (the `!tags`/`!ack`/`!at` directive
+  block, inline `!delay`), tag targeting (exact equality), acknowledgements
+  and the reply-jitter window, the sync → verify → schedule recipe for `!at`,
+  idempotency, two-phase cutovers, recipes, troubleshooting and limits. First
+  stop for anything about the fleet feature.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
 
@@ -45,15 +46,25 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `PacketFilter.h/.cpp` — rule model, evaluation (`checkPacket` packet-level,
   `checkContent` decrypted-content single pass, verdict stash), binary
   persistence (`load`/`save`, v3..v7 stepwise migration), `filterCLI`.
-- `CliScript.h/.cpp` — the `action=cli` remote-script runner: `!id` parse,
-  2-slot pending queue, the seen-key hash ring, and the run callback that
+- `FleetManager.h/.cpp` — the fleet feature: one PSK-backed channel, the
+  repeater's tag set, `fleetCLI`, the receive-side hook (`onGroupData`), the
+  relay-side battery exemption (`checkForward`), acknowledgements (jittered,
+  sent on the captured channel), scheduled `!at` jobs (RAM-only store), and
+  the `/fleet_cfg` persistence (v1 with a whole-payload CRC-16). Owns a
+  `CliScriptRunner`.
+- `CliScript.h/.cpp` — the fleet script runner: `!id` parse, the
+  `!tags`/`!ack`/`!at` directive block, inline `!delay` with resumable run,
+  the 2-slot pending queue, the seen-key hash ring, and the run callback
   MyMesh drives (see the behavioral-invariants note).
 - `AdvertRateLimiter.h/.cpp` — the per-origin advert repeat window: cache,
   counters, and the check/commit split (see the fork's rule-model note).
 - `PersistUtil.h` — the lazy dirty-save pattern, the per-platform file opens, and
   the shared staged-save transaction; also the config-integrity note.
-- `PacketFilterConfig.h` — all capacity tunables (`FILTER_MAX_RULES`, ...),
-  override via build flags; persistence-layout caveats noted inline.
+- `PacketFilterConfig.h` — the filter's capacity tunables (`FILTER_MAX_RULES`,
+  ...), override via build flags; persistence-layout caveats noted inline.
+  `FleetConfig.h` holds the fleet's (`FLEET_*`, including the renamed
+  `FLEET_CLI_*` runner capacities and the `!tags`/`!delay`/`!at` grammar
+  limits).
 - `TinyRegex.h/.cpp` — vendored kokke/tiny-regex-c + step budget (see Hard
   invariants; treat as upstream).
 - `PatternMatch.h/.cpp` — the user-facing pattern language: top-level `|`
@@ -64,17 +75,22 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
-  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline).
+  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline and
+  the fleet device-service injections).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
-**Tests:** `test/test_packet_filter/` (323 behavior-level cases: matching,
-content rules, limiter, cli scripts, persistence upgrades, CLI surface,
-TinyRegex, PatternMatch) and `test/test_battery_gate/`. Test-only shims: `NativeShim.h`,
-`NativeTestStubs.cpp`, `RegionMapStub.cpp`, `FilterTestHelpers.h`.
+**Tests:** `test/test_packet_filter/` (295 behavior-level cases: matching,
+content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
+PatternMatch), `test/test_fleet/` (81 cases: runner grammar, tag targeting,
+acknowledgements, scheduling, persistence, CLI surface, the battery
+exemption contract) and `test/test_battery_gate/`. Test-only shims:
+`NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
+`FilterTestHelpers.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` (host-native, no hardware), plus `-e
-native_packet_filter_san` / `-e native_battery_gate_san` for ASan+UBSan;
+native_battery_gate` / `-e native_fleet` (host-native, no hardware), plus
+`-e native_packet_filter_san` / `-e native_battery_gate_san` /
+`-e native_fleet_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 `build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
 target being `Xiao_S3_WIO_repeater`. **Compile-check every filesystem
@@ -108,7 +124,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
-- `FILTER.md`, `CLI.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
+- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
 — a reviewer should see a handful of lines, not a fork interleaved into
@@ -171,10 +187,12 @@ FILTER.md:
 - **Behavioral invariants are compatibility.** First-match-wins ordering,
   prob-before-throttle, stats semantics (hits travel with the rule on
   move/del; a stats reset never grants a throttle free pass) are observable
-  behavior. So is the action=cli model: a `!id` job key runs at most once per
-  boot (marked at enqueue, RAM-only seen ring), cli rules are txt-only,
-  chan-required and gate-free, a cli rule left with `'#'` channels only is
-  inert, and the script execution is deferred out of the receive path.
+  behavior. So is the fleet model: a `!id` job key runs at most once per
+  boot (marked at admission, RAM-only seen ring), targeting is by exact tag
+  equality via `!tags` (absent = broadcast), the fleet channel is a single
+  unnamed PSK that supersedes the battery gate (scripts run, fleet traffic
+  relays, acks send while suspended), armed `!at` jobs and pending acks are
+  RAM-only, and script execution is deferred out of the receive path.
   Changing them is a breaking decision, not a refactor side effect.
 - **New pattern syntax must not silently change the meaning of an
   already-storable pattern.** If it would, either ship an escape (`\|`) or
@@ -231,20 +249,21 @@ FILTER.md:
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
   entry points a user or the firmware would.
-- Pure refactors keep both suites green **unchanged** — the suites (323 filter,
-  44 battery) are the safety net that proves no behavior slipped.
+- Pure refactors keep both suites green **unchanged** — the suites (295 filter,
+  81 fleet, 44 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
 ```
 pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + persistence
 pio test -e native_battery_gate     # battery gate
+pio test -e native_fleet            # fleet manager + runner + CLI + persistence
 ```
 
-All green, and every touched line required — together with the full four-env
+All green, and every touched line required — together with the full five-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks
