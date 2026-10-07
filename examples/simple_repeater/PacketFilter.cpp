@@ -78,6 +78,7 @@ void FilterRules::resetToDefaults() {
   uptime_ms = 0;
   last_millis = millis();   // the accumulator starts from the boot clock
   limiter.reset();
+  cli_scripts.reset();   // queued scripts and seen keys die with the rule state they came from
   budget_aborts = 0;
   air_saved_ms = 0;
   air_evaluated_ms = 0;
@@ -665,7 +666,17 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
     if ((cp & FILTER_CONTENT_CHAN) && !channelMatchesStore(r, channel)) continue;
     if ((cp & FILTER_CONTENT_SENDER) && (!parsed || !has_sender || !regexMatches(r->sender, sender))) continue;
     if ((cp & FILTER_CONTENT_TEXT) && (!parsed || !has_text || !regexMatches(r->text, text))) continue;
-    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) break;   // first match wins
+    if (decideMatch(r, pkt_hash, now, est_air_ms, verdict)) {
+      // A cli verdict forwards like `forward` AND queues the message text for
+      // deferred execution (MyMesh::loop drains it outside the receive
+      // bracket, so scripts may safely run `filter ...` commands). Marking at
+      // enqueue makes duplicate flood deliveries and re-sends no-ops; a
+      // refused script is never marked, so a re-send still reaches it.
+      // parsed: a cli rule is txt-only by validation, so `text` is always the
+      // parsed message text here.
+      if (parsed && verdict == FILTER_ACT_CLI) cli_scripts.enqueue(text);
+      break;   // first match wins
+    }
   }
 
   // Content drops never reach the forwarding hook; passes are counted in checkPacket().

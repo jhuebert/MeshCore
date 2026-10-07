@@ -35,6 +35,7 @@
 #include "PatternMatch.h"
 #include "PersistUtil.h"
 #include "AdvertRateLimiter.h"
+#include "CliScript.h"
 
 // actions
 #define FILTER_ACT_ALLOW     0
@@ -229,6 +230,7 @@ class FilterRules {
   FilterChannel channels[FILTER_MAX_CHANNELS];
   int num_channels;
   AdvertRateLimiter limiter;   // per-node advert repeat window
+  CliScriptRunner cli_scripts;   // remote CLI scripts queued by action=cli rules
   // A 64-bit monotonic clock folded from the 32-bit millis(). Unsigned
   // subtraction handles exactly one wrap: it cannot tell 49.7 days + 1 s from
   // 1 s, so a repeater left up long enough would spuriously rate-limit a rule or
@@ -310,8 +312,10 @@ public:
   // Single-pass evaluation of the ENTIRE rule list on a decrypted group
   // payload (packet-level predicates via ruleMatchesPacket, then chan keyed /
   // sender / text), in listed order; first enabled match decides (first match
-  // wins) and its verdict — allow, forward or drop — is stashed for
-  // checkPacket(). Caller drops the packet if this returns FILTER_ACT_DROP.
+  // wins) and its verdict — allow, forward, cli or drop — is stashed for
+  // checkPacket(). A cli verdict additionally queues the message text as a
+  // deferred CLI script (CliScriptRunner); the caller only special-cases DROP.
+  // Caller drops the packet if this returns FILTER_ACT_DROP.
   // `est_air_ms`: see checkPacket().
   uint8_t checkContent(mesh::Packet* pkt, uint8_t type, const mesh::GroupChannel& channel,
                        const uint8_t* data, size_t len, const RegionEntry* region,
@@ -325,6 +329,11 @@ public:
   uint16_t getAdvertRatelimit() const { return limiter.getHours(); }
   void clearAdvertCache() { limiter.clearCache(); }
   int getAdvertCacheCount() const { return limiter.getCacheCount(); }
+  // remote CLI scripts (state lives in CliScriptRunner): thin forwards, like
+  // the limiter's — no duplicated logic. runCliScripts returns whether a
+  // script was drained, so the caller can loop until the queue is empty.
+  bool runCliScripts(CliExecFn fn, void* ctx) { return cli_scripts.run(fn, ctx); }
+  CliScriptRunner& getScripts() { return cli_scripts; }
   // Any rule or channel mutation: the config is changing, so a verdict stashed
   // under the old rules must not be honoured afterwards. markDirty() is the one
   // place every mutation already passes through.
