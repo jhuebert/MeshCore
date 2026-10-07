@@ -366,11 +366,44 @@ jobs:
         env:
           FIRMWARE_VERSION: ${{ needs.version.outputs.firmware_version }}
           TARGET: ${{ matrix.target }}
+          # metadata-only (emits .su files next to the objects; codegen is
+          # unchanged) — consumed by the stack usage check below
+          PLATFORMIO_BUILD_FLAGS: -fstack-usage
         run: /usr/bin/env bash build.sh build-firmware "$TARGET"
 
+      - name: Stack usage check
+        # One big stack scratch array in boot- or loop-path code brick-reboots
+        # every repeater flashed with the release (2026-10: an 8.5 KB scratch
+        # in FilterRules::load overflowed the 4 KB nRF52 / 8 KB ESP32 loop
+        # task stacks at boot). The compiler's own accounting catches that
+        # class on every target we publish; the binary is unaffected.
+        env:
+          TARGET: ${{ matrix.target }}
+          STACK_FRAME_LIMIT: 2048
+        run: |
+          set -euo pipefail
+          SU_DIR=".pio/build/$TARGET"
+          # repo code only: src/ and examples/. Vendored crypto (lib/ed25519) and
+          # libdeps libraries carry frames above the limit that ship today and are
+          # not what this repo edits; gating them would train everyone to ignore
+          # the check. The frames this repo owns are the ones it can break.
+          mapfile -t SU_FILES < <(find "$SU_DIR/src" "$SU_DIR/examples" -name '*.su' 2>/dev/null)
+          if [ "${#SU_FILES[@]}" -eq 0 ]; then
+            echo "ERROR: no .su files under $SU_DIR — the build did not run with -fstack-usage, check is blind" >&2
+            exit 1
+          fi
+          OFFENDERS=$(LC_ALL=C sort -t$'\t' -k2,2 -rn "${SU_FILES[@]}" \
+            | awk -F'\t' -v limit="$STACK_FRAME_LIMIT" '$2+0 >= limit { print $2 " B  " $1 }')
+          if [ -n "$OFFENDERS" ]; then
+            echo "ERROR: stack frames >= ${STACK_FRAME_LIMIT} B (loop task is 4 KB on nRF52, 8 KB on ESP32):" >&2
+            echo "$OFFENDERS" >&2
+            exit 1
+          fi
+          echo "OK: $(echo "${SU_FILES[@]" | wc -w}) translation units, no stack frame >= ${STACK_FRAME_LIMIT} B"
+
       - name: Write build manifest
-        # a per-target record of what was actually produced, so a release can
-        # never imply coverage it does not have
+        # a per-target record of what was actually produced (after the stack
+        # usage check passed), so a release can never imply coverage it does not have
         env:
           TARGET: ${{ matrix.target }}
           SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
