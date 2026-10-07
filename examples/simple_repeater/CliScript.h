@@ -16,8 +16,8 @@
 // channel MAC must verify before anything reaches the filter). The seen table
 // is RAM-only like the advert cache: it starts empty on every boot, so scripts
 // must be safe to re-run — commands that set state are repeatable by
-// convention; index-based mutations and one-shot effects (reset) ship as their
-// own jobs sent deliberately.
+// convention; index-based mutations and one-shot effects (reboot, start ota)
+// ship as their own jobs sent deliberately.
 //
 // No persistence code: the runner is pure RAM state. Everything resets on
 // reboot; nothing touches flash.

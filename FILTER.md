@@ -11,7 +11,8 @@ access to the repeater is required.
 **Quick navigation:** [Quick start](#quick-start) ·
 [Common setups](#common-setups) ·
 [Command reference](#command-reference) ·
-[Writing sender/text patterns](#writing-sendertext-patterns)
+[Writing sender/text patterns](#writing-sendertext-patterns) ·
+[Fleet management](#fleet-management-over-a-channel) (details in [CLI.md](./CLI.md))
 
 ---
 
@@ -132,7 +133,7 @@ by spaces. Values containing spaces go in double quotes: `text="^RX in place"`.
 | `text` | pattern | Message text in group text |
 | `prob` | `1..100` | Match probability: the rule decides only that percentage of the packets its conditions match (see [prob examples](#prob)) |
 | `throttle` | seconds, `1..65535` | Rate gate: the rule decides only the matches that exceed one per N seconds; one per N seconds slips past (see [throttle examples](#throttle)) |
-| `action` | `drop` (default), `forward` or `cli` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)), `cli` forwards it **and** runs its text as a deferred CLI script (see [fleet management](#running-cli-scripts-from-a-channel-fleet-management)). Upgrading from firmware that called this `logonly`: such rules now read as `forward` — the stored value is unchanged, only the keyword and display moved. The *rule ordering* around them is not identical on old firmware (see [Upgrading from earlier firmware](#upgrading-from-earlier-firmware)) |
+| `action` | `drop` (default), `forward` or `cli` | What to do on a match: `drop` discards the packet, `forward` stops the rule list and lets it through (see [shadow mode](#trying-a-rule-before-enforcing-it-shadow-mode)), `cli` forwards it **and** runs its text as a deferred CLI script — a fleet management channel (see [CLI.md](./CLI.md)). Upgrading from firmware that called this `logonly`: such rules now read as `forward` — the stored value is unchanged, only the keyword and display moved. The *rule ordering* around them is not identical on old firmware (see [Upgrading from earlier firmware](#upgrading-from-earlier-firmware)) |
 
 `chan`, `sender`, and `text` are content conditions: they are checked after the
 message is decrypted. Everything else is checked before forwarding and works on
@@ -270,9 +271,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter ratelimit` | Show the advert ratelimit window and cache usage |
 | `filter ratelimit advert <hours>` | Set the window (0–720 h; 0 = off) |
 | `filter ratelimit clear` | Empty the advert cache |
-| `filter cli` | Remote CLI script counters (ran/dup/refused/…), pending queue and seen-ring fill (see [fleet management](#running-cli-scripts-from-a-channel-fleet-management)) |
-| `filter cli seen [<key>]` | Seen-key count, or whether one job key has run on this repeater |
-| `filter cli forget <key>` / `filter cli forget all` | Re-arm one job key / clear the seen table |
+| `filter cli`, `filter cli seen [<key>]`, `filter cli forget <key>` / `all` | Status, seen-check and re-arm levers for the `action=cli` script machinery (see [CLI.md](./CLI.md#command-reference)) |
 | `filter stats` | Per-rule hit counters, limiter/abort counters, and total saved airtime with percentage (see below) |
 | anything else | Usage line listing the commands |
 
@@ -795,157 +794,30 @@ await mc.commands.send_cmd(rep, "filter stats", dst_type=2)
 This is the normal management path for a repeater on a tower — the serial port
 is only needed for initial flashing and emergencies.
 
-## Running CLI scripts from a channel (fleet management)
+## Fleet management over a channel
 
 A filter rule with `action=cli` turns a **private** keyed channel into a fleet
 management channel: a group text message on that channel is relayed like any
 `forward` rule would relay it, **and** its text is executed as a small CLI
-script — deferred, and at most once per job, on every repeater carrying the
-rule. One broadcast message therefore configures a whole fleet.
+script — deferred, and at most once per job key per boot — on every repeater
+carrying the rule. One broadcast message configures a whole fleet, with no
+serial cable and no per-node logins.
 
-**Possession of the channel PSK is full admin access.** Anyone who can encrypt
-to the channel can run any CLI command on every fleet member — equivalent to
-serial-console access. The sender name in a message is chosen freely by the
-sender, and `sender=`/`text=` conditions narrow *which* messages run; they are
-**not** authentication. PSK hygiene is the whole defense: if a key leaks, treat
-every fleet member as compromised, rotate the PSK (new channel name + key), and
-`filter off` in the meantime.
+**Possession of the channel PSK is full admin access** — equivalent to
+serial-console access on every member. `sender=` and `text=` conditions narrow
+*which* messages run; they are not authentication.
 
-### Setting it up
+The rule refuses `'#'`-named channels (their key is derived from the public
+name, so they authenticate nobody), is forced to group text only, and takes no
+`prob=`/`throttle=`. Use `filter cli` for the script counters, `filter cli
+seen <key>` to check whether a job ran here, and `filter cli forget <key>` to
+re-arm one.
 
-```text
-filter chan add ops 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
-filter add chan=ops action=cli
-```
+Because the details — script format, idempotency, the two-phase cutover
+pattern, target groups, recipes, troubleshooting — are fleet operations more
+than packet filtering, they live in their own guide:
 
-The rule refuses `'#'`-named channels — even one holding an explicit PSK; name
-the channel without the `#`. A `'#'`-name derives its key from the public
-channel name, so it authenticates nobody. The add reply carries the warning
-`cli: PSK holder = admin`. A `cli` rule is terminal like `forward` (first match
-wins), so it normally belongs at the top of the list for its channel. It also
-refuses `prob=` and `throttle=` — a gated rule would make different repeaters
-decide differently, which is exactly what fleet management must not do.
-
-### Script format
-
-The script is the **text of an ordinary group text message** — exactly the field
-`text=` matches, so companions that auto-prepend `name: ` work unchanged:
-
-```text
-alice: !id 2026-06-12-preset2-cfg
-set radio 869.650,62.5,9,5
-```
-
-- **Line 1 must be `!id <key>`** — the marker doubles as the job identity, so no
-  message can ever run un-deduplicated by accident. `<key>` is 1–32 characters
-  of letters, digits, `.`, `_`, `-`.
-- Remaining lines are CLI commands, one per line. Blank lines and lines starting
-  with `#` are skipped. Every admin command works: `filter …`, `set …`,
-  `battery …`, `reset`.
-- Any other line starting with `!` is reserved; an unknown `!` directive refuses
-  the **whole** script (fail-safe, not fail-open).
-- A line longer than the serial CLI's own command buffer is skipped (counted in
-  `filter cli` as `badline`); the rest of the script still runs.
-- **Size reality:** one LoRa packet carries ~175 bytes of script — about 3–4
-  short commands. Bigger jobs are several messages with **distinct `!id` keys**,
-  and their parts must be order-independent (flood arrival order is not
-  guaranteed).
-
-### Idempotency: at most once per key, per boot
-
-Each repeater remembers the job keys it has executed **in RAM only** — the
-memory starts empty on every boot, like the advert cache. Within one boot a key
-executes at most once; a duplicate delivery or a deliberate re-send no-ops (but
-the message is still forwarded). This means:
-
-- **Re-send freely while the fleet is up** — that is how you catch nodes that
-  were offline or out of range; repeats cost nothing.
-- `filter cli forget <key>` re-arms one key for a deliberate re-run;
-  `filter cli forget all` re-arms everything. `filter cli seen <key>` answers
-  "did this job run here?".
-- **After a reboot, keys are forgotten and a re-sent job runs again.** Scripts
-  are therefore re-runnable by convention: commands that *set* state (`set …`,
-  `filter add …`, `filter ratelimit …`) are safe to repeat; index-based
-  mutations (`filter del 3` — indices shift!) and one-shot effects (`reset`)
-  belong in their own jobs, sent deliberately and only once.
-- A captured message replayed after a reboot re-runs. That residual exposure is
-  bounded by the re-runnable-scripts convention above; cross-reboot replay
-  immunity is not a property of this feature.
-
-### Two-phase fleet changes (radio presets and other cutovers)
-
-A job that reboots a repeater on first receipt splits the mesh **before**
-stragglers got the new settings — repeaters still on the old frequency would be
-orphaned. So cut over in two phases:
-
-```text
-# phase 1 — saturate: re-send this over a period of time; it no-ops on
-# repeaters that already ran it, and re-running it after a reboot is harmless
-alice: !id 2026-06-12-preset2-cfg
-set radio 869.650,62.5,9,5
-
-# phase 2 — commit: one-line job, sent once, only after phase 1 has reached
-# every node (check with filter cli seen over a normal admin session)
-alice: !id 2026-06-12-preset2-go
-reset
-```
-
-Rollback is a new key — it runs everywhere, including repeaters that already ran
-the first job:
-
-```text
-alice: !id 2026-06-12-preset2-fix
-set radio 869.525,62.5,8,5
-```
-
-followed by its own `reset` job once saturated.
-
-### What runs where
-
-Forwarding happens in the normal relay path; **execution happens after it** — a
-queued script runs in the main loop, outside the packet handling that queued it,
-so scripts may safely contain `filter …` commands that mutate the rule list.
-Kill switches, all existing behavior: `filter off` (nothing is scanned or
-queued), disabling or deleting the rule, battery-gate suspension, or deleting
-the channel (the rule then goes inert — a `cli` rule never falls back to
-running on a `'#'`-derived channel).
-
-### Targeting groups of repeaters
-
-`text=` selectors on the `!id` key address nested groups while keeping one keyed
-channel and one script mechanism — fleet selection by tag, not authentication.
-Provision non-XIAO repeaters with a global selector and XIAO repeaters with a
-selector that accepts both tags:
-
-```text
-# other repeaters:
-filter add chan=ops action=cli text="^!id .*-all-.*"
-
-# XIAO repeaters:
-filter add chan=ops action=cli text="^!id .*-all-.*|^!id .*-xiao-.*"
-```
-
-A job `!id 26-all-radio` then reaches every repeater, `!id 26-xiao-radio` only
-the XIAOs. Put the group marker in the key and nowhere else — `text=` examines
-the whole message, so repeating tags in command lines is redundant. More tags
-(location, firmware channel, …) form further overlapping groups, subject to the
-pattern-length and 8-alternative limits. Canary rollouts use two rules on two
-channels, or two jobs with distinct keys.
-
-### Status, limits and failure modes
-
-| Command | Effect |
-|---|---|
-| `filter cli` | Counters (`ran`/`dup`/`noid`/`refused`/`badline`), queue fill, seen-ring fill |
-| `filter cli seen [<key>]` | Seen-key count, or whether one key ran here |
-| `filter cli forget <key>` / `filter cli forget all` | Re-arm one key / clear the table |
-
-Limits: at most **2 scripts** are queued; a third arrives before the queue
-drains and is refused (`refused` counter) — but it is **not** marked as seen, so
-a re-send reaches it. The seen ring holds the **last 32** keys this boot; a
-33rd evicts the oldest, which re-arms a very old job. Every executed line and
-its reply is logged to the serial console (`cli[<key>] <line>`), so an operator
-at the console sees exactly what ran.
+→ Full guide, including recipes and the security model: **[CLI.md](./CLI.md)**
 
 ## Limits and good-to-knows
 
@@ -956,9 +828,6 @@ at the console sees exactly what ran.
 | Sender pattern length | 31 characters |
 | Text pattern length | 63 characters |
 | Alternatives per pattern | 8 (`\|`-separated) |
-| Script per message | ~175 bytes of script (`!id` line included) — use several messages with distinct keys for bigger jobs |
-| Pending scripts | 2 (a refused script is not marked seen; a re-send reaches it) |
-| Seen job keys | last 32 per boot (RAM-only; a 33rd evicts the oldest) |
 | Advert rate-limit window | 0–720 hours (0 = off) |
 | CLI reply length | short (~160 bytes) — use `filter get <idx>` for detail |
 
@@ -968,10 +837,10 @@ at the console sees exactly what ran.
   `sender=` fits about four short exact names (`^Alice$|^Bob$|^Carol$|^Dan$` is
   28 of 31 characters) and `text=` about eight. Need more? Add a second rule, or
   use one broader alternative such as `^Bot`.
-- Rules, channels, and settings survive reboots. Counters, the advert cache
-  and the job-key memory of CLI-script rules do not — they start fresh after
-  every reboot (that is what makes re-sent scripts run again; see
-  [fleet management](#running-cli-scripts-from-a-channel-fleet-management)).
+- Rules, channels, and settings survive reboots. Counters and the advert cache
+  do not — they start fresh after every reboot. The job-key memory of CLI-script
+  rules is RAM-only the same way, which is what makes re-sent scripts run again
+  (see [CLI.md](./CLI.md)).
 - An edit is written to flash about **3 seconds** after you make it (a burst of
   commands costs one write, not one each). Power the repeater off within that
   window and that edit is lost — everything before it is safe.
@@ -1067,7 +936,8 @@ this section if you write firmware or tooling that touches the file.
   firmware from before the feature still accepts the file but treats a `cli`
   record as invalid, which **ends the rule list at that point** — rules stored
   after a `cli` rule are lost on the next save. Keep `cli` rules last in the
-  list if you might roll firmware back; a downgrade removes the feature anyway.
+  list if you might roll firmware back; a downgrade removes the feature anyway
+  (see [CLI.md](./CLI.md) for what `action=cli` is).
 
 ## Writing sender/text patterns
 
