@@ -4350,6 +4350,31 @@ TEST_F(FilterTest, ChanDelRemapsRuleMasks) {
             FILTER_ACT_DROP);
 }
 
+TEST_F(FilterTest, ChanDelRemapsMasksAtTheWidenedStoreEdge) {
+  // chan_mask is 32 bits wide and the store can hold 32 channels: deleting the
+  // LAST channel of a full store shifts by idx+1 == 32, which must yield no
+  // "bits above" contribution at all (a naive chan_mask >> 32 is undefined)
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    ASSERT_EQ(cli(filter, ("chan add #c" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
+  }
+  ASSERT_EQ(filter.getNumChannels(), FILTER_MAX_CHANNELS);
+  int last = filter.indexOfChannel("#c30");
+  int first = filter.indexOfChannel("Public");
+  ASSERT_EQ(last, FILTER_MAX_CHANNELS - 1);
+  ASSERT_EQ(first, 0);
+  ASSERT_EQ(cli(filter, "add chan=Public,#c30"), "OK - rule 0 added");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, (1u << first) | (1u << last));
+
+  ASSERT_EQ(cli(filter, "chan del #c30"), "OK - chan #c30 deleted");
+  EXPECT_EQ(filter.getRule(0)->chan_mask, 1u << first);   // exactly Public, nothing above
+
+  // behaviourally: the rule still matches the surviving named channel
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10);
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(filter, first),
+                                nullptr, 0, nullptr),
+            FILTER_ACT_DROP);
+}
+
 TEST_F(FilterTest, ChanListStaysWithinReplyBuffer) {
   // real CLI reply buffers are 160 B (serial/ethernet reply[160]; mesh path is
   // &temp[5] of temp[166] — CliUtil.h caps radd() at CLI_REPLY_MAX for this);
