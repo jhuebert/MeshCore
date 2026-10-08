@@ -53,17 +53,9 @@ jobs:
           fetch-depth: 0
 
       - name: Configure Git
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const { spawnSync } = require('child_process');
-            for (const [key, value] of [
-              ['user.name', 'github-actions[bot]'],
-              ['user.email', '41898282+github-actions[bot]@users.noreply.github.com'],
-            ]) {
-              const r = spawnSync('git', ['config', key, value], { encoding: 'utf8' });
-              if (r.status !== 0) throw new Error(`git config ${key} failed: ${(r.stderr || '').trim()}`);
-            }
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Fast-forward fork dev and main to upstream
         uses: actions/github-script@v8
@@ -132,44 +124,14 @@ jobs:
 
       - name: Open merge-conflict issue
         if: steps.merge.outputs.conflict == 'true'
-        uses: actions/github-script@v8
+        uses: ./.github/actions/open-conflict-issue
         with:
-          script: |
-            const fs = require('fs');
-            const marker = '[filter-sync-conflict]';
-            const files = fs.readFileSync('conflicted-files.txt', 'utf8').trim() || '(none listed)';
-            const body = [
-              marker,
-              'Automatic merge of `dev` into `repeater-filter` failed with conflicts.',
-              '',
-              '**Conflicted files:**',
-              '',
-              ...files.split('\n').map((f) => '- ' + f),
-              '',
-              'Resolve the conflicts locally, push the merge, then close this issue.',
-            ].join('\n');
-            const res = await github.rest.search.issuesAndPullRequests({
-              q: 'repo:' + context.repo.owner + '/' + context.repo.repo + ' is:issue is:open "' + marker + '" in:body',
-            });
-            if (res.data.total_count > 0) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: res.data.items[0].number,
-                title: 'Upstream merge conflict in repeater-filter',
-                body,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: 'Upstream merge conflict in repeater-filter',
-                body,
-              });
-            }
-            // a conflict is a failure like any other, not a warning; the issue
-            // step is also where the merge step leaves the job failing
-            core.setFailed('Upstream merge conflict in repeater-filter; resolve locally, push the merge, then close this issue.');
+          marker: '[filter-sync-conflict]'
+          files-file: conflicted-files.txt
+          title: Upstream merge conflict in repeater-filter
+          intro: 'Automatic merge of `dev` into `repeater-filter` failed with conflicts.'
+          closing: 'Resolve the conflicts locally, push the merge, then close this issue.'
+          failure-message: 'Upstream merge conflict in repeater-filter; resolve locally, push the merge, then close this issue.'
 
       - name: Setup Build Environment
         # the promotion gate runs the native suites, and this runner has no
@@ -308,44 +270,14 @@ jobs:
 
       - name: Open stable-sync conflict issue
         if: steps.stable.outputs.conflict == 'true'
-        uses: actions/github-script@v8
+        uses: ./.github/actions/open-conflict-issue
         with:
-          script: |
-            const fs = require('fs');
-            const marker = '[filter-sync-conflict-stable]';
-            const files = fs.readFileSync('stable-conflicted-files.txt', 'utf8').trim() || '(none listed)';
-            const body = [
-              marker,
-              'Promoting `repeater-filter-stable` (merge of `main` and/or cherry-picks from `repeater-filter`) failed with conflicts. Stable was not changed.',
-              '',
-              '**Conflicted files:**',
-              '',
-              ...files.split('\n').map((f) => '- ' + f),
-              '',
-              'Resolve the conflicts locally, push the branch, then close this issue.',
-            ].join('\n');
-            const res = await github.rest.search.issuesAndPullRequests({
-              q: 'repo:' + context.repo.owner + '/' + context.repo.repo + ' is:issue is:open "' + marker + '" in:body',
-            });
-            if (res.data.total_count > 0) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: res.data.items[0].number,
-                title: 'Upstream sync conflict in repeater-filter-stable',
-                body,
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: 'Upstream sync conflict in repeater-filter-stable',
-                body,
-              });
-            }
-            // a conflict is a failure like any other, not a warning: the stable
-            // step reports it via its output, this step raises the failure
-            core.setFailed('Upstream sync conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.');
+          marker: '[filter-sync-conflict-stable]'
+          files-file: stable-conflicted-files.txt
+          title: Upstream sync conflict in repeater-filter-stable
+          intro: 'Promoting `repeater-filter-stable` (merge of `main` and/or cherry-picks from `repeater-filter`) failed with conflicts. Stable was not changed.'
+          closing: 'Resolve the conflicts locally, push the branch, then close this issue.'
+          failure-message: 'Upstream sync conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.'
 
   build-dev:
     name: Build firmware (dev)
