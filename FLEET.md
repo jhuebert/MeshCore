@@ -215,7 +215,9 @@ Protocol guarantees, by construction:
    marker. Keep future reply formats key-prefixed for the same reason.
 3. Flood is the only reply route — group texts carry no pubkey, so a repeater
    cannot direct-reply to "alice" (sender-controlled text, not an identity).
-   Every reply floods and is relayed by the fleet.
+   Every reply floods and is relayed by the fleet, using the repeater's
+   configured path-hash size and its default region scope when one is set
+   (unscoped otherwise).
 
 **Storm control:** the reply is scheduled at a uniform-random instant in a
 jitter window (default 60 s, node-tunable via `fleet reply <secs>`, 1–600 s)
