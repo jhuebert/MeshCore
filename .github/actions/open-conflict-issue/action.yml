@@ -1,0 +1,70 @@
+name: Open conflict issue
+description: >-
+  Create or update the merge-conflict issue for a failed sync (dev merge or
+  stable promotion), then fail the run. Conflict details come from a
+  workspace file written by the step that detected the conflict.
+
+inputs:
+  marker:
+    description: Unique text marker used to find an already-open issue
+    required: true
+  files-file:
+    description: Workspace file holding the conflicted paths, one per line
+    required: true
+  title:
+    description: Issue title
+    required: true
+  intro:
+    description: First body paragraph (before the file list)
+    required: true
+  closing:
+    description: Final body paragraph (how to resolve)
+    required: true
+  failure-message:
+    description: Message used to fail the run
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Create or update issue
+      uses: actions/github-script@v8
+      # inputs ride env, never string interpolation: issue text must stay data
+      env:
+        CONFLICT_MARKER: ${{ inputs.marker }}
+        CONFLICT_FILES_FILE: ${{ inputs.files-file }}
+        CONFLICT_TITLE: ${{ inputs.title }}
+        CONFLICT_INTRO: ${{ inputs.intro }}
+        CONFLICT_CLOSING: ${{ inputs.closing }}
+        CONFLICT_FAILURE: ${{ inputs.failure-message }}
+      with:
+        script: |
+          const fs = require('fs');
+          const files = fs.readFileSync(process.env.CONFLICT_FILES_FILE, 'utf8').trim() || '(none listed)';
+          const body = [
+            process.env.CONFLICT_MARKER,
+            process.env.CONFLICT_INTRO,
+            '',
+            '**Conflicted files:**',
+            '',
+            ...files.split('\n').map((f) => '- ' + f),
+            '',
+            process.env.CONFLICT_CLOSING,
+          ].join('\n');
+          const res = await github.rest.search.issuesAndPullRequests({
+            q: 'repo:' + context.repo.owner + '/' + context.repo.repo + ' is:issue is:open "' + process.env.CONFLICT_MARKER + '" in:body',
+          });
+          const payload = {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: process.env.CONFLICT_TITLE,
+            body,
+          };
+          if (res.data.total_count > 0) {
+            await github.rest.issues.update({ ...payload, issue_number: res.data.items[0].number });
+          } else {
+            await github.rest.issues.create(payload);
+          }
+          // a conflict is a failure like any other, not a warning; this step
+          // is also where the conflicted step leaves the job failing
+          core.setFailed(process.env.CONFLICT_FAILURE);

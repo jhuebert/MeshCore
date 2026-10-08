@@ -9,7 +9,7 @@ on:
         type: string
         default: dev
       targets:
-        description: Comma- or newline-separated build targets (defaults to the FIRMWARE_TARGETS repo variable)
+        description: Comma- or newline-separated build targets (defaults to every repeater target this branch defines)
         required: false
         type: string
         default: ""
@@ -39,7 +39,7 @@ on:
           - dev
           - stable
       targets:
-        description: Comma- or newline-separated build targets (defaults to the FIRMWARE_TARGETS repo variable)
+        description: Comma- or newline-separated build targets (defaults to every repeater target this branch defines)
         required: false
         type: string
         default: ""
@@ -259,42 +259,40 @@ jobs:
         uses: actions/github-script@v8
         env:
           TARGETS_INPUT: ${{ inputs.targets }}
-          FIRMWARE_TARGETS: ${{ vars.FIRMWARE_TARGETS }}
         with:
           script: |
             const { execFileSync } = require('child_process');
 
-            // resolve targets: explicit input, else FIRMWARE_TARGETS repo
-            // variable (both via env: an input containing a quote must stay data)
-            const input = (process.env.TARGETS_INPUT || process.env.FIRMWARE_TARGETS || '').trim();
-            if (!input) {
-              core.setFailed("No targets: set the FIRMWARE_TARGETS repo variable or pass the 'targets' input");
-              return;
-            }
-
             // known targets come from platformio.ini via build.sh
             // build.sh uses bash arrays; /bin/sh is not a contract
-            const known = new Set(
-              execFileSync('bash', ['build.sh', 'list'], { encoding: 'utf8' })
-                .split(/\r?\n/).map((s) => s.trim()),
-            );
+            const known = execFileSync('bash', ['build.sh', 'list'], { encoding: 'utf8' })
+              .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 
-            // warn and skip unknown names instead of failing: a target can be
-            // valid on the dev branch but not yet on stable's upstream base
-            const selected = [];
-            for (const target of new Set(input.split(/[\s,]+/).filter(Boolean))) {
-              if (known.has(target)) {
-                selected.push(target);
-              } else {
-                core.warning(`unknown build target '${target}' - skipped (not in this branch's platformio.ini)`);
+            // explicit input wins (via env: an input containing a quote must
+            // stay data); otherwise every repeater firmware this branch defines
+            const input = (process.env.TARGETS_INPUT || '').trim();
+            const selected = new Set();
+            if (input) {
+              for (const target of input.split(/[\s,]+/).filter(Boolean)) {
+                if (known.includes(target)) {
+                  selected.add(target);
+                } else {
+                  // warn and skip unknown names instead of failing: a target can
+                  // be valid on the dev branch but not yet on stable's upstream base
+                  core.warning(`unknown build target '${target}' - skipped (not in this branch's platformio.ini)`);
+                }
+              }
+            } else {
+              for (const target of known) {
+                if (/repeater/i.test(target)) selected.add(target);
               }
             }
-            if (selected.length === 0) {
-              core.setFailed('No known build targets: every entry in the target list is unknown to this branch');
+            if (selected.size === 0) {
+              core.setFailed("No known build targets: pass the 'targets' input, or this branch defines no repeater firmware");
               return;
             }
 
-            core.setOutput('targets', JSON.stringify(selected));
+            core.setOutput('targets', JSON.stringify([...selected]));
 
   build:
     name: Build ${{ matrix.target }}
@@ -321,13 +319,6 @@ jobs:
 
       - name: Setup Build Environment
         uses: ./.github/actions/setup-build-environment
-
-      - name: Clear stale artifacts
-        # a previous run's output must never be mistaken for this run's
-        uses: actions/github-script@v8
-        with:
-          script: |
-            require('fs').rmSync('out', { recursive: true, force: true });
 
       - name: Build Firmware
         uses: actions/github-script@v8
@@ -408,8 +399,10 @@ jobs:
 
   release:
     name: Create Release
-    needs: [version, validate-targets, build]
-    if: inputs.create_release && needs.version.outputs.skip != 'true'
+    # validate-targets rides in through build's own needs; a skipped build
+    # (nothing to release) skips this job the same way
+    needs: [version, build]
+    if: inputs.create_release
     runs-on: ubuntu-latest
     # only this job writes; build and test jobs stay at contents: read
     permissions:
