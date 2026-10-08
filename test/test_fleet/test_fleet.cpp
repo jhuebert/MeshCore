@@ -932,7 +932,7 @@ TEST_F(FleetHooksTest, AckAlwaysRepliesJitteredInChannel) {
   g_mock_millis += env.jitter;
   fleet.runScripts(ExecRecorder::fn, &env.rec);   // due: sends the reply
   ASSERT_EQ(env.sent.size(), (size_t)1);
-  EXPECT_EQ(env.sent[0].body, "k1 OK - done: filter stats");
+  EXPECT_EQ(env.sent[0].body, "k1\nOK - done: filter stats");
   EXPECT_EQ(env.sent[0].hash, chan.hash[0]);
   EXPECT_EQ(memcmp(env.sent[0].secret, chan.secret, PUB_KEY_SIZE), 0);
   EXPECT_EQ(fleet.getReplyCount(), 0);
@@ -955,7 +955,7 @@ TEST_F(FleetHooksTest, AckErrSilentOnSuccessRepliesOnError) {
   g_mock_millis += env.jitter;
   fleet.runScripts(ExecRecorder::fn, &env.rec);
   ASSERT_EQ(env.sent.size(), (size_t)1);
-  EXPECT_EQ(env.sent[0].body, "k2 ran 2; err: Err - injected failure");
+  EXPECT_EQ(env.sent[0].body, "k2\nran 2; err: Err - injected failure");
 }
 
 TEST_F(FleetHooksTest, NoAckDirectiveStaysSilent) {
@@ -1045,9 +1045,9 @@ TEST_F(FleetHooksTest, AtScheduledAckRepliesAfterExecution) {
   ASSERT_TRUE(pass());   // fires, then the ack is scheduled
   EXPECT_EQ(fleet.getReplyCount(), 1);
   g_mock_millis += env.jitter;
-  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // due: sends the reply
   ASSERT_EQ(env.sent.size(), (size_t)1);
-  EXPECT_EQ(env.sent[0].body, "k1 OK - done: filter stats");
+  EXPECT_EQ(env.sent[0].body, "k1\nOK - done: filter stats");
 }
 
 TEST_F(FleetHooksTest, AtDupAndStoreFull) {
