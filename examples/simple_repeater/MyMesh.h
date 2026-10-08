@@ -205,6 +205,12 @@ public:
 
   void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size);
 
+  // fleet ack reply route: the node's configured path-hash size, and the
+  // default flood scope when set (unscoped otherwise)
+  void sendFleetReply(mesh::Packet* pkt) {
+    sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  }
+
   // CommonCLICallbacks
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) override;
   bool formatFileSystem() override;
