@@ -77,7 +77,6 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       release_title: ${{ steps.version.outputs.release_title }}
       firmware_version: ${{ steps.version.outputs.firmware_version }}
-      changes_section: ${{ steps.version.outputs.changes_section }}
       source_sha: ${{ steps.version.outputs.source_sha }}
     steps:
 
@@ -91,188 +90,150 @@ jobs:
 
       - name: Derive Version
         id: version
+        uses: actions/github-script@v8
         env:
           CHANNEL: ${{ inputs.channel }}
           FORCE_BUILD: ${{ inputs.force_build }}
           BRANCH_INPUT: ${{ inputs.branch }}
-        run: |
-          set -euo pipefail
-          case "$CHANNEL" in
-            dev|stable) ;;
-            *) echo "channel must be 'dev' or 'stable'" >&2; exit 1 ;;
-          esac
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const git = (...args) => {
+              const r = spawnSync('git', args, { encoding: 'utf8' });
+              if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
+              return r.stdout;
+            };
+            const gitOk = (...args) => spawnSync('git', args, { encoding: 'utf8' }).status === 0;
 
-          if [ "$CHANNEL" = stable ]; then
-            BRANCH="repeater-filter-stable"
-            BASE_REF="origin/main"
-          else
-            BRANCH="repeater-filter"
-            BASE_REF="origin/dev"
-          fi
-          # via env, not an Actions expression: input text must never become
-          # shell syntax
-          if [ -n "$BRANCH_INPUT" ]; then BRANCH="$BRANCH_INPUT"; fi
-          # recorded so the release can name the exact revision it came from
-          SHORT_SHA=$(git rev-parse --short HEAD)
+            // sort -V equivalent for the version-suffix ordering of tag names
+            const natCmp = (a, b) => {
+              const pa = a.split(/(\d+)/), pb = b.split(/(\d+)/);
+              for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+                if (pa[i] === undefined) return -1;
+                if (pb[i] === undefined) return 1;
+                const x = /^\d+$/.test(pa[i]) ? parseInt(pa[i], 10) : pa[i];
+                const y = /^\d+$/.test(pb[i]) ? parseInt(pb[i], 10) : pb[i];
+                if (x === y) continue;
+                if (typeof x === 'number' && typeof y === 'number') return x - y;
+                return String(x) < String(y) ? -1 : 1;
+              }
+              return 0;
+            };
 
-          # upstream base: last companion-v* tag reachable from HEAD, X.Y.Z only
-          # (companion-v1.17.1-25-g6df98abe -> v1.17.1)
-          DESC=$(git describe --tags --match 'companion-v*' HEAD 2>/dev/null || true)
-          if [ -n "$DESC" ]; then
-            UPSTREAM_VERSION="${DESC#companion-}"
-            UPSTREAM_VERSION="${UPSTREAM_VERSION%%-*}"
-          else
-            UPSTREAM_VERSION="untagged"
-          fi
+            const channel = process.env.CHANNEL;
+            if (channel !== 'dev' && channel !== 'stable') {
+              core.setFailed("channel must be 'dev' or 'stable'");
+              return;
+            }
 
-          if [ "$CHANNEL" = stable ]; then
-            # previous stable tag = latest filter-v* tag under the new scheme
-            # (no -dev suffix, no old date-scheme tags)
-            PREV_TAG=$(git tag --list 'filter-v*' \
-              | grep -v -- '-dev\.' | grep -vE -- '-20[0-9]{6}-' \
-              | sort -V | tail -1 || true)
-            # tag: filter-v<base>, or -rN when that base was already released
-            RN_SUFFIX=""
-            if git rev-parse -q --verify "refs/tags/filter-${UPSTREAM_VERSION}" >/dev/null; then
-              N=1
-              while git rev-parse -q --verify "refs/tags/filter-${UPSTREAM_VERSION}-r${N}" >/dev/null; do
-                N=$((N + 1))
-              done
-              RN_SUFFIX="-r${N}"
-            fi
-            RELEASE_TAG="filter-${UPSTREAM_VERSION}${RN_SUFFIX}"
-            DISPLAY_VERSION="${UPSTREAM_VERSION}${RN_SUFFIX}"
-            RELEASE_TITLE="Filter Firmware ${DISPLAY_VERSION} (stable)"
-            # build.sh appends -<short sha> itself
-            FIRMWARE_VERSION="${UPSTREAM_VERSION}-filter"
-          else
-            # previous dev tag = latest filter-*-dev.* tag (new scheme only).
-            # Scoped to the channel's own tags, so an unrelated stable release
-            # cannot mask a dev change (or vice versa).
-            PREV_TAG=$(git tag --list 'filter-*-dev.*' \
-                       | sort -V | tail -1 || true)
-            # counter = highest existing suffix for this base + 1. Counting the
-            # tags (count + 1) collides when one was deleted or a gap exists,
-            # and a duplicate tag fails the release.
-            MAXN=$(git tag --list "filter-${UPSTREAM_VERSION}-dev.*" \
-                   | sed -n 's/.*\.\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1 || true)
-            N=$(( ${MAXN:-0} + 1 ))
-            RELEASE_TAG="filter-${UPSTREAM_VERSION}-dev.${N}"
-            DISPLAY_VERSION="${UPSTREAM_VERSION}-dev.${N}"
-            RELEASE_TITLE="Filter Firmware ${DISPLAY_VERSION}"
-            # build.sh appends -<short sha> itself
-            FIRMWARE_VERSION="${UPSTREAM_VERSION}-dev.${N}-filter"
-          fi
+            let branch = 'repeater-filter';
+            let baseRef = 'origin/dev';
+            if (channel === 'stable') {
+              branch = 'repeater-filter-stable';
+              baseRef = 'origin/main';
+            }
+            // via env, not an Actions expression: input text must never become
+            // shell syntax
+            if (process.env.BRANCH_INPUT) branch = process.env.BRANCH_INPUT;
 
-          # ---- gate: should this channel build at all? ----
-          SKIP=true
-          RANGE="HEAD"
-          if [ "$FORCE_BUILD" = true ]; then
-            SKIP=false
-            # forced builds still list changes since the previous release,
-            # when there is one to compare against
-            if [ -n "$PREV_TAG" ]; then
-              RANGE="${PREV_TAG}..HEAD"
-            fi
-          elif [ -z "$PREV_TAG" ]; then
-            # first release of this channel under the new scheme
-            SKIP=false
-            RANGE="HEAD"
-          else
-            # upstream base changed -> build to carry the new base
-            PREV_BASE=$(echo "$PREV_TAG" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)
-            if [ -n "$PREV_BASE" ] && [ "$PREV_BASE" != "$UPSTREAM_VERSION" ]; then
-              SKIP=false
-            fi
-            RANGE="${PREV_TAG}..HEAD"
-          fi
+            // upstream base: last companion-v* tag reachable from HEAD, X.Y.Z only
+            // (companion-v1.17.1-25-g6df98abe -> v1.17.1)
+            const desc = spawnSync('git', ['describe', '--tags', '--match', 'companion-v*', 'HEAD'],
+              { encoding: 'utf8' });
+            let upstreamVersion = 'untagged';
+            if (desc.status === 0 && desc.stdout.trim()) {
+              upstreamVersion = desc.stdout.trim().replace(/^companion-/, '').split('-')[0];
+            }
 
-          if [ "$SKIP" = true ]; then
-            # build when any commit since the channel's last release touches
-            # code (dev channel counts upstream commits too; stable excludes
-            # upstream history so only cherry-picked filter commits count)
-            # merges INCLUDED: a merge commit can carry a hand-resolved conflict,
-            # which is a real code change that --no-merges would hide
-            if [ "$CHANNEL" = stable ]; then
-              COMMITS=$(git rev-list "$RANGE" --not "$BASE_REF")
-            else
-              COMMITS=$(git rev-list "$RANGE")
-            fi
-            for c in $COMMITS; do
-              CODE=0
-              while IFS= read -r p; do
-                case "$p" in
-                  *.md|docs/*) ;;                       # docs only
-                  .github/actions/*) CODE=1; break ;;   # build env = code
-                  .github/*) ;;                         # CI only
-                  *) CODE=1; break ;;
-                esac
-              done < <(git diff-tree --no-commit-id --name-only -r "$c")
-              if [ "$CODE" = 1 ]; then
-                SKIP=false
-                break
-              fi
-            done
-          fi
+            const tags = (pattern) => git('tag', '--list', pattern).split('\n').filter(Boolean);
+            let releaseTag, displayVersion, releaseTitle, firmwareVersion, prevTag;
+            if (channel === 'stable') {
+              // previous stable tag = latest filter-v* tag under the new scheme
+              // (no -dev suffix, no old date-scheme tags)
+              prevTag = tags('filter-v*')
+                .filter((t) => !t.includes('-dev.') && !/-20\d{6}-/.test(t))
+                .sort(natCmp).pop() || '';
+              // tag: filter-v<base>, or -rN when that base was already released
+              let rnSuffix = '';
+              if (gitOk('rev-parse', '-q', '--verify', `refs/tags/filter-${upstreamVersion}`)) {
+                let n = 1;
+                while (gitOk('rev-parse', '-q', '--verify', `refs/tags/filter-${upstreamVersion}-r${n}`)) n += 1;
+                rnSuffix = `-r${n}`;
+              }
+              releaseTag = `filter-${upstreamVersion}${rnSuffix}`;
+              displayVersion = `${upstreamVersion}${rnSuffix}`;
+              releaseTitle = `Filter Firmware ${displayVersion} (stable)`;
+              // build.sh appends -<short sha> itself
+              firmwareVersion = `${upstreamVersion}-filter`;
+            } else {
+              // previous dev tag = latest filter-*-dev.* tag (new scheme only).
+              // Scoped to the channel's own tags, so an unrelated stable release
+              // cannot mask a dev change (or vice versa).
+              prevTag = tags('filter-*-dev.*').sort(natCmp).pop() || '';
+              // counter = highest existing suffix for this base + 1. Counting the
+              // tags (count + 1) collides when one was deleted or a gap exists,
+              // and a duplicate tag fails the release.
+              const maxN = tags(`filter-${upstreamVersion}-dev.*`)
+                .map((t) => { const m = t.match(/\.(\d+)$/); return m ? parseInt(m[1], 10) : 0; })
+                .reduce((a, b) => Math.max(a, b), 0);
+              const n = maxN + 1;
+              releaseTag = `filter-${upstreamVersion}-dev.${n}`;
+              displayVersion = `${upstreamVersion}-dev.${n}`;
+              releaseTitle = `Filter Firmware ${displayVersion}`;
+              // build.sh appends -<short sha> itself
+              firmwareVersion = `${upstreamVersion}-dev.${n}-filter`;
+            }
 
-          # ---- curated "Filter changes in this build" section ----
-          # filter-only commits since the previous release of this channel
-          # (--not <upstream base> subtracts everything reachable from upstream)
-          CHANGES_FILE=$(mktemp)
-          for c in $(git rev-list "$RANGE" --not "$BASE_REF"); do
-            SUBJECT=$(git log -1 --format=%s "$c")
-            DOCS_ONLY=1
-            while IFS= read -r p; do
-              case "$p" in
-                *.md|docs/*|.github/*) ;;
-                *) DOCS_ONLY=0; break ;;
-              esac
-            done < <(git diff-tree --no-commit-id --name-only -r "$c")
-            if [ "$DOCS_ONLY" = 1 ]; then
-              echo "- $SUBJECT" >> "${CHANGES_FILE}.extra"
-            else
-              case "$SUBJECT" in
-                test:*|test\(*) echo "- $SUBJECT" >> "${CHANGES_FILE}.extra" ;;
-                *) echo "- $SUBJECT" >> "${CHANGES_FILE}.main" ;;
-              esac
-            fi
-          done
+            // ---- gate: should this channel build at all? ----
+            let skip = true;
+            let range = 'HEAD';
+            if (process.env.FORCE_BUILD === 'true') {
+              skip = false;
+              // forced builds still list changes since the previous release,
+              // when there is one to compare against
+              if (prevTag) range = `${prevTag}..HEAD`;
+            } else if (!prevTag) {
+              // first release of this channel under the new scheme
+              range = 'HEAD';
+            } else {
+              // upstream base changed -> build to carry the new base
+              const prevBase = (prevTag.match(/v\d+\.\d+\.\d+/) || [])[0] || '';
+              if (prevBase && prevBase !== upstreamVersion) skip = false;
+              range = `${prevTag}..HEAD`;
+            }
 
-          if [ -s "${CHANGES_FILE}.main" ] || [ -s "${CHANGES_FILE}.extra" ]; then
-            {
-              echo "## Filter changes in this build"
-              echo
-              cat "${CHANGES_FILE}.main" 2>/dev/null || true
-              if [ -s "${CHANGES_FILE}.extra" ]; then
-                echo "<details><summary>Tests, docs & CI</summary>"
-                echo
-                cat "${CHANGES_FILE}.extra"
-                echo
-                echo "</details>"
-              fi
-            } > "$CHANGES_FILE"
-          else
-            : > "$CHANGES_FILE"
-          fi
+            if (skip) {
+              // build when any commit since the channel's last release touches
+              // code (dev channel counts upstream commits too; stable excludes
+              // upstream history so only cherry-picked filter commits count)
+              // merges INCLUDED: a merge commit can carry a hand-resolved conflict,
+              // which is a real code change that --no-merges would hide
+              const revListArgs = ['rev-list', range];
+              if (channel === 'stable') revListArgs.push('--not', baseRef);
+              const commits = git(...revListArgs).split('\n').filter(Boolean);
+              for (const c of commits) {
+                const isCode = git('diff-tree', '--no-commit-id', '--name-only', '-r', c)
+                  .split('\n').filter(Boolean)
+                  .some((p) => {
+                    if (p.endsWith('.md') || p.startsWith('docs/')) return false;  // docs only
+                    if (p.startsWith('.github/actions/')) return true;             // build env = code
+                    if (p.startsWith('.github/')) return false;                    // CI only
+                    return true;
+                  });
+                if (isCode) {
+                  skip = false;
+                  break;
+                }
+              }
+            }
 
-          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
-          echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
-          echo "firmware_version=$FIRMWARE_VERSION" >> "$GITHUB_OUTPUT"
-          # the exact revision everything below was derived from and built at
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          {
-            # generated delimiter: a commit subject containing a fixed
-            # CHANGES_EOF line would truncate the output block
-            DELIM="CHANGES_EOF_$(git rev-parse --short HEAD)_RANDOM"
-            while grep -qF "$DELIM" "$CHANGES_FILE" 2>/dev/null; do
-              DELIM="${DELIM}X"
-            done
-            echo "changes_section<<$DELIM"
-            cat "$CHANGES_FILE"
-            echo "$DELIM"
-          } >> "$GITHUB_OUTPUT"
+            core.setOutput('skip', String(skip));
+            core.setOutput('branch', branch);
+            core.setOutput('release_tag', releaseTag);
+            core.setOutput('release_title', releaseTitle);
+            core.setOutput('firmware_version', firmwareVersion);
+            // the exact revision everything below was derived from and built at
+            core.setOutput('source_sha', git('rev-parse', 'HEAD').trim());
 
   validate-targets:
     name: Validate build targets
@@ -295,50 +256,53 @@ jobs:
 
       - name: Validate Build Targets
         id: validate
+        uses: actions/github-script@v8
         env:
           TARGETS_INPUT: ${{ inputs.targets }}
           FIRMWARE_TARGETS: ${{ vars.FIRMWARE_TARGETS }}
-        run: |
-          # resolve targets: explicit input, else FIRMWARE_TARGETS repo variable
-          # (both via env: an input containing a quote must stay data)
-          TARGETS="${TARGETS_INPUT:-$FIRMWARE_TARGETS}"
-          if [ -z "$TARGETS" ]; then
-            echo "No targets: set the FIRMWARE_TARGETS repo variable or pass the 'targets' input" >&2
-            exit 1
-          fi
+        with:
+          script: |
+            const { execFileSync } = require('child_process');
 
-          # known targets come from platformio.ini via build.sh
-          # build.sh uses bash arrays; /bin/sh is not a contract
-          bash build.sh list > /tmp/known-targets.txt
+            // resolve targets: explicit input, else FIRMWARE_TARGETS repo
+            // variable (both via env: an input containing a quote must stay data)
+            const input = (process.env.TARGETS_INPUT || process.env.FIRMWARE_TARGETS || '').trim();
+            if (!input) {
+              core.setFailed("No targets: set the FIRMWARE_TARGETS repo variable or pass the 'targets' input");
+              return;
+            }
 
-          # warn and skip unknown names instead of failing: a target can be
-          # valid on the dev branch but not yet on stable's upstream base
-          VALID_TARGETS=""
-          for target in $(echo "$TARGETS" | tr -d '\r' | tr ' ,' '\n'); do
-            [ -z "$target" ] && continue
-            if grep -qx "$target" /tmp/known-targets.txt; then
-              VALID_TARGETS="$VALID_TARGETS $target"
-            else
-              echo "Warning: unknown build target '$target' - skipped (not in this branch's platformio.ini)" >&2
-            fi
-          done
-          if [ -z "${VALID_TARGETS// }" ]; then
-            echo "No known build targets: every entry in the target list is unknown to this branch" >&2
-            exit 1
-          fi
+            // known targets come from platformio.ini via build.sh
+            // build.sh uses bash arrays; /bin/sh is not a contract
+            const known = new Set(
+              execFileSync('bash', ['build.sh', 'list'], { encoding: 'utf8' })
+                .split(/\r?\n/).map((s) => s.trim()),
+            );
 
-          # convert targets separated by spaces into a json array string
-          JSON_ARRAY=$(echo "$VALID_TARGETS" | tr ' ' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            // warn and skip unknown names instead of failing: a target can be
+            // valid on the dev branch but not yet on stable's upstream base
+            const selected = [];
+            for (const target of new Set(input.split(/[\s,]+/).filter(Boolean))) {
+              if (known.has(target)) {
+                selected.push(target);
+              } else {
+                core.warning(`unknown build target '${target}' - skipped (not in this branch's platformio.ini)`);
+              }
+            }
+            if (selected.length === 0) {
+              core.setFailed('No known build targets: every entry in the target list is unknown to this branch');
+              return;
+            }
 
-          echo "targets=$JSON_ARRAY" >> $GITHUB_OUTPUT
+            core.setOutput('targets', JSON.stringify(selected));
 
   build:
     name: Build ${{ matrix.target }}
     needs: [version, validate-targets]
     if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    # Dev publishes what built, and every omission is visible in the per-target
-    # manifests shipped with the release. Stable does NOT: a stable release is
+    # Dev publishes what built; a board that failed is visible as a red matrix
+    # job in the run. Stable does NOT skip failures: a stable release is
     # what users install, so any requested board failing must block it.
     continue-on-error: ${{ inputs.channel != 'stable' }}
     strategy:
@@ -351,7 +315,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           # pinned, like the target list: if the branch moved after version
-          # selection, the manifest, the release body and the tag would all name
+          # selection, the release body and the tag would all name
           # a revision this job never built
           ref: ${{ needs.version.outputs.source_sha }}
 
@@ -360,16 +324,26 @@ jobs:
 
       - name: Clear stale artifacts
         # a previous run's output must never be mistaken for this run's
-        run: rm -rf out
+        uses: actions/github-script@v8
+        with:
+          script: |
+            require('fs').rmSync('out', { recursive: true, force: true });
 
       - name: Build Firmware
+        uses: actions/github-script@v8
         env:
           FIRMWARE_VERSION: ${{ needs.version.outputs.firmware_version }}
           TARGET: ${{ matrix.target }}
           # metadata-only (emits .su files next to the objects; codegen is
           # unchanged) — consumed by the stack usage check below
           PLATFORMIO_BUILD_FLAGS: -fstack-usage
-        run: /usr/bin/env bash build.sh build-firmware "$TARGET"
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const target = process.env.TARGET;
+            const r = spawnSync('bash', ['build.sh', 'build-firmware', target], { stdio: 'inherit' });
+            if (r.error) throw r.error;
+            if (r.status !== 0) throw new Error(`build.sh build-firmware ${target} exited with status ${r.status}`);
 
       - name: Stack usage check
         # One big stack scratch array in boot- or loop-path code brick-reboots
@@ -377,55 +351,51 @@ jobs:
         # in FilterRules::load overflowed the 4 KB nRF52 / 8 KB ESP32 loop
         # task stacks at boot). The compiler's own accounting catches that
         # class on every target we publish; the binary is unaffected.
+        uses: actions/github-script@v8
         env:
           TARGET: ${{ matrix.target }}
           STACK_FRAME_LIMIT: 2048
-        run: |
-          set -euo pipefail
-          SU_DIR=".pio/build/$TARGET"
-          # repo code only: src/ and examples/. Vendored crypto (lib/ed25519) and
-          # libdeps libraries carry frames above the limit that ship today and are
-          # not what this repo edits; gating them would train everyone to ignore
-          # the check. The frames this repo owns are the ones it can break.
-          mapfile -t SU_FILES < <(find "$SU_DIR/src" "$SU_DIR/examples" -name '*.su' 2>/dev/null)
-          if [ "${#SU_FILES[@]}" -eq 0 ]; then
-            echo "ERROR: no .su files under $SU_DIR — the build did not run with -fstack-usage, check is blind" >&2
-            exit 1
-          fi
-          OFFENDERS=$(LC_ALL=C sort -t$'\t' -k2,2 -rn "${SU_FILES[@]}" \
-            | awk -F'\t' -v limit="$STACK_FRAME_LIMIT" '$2+0 >= limit { print $2 " B  " $1 }')
-          if [ -n "$OFFENDERS" ]; then
-            echo "ERROR: stack frames >= ${STACK_FRAME_LIMIT} B (loop task is 4 KB on nRF52, 8 KB on ESP32):" >&2
-            echo "$OFFENDERS" >&2
-            exit 1
-          fi
-          echo "OK: $(echo "${SU_FILES[@]}" | wc -w) translation units, no stack frame >= ${STACK_FRAME_LIMIT} B"
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const limit = parseInt(process.env.STACK_FRAME_LIMIT, 10);
+            const suDir = path.join('.pio', 'build', process.env.TARGET);
 
-      - name: Write build manifest
-        # a per-target record of what was actually produced (after the stack
-        # usage check passed), so a release can never imply coverage it does not have
-        env:
-          TARGET: ${{ matrix.target }}
-          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
-          CHANNEL: ${{ inputs.channel }}
-        run: |
-          set -euo pipefail
-          # built outside out/ so the glob below cannot see the manifest itself:
-          # the redirect would create it before the listing ran, and it would
-          # record its own (still-being-written) sha256
-          {
-            echo "target: $TARGET"
-            echo "source_sha: $SOURCE_SHA"
-            echo "channel: $CHANNEL"
-            echo "status: built"
-            echo "artifacts:"
-            for f in out/*; do
-              [ -f "$f" ] || continue
-              echo "  - $(basename "$f")  sha256=$(sha256sum "$f" | cut -d' ' -f1)"
-            done
-          } > manifest-$TARGET.txt
-          mv manifest-$TARGET.txt "out/manifest-$TARGET.txt"
-          cat "out/manifest-$TARGET.txt"
+            // repo code only: src/ and examples/. Vendored crypto (lib/ed25519) and
+            // libdeps libraries carry frames above the limit that ship today and are
+            // not what this repo edits; gating them would train everyone to ignore
+            // the check. The frames this repo owns are the ones it can break.
+            const suFiles = [];
+            const walk = (dir) => {
+              if (!fs.existsSync(dir)) return;
+              for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+                const p = path.join(dir, ent.name);
+                if (ent.isDirectory()) walk(p);
+                else if (p.endsWith('.su')) suFiles.push(p);
+              }
+            };
+            walk(path.join(suDir, 'src'));
+            walk(path.join(suDir, 'examples'));
+
+            if (suFiles.length === 0) {
+              core.setFailed(`ERROR: no .su files under ${suDir} — the build did not run with -fstack-usage, check is blind`);
+              return;
+            }
+            // .su lines are "file:line:col:function\tbytes\ttype"
+            const offenders = [];
+            for (const f of suFiles) {
+              for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+                if (!line.trim()) continue;
+                const [loc, size] = line.split('\t');
+                if (parseInt(size, 10) >= limit) offenders.push(`${size} B  ${loc}`);
+              }
+            }
+            if (offenders.length > 0) {
+              core.setFailed(`ERROR: stack frames >= ${limit} B (loop task is 4 KB on nRF52, 8 KB on ESP32):\n${offenders.join('\n')}`);
+              return;
+            }
+            core.info(`OK: ${suFiles.length} translation units, no stack frame >= ${limit} B`);
 
       - name: Upload Workflow Artifacts
         uses: actions/upload-artifact@v7
@@ -453,47 +423,6 @@ jobs:
           merge-multiple: true
           path: out
 
-      - name: Move manifests out of the release assets
-        # the manifests describe the release; they are not part of it
-        run: |
-          set -euo pipefail
-          mkdir -p .manifests
-          mv out/manifest-*.txt .manifests/ 2>/dev/null || true
-
-      - name: Summarise what actually built
-        id: manifest
-        env:
-          CHANNEL: ${{ inputs.channel }}
-        run: |
-          set -euo pipefail
-          # Every build writes a manifest naming its target, the source SHA and
-          # the files it produced. Collecting them here means a dev release that
-          # published only some boards says so, loudly, instead of implying the
-          # whole list was covered. They are read from where the previous step
-          # moved them: the asset directory no longer holds them.
-          SUMMARY=""
-          COUNT=0
-          for m in .manifests/manifest-*.txt; do
-            [ -f "$m" ] || continue
-            COUNT=$((COUNT + 1))
-            TARGET=$(sed -n 's/^target: //p' "$m")
-            SUMMARY="${SUMMARY}- \`${TARGET}\`\n"
-          done
-          if [ "$COUNT" = 0 ]; then
-            BODY="_No build manifests were produced._"
-          else
-            # %b, not the bare format: SUMMARY starts with "-", which printf
-            # would otherwise read as an option and refuse. The header joins the
-            # same expansion, so the list below it is real newlines rather than
-            # literal "\n" text on the heading line.
-            BODY="### Boards in this release$(printf '\n\n%b' "$SUMMARY")"
-          fi
-          {
-            echo "summary<<MANIFEST_EOF"
-            echo "$BODY"
-            echo "MANIFEST_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
@@ -502,12 +431,7 @@ jobs:
           # dev releases are pre-releases; the stable release is the repo's latest
           prerelease: ${{ inputs.channel != 'stable' }}
           make_latest: ${{ inputs.channel == 'stable' && 'true' || 'false' }}
-          generate_release_notes: true
-          body: |
-            Built from commit `${{ needs.version.outputs.source_sha }}`.
-
-            ${{ needs.version.outputs.changes_section }}
-
-            ${{ steps.manifest.outputs.summary }}
+          # release notes are written by hand after the release is created
+          body: "Built from commit `${{ needs.version.outputs.source_sha }}`."
           files: out/*
           target_commitish: ${{ needs.version.outputs.source_sha }}
