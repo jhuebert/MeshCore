@@ -197,7 +197,8 @@ message.
 - No `!ack` — no reply.
 
 Reply content, always prefixed with the job key so replies are correlatable
-when several jobs are in flight:
+when several jobs are in flight. On air the body is `<key>`, then a newline,
+then the response — companions show the id and the response on separate lines:
 
 - Single-command script → the command's **actual reply** (e.g.
   `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), truncated to fit one packet.
