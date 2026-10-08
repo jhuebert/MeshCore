@@ -49,8 +49,9 @@ transmission is not cancelled by suspending.
 
 **Exception — the fleet channel.** Fleet-channel traffic, scripts and
 acknowledgements are exempt from suspension: fleet-channel group packets relay
-(they are never counted as battery drops — the exemption is a one-byte channel
-hash compare on the still-encrypted packet), queued fleet scripts run while
+(they are never counted as battery drops — the exemption is the one packet the
+repeater has just MAC-verified under the fleet key, never a channel-hash match),
+queued fleet scripts run while
 suspended, and `!ack` replies are still sent. A node in trouble is exactly the
 node you need to reach; whether to spend battery on a response is the
 operator's `!ack` choice, not the gate's. See [FLEET.md](./FLEET.md#battery-supersession).

@@ -76,7 +76,9 @@ struct CliScriptMeta {
   char tags[FLEET_MAX_SCRIPT_TAGS][FLEET_TAG_LEN + 1];
   uint8_t tag_count;                 // 0 = no !tags directive = broadcast
   uint8_t ack;                       // CliAckMode
-  uint32_t due_epoch;                // !at target (unix seconds UTC); 0 = run now
+  bool scheduled;                    // an !at directive was present: due_epoch is
+                                     // authoritative, and 0 is a (stale) time, not "now"
+  uint32_t due_epoch;                // !at target (unix seconds UTC)
   uint16_t body_off;                 // offset of the first command line in the
                                      // message text (strlen(text) when none)
 };
@@ -176,6 +178,14 @@ public:
   bool enqueueValidated(const char* text, const char* key, uint8_t ack, uint16_t body_off,
                         const uint8_t* chan_secret, uint8_t chan_hash);
 
+  // Is a script with this key queued or sleeping right now? The manager checks
+  // this (and its armed store) so a forgotten key cannot run twice at once.
+  bool hasPending(const char* key) const;
+
+  // Drop every queued and sleeping script (the fleet kill switch). Their keys
+  // stay marked: a cancelled job is consumed, like one that ran.
+  void abortPending();
+
   // Mark a key seen without queueing (the manager admits scheduled scripts to
   // its own store). Returns false — without marking — when the key was already
   // seen this boot, so the caller can count the duplicate.
@@ -201,6 +211,7 @@ public:
   // counter notes for refusals that happen outside the runner but are still
   // script refusals (the manager's scheduled-store admission), so the
   // status-line counters tell one story
+  void noteNoId() { noid++; }
   void noteDup() { dup++; }
   void noteRefused() { refused++; }
 

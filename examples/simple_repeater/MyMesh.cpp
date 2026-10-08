@@ -482,7 +482,7 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
   // fleet management must work when the battery is low — a node in trouble is
   // exactly the node you need to reach. Scripts enqueue and run while
   // suspension would otherwise skip the whole receive handler.
-  fleet.onGroupData(type, channel, data, len);
+  fleet.onGroupData(packet, type, channel, data, len);
 
   // The battery gate outranks the filter. Without this, decryptable group traffic
   // runs the content rules and banks hits/airtime while a suspended repeater is
@@ -1394,8 +1394,9 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 // in the serial CLI's style, so an operator at the console sees exactly what
 // ran. `key` is the job's !id key string from the queued script itself.
 static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
-  ((MyMesh*)ctx)->handleCommand(0, line, reply);
+  // logged before dispatch: the handlers tokenise the line in place
   Serial.printf("cli[%s] %s\n", key, line);
+  ((MyMesh*)ctx)->handleCommand(0, line, reply);
   if (reply[0]) Serial.printf("  -> %s\n", reply);
 }
 
