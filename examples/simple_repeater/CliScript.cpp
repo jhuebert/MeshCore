@@ -125,6 +125,7 @@ CliEnqueue CliScriptRunner::parse(const char* text, CliScriptMeta* meta) {
   meta->key[0] = 0;
   meta->tag_count = 0;
   meta->ack = CLI_ACK_NONE;
+  meta->scheduled = false;
   meta->due_epoch = 0;
   meta->body_off = 0;
 
@@ -181,6 +182,7 @@ CliEnqueue CliScriptRunner::parse(const char* text, CliScriptMeta* meta) {
           return CLI_ENQUEUE_BAD_DIRECTIVE;
         }
         seen_at = true;
+        meta->scheduled = true;
       } else {
         return CLI_ENQUEUE_BAD_DIRECTIVE;
       }
@@ -242,6 +244,18 @@ bool CliScriptRunner::enqueueValidated(const char* text, const char* key, uint8_
     slot->chan_hash = chan_hash;
   }
   return true;
+}
+
+bool CliScriptRunner::hasPending(const char* key) const {
+  for (int i = 0; i < pending_count; i++) {
+    if (strcmp(pending[i].key, key) == 0) return true;
+  }
+  return false;
+}
+
+void CliScriptRunner::abortPending() {
+  memset(pending, 0, sizeof(pending));
+  pending_count = 0;
 }
 
 bool CliScriptRunner::markKeySeen(const char* key) {

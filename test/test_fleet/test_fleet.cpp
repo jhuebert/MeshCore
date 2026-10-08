@@ -770,6 +770,27 @@ static GroupTextPayload makeGroupText(const char* sender, const char* text) {
   return p;
 }
 
+// The packet the core hands onGroupDataRecv(): the payload is the channel hash
+// followed by the bytes (the native crypto mocks cannot MAC, so the plaintext
+// stands in for ciphertext; the hook only sees it through the packet hash).
+static mesh::Packet makeGroupPacket(uint8_t type, uint8_t hash, const GroupTextPayload& p) {
+  mesh::Packet pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.header = type << PH_TYPE_SHIFT;
+  size_t n = p.len < MAX_PACKET_PAYLOAD - 1 ? p.len : MAX_PACKET_PAYLOAD - 1;
+  pkt.payload[0] = hash;
+  memcpy(&pkt.payload[1], p.data, n);
+  pkt.payload_len = (uint16_t)(1 + n);
+  return pkt;
+}
+
+// deliver a decrypted group message to the hook the way MyMesh does
+static void groupRecv(FleetManager& f, uint8_t type, const mesh::GroupChannel& c,
+                      const GroupTextPayload& p) {
+  mesh::Packet pkt = makeGroupPacket(type, c.hash[0], p);
+  f.onGroupData(&pkt, type, c, p.data, p.len);
+}
+
 // what the send callback saw
 struct SentReply {
   uint8_t secret[PUB_KEY_SIZE];
@@ -825,7 +846,7 @@ struct FleetHooksTest : public ::testing::Test {
 
   void deliver(const char* text) {
     GroupTextPayload p = makeGroupText("alice", text);
-    fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+    groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, chan, p);
   }
   // one runScripts pass, mirroring MyMesh::loop()
   bool pass() { fleet.runScripts(ExecRecorder::fn, &env.rec); return env.rec.lines.size() > 0; }
@@ -850,16 +871,16 @@ TEST_F(FleetHooksTest, OtherChannelAndNonTxtIgnored) {
   mesh::GroupChannel other = chan;
   other.secret[0] ^= 0xFF;
   GroupTextPayload p = makeGroupText("alice", "!id k1\nset a");
-  fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, other, p.data, p.len);
+  groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, other, p);
   EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
-  fleet.onGroupData(PAYLOAD_TYPE_GRP_DATA, chan, p.data, p.len);
+  groupRecv(fleet, PAYLOAD_TYPE_GRP_DATA, chan, p);
   EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
 }
 
 TEST_F(FleetHooksTest, ChatIsNotAScript) {
   deliver("hello from alice");
   EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
-  EXPECT_EQ(fleet.getScripts().getNoId(), (uint32_t)0);   // parse is pure: no counter
+  EXPECT_EQ(fleet.getScripts().getNoId(), (uint32_t)1);   // counted, never queued
   EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
 }
 
@@ -898,7 +919,7 @@ TEST_F(FleetHooksTest, ExecutionIsDeferredOutOfTheReceivePath) {
 TEST_F(FleetHooksTest, ReplyNeverRuns) {
   // a reply is group text on the fleet channel: it must never parse as a script
   GroupTextPayload p = makeGroupText("xiao", "k1 ran 2 ok");   // sender + key prefix, no '!'
-  fleet.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, chan, p);
   EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
 }
 
@@ -1079,33 +1100,57 @@ TEST_F(FleetHooksTest, ScheduledAndRepliesAreRamOnly) {
   EXPECT_FALSE(loaded.getScripts().keySeen("k1"));   // seen ring fresh too
 }
 
-TEST_F(FleetHooksTest, CheckForwardExemptsOnlyFleetChannelGroupPackets) {
-  auto makePkt = [&](uint8_t type, uint8_t first_payload_byte) {
-    mesh::Packet p;
-    memset(&p, 0, sizeof(p));
-    p.header = (type << PH_TYPE_SHIFT) | ROUTE_TYPE_FLOOD;
-    p.payload[0] = first_payload_byte;
-    p.payload_len = 20;
-    return p;
-  };
-  // fleet-channel group traffic (GRP_TXT and GRP_DATA): exempt from the gate
-  mesh::Packet txt = makePkt(PAYLOAD_TYPE_GRP_TXT, chan.hash[0]);
-  mesh::Packet data = makePkt(PAYLOAD_TYPE_GRP_DATA, chan.hash[0]);
-  mesh::Packet other_chan = makePkt(PAYLOAD_TYPE_GRP_TXT, chan.hash[0] ^ 0xFF);
-  mesh::Packet advert = makePkt(PAYLOAD_TYPE_ADVERT, chan.hash[0]);
-  mesh::Packet txtmsg = makePkt(PAYLOAD_TYPE_TXT_MSG, chan.hash[0]);
+TEST_F(FleetHooksTest, CheckForwardExemptsOnlyTheVerifiedFleetPacket) {
+  GroupTextPayload p = makeGroupText("bob", "!id f1\nset a");
+  // the core delivers a fleet-channel packet only after its MAC verified, and
+  // that packet is the one the battery gate must not see
+  mesh::Packet txt = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, chan.hash[0], p);
+  fleet.onGroupData(&txt, PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
   EXPECT_FALSE(fleet.checkForward(&txt));
+  // the same content relayed with a longer path is still the same packet
+  mesh::Packet relayed = txt;
+  relayed.path_len = 3;
+  EXPECT_FALSE(fleet.checkForward(&relayed));
+  // GRP_DATA verified under the fleet key is exempt the same way
+  GroupTextPayload q = makeGroupText("bob", "data");
+  mesh::Packet data = makeGroupPacket(PAYLOAD_TYPE_GRP_DATA, chan.hash[0], q);
+  fleet.onGroupData(&data, PAYLOAD_TYPE_GRP_DATA, chan, q.data, q.len);
   EXPECT_FALSE(fleet.checkForward(&data));
-  // everything else defers to the gate ("true = let the battery gate decide")
-  EXPECT_TRUE(fleet.checkForward(&other_chan));
+  // any other group packet, even on the same hash byte, defers to the gate
+  GroupTextPayload r = makeGroupText("eve", "hello from another channel");
+  mesh::Packet other = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, chan.hash[0], r);
+  EXPECT_TRUE(fleet.checkForward(&other));
+  mesh::Packet other_hash = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, chan.hash[0] ^ 0xFF, p);
+  EXPECT_TRUE(fleet.checkForward(&other_hash));
+  // everything that is not group traffic defers to the gate ("true = let the
+  // battery gate decide")
+  mesh::Packet advert = makeGroupPacket(PAYLOAD_TYPE_ADVERT, chan.hash[0], p);
   EXPECT_TRUE(fleet.checkForward(&advert));
-  EXPECT_TRUE(fleet.checkForward(&txtmsg));
   // hooks idle: the gate decides for everything
   fleet.setEnabled(false);
   EXPECT_TRUE(fleet.checkForward(&txt));
   fleet.setEnabled(true);
   fleet.clearChannel();
   EXPECT_TRUE(fleet.checkForward(&txt));
+}
+
+// a colliding channel's packet is never exempt, even while a fleet packet is
+// the recorded one: its content differs, and its MAC never verified under the fleet key
+TEST_F(FleetHooksTest, ForeignChannelWithSameHashKeepsGateApplied) {
+  GroupTextPayload p = makeGroupText("bob", "!id f2\nset a");
+  mesh::Packet fleet_pkt = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, chan.hash[0], p);
+  fleet.onGroupData(&fleet_pkt, PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  ASSERT_FALSE(fleet.checkForward(&fleet_pkt));
+
+  mesh::GroupChannel other;
+  memset(&other, 0, sizeof(other));
+  memset(other.secret, 0x77, sizeof(other.secret));
+  other.hash[0] = chan.hash[0];                 // forced collision
+  GroupTextPayload o = makeGroupText("eve", "hello");
+  mesh::Packet other_pkt = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, chan.hash[0], o);
+  fleet.onGroupData(&other_pkt, PAYLOAD_TYPE_GRP_TXT, other, o.data, o.len);
+  EXPECT_TRUE(fleet.checkForward(&other_pkt));  // gate decides, not exempt
+  EXPECT_FALSE(fleet.checkForward(&fleet_pkt)); // the fleet packet still is
 }
 
 TEST_F(FleetHooksTest, AppendChannelByHash) {
@@ -1149,7 +1194,7 @@ TEST_F(FleetHooksTest, LoadPreservesDeviceServices) {
   // within the stale window is admitted and fires on the next pass; a wiped
   // clock would read as unset and refuse it
   GroupTextPayload p = makeGroupText("alice", "!id k1\n!at 1800000000\nreset");
-  loaded.onGroupData(PAYLOAD_TYPE_GRP_TXT, chan, p.data, p.len);
+  groupRecv(loaded, PAYLOAD_TYPE_GRP_TXT, chan, p);
   EXPECT_EQ(loaded.getSchedCount(), 1);   // clock survived load: job admitted
   loaded.runScripts(ExecRecorder::fn, &env.rec);
   ASSERT_EQ(env.rec.lines.size(), (size_t)1);   // dequeued by the wired clock
@@ -1168,8 +1213,20 @@ TEST_F(FleetHooksTest, StatusLine) {
   EXPECT_NE(r.find("sched 0/2"), std::string::npos);
   EXPECT_NE(r.find("seen 0/32"), std::string::npos);
   EXPECT_NE(r.find("ackq 0/2"), std::string::npos);
+  EXPECT_NE(r.find("badline 0"), std::string::npos);
   // the psk is never echoed
   EXPECT_EQ(r.find("00010203"), std::string::npos);
+}
+
+TEST_F(FleetHooksTest, StatusCountsSkippedLines) {
+  // an over-long command line is skipped at run time and shows in the status.
+  // The whole message must fit one packet (5 B header + "alice: " + text).
+  std::string script = "!id bl1\n" + std::string(FLEET_CLI_LINE_MAX + 1, 'a');
+  ASSERT_LE(script.size(), (size_t)MAX_PACKET_PAYLOAD - 12);
+  deliver(script.c_str());
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_TRUE(env.rec.lines.empty());
+  EXPECT_NE(cli(fleet, "").find("badline 1"), std::string::npos);
 }
 
 TEST_F(FleetHooksTest, OnOffReplies) {
@@ -1257,4 +1314,166 @@ TEST_F(FleetHooksTest, UsageLines) {
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
+}
+// ------------------------------------------------------- adversarial regressions
+
+TEST_F(FleetHooksTest, AtZeroEpochIsStaleNotRunNow) {
+  // !at 0000000000 parses to due_epoch 0. It must be refused as a stale,
+  // unset-clock timestamp, never run as if it had no !at at all.
+  env.clock_now = 0;   // RTC unset
+  deliver("!id z1\n!at 0000000000\nset a");
+  EXPECT_FALSE(pass());
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)1);
+}
+
+TEST_F(FleetHooksTest, ChatCountsAsNoId) {
+  deliver("just chatting");
+  EXPECT_EQ(fleet.getScripts().getNoId(), (uint32_t)1);
+}
+
+TEST_F(FleetHooksTest, MalformedScriptCountsRefused) {
+  deliver("!id bad key!\nset a");        // BAD_KEY
+  deliver("!id ok1\n!bogus\nset a");     // BAD_DIRECTIVE
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)2);
+  EXPECT_FALSE(pass());
+}
+
+TEST_F(FleetHooksTest, ForgetWhileQueuedDoesNotDoubleRun) {
+  deliver("!id d1\nset a");
+  fleet.getScripts().forgetKey("d1");
+  deliver("!id d1\nset a");              // re-send after forget
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 1);
+}
+
+TEST_F(FleetHooksTest, ForgetWhileArmedDoesNotDoubleArm) {
+  env.clock_now = 1800000000UL;
+  uint32_t due = env.clock_now + 600;
+  char text[80];
+  snprintf(text, sizeof(text), "!id a1\n!at %lu\nset a", (unsigned long)due);
+  deliver(text);
+  fleet.getScripts().forgetKey("a1");
+  deliver(text);
+  EXPECT_EQ(fleet.getSchedCount(), 1);
+}
+
+TEST_F(FleetHooksTest, FleetOffCancelsArmedJob) {
+  env.clock_now = 1800000000UL;
+  char text[80];
+  snprintf(text, sizeof(text), "!id k9\n!at %lu\nset a", (unsigned long)(env.clock_now + 60));
+  deliver(text);
+  fleet.setEnabled(false);               // kill switch
+  env.clock_now += 120;                  // due time passes
+  EXPECT_FALSE(pass());
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+}
+
+TEST_F(FleetHooksTest, FleetOffCancelsQueuedScript) {
+  deliver("!id q1\nset a");
+  fleet.setEnabled(false);               // kill switch
+  EXPECT_FALSE(pass());
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+}
+
+TEST_F(FleetHooksTest, NonPlainTxtTypeNotAScript) {
+  GroupTextPayload p = makeGroupText("alice", "!id t2\nset a");
+  p.data[4] = 2 << 2;   // TXT_TYPE_SIGNED_PLAIN in the on-air header
+  groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, chan, p);
+  EXPECT_FALSE(pass());
+}
+
+// Random-script fuzz: no crash, no overrun, and the stores stay within their caps
+// whatever mix of directives, clock values and kill switches arrives.
+TEST_F(FleetHooksTest, FuzzScriptsNeverCrash) {
+  static const char* atoms[] = {
+      "!id ", "!id k", "!tags ", "!ack", "!ack err", "!at ", "!delay ", "!delay 1",
+      "!", "\n", "\r\n", "\n\n", "#c", " ", ",", "xiao", "all", "set a", "fleet off",
+      "fleet on", "fleet forget all", "fleet seen", "0000000000", "1800000000",
+      "1800000301", "1700000000", "4294967296", "300000", "300001", "k1", "\"", "=",
+      "reboot?", "filter add chan=#x", "fleet chan clear", "fleet tag del xiao"};
+  const int natoms = sizeof(atoms) / sizeof(atoms[0]);
+  uint32_t seed = 0xC0FFEE;
+  auto rnd = [&](uint32_t m) { seed = seed * 1103515245u + 12345u; return (seed >> 8) % m; };
+  for (int iter = 0; iter < 4000; iter++) {
+    std::string s;
+    if (rnd(4) != 0) s += "!id f" + std::to_string(rnd(40)) + "\n";
+    int parts = 1 + rnd(12);
+    for (int i = 0; i < parts; i++) s += atoms[rnd(natoms)];
+    if (s.size() > 170) s.resize(170);
+    GroupTextPayload p = makeGroupText("alice", s.c_str());
+    groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, chan, p);
+    if (rnd(3) == 0) { env.clock_now += rnd(900); g_mock_millis += rnd(4000); }
+    fleet.runScripts(ExecRecorder::fn, &env.rec);
+    if (rnd(50) == 0) fleet.getScripts().forgetAll();
+    if (rnd(40) == 0) fleet.setEnabled(!fleet.isEnabled());
+    if (rnd(60) == 0) fleet.setEnabled(true);
+    if (env.rec.lines.size() > 100000) env.rec.lines.clear();
+  }
+  EXPECT_LE(fleet.getScripts().getPendingCount(), FLEET_CLI_QUEUE_DEPTH);
+  EXPECT_LE(fleet.getSchedCount(), FLEET_SCHED_STORE);
+  EXPECT_LE(fleet.getReplyCount(), FLEET_REPLY_STORE);
+}
+
+// Random fleet CLI fuzz: every reply stays inside the 160-byte buffer and is
+// NUL-terminated (the cli() helper asserts both).
+TEST_F(FleetHooksTest, FuzzFleetCliReplyBounded) {
+  static const char* atoms[] = {
+      "fleet", "on", "off", "chan", "set", "clear", "tag", "add", "del", "list",
+      "reply", "seen", "forget", "all", "0", "1", "600", "601", "-1", "x", "\"",
+      "\"a b\"", "00112233445566778899aabbccddeeff", "zz", "xiao", "a.b_c-d", "12345678901234567890123456789012345678901234567890", " ", "  "};
+  const int natoms = sizeof(atoms) / sizeof(atoms[0]);
+  uint32_t seed = 0xBEEF;
+  auto rnd = [&](uint32_t m) { seed = seed * 1103515245u + 12345u; return (seed >> 8) % m; };
+  for (int iter = 0; iter < 3000; iter++) {
+    std::string s = "fleet";
+    int parts = rnd(8);
+    for (int i = 0; i < parts; i++) { s += " "; s += atoms[rnd(natoms)]; }
+    cli(fleet, s.c_str());
+  }
+  SUCCEED();
+}
+
+TEST_F(FleetHooksTest, ChannelClearCancelsQueuedAndArmed) {
+  env.clock_now = 1800000000UL;
+  char text[80];
+  snprintf(text, sizeof(text), "!id ca1\n!at %lu\nset a", (unsigned long)(env.clock_now + 60));
+  deliver(text);
+  deliver("!id ca2\nset b");
+  ASSERT_EQ(fleet.getSchedCount(), 1);
+  ASSERT_EQ(fleet.getScripts().getPendingCount(), 1);
+  fleet.clearChannel();                  // kill switch
+  env.clock_now += 120;
+  EXPECT_FALSE(pass());
+  EXPECT_EQ(fleet.getSchedCount(), 0);
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+}
+
+// a script that switches the fleet off while it is running: the in-flight script
+// finishes, the one queued behind it is cancelled, and nothing corrupts the slot
+TEST_F(FleetHooksTest, FleetOffFromInsideRunningScriptIsSafe) {
+  struct Ctx { FleetManager* f; std::vector<std::string> lines; } ctx{&fleet, {}};
+  auto fn = [](void* c, const char*, char* line, char* reply) {
+    auto* x = (Ctx*)c;
+    x->lines.push_back(line);
+    if (strcmp(line, "fleet off") == 0) x->f->setEnabled(false);
+    reply[0] = 0;
+  };
+  deliver("!id in1\nset a\nfleet off\nset b");
+  deliver("!id in2\nset c");
+  fleet.runScripts(fn, &ctx);
+  EXPECT_EQ(ctx.lines, (std::vector<std::string>{"set a", "fleet off", "set b"}));
+  EXPECT_FALSE(fleet.isEnabled());
+  // the cancel lands on the next pass; nothing else runs
+  fleet.runScripts(fn, &ctx);
+  EXPECT_EQ(ctx.lines.size(), (size_t)3);
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+}
+
+TEST_F(FleetHooksTest, ReSendOfCancelledJobStaysConsumed) {
+  deliver("!id cx\nset a");
+  fleet.setEnabled(false);
+  EXPECT_FALSE(pass());
+  fleet.setEnabled(true);
+  deliver("!id cx\nset a");               // same key: consumed, not re-run
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+  EXPECT_EQ(fleet.getScripts().getDup(), (uint32_t)1);
 }

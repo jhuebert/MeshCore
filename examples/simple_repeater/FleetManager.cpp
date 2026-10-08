@@ -2,6 +2,7 @@
 
 #include "FleetManager.h"
 #include "CliUtil.h"
+#include <helpers/TxtDataHelpers.h>   // TXT_TYPE_PLAIN
 
 #define FLEET_CFG_FILE "/fleet_cfg"
 
@@ -20,6 +21,8 @@ void FleetManager::resetToDefaults() {
   runner.reset();
   memset(sched, 0, sizeof(sched));
   sched_count = 0;
+  cancel_pending = false;
+  auth_valid = false;
   memset(replies, 0, sizeof(replies));
   reply_count = 0;
   offered = 0;
@@ -44,6 +47,7 @@ void FleetManager::loop(FILESYSTEM* fs) {
 void FleetManager::setEnabled(bool on) {
   if (enabled == on) return;
   enabled = on;
+  if (!on) cancel_pending = true;   // kill switch: applied by runScripts()
   markDirty();
 }
 
@@ -70,6 +74,7 @@ bool FleetManager::setChannel(const char* psk_hex) {
 
 void FleetManager::clearChannel() {
   if (psk_len == 0) return;   // already unset: no dirty write for a no-op
+  cancel_pending = true;      // kill switch: applied by runScripts()
   memset(psk, 0, sizeof(psk));
   psk_len = 0;
   chan_hash = 0;
@@ -127,14 +132,23 @@ void FleetManager::setReplyWindowMs(uint32_t ms) {
 
 // ---------------------------------------------------------------- scripts
 
-void FleetManager::onGroupData(uint8_t type, const mesh::GroupChannel& channel,
+void FleetManager::onGroupData(const mesh::Packet* packet, uint8_t type,
+                               const mesh::GroupChannel& channel,
                                const uint8_t* data, size_t len) {
   if (!enabled || psk_len == 0) return;   // hooks idle: config preserved
-  if (type != PAYLOAD_TYPE_GRP_TXT) return;
   // keyed-channel identity: compare the delivered (MAC-proven) secret against
   // the stored PSK, both zero-padded — the same mechanism the filter's channel
-  // store uses
+  // store uses. The core only delivers after its MAC check, so a match here
+  // means this exact packet verified under the fleet key: checkForward() reads
+  // that back for the relay exemption.
   if (memcmp(psk, channel.secret, sizeof(psk)) != 0) return;
+  packet->calculatePacketHash(auth_hash);
+  auth_valid = true;
+
+  if (type != PAYLOAD_TYPE_GRP_TXT) return;
+  // scripts are plain group text, like the replies this channel carries; the
+  // core drops every other txt_type on its own path, so none may run here
+  if (len < 5 || (data[4] >> 2) != TXT_TYPE_PLAIN) return;
 
   // split the message body (sender prefix skipped; the fleet intake never
   // uses it — targeting is tags)
@@ -147,7 +161,9 @@ void FleetManager::onGroupData(uint8_t type, const mesh::GroupChannel& channel,
   // ordinary chat on the fleet channel is not a script: parse is pure, so
   // non-scripts move nothing but the counters below
   CliScriptMeta meta;
-  if (CliScriptRunner::parse(text, &meta) != CLI_ENQUEUE_OK) return;
+  CliEnqueue rc = CliScriptRunner::parse(text, &meta);
+  if (rc == CLI_ENQUEUE_NO_ID) { runner.noteNoId(); return; }   // ordinary chat
+  if (rc != CLI_ENQUEUE_OK) { runner.noteRefused(); return; }   // malformed: fail-safe
   offered++;
 
   // tag targeting: absent !tags = broadcast; otherwise exact set membership —
@@ -159,13 +175,23 @@ void FleetManager::onGroupData(uint8_t type, const mesh::GroupChannel& channel,
   }
   matched++;
 
-  if (meta.due_epoch != 0) {
+  // a key forgotten while its job is still armed or queued must not run twice
+  if (inFlight(meta.key)) { runner.noteDup(); return; }
+
+  if (meta.scheduled) {
     admitScheduled(text, meta, channel);
   } else {
     // mark-at-enqueue happens inside; refusals are counted there too. Nothing
     // executes in the receive path — runScripts() drains later.
     runner.enqueue(text, channel.secret, channel.hash[0]);
   }
+}
+
+bool FleetManager::inFlight(const char* key) const {
+  for (int i = 0; i < sched_count; i++) {
+    if (strcmp(sched[i].key, key) == 0) return true;
+  }
+  return runner.hasPending(key);
 }
 
 void FleetManager::admitScheduled(const char* text, const CliScriptMeta& meta,
@@ -212,6 +238,16 @@ void FleetManager::scheduleAckIfNeeded(const CliRunResult& res) {
 }
 
 void FleetManager::runScripts(CliExecFn fn, void* exec_ctx) {
+  // a kill switch raised since the last pass: nothing queued, sleeping or armed
+  // survives it. Applied here, never inside run(), so a script that switches
+  // the fleet off cannot pull the slot out from under its own execution.
+  if (cancel_pending) {
+    cancel_pending = false;
+    runner.abortPending();
+    memset(sched, 0, sizeof(sched));
+    sched_count = 0;
+  }
+
   // scheduled scripts that have come due move to the run queue; one that
   // cannot fit waits in the store for the next pass (no drops)
   if (sched_count > 0 && time_fn != NULL) {
@@ -267,13 +303,14 @@ bool FleetManager::checkForward(const mesh::Packet* packet) {
   if (!enabled || psk_len == 0) return true;
   uint8_t type = packet->getPayloadType();
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return true;
-  if (packet->payload_len < 1) return true;
   // payload[0] of a group packet IS the on-air channel hash (Mesh.cpp reads it
-  // at offset 0) and the packet is still encrypted here: a one-byte compare on
-  // the relay path. A hash-byte collision with some other channel would only
-  // ever widen relay availability by one packet that still needs a valid MAC
-  // to affect anything downstream.
-  return packet->payload[0] != chan_hash;
+  // at offset 0): a cheap pre-filter only. Colliding channels share it, so the
+  // exemption is the recorded MAC-verified packet, identified by content hash
+  // (path-independent, the same identity the core dedupes on).
+  if (!auth_valid || packet->payload_len < 1 || packet->payload[0] != chan_hash) return true;
+  uint8_t hash[MAX_HASH_SIZE];
+  packet->calculatePacketHash(hash);
+  return memcmp(hash, auth_hash, sizeof(hash)) != 0;
 }
 
 // ---------------------------------------------------------------- channels
@@ -429,6 +466,7 @@ static void fleetStatus(FleetManager& fleet, char* reply) {
   radd(&out, &remain, "; sched %d/%d", fleet.getSchedCount(), FLEET_SCHED_STORE);
   radd(&out, &remain, "; seen %d/%d", s.getSeenCount(), FLEET_CLI_SEEN_SIZE);
   radd(&out, &remain, "; ackq %d/%d", fleet.getReplyCount(), FLEET_REPLY_STORE);
+  radd(&out, &remain, "; badline %lu", (unsigned long)s.getBadLines());
 }
 
 static void fleetTagCLI(FleetManager& fleet, char* params, char* reply) {

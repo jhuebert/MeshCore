@@ -100,6 +100,13 @@ class FleetManager {
   };
   FleetSched sched[FLEET_SCHED_STORE];
   int sched_count;
+  // kill switch raised by `fleet off` and `fleet chan clear`: the next
+  // runScripts() pass cancels every queued, sleeping and armed script
+  bool cancel_pending;
+  // content hash of the packet the core last MAC-verified under the fleet key:
+  // set by onGroupData(), consumed by checkForward() for the same packet
+  uint8_t auth_hash[MAX_HASH_SIZE];
+  bool auth_valid;
 
   // pending acknowledgements (RAM-only, FLEET_REPLY_STORE entries): summary +
   // captured channel move here when a script finishes, and the reply is sent
@@ -179,15 +186,17 @@ public:
   // battery gate's early return, so scripts still arrive while forwarding is
   // suspended (§ fleet supersedes the gate). Parses the message, matches tags,
   // and queues/admits the script — nothing executes here.
-  void onGroupData(uint8_t type, const mesh::GroupChannel& channel,
+  // `packet` is the MAC-verified packet the core delivered (its content hash
+  // is the relay exemption's identity; see checkForward()).
+  void onGroupData(const mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel,
                    const uint8_t* data, size_t len);
 
   // Relay-side hook (MyMesh::allowPacketForward): returns true — meaning "let
-  // the battery gate decide", not "allow" — except for GRP_TXT/GRP_DATA
-  // packets whose first payload byte (the on-air channel hash, read while the
-  // packet is still encrypted) equals the fleet channel's hash. Those return
-  // false so the gate is never consulted: fleet traffic relays while
-  // suspended, and is never counted as a battery drop.
+  // the battery gate decide", not "allow" — except for the GRP_TXT/GRP_DATA
+  // packet onGroupData() just recorded as MAC-verified under the fleet key.
+  // That one returns false so the gate is never consulted: fleet traffic relays
+  // while suspended, and is never counted as a battery drop. The one-byte
+  // channel hash alone never exempts a packet (1 in 256 channels collide).
   bool checkForward(const mesh::Packet* packet);
 
   // Main-loop drain, called from MyMesh::loop() after mesh::Mesh::loop():
@@ -219,6 +228,8 @@ private:
   void admitScheduled(const char* text, const CliScriptMeta& meta,
                       const mesh::GroupChannel& chan);
   void scheduleAckIfNeeded(const CliRunResult& res);
+  // a script with this key is armed or queued: a re-send must not run it twice
+  bool inFlight(const char* key) const;
   void sendDueReplies();
 };
 

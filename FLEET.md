@@ -74,11 +74,12 @@ the jobs and when.
   reports the derived on-air channel hash (`OK - fleet channel set h=XX (PSK
   holder = admin)`) — never the PSK itself. The same PSK must be configured on
   every companion you drive the fleet from.
-- `fleet chan clear` disables receipt (the runner keeps its state: seen keys
-  and counters survive).
+- `fleet chan clear` disables receipt and cancels every queued, sleeping and
+  armed script (seen keys and counters survive). See [Kill switches](#kill-switches).
 - Tags (below) name this repeater for targeting. A repeater with **no tags**
   still runs broadcast scripts.
-- `fleet on` arms the hooks; `fleet off` idles them but preserves all config.
+- `fleet on` arms the hooks; `fleet off` idles them, cancels queued, sleeping
+  and armed scripts, and preserves all config.
 - Config persists in `/fleet_cfg` across reboots. Pending acknowledgements,
   armed `!at` scripts and the seen-key table are RAM-only — a reboot forgets
   them.
@@ -116,7 +117,8 @@ the tag after verification.
 
 The script is the **text of an ordinary group text message** — companions that
 auto-prepend `name: ` work unchanged, since the script is everything after the
-first `": "`.
+first `": "`. Only **plain** group text (txt_type 0) can be a script; any other
+text type on the channel is ignored.
 
 ```text
 !id <key>              # line 1, always
@@ -136,6 +138,9 @@ first `": "`.
   the block refuses the **whole** script (fail-safe, not fail-open).
 - After the block, `!`-lines are only valid as `!delay <ms>`; any other
   unknown `!` line still refuses the whole script.
+- The block ends at the first command line, so a `!delay` cannot open a script:
+  a script whose first line after the directives is `!delay` is refused. Put a
+  command first.
 - Blank lines and lines starting with `#` are skipped (the same comment
   convention FILTER.md uses).
 - A line longer than the serial CLI's own command buffer is skipped and
@@ -160,7 +165,12 @@ What this means in practice:
 - `fleet seen <key>` answers "did this job run here?" — over a normal admin
   session, one per repeater.
 - `fleet forget <key>` re-arms one key for a deliberate re-run; `fleet forget
-  all` re-arms everything.
+  all` re-arms everything. A job that is still **queued, sleeping or armed** is
+  never doubled: a re-send is refused as a duplicate until it has run or been
+  cancelled, even after a `forget`.
+- `fleet off` and `fleet chan clear` cancel queued, sleeping and armed jobs.
+  Their keys stay consumed: send the job again under a new key, or `fleet
+  forget <key>` first.
 - **After a reboot, keys are forgotten and a re-sent job runs again.** Scripts
   are therefore *re-runnable by convention*: commands that **set** state
   (`set …`, `filter add …`, `filter ratelimit …`, `battery …`) are safe to
@@ -289,7 +299,10 @@ only:
    so scripts must use `time` with an explicit epoch.
 2. **Verify**: a `!ack` query job running **`clock`** — every node replies with
    its current time (minute resolution, UTC), so you can confirm agreement
-   before trusting a scheduled job.
+   before trusting a scheduled job. Minute resolution cannot see a node that is
+   a minute or so behind: an `!at` job fires when the node's own RTC reaches the
+   timestamp, so a node running 70 s slow fires 70 s late. Sync right before you
+   schedule, and keep the cutover timestamp well clear of the verify step.
 3. **Schedule**: only then arm the `!at` job.
 
 ## Command reference
@@ -298,10 +311,10 @@ All commands begin with `fleet`.
 
 | Command | Effect |
 |---|---|
-| `fleet` | Status: `on, chan h=XX, tags 2/8; scripts ran:3 dup:1 noid:0 refused:0; pending 0/2; sched 0/2; seen 2/32; ackq 0/2` |
+| `fleet` | Status: `on, chan h=XX, tags 2/8; scripts ran:3 dup:1 noid:0 refused:0; pending 0/2; sched 0/2; seen 2/32; ackq 0/2; badline 0` |
 | `fleet on` / `fleet off` | Arm / idle the hooks (config preserved either way) |
 | `fleet chan set <psk-hex>` | Set/replace the one fleet channel (16 or 32 bytes hex) — `OK - fleet channel set h=XX (PSK holder = admin)` |
-| `fleet chan clear` | `OK - fleet channel cleared` — receipt stops, runner state kept |
+| `fleet chan clear` | `OK - fleet channel cleared` — receipt stops, queued and armed scripts are cancelled, seen keys and counters kept |
 | `fleet tag add <tag>` | `OK - tag xiao added (2/8)`; duplicates no-op `OK` |
 | `fleet tag del <tag>` | `OK - tag xiao deleted` / `Err - tag xiao not set` |
 | `fleet tag list` | `tags: xiao siteA` or `tags: (none) - broadcast scripts only` |
@@ -319,7 +332,7 @@ Counter meanings:
 | `ran` | Scripts executed since boot |
 | `dup` | Messages refused because their key was already seen (the normal "re-send" case) |
 | `noid` | Messages ignored because line 1 was not `!id …` (ordinary chat on the channel) |
-| `refused` | Scripts refused: queue full, a bad `!id` key, an unknown `!` directive, a stale/unset-clock/full-store `!at` admission, or a dropped acknowledgement |
+| `refused` | Scripts refused: queue full, a bad `!id` key, a malformed or unknown `!` directive, a stale/unset-clock/full-store `!at` admission, or a dropped acknowledgement |
 | `badline` | Command lines skipped at run time for being over-long |
 | `sched` | Armed `!at` scripts (`0/2`) |
 | `ackq` | Pending acknowledgements (`0/2`) |
@@ -504,8 +517,13 @@ cli[2026-06-12-preset2-cfg] set radio 869.650,62.5,9,5
 | `!at` job never fired | `sched` count; `clock` reply per node | Clock not synced (below the 2025 floor → refused), or the RTC is past it and it fired already; or a reboot wiped the armed job — re-send |
 | `!at` refused, `refused` up | — | Timestamp > 300 s in the past (stale), RTC unset, or the scheduled store was full |
 
-Kill switches, all existing behavior: `fleet off`, `fleet chan clear`, or
-`fleet forget <key>` for one job. `filter off` does not stop fleet; the
+### Kill switches
+
+`fleet off` and `fleet chan clear` stop the fleet at once: receipt stops, and
+every queued, sleeping and armed script is cancelled (its key stays consumed,
+see [Idempotency](#idempotency-at-most-once-per-key-per-boot)). A script that
+switches the fleet off runs its remaining lines up to its next `!delay`, and
+nothing after that. `fleet forget <key>` re-arms one job. `filter off` does not stop fleet; the
 [battery gate does not stop fleet either](#battery-supersession).
 
 ## Battery supersession
@@ -516,9 +534,9 @@ exempt for the fleet channel:
 
 - **Execution**: fleet scripts enqueue and run while forwarding is suspended.
 - **Relaying**: fleet-channel traffic relays while suspended, and is never
-  counted as a battery drop. (The exemption is decided by a one-byte channel
-  hash compare on the still-encrypted packet; the MAC still has to verify for
-  anything downstream.)
+  counted as a battery drop. (The exemption is exactly the packet the repeater
+  has just MAC-verified under the fleet key. The one-byte channel hash only
+  narrows the search, so other channels that share it stay gated.)
 - **Acknowledgements**: replies are sent regardless of gate state — the
   operator chose `!ack`, and it is the operator's call whether to spend
   battery on a response. A battery report from a *low* node is the most
