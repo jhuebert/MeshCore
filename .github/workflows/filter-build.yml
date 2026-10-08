@@ -399,7 +399,7 @@ jobs:
             echo "$OFFENDERS" >&2
             exit 1
           fi
-          echo "OK: $(echo "${SU_FILES[@]" | wc -w}) translation units, no stack frame >= ${STACK_FRAME_LIMIT} B"
+          echo "OK: $(echo "${SU_FILES[@]}" | wc -w) translation units, no stack frame >= ${STACK_FRAME_LIMIT} B"
 
       - name: Write build manifest
         # a per-target record of what was actually produced (after the stack
