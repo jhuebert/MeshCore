@@ -39,9 +39,12 @@ jobs:
   sync:
     name: Sync upstream and filter branches
     runs-on: ubuntu-latest
+    # dev is built when the integration branch moved; stable only when it was
+    # promoted (building the channel that did not move would re-tag a release
+    # for no reason) — outputs map straight from the steps that did the work
     outputs:
-      dev_changed: ${{ steps.gate.outputs.dev_changed }}
-      stable_changed: ${{ steps.gate.outputs.stable_changed }}
+      dev_changed: ${{ steps.merge.outputs.merged }}
+      stable_changed: ${{ steps.stable.outputs.pushed }}
     steps:
 
       - name: Clone Repo
@@ -50,67 +53,82 @@ jobs:
           fetch-depth: 0
 
       - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            for (const [key, value] of [
+              ['user.name', 'github-actions[bot]'],
+              ['user.email', '41898282+github-actions[bot]@users.noreply.github.com'],
+            ]) {
+              const r = spawnSync('git', ['config', key, value], { encoding: 'utf8' });
+              if (r.status !== 0) throw new Error(`git config ${key} failed: ${(r.stderr || '').trim()}`);
+            }
 
-      - name: Fast-forward fork dev to upstream dev
-        id: sync-dev
-        run: |
-          git remote add upstream https://github.com/meshcore-dev/MeshCore.git
-          git fetch upstream dev
-          git checkout -B dev origin/dev
-          if ! git merge --ff-only upstream/dev; then
-            echo "fork/dev has diverged from upstream/dev; refusing to force-push." >&2
-            exit 1
-          fi
-          git push origin dev
-
-      - name: Fast-forward fork main to upstream main
-        id: sync-main
-        run: |
-          git fetch upstream main
-          git checkout -B main origin/main
-          if ! git merge --ff-only upstream/main; then
-            echo "fork/main has diverged from upstream/main; refusing to force-push." >&2
-            exit 1
-          fi
-          git push origin main
+      - name: Fast-forward fork dev and main to upstream
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const git = (...args) => spawnSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+            const run = (...args) => {
+              const r = git(...args);
+              if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${(r.stdout || '').trim()}`);
+            };
+            run('remote', 'add', 'upstream', 'https://github.com/meshcore-dev/MeshCore.git');
+            for (const branch of ['dev', 'main']) {
+              run('fetch', 'upstream', branch);
+              run('checkout', '-B', branch, `origin/${branch}`);
+              const merge = git('merge', '--ff-only', `upstream/${branch}`);
+              if (merge.status !== 0) {
+                core.setFailed(`fork/${branch} has diverged from upstream/${branch}; refusing to force-push.`);
+                return;
+              }
+              run('push', 'origin', branch);
+            }
 
       - name: Merge fork dev into repeater-filter
         id: merge
-        run: |
-          git checkout repeater-filter
-          # --no-commit so the fork-owned README can be restored before the
-          # merge commit is created
-          # `|| true` here would hide a git error that is not a conflict (a
-          # failed checkout, a bad object); only a real conflict is tolerated,
-          # and it is reported below.
-          MERGE_RC=0
-          git merge origin/dev --no-commit --no-ff || MERGE_RC=$?
-          # README.md is fork-owned: force it back to this branch's version no
-          # matter what the merge did (clean take of upstream changes or conflict)
-          git checkout HEAD -- README.md
-          if [ "$MERGE_RC" != 0 ] && [ ! -f .git/MERGE_HEAD ]; then
-            echo "git merge failed with status $MERGE_RC and left no merge in progress;" >&2
-            echo "that is a git error, not an already-up-to-date merge" >&2
-            exit 1
-          fi
-          if [ ! -f .git/MERGE_HEAD ]; then
-            echo "Already up to date with dev"
-            echo "merged=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-            git diff --name-only --diff-filter=U > conflicted-files.txt
-            git merge --abort
-            echo "merged=false" >> $GITHUB_OUTPUT
-            echo "conflict=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          git commit --no-edit
-          git push origin repeater-filter
-          echo "merged=true" >> $GITHUB_OUTPUT
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const fs = require('fs');
+            const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
+            const run = (...args) => {
+              const r = git(...args);
+              if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
+            };
+            run('checkout', 'repeater-filter');
+            // --no-commit so the fork-owned README can be restored before the
+            // merge commit is created
+            // the status is inspected, not just thrown: only a real conflict is
+            // tolerated, any other git failure is reported below
+            const merge = git('merge', 'origin/dev', '--no-commit', '--no-ff');
+            if (merge.error) throw merge.error;
+            // README.md is fork-owned: force it back to this branch's version no
+            // matter what the merge did (clean take of upstream changes or conflict)
+            run('checkout', 'HEAD', '--', 'README.md');
+            if (merge.status !== 0 && !fs.existsSync('.git/MERGE_HEAD')) {
+              core.setFailed(`git merge failed with status ${merge.status} and left no merge in progress; that is a git error, not an already-up-to-date merge`);
+              return;
+            }
+            if (!fs.existsSync('.git/MERGE_HEAD')) {
+              core.info('Already up to date with dev');
+              core.setOutput('merged', 'false');
+              return;
+            }
+            const unmerged = git('diff', '--name-only', '--diff-filter=U').stdout.trim();
+            if (unmerged) {
+              fs.writeFileSync('conflicted-files.txt', unmerged + '\n');
+              run('merge', '--abort');
+              core.setOutput('merged', 'false');
+              core.setOutput('conflict', 'true');
+              return;
+            }
+            run('commit', '--no-edit');
+            run('push', 'origin', 'repeater-filter');
+            core.setOutput('merged', 'true');
 
       - name: Open merge-conflict issue
         if: steps.merge.outputs.conflict == 'true'
@@ -149,6 +167,9 @@ jobs:
                 body,
               });
             }
+            // a conflict is a failure like any other, not a warning; the issue
+            // step is also where the merge step leaves the job failing
+            core.setFailed('Upstream merge conflict in repeater-filter; resolve locally, push the merge, then close this issue.');
 
       - name: Setup Build Environment
         # the promotion gate runs the native suites, and this runner has no
@@ -162,102 +183,128 @@ jobs:
         # publishing a feature series as "the stable release" users install, so
         # it is a deliberate act: dispatch this workflow with promote_stable.
         if: inputs.promote_stable == true
+        uses: actions/github-script@v8
         env:
           STABLE_SOURCE: ${{ inputs.stable_source }}
           SKIP_GATE: ${{ inputs.stable_skip_gate }}
-        run: |
-          set -euo pipefail
-          SOURCE="${STABLE_SOURCE:-repeater-filter}"
-          if ! SOURCE_SHA=$(git rev-parse --verify "refs/remotes/origin/$SOURCE"); then
-            echo "No such branch to promote from: $SOURCE" >&2
-            exit 1
-          fi
-          # git cherry and `git checkout <rev> -- README.md` both work from the
-          # verified revision directly. Resolving it to a SHA is what keeps a
-          # source branch that exists only as origin/<name> from failing the
-          # cherry: the branch may well be the one checked out here, and a
-          # `git branch --force` for it would be refused.
-          STABLE_BEFORE=$(git rev-parse refs/remotes/origin/repeater-filter-stable)
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
+            const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
+            const run = (...args) => {
+              const r = git(...args);
+              if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
+              return r.stdout;
+            };
 
-          # Everything happens on a scratch branch. The real stable branch is
-          # touched exactly once, at the end, and only if the whole series
-          # applied AND the gate passed. A half-applied series is never published.
-          STAGE="promote-$(git rev-parse --short HEAD)"
-          git checkout -B "$STAGE" "$STABLE_BEFORE"
+            const source = process.env.STABLE_SOURCE || 'repeater-filter';
+            const resolved = git('rev-parse', '--verify', `refs/remotes/origin/${source}`);
+            if (resolved.status !== 0) {
+              core.setFailed(`No such branch to promote from: ${source}`);
+              return;
+            }
+            const sourceSha = resolved.stdout.trim();
+            // git cherry and `git checkout <rev> -- README.md` both work from the
+            // verified revision directly. Resolving it to a SHA is what keeps a
+            // source branch that exists only as origin/<name> from failing the
+            // cherry: the branch may well be the one checked out here, and a
+            // `git branch --force` for it would be refused.
+            const stableBefore = run('rev-parse', 'refs/remotes/origin/repeater-filter-stable').trim();
 
-          # carry the upstream release branch. README.md is fork-owned and is
-          # restored BEFORE the merge commit is created, so upstream's README
-          # never lands in an intermediate commit just to be overwritten later.
-          if ! git merge origin/main --no-commit --no-ff; then
-            git diff --name-only --diff-filter=U > stable-conflicted-files.txt || true
-            git checkout "$SOURCE_SHA" -- README.md
-            if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-              git merge --abort || true
-              echo "conflict=true" >> $GITHUB_OUTPUT
-              echo "Upstream main did not merge into stable; stable is unchanged" >&2
-              exit 1
-            fi
-          fi
-          git checkout "$SOURCE_SHA" -- README.md
-          if [ -f .git/MERGE_HEAD ]; then
-            git commit --no-edit
-          fi
+            // Everything happens on a scratch branch. The real stable branch is
+            // touched exactly once, at the end, and only if the whole series
+            // applied AND the gate passed. A half-applied series is never published.
+            const stage = `promote-${run('rev-parse', '--short', 'HEAD').trim()}`;
+            run('checkout', '-B', stage, stableBefore);
 
-          # cherry-pick the filter commits not yet on stable (git cherry matches
-          # by patch-id, so already-picked commits are skipped); oldest first.
-          # git cherry is called on its own so a failure of it aborts the step
-          # under `set -e`: with the whole pipeline guarded, a git error and a
-          # genuine "nothing to pick" are indistinguishable, and the second would
-          # publish a promotion that silently contained none of its commits.
-          CHERRY=$(git cherry HEAD "$SOURCE_SHA" origin/dev)
-          PICKS=$(printf '%s\n' "$CHERRY" | grep '^+' | cut -d' ' -f2 || true)
-          PICK_COUNT=0
-          for c in $PICKS; do
-            # skip fork-owned-README-only commits; the README is synced below
-            if [ -z "$(git show --pretty=format: --name-only "$c" | grep -v '^README.md$')" ]; then
-              continue
-            fi
-            if ! git cherry-pick "$c"; then
-              git diff --name-only --diff-filter=U > stable-conflicted-files.txt || true
-              git cherry-pick --abort
-              echo "conflict=true" >> $GITHUB_OUTPUT
-              # A stable conflict is a failure, not a warning. The previous
-              # stable is still intact on the remote; nothing was pushed.
-              echo "Cherry-pick of $c conflicted; stable is unchanged. Resolve and re-run." >&2
-              exit 1
-            fi
-            PICK_COUNT=$((PICK_COUNT + 1))
-          done
+            // carry the upstream release branch. README.md is fork-owned and is
+            // restored BEFORE the merge commit is created, so upstream's README
+            // never lands in an intermediate commit just to be overwritten later.
+            const mainMerge = git('merge', 'origin/main', '--no-commit', '--no-ff');
+            if (mainMerge.status !== 0) {
+              fs.writeFileSync('stable-conflicted-files.txt',
+                git('diff', '--name-only', '--diff-filter=U').stdout);
+              run('checkout', sourceSha, '--', 'README.md');
+              if (git('diff', '--name-only', '--diff-filter=U').stdout.trim()) {
+                run('merge', '--abort');
+                core.setOutput('conflict', 'true');
+                // A stable conflict is a failure, not a warning. The previous
+                // stable is still intact on the remote; nothing was pushed.
+                // The failure is raised by the issue step below.
+                return;
+              }
+            }
+            run('checkout', sourceSha, '--', 'README.md');
+            if (fs.existsSync('.git/MERGE_HEAD')) run('commit', '--no-edit');
 
-          # keep the fork-owned README in step with the source branch
-          git checkout "$SOURCE_SHA" -- README.md
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "docs: sync fork README"
-          fi
-          echo "picked=$PICK_COUNT" >> $GITHUB_OUTPUT
+            // cherry-pick the filter commits not yet on stable (git cherry matches
+            // by patch-id, so already-picked commits are skipped); oldest first.
+            // git cherry is called through run(): a git error must never be
+            // mistaken for a genuine "nothing to pick", which would publish a
+            // promotion silently containing none of its commits.
+            const toPick = run('cherry', 'HEAD', sourceSha, 'origin/dev')
+              .split('\n')
+              .filter((line) => line.startsWith('+'))
+              .map((line) => line.split(/\s+/)[1])
+              .filter(Boolean);
+            let pickCount = 0;
+            for (const pick of toPick) {
+              // skip fork-owned-README-only commits; the README is synced below
+              const touched = run('show', '--pretty=format:', '--name-only', pick)
+                .split('\n').filter((line) => line.trim() && line !== 'README.md');
+              if (touched.length === 0) continue;
+              const pickResult = git('cherry-pick', pick);
+              if (pickResult.status !== 0) {
+                fs.writeFileSync('stable-conflicted-files.txt',
+                  git('diff', '--name-only', '--diff-filter=U').stdout);
+                run('cherry-pick', '--abort');
+                core.setOutput('conflict', 'true');
+                // A stable conflict is a failure, not a warning. The previous
+                // stable is still intact on the remote; nothing was pushed.
+                // The failure is raised by the issue step below.
+                return;
+              }
+              pickCount += 1;
+            }
 
-          # ---- quality gate: never publish something that does not pass ----
-          if [ "$SKIP_GATE" != true ]; then
-            if [ -z "${PIO:-}" ] && ! command -v pio >/dev/null 2>&1; then
-              echo "pio is not available; cannot run the gate (or set stable_skip_gate)" >&2
-              exit 1
-            fi
-            pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate
-          else
-            echo "stable_skip_gate set: publishing without the native test gate" >&2
-          fi
+            // keep the fork-owned README in step with the source branch
+            run('checkout', sourceSha, '--', 'README.md');
+            run('add', '-A');
+            if (git('diff', '--cached', '--quiet').status !== 0) {
+              run('commit', '-m', 'docs: sync fork README');
+            }
+            core.setOutput('picked', String(pickCount));
 
-          # ---- publish: once, and never force ----
-          # An ordinary non-fast-forward rejection is the correct outcome if
-          # something else moved stable while this ran.
-          git checkout -B repeater-filter-stable
-          git reset --hard "$STAGE"
-          git push origin repeater-filter-stable
-          STABLE_AFTER=$(git ls-remote origin refs/heads/repeater-filter-stable | cut -f1)
-          if [ "$STABLE_BEFORE" != "$STABLE_AFTER" ]; then
-            echo "pushed=true" >> $GITHUB_OUTPUT
-          fi
+            // ---- quality gate: never publish something that does not pass ----
+            if (process.env.SKIP_GATE !== 'true') {
+              const onPath = (cmd) => (process.env.PATH || '').split(':')
+                .some((dir) => fs.existsSync(path.join(dir, cmd)));
+              if (!process.env.PIO && !onPath('pio')) {
+                core.setFailed('pio is not available; cannot run the gate (or set stable_skip_gate)');
+                return;
+              }
+              const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
+                '-e', 'native_packet_filter', '-e', 'native_battery_gate'], { stdio: 'inherit' });
+              if (gate.status !== 0) {
+                core.setFailed('native test gate failed; stable is unchanged');
+                return;
+              }
+            } else {
+              core.warning('stable_skip_gate set: publishing without the native test gate');
+            }
+
+            // ---- publish: once, and never force ----
+            // An ordinary non-fast-forward rejection is the correct outcome if
+            // something else moved stable while this ran: run() throws on it and
+            // the previous stable stays as it is on the remote.
+            run('checkout', '-B', 'repeater-filter-stable');
+            run('reset', '--hard', stage);
+            run('push', 'origin', 'repeater-filter-stable');
+            const stableAfter = run('ls-remote', 'origin', 'refs/heads/repeater-filter-stable')
+              .trim().split('\t')[0];
+            core.setOutput('pushed', stableBefore !== stableAfter ? 'true' : 'false');
 
       - name: Open stable-sync conflict issue
         if: steps.stable.outputs.conflict == 'true'
@@ -296,32 +343,9 @@ jobs:
                 body,
               });
             }
-
-      - name: Set build gate
-        id: gate
-        if: always()
-        env:
-          MERGED: ${{ steps.merge.outputs.merged }}
-          STABLE_PUSHED: ${{ steps.stable.outputs.pushed }}
-        run: |
-          # dev is built when the integration branch moved; stable only when it
-          # was promoted. Building the channel that did not move would re-tag a
-          # release for no reason.
-          DEV=false
-          STABLE=false
-          if [ "$MERGED" = "true" ]; then DEV=true; fi
-          if [ "$STABLE_PUSHED" = "true" ]; then STABLE=true; fi
-          echo "dev_changed=$DEV" >> $GITHUB_OUTPUT
-          echo "stable_changed=$STABLE" >> $GITHUB_OUTPUT
-
-      - name: Fail on merge conflict
-        if: steps.merge.outputs.conflict == 'true'
-        run: exit 1
-
-      - name: Fail on stable promotion conflict
-        # a stable conflict is a failure like any other, not a warning
-        if: steps.stable.outputs.conflict == 'true'
-        run: exit 1
+            // a conflict is a failure like any other, not a warning: the stable
+            // step reports it via its output, this step raises the failure
+            core.setFailed('Upstream sync conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.');
 
   build-dev:
     name: Build firmware (dev)
@@ -336,10 +360,10 @@ jobs:
   build-stable:
     name: Build firmware (stable)
     needs: sync
-    # stable is built only when it was deliberately promoted
+    # stable is built only when it was deliberately promoted; it never needs
+    # force_build because the promotion step is the only way it gets triggered
     if: needs.sync.outputs.stable_changed == 'true'
     uses: ./.github/workflows/filter-build.yml
     with:
       channel: stable
       branch: repeater-filter-stable
-      force_build: ${{ inputs.force_build == true }}
