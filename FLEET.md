@@ -197,7 +197,8 @@ message.
 - No `!ack` — no reply.
 
 Reply content, always prefixed with the job key so replies are correlatable
-when several jobs are in flight:
+when several jobs are in flight. On air the body is `<key>`, then a newline,
+then the response — companions show the id and the response on separate lines:
 
 - Single-command script → the command's **actual reply** (e.g.
   `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), truncated to fit one packet.
@@ -214,7 +215,9 @@ Protocol guarantees, by construction:
    marker. Keep future reply formats key-prefixed for the same reason.
 3. Flood is the only reply route — group texts carry no pubkey, so a repeater
    cannot direct-reply to "alice" (sender-controlled text, not an identity).
-   Every reply floods and is relayed by the fleet.
+   Every reply floods and is relayed by the fleet, using the repeater's
+   configured path-hash size and its default region scope when one is set
+   (unscoped otherwise).
 
 **Storm control:** the reply is scheduled at a uniform-random instant in a
 jitter window (default 60 s, node-tunable via `fleet reply <secs>`, 1–600 s)

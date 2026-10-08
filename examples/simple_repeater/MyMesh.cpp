@@ -1023,7 +1023,10 @@ static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   snprintf((char*)&msg[5], sizeof(msg) - 5, "%s: %s", m->getNodeName(), body);
   mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg,
                                              5 + strlen((char*)&msg[5]));
-  if (pkt) m->sendFlood(pkt);   // flood is the only reply route: group texts carry no pubkey
+  // flood is the only reply route (group texts carry no pubkey); the hook
+  // method applies the repeater's configured path-hash size and its default
+  // flood scope when set (unscoped otherwise)
+  if (pkt) m->sendFleetReply(pkt);
 }
 
 void MyMesh::begin(FILESYSTEM *fs) {

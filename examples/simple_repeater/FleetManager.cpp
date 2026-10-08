@@ -282,8 +282,8 @@ void FleetManager::sendDueReplies() {
     // the subtraction only wraps when millis() itself does
     if ((int32_t)(millis() - replies[i].deadline_ms) < 0) { i++; continue; }
     if (send_fn != NULL) {
-      char body[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key> <summary>"
-      snprintf(body, sizeof(body), "%s %s", replies[i].key, replies[i].summary);
+      char body[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key>\n<summary>"
+      snprintf(body, sizeof(body), "%s\n%s", replies[i].key, replies[i].summary);
       // the captured channel goes back out as-is; if the send cannot happen
       // (packet pool empty), the reply is skipped silently
       send_fn(send_ctx, replies[i].chan_secret, replies[i].chan_hash, body);
