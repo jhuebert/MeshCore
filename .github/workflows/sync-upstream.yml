@@ -282,7 +282,7 @@ jobs:
           closing: 'Resolve the conflicts locally, push the branch, then close this issue.'
           failure-message: 'Upstream sync conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.'
 
-  build-dev:
+  release-dev:
     name: Create release (dev)
     needs: sync
     if: needs.sync.outputs.dev_changed == 'true' || inputs.force_build == true
@@ -292,7 +292,7 @@ jobs:
       branch: repeater-filter
       force_build: ${{ inputs.force_build == true }}
 
-  build-stable:
+  release-stable:
     name: Create release (stable)
     needs: sync
     # stable is released only when it was deliberately promoted; it never needs
