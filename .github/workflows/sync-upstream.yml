@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: Build firmware even if upstream is unchanged
+        description: Create the release even if upstream is unchanged
         required: false
         type: boolean
         default: false
@@ -39,9 +39,11 @@ jobs:
   sync:
     name: Sync upstream and filter branches
     runs-on: ubuntu-latest
-    # dev is built when the integration branch moved; stable only when it was
-    # promoted (building the channel that did not move would re-tag a release
-    # for no reason) — outputs map straight from the steps that did the work
+    # dev gets a release when the integration branch moved; stable only when it
+    # was promoted (re-releasing the channel that did not move would re-tag a
+    # release for no reason) — outputs map straight from the steps that did the
+    # work. Firmware itself is built and uploaded locally
+    # (scripts/local-release-build.sh); CI only cuts the tag and release.
     outputs:
       dev_changed: ${{ steps.merge.outputs.merged }}
       stable_changed: ${{ steps.stable.outputs.pushed }}
@@ -280,7 +282,7 @@ jobs:
           failure-message: 'Upstream sync conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.'
 
   build-dev:
-    name: Build firmware (dev)
+    name: Create release (dev)
     needs: sync
     if: needs.sync.outputs.dev_changed == 'true' || inputs.force_build == true
     uses: ./.github/workflows/filter-build.yml
@@ -290,9 +292,9 @@ jobs:
       force_build: ${{ inputs.force_build == true }}
 
   build-stable:
-    name: Build firmware (stable)
+    name: Create release (stable)
     needs: sync
-    # stable is built only when it was deliberately promoted; it never needs
+    # stable is released only when it was deliberately promoted; it never needs
     # force_build because the promotion step is the only way it gets triggered
     if: needs.sync.outputs.stable_changed == 'true'
     uses: ./.github/workflows/filter-build.yml

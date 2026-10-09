@@ -1,4 +1,4 @@
-name: Filter Firmware Build
+name: Filter Release
 
 on:
   workflow_call:
@@ -8,23 +8,18 @@ on:
         required: false
         type: string
         default: dev
-      targets:
-        description: Comma- or newline-separated build targets (defaults to every repeater target this branch defines)
-        required: false
-        type: string
-        default: ""
       branch:
-        description: Branch to build (defaults to the channel's branch)
+        description: Branch to release (defaults to the channel's branch)
         required: false
         type: string
         default: ""
       create_release:
-        description: Attach the built firmware to a release
+        description: Create the release
         required: false
         type: boolean
         default: true
       force_build:
-        description: Build even if nothing changed since the last release of this channel
+        description: Create the release even if nothing changed since the last one of this channel
         required: false
         type: boolean
         default: false
@@ -38,23 +33,18 @@ on:
         options:
           - dev
           - stable
-      targets:
-        description: Comma- or newline-separated build targets (defaults to every repeater target this branch defines)
-        required: false
-        type: string
-        default: ""
       branch:
-        description: Branch to build (defaults to the channel's branch)
+        description: Branch to release (defaults to the channel's branch)
         required: false
         type: string
         default: ""
       create_release:
-        description: Attach the built firmware to a release
+        description: Create the release
         required: false
         type: boolean
         default: true
       force_build:
-        description: Build even if nothing changed since the last release of this channel
+        description: Create the release even if nothing changed since the last one of this channel
         required: false
         type: boolean
         default: true
@@ -235,186 +225,15 @@ jobs:
             // the exact revision everything below was derived from and built at
             core.setOutput('source_sha', git('rev-parse', 'HEAD').trim());
 
-  validate-targets:
-    name: Validate build targets
-    needs: version
-    if: needs.version.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      targets: ${{ steps.validate.outputs.targets }}
-    steps:
-
-      - name: Clone Repo
-        uses: actions/checkout@v6
-        with:
-          # the revision the release names, not the branch tip: the target list
-          # must describe the same tree the firmware is built from
-          ref: ${{ needs.version.outputs.source_sha }}
-
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-build-environment
-
-      - name: Validate Build Targets
-        id: validate
-        uses: actions/github-script@v8
-        env:
-          TARGETS_INPUT: ${{ inputs.targets }}
-        with:
-          script: |
-            const { execFileSync } = require('child_process');
-
-            // known targets come from platformio.ini via build.sh
-            // build.sh uses bash arrays; /bin/sh is not a contract
-            const known = execFileSync('bash', ['build.sh', 'list'], { encoding: 'utf8' })
-              .split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-
-            // explicit input wins (via env: an input containing a quote must
-            // stay data); otherwise every repeater firmware this branch defines
-            const input = (process.env.TARGETS_INPUT || '').trim();
-            const selected = new Set();
-            if (input) {
-              for (const target of input.split(/[\s,]+/).filter(Boolean)) {
-                if (known.includes(target)) {
-                  selected.add(target);
-                } else {
-                  // warn and skip unknown names instead of failing: a target can
-                  // be valid on the dev branch but not yet on stable's upstream base
-                  core.warning(`unknown build target '${target}' - skipped (not in this branch's platformio.ini)`);
-                }
-              }
-            } else {
-              for (const target of known) {
-                if (/repeater/i.test(target)) selected.add(target);
-              }
-            }
-            if (selected.size === 0) {
-              core.setFailed("No known build targets: pass the 'targets' input, or this branch defines no repeater firmware");
-              return;
-            }
-
-            core.setOutput('targets', JSON.stringify([...selected]));
-
-  build:
-    name: Build ${{ matrix.target }}
-    needs: [version, validate-targets]
-    if: needs.version.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    # Dev publishes what built; a board that failed is visible as a red matrix
-    # job in the run. Stable does NOT skip failures: a stable release is
-    # what users install, so any requested board failing must block it.
-    continue-on-error: ${{ inputs.channel != 'stable' }}
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.validate-targets.outputs.targets) }}
-      fail-fast: false
-    steps:
-
-      - name: Clone Repo
-        uses: actions/checkout@v6
-        with:
-          # pinned, like the target list: if the branch moved after version
-          # selection, the release body and the tag would all name
-          # a revision this job never built
-          ref: ${{ needs.version.outputs.source_sha }}
-
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-build-environment
-
-      - name: Build Firmware
-        uses: actions/github-script@v8
-        env:
-          FIRMWARE_VERSION: ${{ needs.version.outputs.firmware_version }}
-          TARGET: ${{ matrix.target }}
-          # metadata-only (emits .su files next to the objects; codegen is
-          # unchanged) — consumed by the stack usage check below
-          PLATFORMIO_BUILD_FLAGS: -fstack-usage
-        with:
-          script: |
-            const { spawnSync } = require('child_process');
-            const target = process.env.TARGET;
-            const r = spawnSync('bash', ['build.sh', 'build-firmware', target], { stdio: 'inherit' });
-            if (r.error) throw r.error;
-            if (r.status !== 0) throw new Error(`build.sh build-firmware ${target} exited with status ${r.status}`);
-
-      - name: Stack usage check
-        # One big stack scratch array in boot- or loop-path code brick-reboots
-        # every repeater flashed with the release (2026-10: an 8.5 KB scratch
-        # in FilterRules::load overflowed the 4 KB nRF52 / 8 KB ESP32 loop
-        # task stacks at boot). The compiler's own accounting catches that
-        # class on every target we publish; the binary is unaffected.
-        uses: actions/github-script@v8
-        env:
-          TARGET: ${{ matrix.target }}
-          STACK_FRAME_LIMIT: 2048
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const limit = parseInt(process.env.STACK_FRAME_LIMIT, 10);
-            const suDir = path.join('.pio', 'build', process.env.TARGET);
-
-            // repo code only: src/ and examples/. Vendored crypto (lib/ed25519) and
-            // libdeps libraries carry frames above the limit that ship today and are
-            // not what this repo edits; gating them would train everyone to ignore
-            // the check. The frames this repo owns are the ones it can break.
-            const suFiles = [];
-            const walk = (dir) => {
-              if (!fs.existsSync(dir)) return;
-              for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-                const p = path.join(dir, ent.name);
-                if (ent.isDirectory()) walk(p);
-                else if (p.endsWith('.su')) suFiles.push(p);
-              }
-            };
-            walk(path.join(suDir, 'src'));
-            walk(path.join(suDir, 'examples'));
-
-            if (suFiles.length === 0) {
-              core.setFailed(`ERROR: no .su files under ${suDir} — the build did not run with -fstack-usage, check is blind`);
-              return;
-            }
-            // .su lines are "file:line:col:function\tbytes\ttype"
-            const offenders = [];
-            for (const f of suFiles) {
-              for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
-                if (!line.trim()) continue;
-                const [loc, size] = line.split('\t');
-                if (parseInt(size, 10) >= limit) offenders.push(`${size} B  ${loc}`);
-              }
-            }
-            if (offenders.length > 0) {
-              core.setFailed(`ERROR: stack frames >= ${limit} B (loop task is 4 KB on nRF52, 8 KB on ESP32):\n${offenders.join('\n')}`);
-              return;
-            }
-            core.info(`OK: ${suFiles.length} translation units, no stack frame >= ${limit} B`);
-
-      - name: Upload Workflow Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          # channel prefix keeps the two concurrently-built channels' artifacts
-          # from colliding in the shared artifact store
-          name: "firmware-${{ inputs.channel }}-${{ matrix.target }}"
-          path: out
-          if-no-files-found: error
-
   release:
     name: Create Release
-    # validate-targets rides in through build's own needs; a skipped build
-    # (nothing to release) skips this job the same way
-    needs: [version, build]
+    needs: [version]
     if: inputs.create_release
     runs-on: ubuntu-latest
-    # only this job writes; build and test jobs stay at contents: read
+    # only this job writes; the version job stays at contents: read
     permissions:
       contents: write
     steps:
-
-      - name: Download All Artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: "firmware-${{ inputs.channel }}-*"
-          merge-multiple: true
-          path: out
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
@@ -425,6 +244,6 @@ jobs:
           prerelease: ${{ inputs.channel != 'stable' }}
           make_latest: ${{ inputs.channel == 'stable' && 'true' || 'false' }}
           # release notes are written by hand after the release is created
+          # firmware assets are built and uploaded locally (scripts/local-release-build.sh)
           body: "Built from commit `${{ needs.version.outputs.source_sha }}`."
-          files: out/*
           target_commitish: ${{ needs.version.outputs.source_sha }}

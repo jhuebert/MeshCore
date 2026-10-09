@@ -98,11 +98,14 @@ family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
 `RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_repeater` — host-native
 tests cannot catch a platform-specific API difference, and one did (the nRF52
 file type has no default constructor).
-`.github/workflows/filter-build.yml` builds release channels (dev →
-`repeater-filter`, stable → `repeater-filter-stable`); `sync-upstream.yml` merges
-upstream weekly and promotes stable only on explicit dispatch. Upstream's own
-docs live in `docs/` (MeshCore protocol/CLI generally) — not fork-filter
-documentation.
+`.github/workflows/filter-build.yml` cuts release channels (dev →
+`repeater-filter`, stable → `repeater-filter-stable`) — tag + release object
+only; the firmware assets are built locally with
+`scripts/local-release-build.sh` and uploaded to the release with `gh`
+(CI no longer builds firmware — the 155-target runner fan-out got Actions
+shut down). `sync-upstream.yml` merges upstream weekly and promotes stable
+only on explicit dispatch. Upstream's own docs live in `docs/` (MeshCore
+protocol/CLI generally) — not fork-filter documentation.
 
 ## Branch model
 
@@ -255,8 +258,9 @@ FILTER.md:
   crash-loops every repeater flashed with the release (2026-10: ~8.5 KB of
   scratch in `FilterRules::load()` did exactly that). Measure frames with
   `PLATFORMIO_BUILD_FLAGS=-fstack-usage pio run -e <env>` before committing
-  large local arrays; `filter-build.yml` fails any release target whose
-  `src/`/`examples/` code holds a frame >= 2 KB — keep new frames well
+  large local arrays; the stack gate in `scripts/local-release-build.sh`
+  fails any release target whose `src/`/`examples/` code holds a frame
+  >= 2 KB (formerly a filter-build.yml CI check) — keep new frames well
   under it.
 - Pure refactors keep both suites green **unchanged** — the suites (295 filter,
   82 fleet, 44 battery) are the safety net that proves no behavior slipped.
