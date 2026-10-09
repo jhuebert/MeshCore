@@ -13,11 +13,6 @@ on:
         required: false
         type: string
         default: ""
-      create_release:
-        description: Create the release
-        required: false
-        type: boolean
-        default: true
       force_build:
         description: Create the release even if nothing changed since the last one of this channel
         required: false
@@ -38,11 +33,6 @@ on:
         required: false
         type: string
         default: ""
-      create_release:
-        description: Create the release
-        required: false
-        type: boolean
-        default: true
       force_build:
         description: Create the release even if nothing changed since the last one of this channel
         required: false
@@ -95,20 +85,10 @@ jobs:
             };
             const gitOk = (...args) => spawnSync('git', args, { encoding: 'utf8' }).status === 0;
 
-            // sort -V equivalent for the version-suffix ordering of tag names
-            const natCmp = (a, b) => {
-              const pa = a.split(/(\d+)/), pb = b.split(/(\d+)/);
-              for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-                if (pa[i] === undefined) return -1;
-                if (pb[i] === undefined) return 1;
-                const x = /^\d+$/.test(pa[i]) ? parseInt(pa[i], 10) : pa[i];
-                const y = /^\d+$/.test(pb[i]) ? parseInt(pb[i], 10) : pb[i];
-                if (x === y) continue;
-                if (typeof x === 'number' && typeof y === 'number') return x - y;
-                return String(x) < String(y) ? -1 : 1;
-              }
-              return 0;
-            };
+            // version ordering comes from git itself (--sort=-v:refname):
+            // r5 > r4, dev.16 > dev.9, base versions compare numerically
+            const tags = (pattern) => git('tag', '--list', pattern, '--sort=-v:refname')
+              .split('\n').map((s) => s.trim()).filter(Boolean);
 
             const channel = process.env.CHANNEL;
             if (channel !== 'dev' && channel !== 'stable') {
@@ -135,14 +115,12 @@ jobs:
               upstreamVersion = desc.stdout.trim().replace(/^companion-/, '').split('-')[0];
             }
 
-            const tags = (pattern) => git('tag', '--list', pattern).split('\n').filter(Boolean);
             let releaseTag, displayVersion, releaseTitle, firmwareVersion, prevTag;
             if (channel === 'stable') {
-              // previous stable tag = latest filter-v* tag under the new scheme
-              // (no -dev suffix, no old date-scheme tags)
+              // previous stable tag = latest filter-v* tag under the new scheme,
+              // skipping dev-suffixed and old date-scheme tags
               prevTag = tags('filter-v*')
-                .filter((t) => !t.includes('-dev.') && !/-20\d{6}-/.test(t))
-                .sort(natCmp).pop() || '';
+                .find((t) => !t.includes('-dev.') && !/-20\d{6}-/.test(t)) || '';
               // tag: filter-v<base>, or -rN when that base was already released
               let rnSuffix = '';
               if (gitOk('rev-parse', '-q', '--verify', `refs/tags/filter-${upstreamVersion}`)) {
@@ -159,14 +137,14 @@ jobs:
               // previous dev tag = latest filter-*-dev.* tag (new scheme only).
               // Scoped to the channel's own tags, so an unrelated stable release
               // cannot mask a dev change (or vice versa).
-              prevTag = tags('filter-*-dev.*').sort(natCmp).pop() || '';
-              // counter = highest existing suffix for this base + 1. Counting the
-              // tags (count + 1) collides when one was deleted or a gap exists,
-              // and a duplicate tag fails the release.
-              const maxN = tags(`filter-${upstreamVersion}-dev.*`)
-                .map((t) => { const m = t.match(/\.(\d+)$/); return m ? parseInt(m[1], 10) : 0; })
-                .reduce((a, b) => Math.max(a, b), 0);
-              const n = maxN + 1;
+              prevTag = tags('filter-*-dev.*')[0] || '';
+              // counter = highest existing suffix for this base + 1: the first
+              // sorted tag carries it. Counting the tags (count + 1) collides
+              // when one was deleted or a gap exists, and a duplicate tag fails
+              // the release.
+              const highestDev = tags(`filter-${upstreamVersion}-dev.*`)[0] || '';
+              const m = highestDev.match(/\.(\d+)$/);
+              const n = (m ? parseInt(m[1], 10) : 0) + 1;
               releaseTag = `filter-${upstreamVersion}-dev.${n}`;
               displayVersion = `${upstreamVersion}-dev.${n}`;
               releaseTitle = `Filter Firmware ${displayVersion}`;
@@ -228,7 +206,6 @@ jobs:
   release:
     name: Create Release
     needs: [version]
-    if: inputs.create_release
     runs-on: ubuntu-latest
     # only this job writes; the version job stays at contents: read
     permissions:
