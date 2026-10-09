@@ -118,7 +118,7 @@ if [[ ${1:-} == __worker ]]; then
   file_base="${target}-${firmware_version_string}"
   mkdir -p out
 
-  platform=$("$0" __platforms "$target" | awk '{print $2}')
+  platform=${WORKER_PLATFORM:-}   # passed by the orchestrator's precomputed map
 
   pio run -e "$target" 1>&2
 
@@ -186,7 +186,16 @@ EOF
       ;;
   esac
 
-  ls "out/${file_base}".* 2>/dev/null
+  # a target that compiled but produced no artifact would otherwise upload
+  # nothing and surface only as a confusing gh error later
+  shopt -s nullglob
+  artifacts=(out/${file_base}.*)
+  shopt -u nullglob
+  if ((${#artifacts[@]} == 0)); then
+    echo "ERROR: no artifacts produced for $target" >&2
+    exit 1
+  fi
+  printf '%s\n' "${artifacts[@]}"
   exit 0
 fi
 
@@ -356,12 +365,14 @@ for line in "${platform_lines[@]}"; do
   fi
 done
 
-run_one() {  # run_one <target> — build, record artifacts, queue upload
+run_one() {  # run_one <target> <platform> — build, record artifacts, queue upload
   local t=$1
   local log="$state_dir/logs/$t.log"
+  # WORKER_PLATFORM: the caller passes the platform from the map computed once
+  # up front; re-deriving it per worker would mean 155 extra pio config runs
   # write to a temp file and rename: the done marker must never be visible
   # while the file list is still empty
-  if run_tool __worker "$t" >"$state_dir/files/$t.tmp" 2>"$log"; then
+  if WORKER_PLATFORM=$2 run_tool __worker "$t" >"$state_dir/files/$t.tmp" 2>"$log"; then
     mv "$state_dir/files/$t.tmp" "$state_dir/files/$t"
     : >"$state_dir/done/$t"
   else
@@ -430,10 +441,10 @@ for idx in "${!queue[@]}"; do
   t=${queue[$idx]}
   if [[ $WARMUP == 1 && $idx -lt $n_warmup ]]; then
     info "[$((idx + 1))/$total] warm-up (serial): $t (${target_platform[$t]})"
-    run_one "$t"
+    run_one "$t" "${target_platform[$t]}"
   else
     while [[ $(jobs -rp | wc -l) -ge $slot_cap ]]; do wait -n || true; done
-    run_one "$t" &
+    run_one "$t" "${target_platform[$t]}" &
     build_pids+=("$!")
     info "[$((idx + 1))/$total] started: $t (${target_platform[$t]})"
   fi
