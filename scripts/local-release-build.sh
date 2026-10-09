@@ -59,6 +59,34 @@ die() { echo "local-release-build: $*" >&2; exit 1; }
 info() { echo "local-release-build: $*"; }
 trap 'exit 130' INT
 
+# Ctrl-C must take the whole tree down: the build workers and the uploader run
+# as asynchronous commands, which bash makes ignore SIGINT when job control is
+# off, so the terminal's INT would otherwise leave them building and uploading
+# after the main script exits (and the uploader's poll loop has no other exit).
+kill_tree() {  # kill_tree <pid> — SIGTERM a process and all its descendants
+  local pid=$1 kid
+  for kid in $(ps -o pid= --ppid "$pid" 2>/dev/null); do
+    kill_tree "$kid"
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+interrupted=""
+cleanup() {
+  trap - INT TERM EXIT   # no re-entry via exit
+  local pid
+  for pid in ${build_pids[@]+"${build_pids[@]}"}; do
+    kill_tree "$pid"
+  done
+  [[ -n ${uploader_pid:-} ]] && kill_tree "$uploader_pid"
+  if [[ -n $interrupted ]]; then
+    info "interrupted — builds and uploads stopped; a rerun is incremental"
+    exit 130
+  fi
+}
+trap 'interrupted=1; cleanup' INT
+trap 'interrupted=1; cleanup' TERM
+trap cleanup EXIT
+
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------- modes ----
@@ -189,7 +217,7 @@ EOF
   # a target that compiled but produced no artifact would otherwise upload
   # nothing and surface only as a confusing gh error later
   shopt -s nullglob
-  artifacts=(out/${file_base}.*)
+  artifacts=(out/${file_base}.* out/${file_base}-merged.bin)
   shopt -u nullglob
   if ((${#artifacts[@]} == 0)); then
     echo "ERROR: no artifacts produced for $target" >&2
