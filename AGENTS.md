@@ -3,7 +3,7 @@
 This is my personal fork of `meshcore-dev/MeshCore`. The fork-specific feature
 is the **repeater packet filter** (`filter ...` CLI, drop/forward rules, advert
 rate limiter) carried on the `repeater-filter*` branches, plus firmware release
-channels released by `.github/workflows/filter-build.yml` (tag + release
+channels released by `.github/workflows/filter-release.yml` (tag + release
 object; firmware assets are built locally).
 
 Remotes: `origin` = upstream `meshcore-dev/MeshCore` (never push there),
@@ -99,7 +99,7 @@ family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
 `RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_repeater` — host-native
 tests cannot catch a platform-specific API difference, and one did (the nRF52
 file type has no default constructor).
-`.github/workflows/filter-build.yml` cuts release channels (dev →
+`.github/workflows/filter-release.yml` cuts release channels (dev →
 `repeater-filter`, stable → `repeater-filter-stable`) — tag + release object
 only; the firmware assets are built locally with
 `scripts/local-release-build.sh` and uploaded to the release with `gh`
@@ -129,7 +129,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
-- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-build.yml`, `sync-upstream.yml`
+- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-release.yml`, `sync-upstream.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
 — a reviewer should see a handful of lines, not a fork interleaved into
@@ -262,7 +262,7 @@ FILTER.md:
   `PLATFORMIO_BUILD_FLAGS=-fstack-usage pio run -e <env>` before committing
   large local arrays; the stack gate in `scripts/local-release-build.sh`
   fails any release target whose `src/`/`examples/` code holds a frame
-  >= 2 KB (formerly a filter-build.yml CI check) — keep new frames well
+  >= 2 KB (formerly a filter-release.yml CI check) — keep new frames well
   under it.
 - Pure refactors keep both suites green **unchanged** — the suites (295 filter,
   82 fleet, 44 battery) are the safety net that proves no behavior slipped.

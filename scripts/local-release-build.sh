@@ -36,7 +36,7 @@
 #      pool of gh release upload --clobber runs beside the build pool).
 #
 # Environment parity with the releases CI cuts: FIRMWARE_VERSION = <tag minus
-# the "filter-" prefix> + "-filter" (exactly what filter-build.yml's version
+# the "filter-" prefix> + "-filter" (exactly what filter-release.yml's version
 # job derived), PLATFORMIO_BUILD_FLAGS starts with -fstack-usage, and build.sh's
 # "-<short-sha>" suffix comes from the release's pinned commit. Artifacts land
 # in <build-dir>/<tag>/out/ as well as on the release, so a failed upload never
@@ -66,7 +66,7 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0
 # environment already prepared by the orchestrator (venv PATH). Target listing,
 # platform mapping and building share one code path.
 
-# repeater targets of the checked-out tree (the selection filter-build.yml
+# repeater targets of the checked-out tree (the selection filter-release.yml
 # used to make before firmware builds moved local)
 if [[ ${1:-} == __list ]]; then
   cd "$WORKER_DIR"
@@ -122,7 +122,7 @@ if [[ ${1:-} == __worker ]]; then
 
   pio run -e "$target" 1>&2
 
-  # stack usage gate, moved here from filter-build.yml's per-target CI job:
+  # stack usage gate, moved here from filter-release.yml's per-target CI job:
   # one big stack scratch array in boot- or loop-path code brick-reboots every
   # repeater flashed with the release (2026-10: an 8.5 KB scratch in
   # FilterRules::load overflowed the 4 KB nRF52 / 8 KB ESP32 loop task stacks

@@ -43,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: filter-build-${{ inputs.channel }}
+  group: filter-release-${{ inputs.channel }}
   cancel-in-progress: false
 
 jobs:
