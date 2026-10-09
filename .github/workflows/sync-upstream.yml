@@ -201,8 +201,16 @@ jobs:
                 return;
               }
             }
-            run('checkout', sourceSha, '--', 'README.md');
-            if (fs.existsSync('.git/MERGE_HEAD')) run('commit', '--no-edit');
+            // Only restore the fork README when a merge commit is being
+            // created. Staging it with no merge in progress (main already
+            // merged into stable) would leave a dirty index, and every later
+            // cherry-pick would be refused before it starts — with no pick
+            // state left, even --abort fails. The post-loop README sync below
+            // covers the no-merge case instead.
+            if (fs.existsSync('.git/MERGE_HEAD')) {
+              run('checkout', sourceSha, '--', 'README.md');
+              run('commit', '--no-edit');
+            }
 
             // cherry-pick the filter commits not yet on stable (git cherry matches
             // by patch-id, so already-picked commits are skipped); oldest first.
