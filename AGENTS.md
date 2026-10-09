@@ -3,7 +3,8 @@
 This is my personal fork of `meshcore-dev/MeshCore`. The fork-specific feature
 is the **repeater packet filter** (`filter ...` CLI, drop/forward rules, advert
 rate limiter) carried on the `repeater-filter*` branches, plus firmware release
-channels built by `.github/workflows/filter-build.yml`.
+channels released by `.github/workflows/filter-build.yml` (tag + release
+object; firmware assets are built locally).
 
 Remotes: `origin` = upstream `meshcore-dev/MeshCore` (never push there),
 `fork` = `jhuebert/MeshCore` (push here). Upstream has **no** AGENTS.md, so this
@@ -103,9 +104,9 @@ file type has no default constructor).
 only; the firmware assets are built locally with
 `scripts/local-release-build.sh` and uploaded to the release with `gh`
 (CI no longer builds firmware — the 155-target runner fan-out got Actions
-shut down). `sync-upstream.yml` merges upstream weekly and promotes stable
-only on explicit dispatch. Upstream's own docs live in `docs/` (MeshCore
-protocol/CLI generally) — not fork-filter documentation.
+shut down). `sync-upstream.yml` merges upstream and promotes stable, run
+only on manual dispatch — never on a schedule. Upstream's own docs live in
+`docs/` (MeshCore protocol/CLI generally) — not fork-filter documentation.
 
 ## Branch model
 
@@ -115,8 +116,9 @@ protocol/CLI generally) — not fork-filter documentation.
   `repeater-filter` deliberately, not automatically.
 - Work branches: `repeater-filter-<topic>` cut from `repeater-filter`, merged
   back with `--no-ff` (keep feature commits traceable).
-- Upstream is tracked via the weekly `sync-upstream.yml` workflow; do not
-  hand-merge upstream `dev` locally unless fixing a sync failure.
+- Upstream is tracked via the manually-dispatched `sync-upstream.yml`
+  workflow; do not hand-merge upstream `dev` locally unless fixing a sync
+  failure.
 
 ## Fork-owned vs upstream code
 
