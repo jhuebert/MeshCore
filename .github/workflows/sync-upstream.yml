@@ -1,8 +1,9 @@
 name: Sync Upstream
 
+# manual only: the fork's Actions usage got shut down once, and the weekly
+# cadence is not worth the surprise — run it deliberately, from the Actions UI
+# or `gh workflow run sync-upstream.yml`
 on:
-  schedule:
-    - cron: "30 3 * * 1"
   workflow_dispatch:
     inputs:
       force_build:
