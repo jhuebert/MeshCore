@@ -259,7 +259,8 @@ jobs:
                 return;
               }
               const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
-                '-e', 'native_packet_filter', '-e', 'native_battery_gate'], { stdio: 'inherit' });
+                '-e', 'native_packet_filter', '-e', 'native_battery_gate', '-e', 'native_fleet'],
+                { stdio: 'inherit' });
               if (gate.status !== 0) {
                 core.setFailed('native test gate failed; stable is unchanged');
                 return;
