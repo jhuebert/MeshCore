@@ -6,6 +6,11 @@
 # Usage:
 #   scripts/local-release-build.sh [options] <release-url-or-tag>
 #
+# A release URL works from any clone; a bare tag additionally assumes the
+# clone has a remote named "fork" pointing at the release's repo (falling
+# back to the URL works everywhere). Requires gh (authenticated), git,
+# python3, and bash 4+.
+#
 #     -j, --jobs N        parallel build workers (default: 4)
 #     --targets LIST      comma/space/newline-separated target list
 #                         (default: every repeater target in the release tree)
@@ -104,7 +109,7 @@ if [[ ${1:-} == __worker ]]; then
 
   short_sha=${RELEASE_SHA:0:7}            # build.sh uses `git rev-parse --short HEAD`
   firmware_version_string="${FIRMWARE_VERSION}-${short_sha}"
-  firmware_build_date=$(date '+%d-%b-%Y')
+  firmware_build_date=$(LC_ALL=C date '+%d-%b-%Y')   # %b is locale-dependent; CI runs C.UTF-8
 
   # flags release firmware has always been built with: stack usage metadata
   # (codegen unchanged, consumed by the stack gate below) + version string
@@ -212,6 +217,7 @@ done
 [[ -n $RELEASE_ARG ]] || { usage; exit 1; }
 command -v gh >/dev/null || die "gh is required"
 command -v git >/dev/null || die "git is required"
+((BASH_VERSINFO[0] >= 4)) || die "bash 4+ is required (macOS ships 3.2; try 'brew install bash')"
 
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 REPO_ROOT=$(git -C "$(dirname "$SCRIPT_PATH")" rev-parse --show-toplevel)
