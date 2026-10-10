@@ -251,10 +251,13 @@ bool MQTTObserver::saveConfig() {
 }
 
 bool MQTTObserver::needsAwake() const {
+  // Only a slot the worker would actually try to bring up may hold the radio
+  // awake — a half-configured one (no SSID, or an {iata} topic without an
+  // IATA) connects to nothing and would otherwise block powersaving forever.
   portENTER_CRITICAL(&_config_mux);
   bool configured = false;
   for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++)
-    configured = configured || (_config.brokers[i].enabled && _config.brokers[i].server[0]);
+    configured = configured || ready(_config, i);
   portEXIT_CRITICAL(&_config_mux);
   State state = _state.load(std::memory_order_relaxed);
   return configured || state == STATE_WIFI || state == STATE_TIME ||
