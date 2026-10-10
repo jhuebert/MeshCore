@@ -507,6 +507,9 @@ const char *MyMesh::getLogDateTime() {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+#ifdef WITH_MQTT_OBSERVER
+  mqttObserver.stageRaw(snr, rssi, raw, len);
+#endif
 #if MESH_PACKET_LOGGING
   Serial.print(getLogDateTime());
   Serial.print(" RAW: ");
@@ -516,6 +519,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
+#ifdef WITH_MQTT_OBSERVER
+  mqttObserver.capture(pkt, score);
+#endif
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 1) {
     bridge.sendPacket(pkt);
@@ -1034,6 +1040,10 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
+#ifdef WITH_MQTT_OBSERVER
+  mqttObserver.begin(_fs, &self_id, _prefs.node_name,
+                     _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+#endif
   acl.load(_fs, self_id);
   filter.begin(fs);
   battGate.begin(fs);
@@ -1374,7 +1384,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
       sendNodeDiscoverReq();
       strcpy(reply, "OK - Discover sent");
     }
-  } else if (memcmp(command, "filter", 6) == 0 && (command[6] == ' ' || command[6] == 0)) {
+  }
+#ifdef WITH_MQTT_OBSERVER
+  else if (mqttObserver.handleCommand(command, reply)) {
+    // observer configuration and status commands
+  }
+#endif
+  else if (memcmp(command, "filter", 6) == 0 && (command[6] == ' ' || command[6] == 0)) {
     const char* sub = command + 6;
     while (*sub == ' ') sub++;
     filterCLI(filter, sub, reply, &region_map);
@@ -1398,6 +1414,15 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 // ran. `key` is the job's !id key string from the queued script itself.
 static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
   // logged before dispatch: the handlers tokenise the line in place
+#ifdef WITH_MQTT_OBSERVER
+  const char* logged_line = line;
+  while (*logged_line == ' ') logged_line++;
+  if (strncmp(logged_line, "set wifi.pwd ", 13) == 0 ||
+      strncmp(logged_line, "set mqtt.password ", 18) == 0 ||
+      strncmp(logged_line, "set mqtt.username ", 18) == 0) {
+    Serial.printf("cli[%s] <credential setting>\n", key);
+  } else
+#endif
   Serial.printf("cli[%s] %s\n", key, line);
   ((MyMesh*)ctx)->handleCommand(0, line, reply);
   if (reply[0]) Serial.printf("  -> %s\n", reply);
@@ -1449,6 +1474,10 @@ void MyMesh::loop() {
 
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
+#ifdef WITH_MQTT_OBSERVER
+  mqttObserver.setRadio(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  mqttObserver.loop();
+#endif
 
   // fleet config save + script drain (one per pass, after mesh::Mesh::loop()
   // and outside the receive bracket that produced it — never while the filter
@@ -1467,6 +1496,9 @@ void MyMesh::loop() {
 bool MyMesh::hasPendingWork() const {
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
+#endif
+#ifdef WITH_MQTT_OBSERVER
+  if (mqttObserver.needsAwake()) return true;
 #endif
   return _mgr->getOutboundTotal() > 0;
 }
