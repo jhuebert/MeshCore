@@ -7,58 +7,64 @@
 #include "MQTTObserverRecord.h"
 #include "PersistUtil.h"
 
-TEST(MQTTObserverConfig, RoundTripsFixedPayload) {
+TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   MQTTObserverConfig config;
   MQTTObserverConfigCodec::setDefaults(config);
-  config.enabled = 1;
   strcpy(config.wifi_ssid, "mesh-net");
   strcpy(config.wifi_password, "wifi-secret");
-  strcpy(config.server, "wss://mqtt.example:443/mqtt");
-  strcpy(config.username, "v1_public-key");
-  strcpy(config.password, "broker-secret");
-  strcpy(config.audience, "mqtt.example");
   strcpy(config.iata, "SEA");
-  config.rx_enabled = 1;
-  config.status_interval_minutes = 12;
-  config.port = 8883;
   strcpy(config.origin, "Roof Repeater");
-  strcpy(config.topic, "meshcore/{iata}/{device}/{type}");
-  strcpy(config.token, "site-token");
   strcpy(config.ntp_server, "192.168.1.1");
-  strcpy(config.owner, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-  strcpy(config.email, "operator@example.org");
+  config.status_interval_minutes = 12;
   config.wifi_power_save = 2;
+  config.brokers[0].enabled = 1;
+  strcpy(config.brokers[0].server, "wss://mqtt.example:443/mqtt");
+  strcpy(config.brokers[0].username, "v1_public-key");
+  strcpy(config.brokers[0].password, "broker-secret");
+  strcpy(config.brokers[0].audience, "mqtt.example");
+  strcpy(config.brokers[0].topic, "meshcore/{iata}/{device}/{type}");
+  strcpy(config.brokers[0].token, "site-token");
+  strcpy(config.brokers[0].owner,
+         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+  strcpy(config.brokers[0].email, "operator@example.org");
+  config.brokers[0].port = 8883;
+  config.brokers[1].enabled = 1;
+  strcpy(config.brokers[1].server, "mqtt://second.example");
+  strcpy(config.brokers[1].username, "second-user");
+  config.brokers[5].enabled = 1;
+  strcpy(config.brokers[5].server, "mqtt://reserved-slot.example");
 
   uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
   ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
   MQTTObserverConfig decoded;
   ASSERT_TRUE(MQTTObserverConfigCodec::decode(payload, sizeof(payload), decoded));
-  EXPECT_EQ(decoded.enabled, 1);
   EXPECT_STREQ(decoded.wifi_ssid, "mesh-net");
   EXPECT_STREQ(decoded.wifi_password, "wifi-secret");
-  EXPECT_STREQ(decoded.server, "wss://mqtt.example:443/mqtt");
-  EXPECT_STREQ(decoded.password, "broker-secret");
-  EXPECT_STREQ(decoded.audience, "mqtt.example");
   EXPECT_STREQ(decoded.iata, "SEA");
-  EXPECT_EQ(decoded.rx_enabled, 1);
-  EXPECT_EQ(decoded.status_interval_minutes, 12);
-  EXPECT_EQ(decoded.port, 8883);
   EXPECT_STREQ(decoded.origin, "Roof Repeater");
-  EXPECT_STREQ(decoded.topic, "meshcore/{iata}/{device}/{type}");
-  EXPECT_STREQ(decoded.token, "site-token");
   EXPECT_STREQ(decoded.ntp_server, "192.168.1.1");
-  EXPECT_STREQ(decoded.owner, config.owner);
-  EXPECT_STREQ(decoded.email, "operator@example.org");
+  EXPECT_EQ(decoded.status_interval_minutes, 12);
   EXPECT_EQ(decoded.wifi_power_save, 2);
+  EXPECT_EQ(decoded.brokers[0].enabled, 1);
+  EXPECT_STREQ(decoded.brokers[0].server, "wss://mqtt.example:443/mqtt");
+  EXPECT_STREQ(decoded.brokers[0].password, "broker-secret");
+  EXPECT_STREQ(decoded.brokers[0].audience, "mqtt.example");
+  EXPECT_STREQ(decoded.brokers[0].owner, config.brokers[0].owner);
+  EXPECT_STREQ(decoded.brokers[0].email, "operator@example.org");
+  EXPECT_EQ(decoded.brokers[0].port, 8883);
+  EXPECT_STREQ(decoded.brokers[1].server, "mqtt://second.example");
+  EXPECT_STREQ(decoded.brokers[1].username, "second-user");
+  EXPECT_EQ(decoded.brokers[5].enabled, 1);
+  EXPECT_STREQ(decoded.brokers[5].server, "mqtt://reserved-slot.example");
 }
 
 TEST(MQTTObserverConfig, RejectsInvalidValuesAndIntegrityChanges) {
   MQTTObserverConfig config;
   MQTTObserverConfigCodec::setDefaults(config);
-  strcpy(config.server, "https://mqtt.example");
+  strcpy(config.brokers[0].server, "https://mqtt.example");
   EXPECT_EQ(MQTTObserverConfigCodec::encode(config, nullptr, 0), 0u);
 
-  strcpy(config.server, "mqtts://mqtt.example");
+  strcpy(config.brokers[0].server, "mqtts://mqtt.example");
   strcpy(config.iata, "Sea");
   EXPECT_EQ(MQTTObserverConfigCodec::encode(config, nullptr, 0), 0u);
 
@@ -69,21 +75,28 @@ TEST(MQTTObserverConfig, RejectsInvalidValuesAndIntegrityChanges) {
   payload[0] = 2;
   EXPECT_NE(crc16_ccitt(payload, sizeof(payload)), checksum);
   EXPECT_FALSE(MQTTObserverConfigCodec::decode(payload, sizeof(payload), config));
+  EXPECT_EQ(config.status_enabled, 1);
   EXPECT_FALSE(MQTTObserverConfigCodec::decode(payload, sizeof(payload) - 1, config));
 }
 
 TEST(MQTTObserverRecord, ChecksVersionLengthAndChecksum) {
   MQTTObserverConfig original;
   MQTTObserverConfigCodec::setDefaults(original);
-  original.enabled = 1;
-  strcpy(original.server, "mqtts://broker.example");
+  original.brokers[0].enabled = 1;
+  strcpy(original.brokers[0].server, "mqtts://broker.example");
+  original.brokers[1].enabled = 1;
+  strcpy(original.brokers[1].server, "mqtt://second.example");
+  original.brokers[5].enabled = 1;
+  strcpy(original.brokers[5].server, "mqtt://reserved.example");
   strcpy(original.iata, "SEA");
   uint8_t record[MQTTObserverRecord::kRecordSize];
   ASSERT_EQ(MQTTObserverRecord::encode(original, record, sizeof(record)), sizeof(record));
 
   MQTTObserverConfig decoded;
   ASSERT_TRUE(MQTTObserverRecord::decode(record, sizeof(record), decoded));
-  EXPECT_STREQ(decoded.server, original.server);
+  EXPECT_STREQ(decoded.brokers[0].server, original.brokers[0].server);
+  EXPECT_STREQ(decoded.brokers[1].server, original.brokers[1].server);
+  EXPECT_STREQ(decoded.brokers[5].server, original.brokers[5].server);
   EXPECT_STREQ(decoded.iata, original.iata);
   EXPECT_FALSE(MQTTObserverRecord::decode(record, sizeof(record) - 1, decoded));
 
@@ -100,52 +113,6 @@ TEST(MQTTObserverRecord, ChecksVersionLengthAndChecksum) {
   EXPECT_FALSE(MQTTObserverRecord::decode(damaged, sizeof(damaged), decoded));
 }
 
-TEST(MQTTObserverRecord, MigratesV1SettingsWithNewDefaults) {
-  uint8_t record[MQTTObserverRecord::kLegacyV1RecordSize] = {};
-  memcpy(record, MQTTObserverRecord::kMagic, sizeof(MQTTObserverRecord::kMagic));
-  record[4] = 1;
-  record[5] = MQTTObserverConfigCodec::kLegacyPayloadSize & 0xff;
-  record[6] = MQTTObserverConfigCodec::kLegacyPayloadSize >> 8;
-  uint8_t* payload = record + MQTTObserverRecord::kHeaderSize;
-  size_t pos = 0;
-  payload[pos++] = 1;
-  payload[pos++] = 1;
-  payload[pos++] = 1;
-  payload[pos++] = 1;
-#define COPY_OLD_FIELD(name) \
-  memcpy(payload + pos, legacy.name, sizeof(legacy.name)); \
-  pos += sizeof(legacy.name)
-  MQTTObserverConfig legacy;
-  MQTTObserverConfigCodec::setDefaults(legacy);
-  strcpy(legacy.wifi_ssid, "old-wifi");
-  strcpy(legacy.wifi_password, "old-password");
-  strcpy(legacy.server, "mqtts://old-broker.example");
-  strcpy(legacy.username, "old-user");
-  strcpy(legacy.password, "old-broker-password");
-  strcpy(legacy.audience, "old-audience");
-  strcpy(legacy.iata, "SEA");
-  COPY_OLD_FIELD(wifi_ssid);
-  COPY_OLD_FIELD(wifi_password);
-  COPY_OLD_FIELD(server);
-  COPY_OLD_FIELD(username);
-  COPY_OLD_FIELD(password);
-  COPY_OLD_FIELD(audience);
-  COPY_OLD_FIELD(iata);
-#undef COPY_OLD_FIELD
-  uint16_t crc = crc16_ccitt(record, sizeof(record) - 2);
-  record[sizeof(record) - 2] = crc & 0xff;
-  record[sizeof(record) - 1] = crc >> 8;
-
-  MQTTObserverConfig migrated;
-  ASSERT_TRUE(MQTTObserverRecord::decode(record, sizeof(record), migrated));
-  EXPECT_STREQ(migrated.wifi_ssid, "old-wifi");
-  EXPECT_STREQ(migrated.server, "mqtts://old-broker.example");
-  EXPECT_STREQ(migrated.iata, "SEA");
-  EXPECT_EQ(migrated.rx_enabled, 1);
-  EXPECT_EQ(migrated.status_interval_minutes, 5);
-  EXPECT_EQ(migrated.port, 1883);
-  EXPECT_EQ(migrated.wifi_power_save, 1);
-}
 
 TEST(MQTTObserverConfig, IataSupportsAlphanumericAndRejectsPlaceholder) {
   EXPECT_TRUE(MQTTObserverConfigCodec::validIata("A1B"));
@@ -164,37 +131,37 @@ TEST(MQTTObserverConfig, BuildsBrokerUrisAndHonorsExplicitPorts) {
   MQTTObserverConfig config;
   MQTTObserverConfigCodec::setDefaults(config);
   char uri[192];
-  strcpy(config.server, "broker.example");
-  config.port = 8883;
-  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config, uri, sizeof(uri)));
+  strcpy(config.brokers[0].server, "broker.example");
+  config.brokers[0].port = 8883;
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
   EXPECT_STREQ(uri, "mqtts://broker.example:8883");
 
-  strcpy(config.server, "wss://broker.example/mqtt");
-  config.port = 1883;
-  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config, uri, sizeof(uri)));
+  strcpy(config.brokers[0].server, "wss://broker.example/mqtt");
+  config.brokers[0].port = 1883;
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
   EXPECT_STREQ(uri, "wss://broker.example:443/mqtt");
-  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config), 443);
+  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config.brokers[0]), 443);
 
-  strcpy(config.server, "mqtts://broker.example:9000/mqtt");
-  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config, uri, sizeof(uri)));
+  strcpy(config.brokers[0].server, "mqtts://broker.example:9000/mqtt");
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
   EXPECT_STREQ(uri, "mqtts://broker.example:9000/mqtt");
-  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config), 9000);
+  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config.brokers[0]), 9000);
 }
 
 TEST(MQTTObserverConfig, ExpandsReferenceTopicTemplate) {
   MQTTObserverConfig config;
   MQTTObserverConfigCodec::setDefaults(config);
   strcpy(config.iata, "A1B");
-  strcpy(config.token, "region-token");
+  strcpy(config.brokers[0].token, "region-token");
   char topic[160];
-  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, "AABB", "packets", topic, sizeof(topic)));
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, config.brokers[0], "AABB", "packets", topic, sizeof(topic)));
   EXPECT_STREQ(topic, "meshcore/A1B/AABB/packets");
-  strcpy(config.topic, "local/{token}/{device}/{type}");
-  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, "AABB", "raw", topic, sizeof(topic)));
+  strcpy(config.brokers[0].topic, "local/{token}/{device}/{type}");
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, config.brokers[0], "AABB", "raw", topic, sizeof(topic)));
   EXPECT_STREQ(topic, "local/region-token/AABB/raw");
   char short_topic[8];
-  EXPECT_FALSE(MQTTObserverConfigCodec::buildTopic(config, "AABB", "packets", short_topic,
-                                                    sizeof(short_topic)));
+  EXPECT_FALSE(MQTTObserverConfigCodec::buildTopic(config, config.brokers[0], "AABB", "packets",
+                                                    short_topic, sizeof(short_topic)));
 }
 
 TEST(MQTTObserverRawStager, ConsumesOnlyTheImmediatelyStagedFrame) {
@@ -226,33 +193,83 @@ TEST(MQTTObserverRawStager, ConsumesOnlyTheImmediatelyStagedFrame) {
   EXPECT_FALSE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
 }
 
-TEST(MQTTObserverQueuePolicy, ExpiresStaleEventsWrapSafely) {
-  EXPECT_FALSE(MQTTObserverQueuePolicy::eventExpired(10000, 1000));
-  EXPECT_TRUE(MQTTObserverQueuePolicy::eventExpired(11001, 1000));
-  EXPECT_FALSE(MQTTObserverQueuePolicy::eventExpired(5, 0xfffffff0));
+TEST(MQTTObserverCommandPolicy, ParsesNumberedSlotsAndRejectsUnnumberedBrokerSettings) {
+  size_t slot = 99;
+  const char* property = nullptr;
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("set mqtt.server broker", "set ", 2,
+                                                     slot, property));
+  ASSERT_TRUE(MQTTObserverCommandPolicy::parseSlot("set mqtt1.server broker", "set ", 2,
+                                                    slot, property));
+  EXPECT_EQ(slot, 0u);
+  EXPECT_STREQ(property, "server broker");
+  ASSERT_TRUE(MQTTObserverCommandPolicy::parseSlot("get mqtt1.password", "get ", 2,
+                                                    slot, property));
+  EXPECT_EQ(slot, 0u);
+  EXPECT_STREQ(property, "password");
+  ASSERT_TRUE(MQTTObserverCommandPolicy::parseSlot("get mqtt2.status", "get ", 2,
+                                                    slot, property));
+  EXPECT_EQ(slot, 1u);
+  EXPECT_STREQ(property, "status");
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("get mqtt3.server", "get ", 2,
+                                                     slot, property));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("get mqtt2x.server", "get ", 2,
+                                                     slot, property));
 }
 
-TEST(MQTTObserverLiveQueue, DropsDisconnectedEventsAndKeepsNewestOnOverflow) {
+TEST(MQTTObserverQueuePolicy, FlushesOnlyAfterLongDisconnectAndRetriesBoundedly) {
+  EXPECT_FALSE(MQTTObserverQueuePolicy::shouldFlushDisconnected(60099, 100));
+  EXPECT_TRUE(MQTTObserverQueuePolicy::shouldFlushDisconnected(60100, 100));
+  EXPECT_FALSE(MQTTObserverQueuePolicy::shouldFlushDisconnected(4, 0xfffffff0));
+  EXPECT_TRUE(MQTTObserverQueuePolicy::retryReady(1200, 1100, 1));
+  EXPECT_FALSE(MQTTObserverQueuePolicy::retryReady(1099, 1100, 1));
+  EXPECT_FALSE(MQTTObserverQueuePolicy::retryReady(0xfffffff8, 4, 1));
+  EXPECT_TRUE(MQTTObserverQueuePolicy::retryReady(4, 4, 1));
+  EXPECT_EQ(MQTTObserverQueuePolicy::retryDecision(false, 0, 10).action,
+            MQTTObserverQueuePolicy::RetryAction::Schedule);
+  EXPECT_EQ(MQTTObserverQueuePolicy::retryDecision(false, 3, 10).action,
+            MQTTObserverQueuePolicy::RetryAction::Drop);
+  EXPECT_EQ(MQTTObserverQueuePolicy::retryDecision(true, 0, 10).action,
+            MQTTObserverQueuePolicy::RetryAction::Complete);
+}
+
+TEST(MQTTObserverEventQueue, BoundedRetriesAndProtectsInFlightHead) {
   struct Event { int id; };
-  typedef MQTTObserverLiveQueue<Event, 2> EventQueue;
+  typedef MQTTObserverEventQueue<Event, 2> EventQueue;
   EventQueue queue;
-  Event one = {1}, two = {2}, three = {3};
-  EXPECT_EQ(queue.offer(false, one), EventQueue::DROPPED_DISCONNECTED);
+  EventQueue::Entry entry;
+  Event one = {1}, two = {2}, three = {3}, event;
+  EXPECT_EQ(queue.offer(one), EventQueue::QUEUED);
+  EXPECT_TRUE(queue.beginAttempt(0, entry));
+  EXPECT_EQ(entry.event.id, 1);
+  EXPECT_EQ(queue.offer(two), EventQueue::QUEUED);
+  EXPECT_EQ(queue.offer(three), EventQueue::DROPPED_OLDEST);
+  EXPECT_FALSE(queue.beginAttempt(0, entry));
+  queue.retryAttempt(1, 300);
+  EXPECT_FALSE(queue.beginAttempt(299, entry));
+  EXPECT_TRUE(queue.beginAttempt(300, entry));
+  EXPECT_EQ(entry.event.id, 1);
+  queue.completeAttempt();
+  EXPECT_EQ(queue.size(), 1u);
+  EXPECT_TRUE(queue.beginAttempt(301, entry));
+  EXPECT_EQ(entry.event.id, 3);
+  queue.completeAttempt();
   EXPECT_EQ(queue.size(), 0u);
-  EXPECT_EQ(queue.offer(true, one), EventQueue::QUEUED);
-  EXPECT_EQ(queue.offer(true, two), EventQueue::QUEUED);
-  EXPECT_EQ(queue.offer(true, three), EventQueue::DROPPED_OLDEST);
-  Event event;
-  ASSERT_TRUE(queue.pop(event));
-  EXPECT_EQ(event.id, 2);
-  ASSERT_TRUE(queue.pop(event));
-  EXPECT_EQ(event.id, 3);
-  EXPECT_FALSE(queue.pop(event));
-  Event four = {4};
-  queue.offer(true, four);
-  queue.clear();
-  EXPECT_EQ(queue.size(), 0u);
-  EXPECT_FALSE(queue.pop(event));
+  EXPECT_FALSE(queue.beginAttempt(400, entry));
+}
+
+TEST(MQTTObserverEventQueue, OverflowReplacesOldestPendingEntry) {
+  struct Event { int id; };
+  typedef MQTTObserverEventQueue<Event, 2> EventQueue;
+  EventQueue queue;
+  EventQueue::Entry entry;
+  EXPECT_EQ(queue.offer(Event{1}), EventQueue::QUEUED);
+  EXPECT_EQ(queue.offer(Event{2}), EventQueue::QUEUED);
+  EXPECT_EQ(queue.offer(Event{3}), EventQueue::DROPPED_OLDEST);
+  ASSERT_TRUE(queue.beginAttempt(0, entry));
+  EXPECT_EQ(entry.event.id, 2);
+  queue.completeAttempt();
+  ASSERT_TRUE(queue.beginAttempt(0, entry));
+  EXPECT_EQ(entry.event.id, 3);
 }
 
 TEST(MQTTObserverFormat, PacketMessageMatchesObserverSchema) {

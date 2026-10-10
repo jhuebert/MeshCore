@@ -1417,10 +1417,19 @@ static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
 #ifdef WITH_MQTT_OBSERVER
   const char* logged_line = line;
   while (*logged_line == ' ') logged_line++;
-  if (strncmp(logged_line, "set wifi.pwd ", 13) == 0 ||
-      strncmp(logged_line, "set mqtt.password ", 18) == 0 ||
-      strncmp(logged_line, "set mqtt.username ", 18) == 0 ||
-      strncmp(logged_line, "set mqtt.token ", 15) == 0) {
+  const char* setting = logged_line;
+  while (*setting && *setting != ' ') setting++;
+  while (*setting == ' ') setting++;
+  bool mqtt_credential = false;
+  if (strncmp(setting, "mqtt", 4) == 0) {
+    const char* field = setting + 4;
+    while (*field >= '0' && *field <= '9') field++;
+    if (*field == '.') field++;
+    mqtt_credential = strncmp(field, "password ", 9) == 0 ||
+                      strncmp(field, "username ", 9) == 0 ||
+                      strncmp(field, "token ", 6) == 0;
+  }
+  if (strncmp(logged_line, "set wifi.pwd ", 13) == 0 || mqtt_credential) {
     Serial.printf("cli[%s] <credential setting>\n", key);
   } else
 #endif
