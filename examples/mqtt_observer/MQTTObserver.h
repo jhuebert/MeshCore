@@ -102,6 +102,7 @@ class MQTTObserver {
   bool publishEvent(const Event& event);
   bool publishStatus(size_t slot);
   void disconnectBroker(size_t slot);
+  void trackDisconnectedQueue(uint32_t now);
   void flushQueue();
   size_t queueSize();
   void markDirty();

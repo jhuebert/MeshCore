@@ -27,6 +27,7 @@ struct PacketView {
 };
 
 bool formatTimestamp(time_t timestamp, long usec, char* out, size_t capacity);
+bool buildClientVersion(const char* firmware, char* out, size_t capacity);
 bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& written);
 bool buildRaw(const char* origin, const char* origin_id, const char* timestamp,
               const uint8_t* bytes, size_t len, char* out, size_t capacity, size_t& written);
