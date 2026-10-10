@@ -217,8 +217,11 @@ EOF
   # a target that compiled but produced no artifact would otherwise upload
   # nothing and surface only as a confusing gh error later
   shopt -s nullglob
-  artifacts=(out/${file_base}.* out/${file_base}-merged.bin)
+  artifacts=(out/${file_base}.*)
   shopt -u nullglob
+  if [[ -f out/${file_base}-merged.bin ]]; then
+    artifacts+=(out/${file_base}-merged.bin)
+  fi
   if ((${#artifacts[@]} == 0)); then
     echo "ERROR: no artifacts produced for $target" >&2
     exit 1
