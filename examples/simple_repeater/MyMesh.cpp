@@ -1414,11 +1414,6 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 // ran. `key` is the job's !id key string from the queued script itself.
 static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
   // logged before dispatch: the handlers tokenise the line in place
-#ifdef WITH_MQTT_OBSERVER
-  if (MQTTObserverCommandPolicy::isCredentialSetting(line)) {
-    Serial.printf("cli[%s] <credential setting>\n", key);
-  } else
-#endif
   Serial.printf("cli[%s] %s\n", key, line);
   ((MyMesh*)ctx)->handleCommand(0, line, reply);
   if (reply[0]) Serial.printf("  -> %s\n", reply);

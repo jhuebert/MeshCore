@@ -9,8 +9,8 @@
 #define MQTT_OBSERVER_MAX_BROKERS 2  // Active broker clients configured by mqttN.*
 #endif
 
-// Reserve the full slot array so increasing the active count does not move the record layout.
-static const size_t MQTT_OBSERVER_CONFIG_BROKER_CAPACITY = 6;
+// The persisted config stores only the broker slots supported by this format.
+static const size_t MQTT_OBSERVER_CONFIG_BROKER_CAPACITY = 2;
 
 #ifndef MQTT_OBSERVER_QUEUE_CAPACITY
 #define MQTT_OBSERVER_QUEUE_CAPACITY 8  // Captured packet events shared by all broker slots
@@ -51,7 +51,7 @@ struct MQTTObserverConfig {
 
 namespace MQTTObserverConfigCodec {
 
-static const uint8_t kVersion = 3;
+static const uint8_t kVersion = 4;
 static const size_t kCommonPayloadSize = 6 + 33 + 65 + 4 + 33 + 65;
 static const size_t kBrokerPayloadSize = 1 + 2 + 129 + 65 + 65 + 65 + 129 + 65 + 65 + 65;
 static const size_t kPayloadSize = kCommonPayloadSize +

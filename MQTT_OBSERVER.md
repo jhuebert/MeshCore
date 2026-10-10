@@ -106,8 +106,8 @@ get mqttN.audience
 get mqttN.owner
 get mqttN.email
 get mqttN.username
-get mqttN.password                 # configured/not set only
-get mqttN.token                    # configured/not set only
+get mqttN.password
+get mqttN.token
 get mqttN.topic
 get mqtt.iata
 get mqtt.origin
@@ -119,27 +119,28 @@ get mqtt.packets
 get mqtt.raw
 get wifi.status                    # connection, IP, RSSI
 get wifi.ssid
+get wifi.pwd
 get wifi.powersave
 ```
 
-`N` is the one-based slot number (`1` or `2` in this build). The worker uses
-a compile-time slot array; `MQTT_OBSERVER_MAX_BROKERS` defaults to 2 and may be
-raised up to 6 at build time. Six broker records are reserved
-in `/mqtt_prefs`, so raising the active count up to 6 does not change the config
-format or require a migration. Increasing the reserved storage capacity beyond
-six would require a format migration. The observer does not include presets,
-packet allowlists, TX uplink, neighbor queries, WebConfig, SNMP, or alerting. It reports all MeshCore packet types received when the
-shared RX and packet/raw switches are enabled.
+`N` is the one-based slot number (`1` or `2` in this build). The worker and
+`/mqtt_prefs` config support two broker slots. Adding more slots requires a
+config format version change. The observer does not include presets, packet
+allowlists, TX uplink, neighbor queries, WebConfig, SNMP, or alerting. It reports
+all MeshCore packet types received when the shared RX and packet/raw switches
+are enabled.
 
 SSID/password values are the rest of the command line; do not quote them. An
 empty value clears a string setting. Settings are saved lazily about three
-seconds after a change. The experimental `/mqtt_prefs` record is versioned and
-CRC-checked. Its six reserved broker records keep the persisted layout stable
-when `MQTT_OBSERVER_MAX_BROKERS` is raised up to 6. No migration from the earlier
-prototype format is included because this observer has not been deployed and
-there are no device configs to preserve. The filesystem is not encrypted; an
-administrator with filesystem or firmware access can recover credentials.
-Commands pass through the repeater's existing CLI permission boundary.
+seconds after a change. The experimental `/mqtt_prefs` record is version 4 and
+CRC-checked; the two broker records make its payload 1,508 bytes (1,517 bytes
+including the record header and CRC). No migration from earlier prototype
+formats is included because this observer has not been deployed and there are
+no device configs to preserve. Credential values are returned by `get` commands
+and appear in fleet-script serial logs; protect CLI access and logs accordingly.
+The filesystem is not encrypted; an administrator with filesystem or firmware
+access can recover credentials. Commands pass through the repeater's existing
+CLI permission boundary.
 
 ## Topics and payloads
 
