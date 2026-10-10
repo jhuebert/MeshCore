@@ -60,16 +60,16 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
 
 TEST(MQTTObserverConfig, RejectsInvalidValuesAndIntegrityChanges) {
   MQTTObserverConfig config;
+  uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
   MQTTObserverConfigCodec::setDefaults(config);
   strcpy(config.brokers[0].server, "https://mqtt.example");
-  EXPECT_EQ(MQTTObserverConfigCodec::encode(config, nullptr, 0), 0u);
+  EXPECT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), 0u);
 
   strcpy(config.brokers[0].server, "mqtts://mqtt.example");
   strcpy(config.iata, "Sea");
-  EXPECT_EQ(MQTTObserverConfigCodec::encode(config, nullptr, 0), 0u);
+  EXPECT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), 0u);
 
   strcpy(config.iata, "SEA");
-  uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
   ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
   uint16_t checksum = crc16_ccitt(payload, sizeof(payload));
   payload[0] = 2;
@@ -143,6 +143,74 @@ TEST(MQTTObserverConfig, BuildsBrokerUrisAndHonorsExplicitPorts) {
   ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
   EXPECT_STREQ(uri, "mqtts://broker.example:9000/mqtt");
   EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config.brokers[0]), 9000);
+
+  strcpy(config.brokers[0].server, "mqtts://[2001:db8::1]/mqtt");
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
+  EXPECT_STREQ(uri, "mqtts://[2001:db8::1]:8883/mqtt");
+  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config.brokers[0]), 8883);
+
+  strcpy(config.brokers[0].server, "ws://[::1]:8080/mqtt");
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(config.brokers[0], uri, sizeof(uri)));
+  EXPECT_STREQ(uri, "ws://[::1]:8080/mqtt");
+  EXPECT_EQ(MQTTObserverConfigCodec::configuredPort(config.brokers[0]), 8080);
+}
+
+TEST(MQTTObserverConfig, RejectsMalformedAuthoritiesAndPorts) {
+  const char* invalid[] = {
+    "mqtt://host:", "mqtt://host:0", "mqtt://host:65536", "mqtt://host:abc",
+    "mqtt://host:12345678901234567890", "mqtt://host:12:34", "mqtt://[::1",
+    "mqtt://[]", "mqtt://[::1]extra", "mqtt://host\\other", "host:1883",
+    "mqtt://user:password@host", "mqtt://?query"
+  };
+  for (const char* server : invalid)
+    EXPECT_FALSE(MQTTObserverConfigCodec::validServer(server)) << server;
+  EXPECT_TRUE(MQTTObserverConfigCodec::validServer("mqtt://[::1]:1883"));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validServer("[2001:db8::1]"));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validServer("wss://host:443/mqtt"));
+}
+
+TEST(MQTTObserverConfig, BrokerSlotsHaveDistinctClientIds) {
+  char first[67], second[67];
+  const char* device = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildClientId(device, 0, first, sizeof(first)));
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildClientId(device, 1, second, sizeof(second)));
+  EXPECT_EQ(std::string(first), std::string(device) + "-1");
+  EXPECT_EQ(std::string(second), std::string(device) + "-2");
+  EXPECT_FALSE(MQTTObserverConfigCodec::buildClientId(device, 2, first, sizeof(first)));
+  EXPECT_FALSE(MQTTObserverConfigCodec::buildClientId(device, 0, first, sizeof(first) - 1));
+}
+
+TEST(MQTTObserverCommandPolicy, UnsignedParsingRejectsRangeAndOverflow) {
+  unsigned value = 99;
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("9", 0, 2, value));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("42949672960", 1, 65535, value));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("0", 1, 60, value));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned(nullptr, 1, 60, value));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("1x", 1, 60, value));
+  EXPECT_EQ(value, 99u);
+  ASSERT_TRUE(MQTTObserverCommandPolicy::parseUnsigned("60", 1, 60, value));
+  EXPECT_EQ(value, 60u);
+}
+
+TEST(MQTTObserverConnectionPolicy, RenewsBeforeReconnectAsWellAsWhileConnected) {
+  EXPECT_FALSE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(1000, 0));
+  EXPECT_FALSE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(1000, 1301));
+  EXPECT_TRUE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(1000, 1300));
+  EXPECT_TRUE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(2000, 1300));
+}
+
+TEST(MQTTObserverQueuePolicy, RestartsStaleWindowAfterFlushAndHandlesWrap) {
+  uint32_t since = 0;
+  EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(100, false, since));
+  EXPECT_EQ(since, 100u);
+  EXPECT_TRUE(MQTTObserverQueuePolicy::trackDisconnected(60100, false, since));
+  EXPECT_EQ(since, 0u);
+  EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(60101, false, since));
+  EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(60102, false, since));
+  EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(60103, true, since));
+  EXPECT_EQ(since, 0u);
+  EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(0xfffffff0, false, since));
+  EXPECT_TRUE(MQTTObserverQueuePolicy::trackDisconnected(59984, false, since));
 }
 
 TEST(MQTTObserverConfig, ExpandsReferenceTopicTemplate) {

@@ -42,6 +42,8 @@ broker slots. Broker-specific settings always use numbered commands (`mqtt1.*`,
 shared settings such as IATA, origin, and publish switches. Broker credentials
 and topic templates are independent. Wi-Fi, IATA, origin, NTP, status interval,
 and packet/status/raw enable switches are shared.
+Each slot uses MQTT client ID `<DEVICE_PUBLIC_KEY>-<N>` so configuring both
+slots on the same broker does not cause them to disconnect one another.
 
 ```text
 set wifi.ssid YourNetwork
@@ -63,8 +65,9 @@ For a username/password connection, set that slot's `username` and `password`
 and leave its `audience` empty. JWT mode takes precedence when that slot has an
 audience configured; it uses username `v1_<PUBLIC_KEY_HEX>` and a 24-hour Ed25519-signed token. The
 worker waits for valid time before connecting and renews tokens before expiry.
-Optional per-slot `owner` and `email` values are included in JWT claims. Secrets
-are not echoed by set/get replies or fleet-script logs.
+Expired tokens are also renewed before reconnecting after an outage.
+Optional per-slot `owner` and `email` values are included in JWT claims. Set
+replies do not echo credentials; get replies and fleet-script logs can expose them.
 
 A server may be configured as a hostname and port separately. Use `mqtts://`
 for MQTT over TLS, `wss://` for secure WebSockets, `mqtt://` for trusted private
@@ -72,7 +75,10 @@ networks, or `ws://` for trusted private networks. Secure URLs retain hostname
 and certificate verification. Do not use plain transport on an untrusted
 network. URLs must not contain embedded `username:password@` credentials. With
 a full URL, an explicit URL port takes precedence; otherwise that slot's
-`mqttN.port` supplies the port. Host-only values infer `mqtts://` for port 8883,
+`mqttN.port` supplies the port. The default port setting (1883) selects the
+scheme's conventional port: 1883 for MQTT, 8883 for MQTT/TLS, 80 for WS, and
+443 for WSS. Explicit URL ports must be 1–65535; IPv6 hosts must be bracketed.
+Host-only values infer `mqtts://` for port 8883,
 `wss://` for 443, and `mqtt://` otherwise.
 
 Supported commands include:
@@ -188,8 +194,9 @@ flight.
 On a failed attempt, the queue retries up to three times with a short
 300–499 ms delay. Pending events are flushed after one continuous minute with
 no connected broker. No packet event, queue entry, or offline history is written
-to flash or replayed after reboot. Publish work, TLS, NTP, and reconnects run
-outside the receive and forwarding path.
+to flash or replayed after reboot. Waiting for valid time also expires queued
+events, and a flush starts a fresh expiry window for newly captured events.
+Publish work, TLS, NTP, and reconnects run outside the receive and forwarding path.
 
 Both connected slots are offered each queued event. Following the reference
 observer's queue policy, the event is considered delivered when any connected

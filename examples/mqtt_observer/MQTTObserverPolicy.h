@@ -6,6 +6,20 @@
 
 namespace MQTTObserverCommandPolicy {
 
+inline bool parseUnsigned(const char* value, unsigned min, unsigned max, unsigned& parsed) {
+  if (!value || !*value) return false;
+  unsigned result = 0;
+  for (const char* p = value; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    unsigned digit = static_cast<unsigned>(*p - '0');
+    if (digit > max || result > (max - digit) / 10) return false;
+    result = result * 10 + digit;
+  }
+  if (result < min) return false;
+  parsed = result;
+  return true;
+}
+
 inline bool parseSlot(const char* command, const char* operation, size_t max_slots,
                       size_t& slot, const char*& property) {
   size_t operation_len = strlen(operation);
@@ -27,6 +41,14 @@ inline bool parseSlot(const char* command, const char* operation, size_t max_slo
 
 }  // namespace MQTTObserverCommandPolicy
 
+namespace MQTTObserverConnectionPolicy {
+
+inline bool jwtNeedsRenewal(int64_t epoch, uint32_t expiry) {
+  return expiry != 0 && epoch + 300 >= expiry;
+}
+
+}  // namespace MQTTObserverConnectionPolicy
+
 namespace MQTTObserverQueuePolicy {
 
 static const uint32_t kDisconnectedStaleMs = 60000UL;
@@ -41,6 +63,19 @@ inline uint32_t elapsedMs(uint32_t now, uint32_t then) {
 inline bool shouldFlushDisconnected(uint32_t now, uint32_t disconnected_since) {
   return disconnected_since != 0 &&
          elapsedMs(now, disconnected_since) >= kDisconnectedStaleMs;
+}
+
+inline bool trackDisconnected(uint32_t now, bool empty, uint32_t& since) {
+  if (empty) {
+    since = 0;
+    return false;
+  }
+  if (shouldFlushDisconnected(now, since)) {
+    since = 0;
+    return true;
+  }
+  if (!since) since = now ? now : 1;
+  return false;
 }
 
 inline bool retryReady(uint32_t now, uint32_t next_retry_ms, uint8_t retry_attempts) {

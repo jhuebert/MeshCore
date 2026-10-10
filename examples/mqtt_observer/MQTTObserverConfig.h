@@ -88,12 +88,45 @@ inline bool validServer(const char* server) {
   }
   if (!*remainder || *remainder == '/' || *remainder == ':' ||
       *remainder == '?' || *remainder == '#') return false;
-  if (!scheme) {
-    for (const unsigned char* p = (const unsigned char*)remainder; *p; p++) {
-      if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') || *p == '.' || *p == '-' ||
-            *p == '[' || *p == ']')) return false;
+  const char* end = strpbrk(remainder, "/?#");
+  if (!end) end = remainder + strlen(remainder);
+  const char* host_end = end;
+  const char* port = nullptr;
+  if (*remainder == '[') {
+    const char* close = static_cast<const char*>(memchr(remainder, ']', end - remainder));
+    if (!close || close == remainder + 1) return false;
+    bool has_colon = false;
+    for (const char* p = remainder + 1; p < close; p++) {
+      if (*p == ':') has_colon = true;
+      else if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+                 (*p >= 'A' && *p <= 'F') || *p == '.')) return false;
     }
+    if (!has_colon) return false;
+    if (close + 1 < end) {
+      if (close[1] != ':') return false;
+      port = close + 2;
+    }
+  } else {
+    const char* colon = static_cast<const char*>(memchr(remainder, ':', end - remainder));
+    if (colon) { host_end = colon; port = colon + 1; }
+    if (host_end == remainder) return false;
+    for (const char* p = remainder; p < host_end; p++) {
+      if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '.' || *p == '-')) return false;
+    }
+  }
+  if (port) {
+    if (port == end) return false;
+    unsigned number = 0;
+    for (const char* p = port; p < end; p++) {
+      if (*p < '0' || *p > '9') return false;
+      number = number * 10 + static_cast<unsigned>(*p - '0');
+      if (number > 65535) return false;
+    }
+    if (!number) return false;
+  }
+  if (!scheme) {
+    if (*end || port) return false;  // Host-only settings use the separate port field.
   }
   for (const unsigned char* p = (const unsigned char*)server; *p; p++) {
     if (*p <= 0x20 || *p == 0x7f || *p == '@') return false;
@@ -281,19 +314,21 @@ inline void hostLabel(const char* server, char* out, size_t capacity) {
   out[len] = 0;
 }
 
+inline const char* authorityPort(const char* authority, const char* end) {
+  if (authority < end && *authority == '[') {
+    const char* close = static_cast<const char*>(memchr(authority, ']', end - authority));
+    return close && close + 1 < end && close[1] == ':' ? close + 1 : nullptr;
+  }
+  return static_cast<const char*>(memchr(authority, ':', end - authority));
+}
+
 inline uint16_t configuredPort(const MQTTObserverBrokerConfig& broker) {
   const char* scheme = strstr(broker.server, "://");
   if (!scheme) return broker.port;
   const char* authority = scheme + 3;
   const char* end = strpbrk(authority, "/?#");
   if (!end) end = broker.server + strlen(broker.server);
-  const char* colon = nullptr;
-  if (authority < end && *authority == '[') {
-    const char* close = static_cast<const char*>(memchr(authority, ']', end - authority));
-    if (close && close + 1 < end && close[1] == ':') colon = close + 1;
-  } else {
-    for (const char* p = authority; p < end; p++) if (*p == ':') colon = p;
-  }
+  const char* colon = authorityPort(authority, end);
   if (!colon || colon + 1 == end) {
     if (broker.port == 1883) {
       size_t scheme_len = static_cast<size_t>(scheme - broker.server);
@@ -319,22 +354,11 @@ inline bool buildServerUri(const MQTTObserverBrokerConfig& broker, char* out, si
     const char* authority = scheme + 3;
     const char* path = strpbrk(authority, "/?#");
     const char* end = path ? path : server + strlen(server);
-    bool has_port = false;
-    if (authority < end && *authority == '[') {
-      const char* close = static_cast<const char*>(memchr(authority, ']', end - authority));
-      has_port = close && close + 1 < end && close[1] == ':';
-    } else {
-      has_port = memchr(authority, ':', end - authority) != nullptr;
-    }
-    if (has_port) {
+    if (authorityPort(authority, end)) {
       int len = snprintf(out, capacity, "%s", server);
       return len > 0 && static_cast<size_t>(len) < capacity;
     }
-    uint16_t port = broker.port;
-    size_t scheme_len = static_cast<size_t>(scheme - server);
-    if (port == 1883 && scheme_len == 5 && strncmp(server, "mqtts", 5) == 0) port = 8883;
-    else if (port == 1883 && scheme_len == 3 && strncmp(server, "wss", 3) == 0) port = 443;
-    else if (port == 1883 && scheme_len == 2 && strncmp(server, "ws", 2) == 0) port = 80;
+    uint16_t port = configuredPort(broker);
     size_t prefix_len = static_cast<size_t>(end - server);
     int len = snprintf(out, capacity, "%.*s:%u%s", static_cast<int>(prefix_len), server,
                        static_cast<unsigned>(port), path ? path : "");
@@ -343,6 +367,12 @@ inline bool buildServerUri(const MQTTObserverBrokerConfig& broker, char* out, si
   const char* protocol = broker.port == 8883 ? "mqtts" : broker.port == 443 ? "wss" : "mqtt";
   int len = snprintf(out, capacity, "%s://%s:%u", protocol, server,
                      static_cast<unsigned>(broker.port));
+  return len > 0 && static_cast<size_t>(len) < capacity;
+}
+
+inline bool buildClientId(const char* device_id, size_t slot, char* out, size_t capacity) {
+  if (!device_id || !out || slot >= MQTT_OBSERVER_CONFIG_BROKER_CAPACITY) return false;
+  int len = snprintf(out, capacity, "%s-%u", device_id, static_cast<unsigned>(slot + 1));
   return len > 0 && static_cast<size_t>(len) < capacity;
 }
 

@@ -52,20 +52,6 @@ bool parseToggle(const char* value, uint8_t& enabled) {
   return false;
 }
 
-bool parseUnsigned(const char* value, unsigned min, unsigned max, unsigned& parsed) {
-  if (!value || !*value) return false;
-  unsigned result = 0;
-  for (const char* p = value; *p; p++) {
-    if (*p < '0' || *p > '9') return false;
-    unsigned digit = static_cast<unsigned>(*p - '0');
-    if (result > (max - digit) / 10) return false;
-    result = result * 10 + digit;
-  }
-  if (result < min) return false;
-  parsed = result;
-  return true;
-}
-
 bool base64Url(const uint8_t* input, size_t input_len, char* output, size_t capacity,
                size_t& written) {
   if (!input || !output || capacity < 2) return false;
@@ -140,7 +126,8 @@ bool sameBrokerConnection(const MQTTObserverBrokerConfig& a,
 }  // namespace
 
 MQTTObserver::BrokerRuntime::BrokerRuntime()
-    : client(nullptr), server_uri{}, username{}, password{}, jwt_username{}, jwt_token{}, jwt_expiry(0),
+    : client(nullptr), server_uri{}, client_id{}, username{}, password{}, jwt_username{},
+      jwt_token{}, jwt_expiry(0),
       next_connect_ms(0), attempt_started(0), connected_at(0), last_status_ms(0),
       status_retry_ms(0), backoff_index(0), status_retry_pending(false),
       client_started(false), configured(false), connected(false), status_pending(false),
@@ -341,20 +328,10 @@ void MQTTObserver::flushQueue() {
   if (discarded) _disconnected_drops.fetch_add(discarded, std::memory_order_relaxed);
 }
 
-// One worker-pass step for every state in which no connected broker will drain
-// the queue this pass: time the outage, and flush once it exceeds the stale
-// threshold. An emptied queue resets the timer, and 0 means "not timing yet" —
-// millis() itself is never stored, so a wrap cannot fake a stale timestamp.
 void MQTTObserver::trackDisconnectedQueue(uint32_t now) {
-  if (queueSize() == 0) {
-    _queue_disconnected_since = 0;
-    return;
-  }
-  if (_queue_disconnected_since != 0 &&
-      MQTTObserverQueuePolicy::shouldFlushDisconnected(now, _queue_disconnected_since)) {
+  if (MQTTObserverQueuePolicy::trackDisconnected(now, queueSize() == 0,
+                                                 _queue_disconnected_since))
     flushQueue();
-  }
-  if (_queue_disconnected_since == 0) _queue_disconnected_since = now ? now : 1;
 }
 
 size_t MQTTObserver::queueSize() {
@@ -446,12 +423,20 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverBrokerConfig& 
     });
   }
   if (!MQTTObserverConfigCodec::buildServerUri(config, runtime.server_uri,
-                                                sizeof(runtime.server_uri))) return false;
+                                                 sizeof(runtime.server_uri)) ||
+      !MQTTObserverConfigCodec::buildClientId(_device_id, slot, runtime.client_id,
+                                              sizeof(runtime.client_id))) return false;
   runtime.client->setServer(runtime.server_uri);
-  runtime.client->setClientId(_device_id);
+  runtime.client->setClientId(runtime.client_id);
   runtime.client->setKeepAlive(60);
   esp_mqtt_client_config_t* mqtt_config = runtime.client->getMqttConfig();
-  if (mqtt_config) mqtt_config->network_timeout_ms = 2500;
+  if (mqtt_config) {
+#if ESP_IDF_VERSION_MAJOR == 5
+    mqtt_config->network.timeout_ms = 2500;
+#else
+    mqtt_config->network_timeout_ms = 2500;
+#endif
+  }
   runtime.client->setBufferSize(1280);
 #if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
   if (mqtt_config) mqtt_config->buffer.out_size = 1280;
@@ -487,8 +472,10 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverBrokerConfig& 
 void MQTTObserver::disconnectBroker(size_t slot) {
   if (slot >= MQTT_OBSERVER_MAX_BROKERS) return;
   BrokerRuntime& runtime = _brokers[slot];
-  if (runtime.client && (runtime.client_started || runtime.connected.load(std::memory_order_relaxed)))
-    runtime.client->disconnect();
+  if (runtime.client && (runtime.client_started || runtime.connected.load(std::memory_order_relaxed))) {
+    // Graceful disconnect waits indefinitely for a disconnect event in the library.
+    runtime.client->forceStop();
+  }
   runtime.client_started = false;
   runtime.connected.store(false, std::memory_order_relaxed);
   runtime.status_pending.store(false, std::memory_order_relaxed);
@@ -585,6 +572,7 @@ void MQTTObserver::worker() {
         if (_work_config.brokers[i].enabled)
           _brokers[i].state.store(STATE_TIME, std::memory_order_relaxed);
       _state.store(STATE_TIME, std::memory_order_relaxed);
+      trackDisconnectedQueue(now);
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -601,7 +589,8 @@ void MQTTObserver::worker() {
       }
       bool connection_changed = !runtime_config_initialized || wifi_changed ||
           !sameBrokerConnection(broker, _runtime_config.brokers[i]);
-      if (connection_changed || !runtime.configured) {
+      if (connection_changed || !runtime.configured ||
+          MQTTObserverConnectionPolicy::jwtNeedsRenewal(epoch, runtime.jwt_expiry)) {
         disconnectBroker(i);
         runtime.configured = false;
         runtime.status_retry_pending = false;
@@ -624,16 +613,6 @@ void MQTTObserver::worker() {
         if (static_cast<uint32_t>(now - runtime.connected_at.load(std::memory_order_relaxed)) >= 120000)
           runtime.backoff_index = 0;
 
-        epoch = time(nullptr);
-        if (runtime.jwt_expiry && epoch + 300 >= runtime.jwt_expiry) {
-          disconnectBroker(i);
-          runtime.configured = false;
-          if (configureClient(i, broker)) {
-            runtime.configured = true;
-            runtime.next_connect_ms = now;
-          } else runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
-          continue;
-        }
         bool status_due = runtime.status_pending.exchange(false, std::memory_order_relaxed) ||
             runtime.status_retry_pending || !runtime.last_status_ms ||
             static_cast<uint32_t>(now - runtime.last_status_ms) >=
@@ -641,7 +620,7 @@ void MQTTObserver::worker() {
         bool status_retry_ready = MQTTObserverQueuePolicy::retryReady(
             now, runtime.status_retry_ms, runtime.status_retry_pending ? 1 : 0);
         if (_work_config.status_enabled && status_due && status_retry_ready) {
-          if (publishStatus(i)) {
+          if (publishStatus(i, _work_config)) {
             runtime.last_status_ms = now ? now : 1;
             runtime.status_retry_pending = false;
           } else {
@@ -657,8 +636,7 @@ void MQTTObserver::worker() {
       runtime.connected.store(false, std::memory_order_relaxed);
       if (runtime.client_started &&
           static_cast<uint32_t>(now - runtime.attempt_started) >= 30000) {
-        runtime.client->disconnect();
-        runtime.client_started = false;
+        disconnectBroker(i);
         uint8_t index = runtime.backoff_index < 5 ? runtime.backoff_index : 4;
         runtime.next_connect_ms = now + kBackoffMs[index];
         if (runtime.backoff_index < 4) runtime.backoff_index++;
@@ -688,7 +666,7 @@ void MQTTObserver::worker() {
       have_event = _queue.beginAttempt(millis(), queued);
       portEXIT_CRITICAL(&_queue_mux);
       if (have_event) {
-        bool published = publishEvent(queued.event);
+        bool published = publishEvent(queued.event, _work_config);
         MQTTObserverQueuePolicy::RetryDecision retry =
             MQTTObserverQueuePolicy::retryDecision(published, queued.retry_attempts, millis());
         portENTER_CRITICAL(&_queue_mux);
@@ -709,13 +687,13 @@ void MQTTObserver::worker() {
   }
 }
 
-bool MQTTObserver::publishStatus(size_t slot) {
+bool MQTTObserver::publishStatus(size_t slot, const MQTTObserverConfig& config) {
   if (slot >= MQTT_OBSERVER_MAX_BROKERS) return false;
   BrokerRuntime& runtime = _brokers[slot];
-  if (!runtime.client || !runtime.client->connected() || !_runtime_config.status_enabled) return false;
-  const MQTTObserverBrokerConfig& broker = _runtime_config.brokers[slot];
+  if (!runtime.client || !runtime.client->connected() || !config.status_enabled) return false;
+  const MQTTObserverBrokerConfig& broker = config.brokers[slot];
   char topic[128];
-  if (!MQTTObserverConfigCodec::buildTopic(_runtime_config, broker, _device_id, "status",
+  if (!MQTTObserverConfigCodec::buildTopic(config, broker, _device_id, "status",
                                            topic, sizeof(topic))) return false;
   struct timeval now;
   gettimeofday(&now, nullptr);
@@ -742,7 +720,7 @@ bool MQTTObserver::publishStatus(size_t slot) {
   return runtime.client->publish(topic, 1, false, _json, written, true) >= 0;
 }
 
-bool MQTTObserver::publishEvent(const Event& event) {
+bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& config) {
   bool any_published = false;
   char origin[sizeof(_origin)];
   portENTER_CRITICAL(&_config_mux);
@@ -751,11 +729,11 @@ bool MQTTObserver::publishEvent(const Event& event) {
 
   for (size_t slot = 0; slot < MQTT_OBSERVER_MAX_BROKERS; slot++) {
     BrokerRuntime& runtime = _brokers[slot];
-    const MQTTObserverBrokerConfig& broker = _runtime_config.brokers[slot];
+    const MQTTObserverBrokerConfig& broker = config.brokers[slot];
     if (!broker.enabled || !runtime.client || !runtime.client->connected()) continue;
     char topic[128];
     size_t written = 0;
-    if (_runtime_config.packets_enabled) {
+    if (config.packets_enabled) {
       uint8_t serialized[MAX_TRANS_UNIT];
       const uint8_t* wire = event.raw;
       size_t wire_len = event.raw_len;
@@ -783,7 +761,7 @@ bool MQTTObserver::publishEvent(const Event& event) {
         event.packet.isRouteDirect() ? event.packet.getPathHashCount() : 0,
         event.packet.getPathHashSize()
       };
-      if (MQTTObserverConfigCodec::buildTopic(_runtime_config, broker, _device_id,
+      if (MQTTObserverConfigCodec::buildTopic(config, broker, _device_id,
                                               "packets", topic, sizeof(topic)) &&
           MQTTObserverFormat::buildPacket(view, _json, sizeof(_json), written)) {
         if (runtime.client->publish(topic, 0, false, _json, written, false) >= 0) {
@@ -797,11 +775,11 @@ bool MQTTObserver::publishEvent(const Event& event) {
       }
     }
 
-    if (_runtime_config.raw_enabled && event.raw_len) {
+    if (config.raw_enabled && event.raw_len) {
       char timestamp[40];
       if (MQTTObserverFormat::formatTimestamp(event.timestamp, event.timestamp_usec,
                                                timestamp, sizeof(timestamp)) &&
-          MQTTObserverConfigCodec::buildTopic(_runtime_config, broker, _device_id,
+          MQTTObserverConfigCodec::buildTopic(config, broker, _device_id,
                                               "raw", topic, sizeof(topic)) &&
           MQTTObserverFormat::buildRaw(origin, _device_id, timestamp,
                                        event.raw, event.raw_len, _json, sizeof(_json), written)) {
@@ -898,7 +876,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       portEXIT_CRITICAL(&_config_mux);
     } else if (strcmp(common_property, "interval") == 0) {
       unsigned minutes;
-      if (!parseUnsigned(common_value, 1, 60, minutes)) {
+      if (!MQTTObserverCommandPolicy::parseUnsigned(common_value, 1, 60, minutes)) {
         snprintf(reply, CLI_REPLY_MAX, "Err - interval must be 1-60 minutes");
         return true;
       }
@@ -955,7 +933,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
 
   if (MQTT_PROP_IS("port")) {
     unsigned port;
-    if (!parseUnsigned(value, 1, 65535, port)) {
+    if (!MQTTObserverCommandPolicy::parseUnsigned(value, 1, 65535, port)) {
       snprintf(reply, CLI_REPLY_MAX, "Err - port must be 1-65535");
       return true;
     }
