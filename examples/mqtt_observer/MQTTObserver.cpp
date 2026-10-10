@@ -4,9 +4,15 @@
 #include "MQTTObserverFormat.h"
 #include "MQTTObserverRecord.h"
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/platform.h>
+#if defined(BOARD_HAS_PSRAM)
+#include <esp_heap_caps.h>
+#endif
 #include <sys/time.h>
 #include <time.h>
+#include <stdlib.h>
 #include <new>
 
 #ifndef FIRMWARE_VERSION
@@ -44,6 +50,20 @@ bool parseToggle(const char* value, uint8_t& enabled) {
   return false;
 }
 
+bool parseUnsigned(const char* value, unsigned min, unsigned max, unsigned& parsed) {
+  if (!value || !*value) return false;
+  unsigned result = 0;
+  for (const char* p = value; *p; p++) {
+    if (*p < '0' || *p > '9') return false;
+    unsigned digit = static_cast<unsigned>(*p - '0');
+    if (result > (max - digit) / 10) return false;
+    result = result * 10 + digit;
+  }
+  if (result < min) return false;
+  parsed = result;
+  return true;
+}
+
 bool base64Url(const uint8_t* input, size_t input_len, char* output, size_t capacity, size_t& written) {
   if (!input || !output || capacity < 2) return false;
   size_t len = 0;
@@ -59,24 +79,71 @@ bool base64Url(const uint8_t* input, size_t input_len, char* output, size_t capa
   return true;
 }
 
+bool jsonEscape(const char* input, char* output, size_t capacity) {
+  if (!input || !output || capacity == 0) return false;
+  size_t used = 0;
+  static const char hex[] = "0123456789abcdef";
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(input); *p; p++) {
+    char escaped[6];
+    const char* value = nullptr;
+    size_t len = 0;
+    if (*p == '"' || *p == '\\') {
+      escaped[0] = '\\';
+      escaped[1] = static_cast<char>(*p);
+      value = escaped;
+      len = 2;
+    } else if (*p < 0x20) {
+      escaped[0] = '\\'; escaped[1] = 'u'; escaped[2] = '0'; escaped[3] = '0';
+      escaped[4] = hex[*p >> 4]; escaped[5] = hex[*p & 0x0f];
+      value = escaped;
+      len = 6;
+    } else {
+      escaped[0] = static_cast<char>(*p);
+      value = escaped;
+      len = 1;
+    }
+    if (used + len >= capacity) return false;
+    memcpy(output + used, value, len);
+    used += len;
+  }
+  output[used] = 0;
+  return true;
+}
+
+void* observerMbedtlsCalloc(size_t count, size_t size) {
+#if defined(BOARD_HAS_PSRAM)
+  void* memory = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (memory) return memory;
+#endif
+  return calloc(count, size);
+}
+
+void observerMbedtlsFree(void* memory) {
+  free(memory);
+}
+
 bool secureUri(const char* uri) {
   return strncmp(uri, "mqtts://", 8) == 0 || strncmp(uri, "wss://", 6) == 0;
 }
 
-bool makeTopic(const MQTTObserverConfig& config, const char* device_id,
-               const char* leaf, char* out, size_t capacity) {
-  int len = snprintf(out, capacity, "meshcore/%s/%s/%s", config.iata, device_id, leaf);
-  return len > 0 && static_cast<size_t>(len) < capacity;
+bool sameConnectionConfig(const MQTTObserverConfig& a, const MQTTObserverConfig& b) {
+  // Publish-only settings update live without tearing down a healthy TLS session.
+  return strcmp(a.wifi_ssid, b.wifi_ssid) == 0 &&
+         strcmp(a.wifi_password, b.wifi_password) == 0 &&
+         strcmp(a.server, b.server) == 0 && a.port == b.port &&
+         strcmp(a.username, b.username) == 0 && strcmp(a.password, b.password) == 0 &&
+         strcmp(a.audience, b.audience) == 0 && strcmp(a.owner, b.owner) == 0 &&
+         strcmp(a.email, b.email) == 0;
 }
 
 }  // namespace
 
 MQTTObserver::MQTTObserver()
     : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{},
-      _radio_freq(0), _radio_bw(0), _radio_sf(0), _radio_cr(0), _config{},
+      _radio_freq(0), _radio_bw(0), _radio_sf(0), _radio_cr(0), _config{}, _save_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
       _queue(), _raw_stager(), _client(nullptr), _task(nullptr), _runtime_config{},
-      _device_id{}, _jwt_username{}, _jwt_token{}, _json{}, _connected(false),
+      _device_id{}, _server_uri{}, _jwt_username{}, _jwt_token{}, _json{}, _connected(false),
       _status_pending(false), _wifi_started(false), _client_started(false),
       _next_connect_ms(0), _last_status_ms(0), _jwt_expiry(0), _backoff_index(0),
       _state(STATE_OFF), _save_state(), _received(0), _published(0),
@@ -90,11 +157,15 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
   _fs = fs;
   _identity = identity;
   _origin_source = origin;
+#if defined(BOARD_HAS_PSRAM)
+  if (psramFound()) mbedtls_platform_set_calloc_free(observerMbedtlsCalloc, observerMbedtlsFree);
+#endif
   _radio_freq = freq;
   _radio_bw = bw;
   _radio_sf = sf;
   _radio_cr = cr;
   strncpy(_origin, origin ? origin : "", sizeof(_origin) - 1);
+  _origin[sizeof(_origin) - 1] = 0;
   bytesToHex(identity->pub_key, PUB_KEY_SIZE, _device_id);
 
   char path[64];
@@ -108,7 +179,8 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
         portENTER_CRITICAL(&_config_mux);
         _config = loaded;
         portEXIT_CRITICAL(&_config_mux);
-        if (source == PERSIST_LOAD_RECOVERED) _save_state.markDirty();
+        if (source == PERSIST_LOAD_RECOVERED || file.size() == MQTTObserverRecord::kLegacyV1RecordSize)
+          _save_state.markDirty();
       }
       file.close();
     }
@@ -132,15 +204,19 @@ void MQTTObserver::copyConfig(MQTTObserverConfig& config) {
 }
 
 bool MQTTObserver::ready(const MQTTObserverConfig& config) const {
-  return config.enabled && config.wifi_ssid[0] && config.server[0] && config.iata[0] &&
+  bool needs_iata = !config.topic[0] || strstr(config.topic, "{iata}") != nullptr;
+  return config.enabled && config.wifi_ssid[0] && config.server[0] &&
+         (!needs_iata || (config.iata[0] && strcmp(config.iata, "XXX") != 0)) &&
          MQTTObserverConfigCodec::valid(config);
 }
 
 bool MQTTObserver::readRecord(File& file, MQTTObserverConfig& config) {
-  if (file.size() != MQTTObserverRecord::kRecordSize) return false;
+  size_t size = file.size();
+  if (size != MQTTObserverRecord::kRecordSize &&
+      size != MQTTObserverRecord::kLegacyV1RecordSize) return false;
   uint8_t record[MQTTObserverRecord::kRecordSize];
-  if (file.read(record, sizeof(record)) != sizeof(record)) return false;
-  return MQTTObserverRecord::decode(record, sizeof(record), config);
+  if (file.read(record, size) != size) return false;
+  return MQTTObserverRecord::decode(record, size, config);
 }
 
 bool MQTTObserver::writeRecord(File& file, void* context) {
@@ -156,12 +232,12 @@ bool MQTTObserver::validateRecord(File& file, void*) {
 bool MQTTObserver::saveConfig() {
   MQTTObserverConfig config;
   copyConfig(config);
-  uint8_t record[MQTTObserverRecord::kRecordSize];
-  if (MQTTObserverRecord::encode(config, record, sizeof(record)) != sizeof(record)) {
+  if (MQTTObserverRecord::encode(config, _save_record, sizeof(_save_record)) !=
+      sizeof(_save_record)) {
     _save_state.retryLater();
     return false;
   }
-  bool saved = saveStaged(_fs, kConfigPath, writeRecord, record,
+  bool saved = saveStaged(_fs, kConfigPath, writeRecord, _save_record,
                           validateRecord, nullptr, validateRecord, nullptr);
   if (saved) _save_state.clear();
   else _save_state.retryLater();
@@ -188,9 +264,12 @@ void MQTTObserver::setRadio(float freq, float bw, uint8_t sf, uint8_t cr) {
 }
 
 void MQTTObserver::loop() {
+  MQTTObserverConfig config;
+  copyConfig(config);
+  const char* origin = config.origin[0] ? config.origin : (_origin_source ? _origin_source : "");
   portENTER_CRITICAL(&_config_mux);
-  if (_origin_source && strncmp(_origin, _origin_source, sizeof(_origin)) != 0) {
-    strncpy(_origin, _origin_source, sizeof(_origin) - 1);
+  if (strncmp(_origin, origin, sizeof(_origin)) != 0) {
+    strncpy(_origin, origin, sizeof(_origin) - 1);
     _origin[sizeof(_origin) - 1] = 0;
   }
   portEXIT_CRITICAL(&_config_mux);
@@ -205,9 +284,13 @@ void MQTTObserver::stageRaw(float snr, float rssi, const uint8_t raw[], int len)
 void MQTTObserver::capture(mesh::Packet* packet, float score) {
   if (!packet) return;
   _received.fetch_add(1, std::memory_order_relaxed);
+  MQTTObserverConfig config;
+  copyConfig(config);
+  if (!config.rx_enabled || (!config.packets_enabled && !config.raw_enabled)) return;
 
-  MQTTObserverRawStager::Snapshot raw;
-  bool has_raw = _raw_stager.consume(raw);
+  Event event{};
+  bool has_raw = _raw_stager.consume(event.raw, sizeof(event.raw), event.raw_len,
+                                     event.snr, event.rssi);
   struct timeval now;
   gettimeofday(&now, nullptr);
   if (now.tv_sec < kMinimumValidTime) {
@@ -215,14 +298,15 @@ void MQTTObserver::capture(mesh::Packet* packet, float score) {
     return;
   }
 
-  Event event{};
   event.packet = *packet;
-  event.raw_len = has_raw ? raw.length : 0;
-  if (event.raw_len) memcpy(event.raw, raw.bytes, event.raw_len);
+  if (!has_raw) {
+    event.raw_len = 0;
+    event.snr = packet->getSNR();
+    event.rssi = 0;
+  }
   event.timestamp = now.tv_sec;
   event.timestamp_usec = now.tv_usec;
-  event.snr = has_raw ? raw.snr : packet->getSNR();
-  event.rssi = has_raw ? raw.rssi : 0;
+  event.received_ms = millis();
   event.score = score;
 
   portENTER_CRITICAL(&_queue_mux);
@@ -262,32 +346,50 @@ bool MQTTObserver::createJwt(char* token, size_t capacity, uint32_t& expires_at)
   snprintf(_jwt_username, sizeof(_jwt_username), "v1_%s", public_key);
 
   const char header_json[] = "{\"alg\":\"Ed25519\",\"typ\":\"JWT\"}";
-  char payload_json[256];
   unsigned long issued_at = static_cast<unsigned long>(now);
   unsigned long expiry = issued_at + kJwtLifetimeSeconds;
-  int payload_len = snprintf(payload_json, sizeof(payload_json),
-      "{\"publicKey\":\"%s\",\"aud\":\"%s\",\"iat\":%lu,\"exp\":%lu}",
-      public_key, _runtime_config.audience, issued_at, expiry);
-  if (payload_len <= 0 || static_cast<size_t>(payload_len) >= sizeof(payload_json)) return false;
+  char owner[sizeof(_runtime_config.owner)];
+  strncpy(owner, _runtime_config.owner, sizeof(owner) - 1);
+  owner[sizeof(owner) - 1] = 0;
+  for (char* p = owner; *p; p++) if (*p >= 'a' && *p <= 'f') *p -= 'a' - 'A';
+  char client_version[96], escaped_client[193], escaped_email[129];
+  snprintf(client_version, sizeof(client_version), "meshcore-jhuebert/%s", FIRMWARE_VERSION);
+  if (!jsonEscape(client_version, escaped_client, sizeof(escaped_client)) ||
+      !jsonEscape(_runtime_config.email, escaped_email, sizeof(escaped_email))) return false;
+  char owner_field[80] = {}, email_field[160] = {};
+  if (owner[0] && snprintf(owner_field, sizeof(owner_field), ",\"owner\":\"%s\"", owner) >=
+                      static_cast<int>(sizeof(owner_field))) return false;
+  if (escaped_email[0] && snprintf(email_field, sizeof(email_field), ",\"email\":\"%s\"",
+                                   escaped_email) >= static_cast<int>(sizeof(email_field))) return false;
+  int payload_len = snprintf(_json, sizeof(_json),
+      "{\"publicKey\":\"%s\",\"aud\":\"%s\",\"iat\":%lu,\"exp\":%lu,\"client\":\"%s\"%s%s}",
+      public_key, _runtime_config.audience, issued_at, expiry, escaped_client,
+      owner_field, email_field);
+  if (payload_len <= 0 || static_cast<size_t>(payload_len) >= sizeof(_json)) return false;
 
-  char encoded_header[64], encoded_payload[384], signing_input[512];
+  char encoded_header[64];
   size_t header_len = 0, encoded_payload_len = 0;
   if (!base64Url(reinterpret_cast<const uint8_t*>(header_json), strlen(header_json),
                  encoded_header, sizeof(encoded_header), header_len) ||
-      !base64Url(reinterpret_cast<const uint8_t*>(payload_json), static_cast<size_t>(payload_len),
-                 encoded_payload, sizeof(encoded_payload), encoded_payload_len)) return false;
-  int signing_len = snprintf(signing_input, sizeof(signing_input), "%s.%s", encoded_header, encoded_payload);
-  if (signing_len <= 0 || static_cast<size_t>(signing_len) >= sizeof(signing_input)) return false;
+      !base64Url(reinterpret_cast<const uint8_t*>(_json), static_cast<size_t>(payload_len),
+                 reinterpret_cast<char*>(token), capacity, encoded_payload_len)) return false;
+  int signing_len = snprintf(_json, sizeof(_json), "%s.%s", encoded_header, token);
+  if (signing_len <= 0 || static_cast<size_t>(signing_len) >= sizeof(_json)) return false;
 
   uint8_t signature[64];
-  _identity->sign(signature, reinterpret_cast<const uint8_t*>(signing_input), signing_len);
+  _identity->sign(signature, reinterpret_cast<const uint8_t*>(_json), signing_len);
   char signature_hex[129];
   bytesToHex(signature, sizeof(signature), signature_hex);
-  int token_len = snprintf(token, capacity, "%s.%s.%s", encoded_header, encoded_payload, signature_hex);
-  if (token_len <= 0 || static_cast<size_t>(token_len) >= capacity) {
+  size_t token_len = header_len + 1 + encoded_payload_len + 1 + sizeof(signature_hex) - 1;
+  if (token_len >= capacity) {
     token[0] = 0;
     return false;
   }
+  memmove(token + header_len + 1, token, encoded_payload_len);
+  memcpy(token, encoded_header, header_len);
+  token[header_len] = '.';
+  memcpy(token + header_len + 1 + encoded_payload_len, ".", 1);
+  memcpy(token + header_len + 2 + encoded_payload_len, signature_hex, sizeof(signature_hex));
   expires_at = expiry;
   return true;
 }
@@ -313,12 +415,27 @@ bool MQTTObserver::configureClient(const MQTTObserverConfig& config) {
     });
   }
 
-  _client->setServer(config.server);
+  if (!MQTTObserverConfigCodec::buildServerUri(config, _server_uri, sizeof(_server_uri))) return false;
+  _client->setServer(_server_uri);
   _client->setClientId(_device_id);
   _client->setKeepAlive(60);
-  _client->setBufferSize(1024);
+  esp_mqtt_client_config_t* mqtt_config = _client->getMqttConfig();
+  if (mqtt_config) mqtt_config->network_timeout_ms = 2500;
+  _client->setBufferSize(1280);
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
+  if (mqtt_config) mqtt_config->buffer.out_size = 1280;
+#endif
   _client->setCleanSession(true);
-  _client->attachArduinoCACertBundle(secureUri(config.server));
+  _client->attachArduinoCACertBundle(secureUri(_server_uri));
+  if (mqtt_config) {
+#if ESP_IDF_VERSION_MAJOR == 5
+    mqtt_config->credentials.username = nullptr;
+    mqtt_config->credentials.authentication.password = nullptr;
+#else
+    mqtt_config->username = nullptr;
+    mqtt_config->password = nullptr;
+#endif
+  }
   if (config.audience[0]) {
     if (!createJwt(_jwt_token, sizeof(_jwt_token), _jwt_expiry)) return false;
     _client->setCredentials(_jwt_username, _jwt_token);
@@ -338,6 +455,8 @@ void MQTTObserver::worker() {
   uint32_t last_ntp_request = 0;
   char active_ssid[sizeof(_config.wifi_ssid)] = {};
   char active_password[sizeof(_config.wifi_password)] = {};
+  char active_ntp_server[sizeof(_config.ntp_server)] = {};
+  uint8_t active_wifi_power_save = 0xff;
 
   while (true) {
     MQTTObserverConfig config;
@@ -381,6 +500,8 @@ void MQTTObserver::worker() {
       strcpy(active_ssid, config.wifi_ssid);
       strcpy(active_password, config.wifi_password);
       _wifi_started = true;
+      active_wifi_power_save = 0xff;
+      active_ntp_server[0] = 0;
       last_ntp_request = 0;
       _state.store(STATE_WIFI, std::memory_order_relaxed);
     }
@@ -397,10 +518,25 @@ void MQTTObserver::worker() {
       continue;
     }
 
+    if (active_wifi_power_save != config.wifi_power_save) {
+      wifi_ps_type_t power_save = config.wifi_power_save == 1 ? WIFI_PS_NONE :
+                                  config.wifi_power_save == 2 ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM;
+      if (esp_wifi_set_ps(power_save) == ESP_OK) active_wifi_power_save = config.wifi_power_save;
+    }
+
+    const char* ntp_server = config.ntp_server[0] ? config.ntp_server : "pool.ntp.org";
+    if (strcmp(active_ntp_server, ntp_server) != 0) {
+      strncpy(active_ntp_server, ntp_server, sizeof(active_ntp_server) - 1);
+      active_ntp_server[sizeof(active_ntp_server) - 1] = 0;
+      configTime(0, 0, active_ntp_server, "time.google.com", "time.cloudflare.com");
+      last_ntp_request = now;
+    }
+
     time_t epoch = time(nullptr);
     if (epoch < static_cast<time_t>(kMinimumValidTime)) {
       if (!last_ntp_request || static_cast<uint32_t>(now - last_ntp_request) >= 30000) {
-        configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+        configTime(0, 0, config.ntp_server[0] ? config.ntp_server : "pool.ntp.org",
+                   "time.google.com", "time.cloudflare.com");
         last_ntp_request = now;
       }
       _state.store(STATE_TIME, std::memory_order_relaxed);
@@ -408,7 +544,7 @@ void MQTTObserver::worker() {
       continue;
     }
 
-    if (!have_runtime_config || memcmp(&config, &_runtime_config, sizeof(config)) != 0) {
+    if (!have_runtime_config || !sameConnectionConfig(config, _runtime_config)) {
       if (_client_started && _client) {
         _client->disconnect();
         _client_started = false;
@@ -423,6 +559,8 @@ void MQTTObserver::worker() {
       }
       _next_connect_ms = now;
       _backoff_index = 0;
+    } else {
+      _runtime_config = config;
     }
 
     if (!_client) {
@@ -457,7 +595,8 @@ void MQTTObserver::worker() {
       portEXIT_CRITICAL(&_queue_mux);
       if (_runtime_config.status_enabled &&
           (send_status || !_last_status_ms ||
-           static_cast<uint32_t>(now - _last_status_ms) >= kStatusIntervalMs)) {
+           static_cast<uint32_t>(now - _last_status_ms) >=
+               static_cast<uint32_t>(_runtime_config.status_interval_minutes) * 60000UL)) {
         if (publishStatus()) _last_status_ms = now;
         else _publish_drops.fetch_add(1, std::memory_order_relaxed);
       }
@@ -467,7 +606,12 @@ void MQTTObserver::worker() {
       portENTER_CRITICAL(&_queue_mux);
       have_event = _queue.pop(event);
       portEXIT_CRITICAL(&_queue_mux);
-      if (have_event) publishEvent(event);
+      if (have_event) {
+        if (MQTTObserverQueuePolicy::eventExpired(millis(), event.received_ms))
+          _publish_drops.fetch_add(1, std::memory_order_relaxed);
+        else
+          publishEvent(event);
+      }
       vTaskDelay(pdMS_TO_TICKS(have_event ? 5 : 50));
       continue;
     }
@@ -496,8 +640,8 @@ void MQTTObserver::worker() {
 
 bool MQTTObserver::publishStatus() {
   if (!_client || !_client->connected() || !_runtime_config.status_enabled) return false;
-  char topic[112];
-  if (!makeTopic(_runtime_config, _device_id, "status", topic, sizeof(topic))) return false;
+  char topic[128];
+  if (!MQTTObserverConfigCodec::buildTopic(_runtime_config, _device_id, "status", topic, sizeof(topic))) return false;
   struct timeval now;
   gettimeofday(&now, nullptr);
   char timestamp[40];
@@ -533,7 +677,7 @@ bool MQTTObserver::publishEvent(const Event& event) {
   portENTER_CRITICAL(&_config_mux);
   memcpy(origin, _origin, sizeof(origin));
   portEXIT_CRITICAL(&_config_mux);
-  char topic[112];
+  char topic[128];
   size_t written = 0;
 
   // Synchronous QoS 0 publishes bypass the client outbox, so packet data cannot replay later.
@@ -564,7 +708,7 @@ bool MQTTObserver::publishEvent(const Event& event) {
       event.packet.isRouteDirect() ? event.packet.getPathHashCount() : 0,
       event.packet.getPathHashSize()
     };
-    if (makeTopic(_runtime_config, _device_id, "packets", topic, sizeof(topic)) &&
+    if (MQTTObserverConfigCodec::buildTopic(_runtime_config, _device_id, "packets", topic, sizeof(topic)) &&
         MQTTObserverFormat::buildPacket(view, _json, sizeof(_json), written)) {
       int result = _client->publish(topic, 0, false, _json, written, false);
       if (result >= 0) {
@@ -582,7 +726,7 @@ bool MQTTObserver::publishEvent(const Event& event) {
     char timestamp[40];
     if (MQTTObserverFormat::formatTimestamp(event.timestamp, event.timestamp_usec,
                                              timestamp, sizeof(timestamp)) &&
-        makeTopic(_runtime_config, _device_id, "raw", topic, sizeof(topic)) &&
+        MQTTObserverConfigCodec::buildTopic(_runtime_config, _device_id, "raw", topic, sizeof(topic)) &&
         MQTTObserverFormat::buildRaw(origin, _device_id, timestamp,
                                      event.raw, event.raw_len, _json, sizeof(_json), written)) {
       int result = _client->publish(topic, 0, false, _json, written, false);
@@ -635,7 +779,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   const char* text = commandValue(command, "set mqtt.server");
   if (text) {
     if (*text && !MQTTObserverConfigCodec::validServer(text)) {
-      snprintf(reply, 160, "Err - expected mqtt(s):// or ws(s):// URL");
+      snprintf(reply, 160, "Err - expected hostname or mqtt(s)/ws(s) URL");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -646,6 +790,22 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       if (changed) markDirty();
       snprintf(reply, 160, "OK - MQTT server saved");
     }
+    return true;
+  }
+
+  text = commandValue(command, "set mqtt.port");
+  if (text) {
+    unsigned port;
+    if (!parseUnsigned(text, 1, 65535, port)) {
+      snprintf(reply, 160, "Err - port must be 1-65535");
+      return true;
+    }
+    portENTER_CRITICAL(&_config_mux);
+    changed = _config.port != port;
+    _config.port = static_cast<uint16_t>(port);
+    portEXIT_CRITICAL(&_config_mux);
+    if (changed) markDirty();
+    snprintf(reply, 160, "OK - MQTT port saved");
     return true;
   }
 
@@ -666,15 +826,88 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
 
   text = commandValue(command, "set mqtt.iata");
   if (text) {
-    if (!MQTTObserverConfigCodec::validIata(text)) {
-      snprintf(reply, 160, "Err - IATA must be 3 uppercase letters");
+    char iata[sizeof(_config.iata)];
+    if (strlen(text) >= sizeof(iata)) {
+      snprintf(reply, 160, "Err - IATA must be 3 letters/digits; XXX is reserved");
+      return true;
+    }
+    for (size_t i = 0; i <= strlen(text); i++)
+      iata[i] = (text[i] >= 'a' && text[i] <= 'z') ? text[i] - 'a' + 'A' : text[i];
+    if (!MQTTObserverConfigCodec::validIata(iata)) {
+      snprintf(reply, 160, "Err - IATA must be 3 letters/digits; XXX is reserved");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
-    changed = strcmp(_config.iata, text) != 0 && setString(_config.iata, sizeof(_config.iata), text);
+    changed = strcmp(_config.iata, iata) != 0 && setString(_config.iata, sizeof(_config.iata), iata);
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
     snprintf(reply, 160, "OK - MQTT IATA saved");
+    return true;
+  }
+
+  text = commandValue(command, "set mqtt.interval");
+  if (text) {
+    unsigned minutes;
+    if (!parseUnsigned(text, 1, 60, minutes)) {
+      snprintf(reply, 160, "Err - interval must be 1-60 minutes");
+      return true;
+    }
+    portENTER_CRITICAL(&_config_mux);
+    changed = _config.status_interval_minutes != minutes;
+    _config.status_interval_minutes = static_cast<uint8_t>(minutes);
+    portEXIT_CRITICAL(&_config_mux);
+    if (changed) markDirty();
+    snprintf(reply, 160, "OK - MQTT interval saved");
+    return true;
+  }
+
+  text = commandValue(command, "set wifi.powersave");
+  if (text) {
+    uint8_t power_save;
+    if (strcmp(text, "min") == 0) power_save = 0;
+    else if (strcmp(text, "none") == 0) power_save = 1;
+    else if (strcmp(text, "max") == 0) power_save = 2;
+    else {
+      snprintf(reply, 160, "Err - expected none, min, or max");
+      return true;
+    }
+    portENTER_CRITICAL(&_config_mux);
+    changed = _config.wifi_power_save != power_save;
+    _config.wifi_power_save = power_save;
+    portEXIT_CRITICAL(&_config_mux);
+    if (changed) markDirty();
+    snprintf(reply, 160, "OK - WiFi power save saved");
+    return true;
+  }
+
+  struct StringSetting { const char* command; size_t offset; size_t capacity; bool secret; };
+  const StringSetting settings[] = {
+    {"set mqtt.origin", offsetof(MQTTObserverConfig, origin), sizeof(_config.origin), false},
+    {"set mqtt.topic", offsetof(MQTTObserverConfig, topic), sizeof(_config.topic), false},
+    {"set mqtt.token", offsetof(MQTTObserverConfig, token), sizeof(_config.token), true},
+    {"set mqtt.ntp", offsetof(MQTTObserverConfig, ntp_server), sizeof(_config.ntp_server), false},
+    {"set mqtt.owner", offsetof(MQTTObserverConfig, owner), sizeof(_config.owner), false},
+    {"set mqtt.email", offsetof(MQTTObserverConfig, email), sizeof(_config.email), false}
+  };
+  for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+    text = commandValue(command, settings[i].command);
+    if (!text) continue;
+    const char* value = (i == 3 && strcmp(text, "none") == 0) ? "" : text;
+    if (((i == 1 || i == 2) && !MQTTObserverConfigCodec::validTopic(value)) ||
+        (i == 3 && !MQTTObserverConfigCodec::validNtpServer(value)) ||
+        (i == 4 && !MQTTObserverConfigCodec::validOwner(value)) ||
+        (i == 5 && !MQTTObserverConfigCodec::validEmail(value)) ||
+        strlen(value) >= settings[i].capacity) {
+      snprintf(reply, 160, "Err - invalid or oversized setting");
+      return true;
+    }
+    portENTER_CRITICAL(&_config_mux);
+    char* field = reinterpret_cast<char*>(&_config) + settings[i].offset;
+    changed = strcmp(field, value) != 0;
+    if (changed) setString(field, settings[i].capacity, value);
+    portEXIT_CRITICAL(&_config_mux);
+    if (changed) markDirty();
+    snprintf(reply, 160, settings[i].secret ? "OK - credential saved" : "OK - MQTT setting saved");
     return true;
   }
 
@@ -682,7 +915,8 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   const ToggleField toggles[] = {
     {"set mqtt.status", offsetof(MQTTObserverConfig, status_enabled)},
     {"set mqtt.packets", offsetof(MQTTObserverConfig, packets_enabled)},
-    {"set mqtt.raw", offsetof(MQTTObserverConfig, raw_enabled)}
+    {"set mqtt.raw", offsetof(MQTTObserverConfig, raw_enabled)},
+    {"set mqtt.rx", offsetof(MQTTObserverConfig, rx_enabled)}
   };
   for (size_t i = 0; i < sizeof(toggles) / sizeof(toggles[0]); i++) {
     text = commandValue(command, toggles[i].command);
@@ -735,48 +969,68 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
     return true;
   }
   if (strcmp(command, "get wifi.status") == 0) {
-    snprintf(reply, 160, "wifi %s; ssid %s",
+    IPAddress ip = WiFi.localIP();
+    snprintf(reply, 160, "wifi %s ip:%u.%u.%u.%u rssi:%d",
              WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
-             WiFi.status() == WL_CONNECTED ? "configured" : "not connected");
+             static_cast<unsigned>(ip[0]), static_cast<unsigned>(ip[1]),
+             static_cast<unsigned>(ip[2]), static_cast<unsigned>(ip[3]),
+             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
     return true;
   }
 
   MQTTObserverConfig config;
-  if (strcmp(command, "get mqtt.server") == 0 || strcmp(command, "get mqtt.iata") == 0 ||
-      strcmp(command, "get mqtt.audience") == 0 || strcmp(command, "get mqtt.enabled") == 0 ||
-      strcmp(command, "get mqtt.status.enabled") == 0 || strcmp(command, "get mqtt.packets") == 0 ||
-      strcmp(command, "get mqtt.raw") == 0 || strcmp(command, "get mqtt.password") == 0 ||
-      strcmp(command, "get mqtt.username") == 0 || strcmp(command, "get wifi.ssid") == 0 ||
-      strcmp(command, "get wifi.pwd") == 0) {
-    copyConfig(config);
-    if (strcmp(command, "get mqtt.server") == 0) {
-      char host[64];
-      MQTTObserverConfigCodec::hostLabel(config.server, host, sizeof(host));
-      snprintf(reply, 160, "%s", host[0] ? host : "not configured");
-    } else if (strcmp(command, "get mqtt.iata") == 0) {
-      snprintf(reply, 160, "%s", config.iata[0] ? config.iata : "not configured");
-    } else if (strcmp(command, "get mqtt.audience") == 0) {
-      snprintf(reply, 160, "%s", config.audience[0] ? config.audience : "not configured");
-    } else if (strcmp(command, "get mqtt.enabled") == 0) {
-      snprintf(reply, 160, "%s", config.enabled ? "on" : "off");
-    } else if (strcmp(command, "get mqtt.status.enabled") == 0) {
-      snprintf(reply, 160, "%s", config.status_enabled ? "on" : "off");
-    } else if (strcmp(command, "get mqtt.packets") == 0) {
-      snprintf(reply, 160, "%s", config.packets_enabled ? "on" : "off");
-    } else if (strcmp(command, "get mqtt.raw") == 0) {
-      snprintf(reply, 160, "%s", config.raw_enabled ? "on" : "off");
-    } else if (strcmp(command, "get mqtt.password") == 0) {
-      snprintf(reply, 160, "%s", config.password[0] ? "configured" : "not set");
-    } else if (strcmp(command, "get mqtt.username") == 0) {
-      snprintf(reply, 160, "%s", config.username[0] ? "configured" : "not set");
-    } else if (strcmp(command, "get wifi.ssid") == 0) {
-      snprintf(reply, 160, "%s", config.wifi_ssid[0] ? "configured" : "not set");
-    } else {
-      snprintf(reply, 160, "%s", config.wifi_password[0] ? "configured" : "not set");
-    }
-    return true;
+  copyConfig(config);
+  if (strcmp(command, "get mqtt.server") == 0) {
+    char host[64];
+    MQTTObserverConfigCodec::hostLabel(config.server, host, sizeof(host));
+    snprintf(reply, 160, "%s", host[0] ? host : "not configured");
+  } else if (strcmp(command, "get mqtt.port") == 0) {
+    snprintf(reply, 160, "%u", static_cast<unsigned>(MQTTObserverConfigCodec::configuredPort(config)));
+  } else if (strcmp(command, "get mqtt.iata") == 0) {
+    snprintf(reply, 160, "%s", config.iata[0] ? config.iata : "not configured");
+  } else if (strcmp(command, "get mqtt.origin") == 0) {
+    const char* origin = config.origin[0] ? config.origin : (_origin_source ? _origin_source : "");
+    snprintf(reply, 160, "%s", origin[0] ? origin : "not configured");
+  } else if (strcmp(command, "get mqtt.audience") == 0) {
+    snprintf(reply, 160, "%s", config.audience[0] ? config.audience : "not configured");
+  } else if (strcmp(command, "get mqtt.topic") == 0) {
+    snprintf(reply, 160, "%s", config.topic[0] ? config.topic : "meshcore/{iata}/{device}/{type}");
+  } else if (strcmp(command, "get mqtt.ntp") == 0) {
+    snprintf(reply, 160, "%s", config.ntp_server[0] ? config.ntp_server : "pool.ntp.org");
+  } else if (strcmp(command, "get mqtt.owner") == 0) {
+    snprintf(reply, 160, "%s", config.owner[0] ? config.owner : "not configured");
+  } else if (strcmp(command, "get mqtt.email") == 0) {
+    snprintf(reply, 160, "%s", config.email[0] ? config.email : "not configured");
+  } else if (strcmp(command, "get mqtt.interval") == 0) {
+    snprintf(reply, 160, "%u", static_cast<unsigned>(config.status_interval_minutes));
+  } else if (strcmp(command, "get mqtt.enabled") == 0) {
+    snprintf(reply, 160, "%s", config.enabled ? "on" : "off");
+  } else if (strcmp(command, "get mqtt.rx") == 0) {
+    snprintf(reply, 160, "%s", config.rx_enabled ? "on" : "off");
+  } else if (strcmp(command, "get mqtt.status.enabled") == 0) {
+    snprintf(reply, 160, "%s", config.status_enabled ? "on" : "off");
+  } else if (strcmp(command, "get mqtt.packets") == 0) {
+    snprintf(reply, 160, "%s", config.packets_enabled ? "on" : "off");
+  } else if (strcmp(command, "get mqtt.raw") == 0) {
+    snprintf(reply, 160, "%s", config.raw_enabled ? "on" : "off");
+  } else if (strcmp(command, "get wifi.powersave") == 0) {
+    const char* value = config.wifi_power_save == 1 ? "none" :
+                        config.wifi_power_save == 2 ? "max" : "min";
+    snprintf(reply, 160, "%s", value);
+  } else if (strcmp(command, "get mqtt.password") == 0) {
+    snprintf(reply, 160, "%s", config.password[0] ? "configured" : "not set");
+  } else if (strcmp(command, "get mqtt.username") == 0) {
+    snprintf(reply, 160, "%s", config.username[0] ? "configured" : "not set");
+  } else if (strcmp(command, "get mqtt.token") == 0) {
+    snprintf(reply, 160, "%s", config.token[0] ? "configured" : "not set");
+  } else if (strcmp(command, "get wifi.ssid") == 0) {
+    snprintf(reply, 160, "%s", config.wifi_ssid[0] ? config.wifi_ssid : "not set");
+  } else if (strcmp(command, "get wifi.pwd") == 0) {
+    snprintf(reply, 160, "%s", config.wifi_password[0] ? "configured" : "not set");
+  } else {
+    return false;
   }
-  return false;
+  return true;
 }
 
 const char* MQTTObserver::stateName() const {

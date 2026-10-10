@@ -14,6 +14,7 @@
 #include "../simple_repeater/PersistUtil.h"
 #include "MQTTObserverConfig.h"
 #include "MQTTObserverPolicy.h"
+#include "MQTTObserverRecord.h"
 
 class MQTTObserver {
   struct Event {
@@ -22,6 +23,7 @@ class MQTTObserver {
     uint16_t raw_len;
     time_t timestamp;
     long timestamp_usec;
+    uint32_t received_ms;
     float snr;
     float rssi;
     float score;
@@ -35,17 +37,17 @@ class MQTTObserver {
   static const size_t kQueueCapacity = 4;
   static const uint32_t kMinimumValidTime = 1735689600UL;
   static const uint32_t kJwtLifetimeSeconds = 86400;
-  static const uint32_t kStatusIntervalMs = 300000;
 
   FILESYSTEM* _fs;
   mesh::LocalIdentity* _identity;
   const char* _origin_source;
-  char _origin[32];
+  char _origin[33];
   float _radio_freq;
   float _radio_bw;
   uint8_t _radio_sf;
   uint8_t _radio_cr;
   MQTTObserverConfig _config;
+  uint8_t _save_record[MQTTObserverRecord::kRecordSize];
   mutable portMUX_TYPE _config_mux;
   portMUX_TYPE _queue_mux;
   MQTTObserverLiveQueue<Event, kQueueCapacity> _queue;
@@ -54,8 +56,10 @@ class MQTTObserver {
   TaskHandle_t _task;
   MQTTObserverConfig _runtime_config;
   char _device_id[2 * PUB_KEY_SIZE + 1];
+  // PsychicMqttClient keeps the URI pointer in its client config across async connects.
+  char _server_uri[sizeof(_config.server) + 16];
   char _jwt_username[3 + 2 * PUB_KEY_SIZE + 1];
-  char _jwt_token[768];
+  char _jwt_token[1024];
   char _json[2048];
   bool _connected;
   bool _status_pending;
