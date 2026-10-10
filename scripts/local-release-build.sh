@@ -99,7 +99,7 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0
 # used to make before firmware builds moved local)
 if [[ ${1:-} == __list ]]; then
   cd "$WORKER_DIR"
-  bash build.sh get-repeater-firmwares-to-build
+  bash build.sh list | grep -i repeater | grep -v '_repeater_observer$'
   exit 0
 fi
 
