@@ -1419,7 +1419,8 @@ static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
   while (*logged_line == ' ') logged_line++;
   if (strncmp(logged_line, "set wifi.pwd ", 13) == 0 ||
       strncmp(logged_line, "set mqtt.password ", 18) == 0 ||
-      strncmp(logged_line, "set mqtt.username ", 18) == 0) {
+      strncmp(logged_line, "set mqtt.username ", 18) == 0 ||
+      strncmp(logged_line, "set mqtt.token ", 15) == 0) {
     Serial.printf("cli[%s] <credential setting>\n", key);
   } else
 #endif

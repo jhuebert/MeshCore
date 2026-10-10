@@ -4,6 +4,16 @@
 #include <stdint.h>
 #include <string.h>
 
+namespace MQTTObserverQueuePolicy {
+
+static const uint32_t kMaxEventAgeMs = 10000;
+
+inline bool eventExpired(uint32_t now, uint32_t received) {
+  return static_cast<uint32_t>(now - received) > kMaxEventAgeMs;
+}
+
+}  // namespace MQTTObserverQueuePolicy
+
 template <typename Event, size_t Capacity>
 class MQTTObserverLiveQueue {
   static_assert(Capacity > 0, "queue capacity must be nonzero");
@@ -73,6 +83,21 @@ public:
   bool consume(Snapshot& snapshot) {
     if (!_valid) return false;
     snapshot = _staged;
+    _valid = false;
+    return true;
+  }
+
+  bool consume(uint8_t* bytes, size_t capacity, uint16_t& length, float& snr, float& rssi) {
+    if (!_valid) return false;
+    if (!bytes || _staged.length > capacity) {
+      _valid = false;
+      length = 0;
+      return false;
+    }
+    memcpy(bytes, _staged.bytes, _staged.length);
+    length = _staged.length;
+    snr = _staged.snr;
+    rssi = _staged.rssi;
     _valid = false;
     return true;
   }

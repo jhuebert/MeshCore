@@ -201,7 +201,9 @@ bool buildStatus(const char* origin, const char* origin_id, const char* model,
   appendKey(writer, "model", model);
   appendKey(writer, "firmware_version", firmware);
   appendKey(writer, "radio", radio);
-  appendKey(writer, "client_version", "MeshCore");
+  char client_version[96];
+  snprintf(client_version, sizeof(client_version), "meshcore-jhuebert/%s", firmware);
+  appendKey(writer, "client_version", client_version);
   writer.append("}");
   return writer.finish(written);
 }
