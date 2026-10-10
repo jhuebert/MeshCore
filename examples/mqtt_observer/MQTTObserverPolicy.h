@@ -19,10 +19,32 @@ inline bool parseSlot(const char* command, const char* operation, size_t max_slo
     number = number * 10 + static_cast<size_t>(*p++ - '0');
     if (number > max_slots) return false;
   }
-  if (*p++ != '.' || number == 0 || number > max_slots) return false;
+  if (*p++ != '.' || number == 0) return false;  // number <= max_slots held by the loop
   slot = number - 1;
   property = p;
   return true;
+}
+
+// True when a `set` line carries a credential value that must not reach the
+// fleet-script log: `set wifi.pwd <...>` and `set mqttN.password|username|token
+// <...>`. `get` lines are never masked — their replies hold only
+// configured/not-set state, and the log is more useful with them visible.
+inline bool isCredentialSetting(const char* line) {
+  if (!line) return false;
+  while (*line == ' ') line++;
+  if (strncmp(line, "set ", 4) != 0) return false;
+  line += 4;
+  if (strncmp(line, "wifi.pwd", 8) == 0 && (line[8] == 0 || line[8] == ' ')) return true;
+  if (strncmp(line, "mqtt", 4) != 0) return false;
+  line += 4;
+  while (*line >= '0' && *line <= '9') line++;
+  if (*line++ != '.') return false;
+  static const char* const fields[] = {"password", "username", "token"};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    size_t len = strlen(fields[i]);
+    if (strncmp(line, fields[i], len) == 0 && (line[len] == 0 || line[len] == ' ')) return true;
+  }
+  return false;
 }
 
 }  // namespace MQTTObserverCommandPolicy
@@ -132,10 +154,8 @@ public:
     _sending = false;
   }
 
-  void cancelAttempt() { _sending = false; }
   void clear() { _count = 0; _sending = false; }
   size_t size() const { return _count; }
-  bool sending() const { return _sending; }
 };
 
 class MQTTObserverRawStager {

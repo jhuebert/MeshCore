@@ -216,6 +216,24 @@ TEST(MQTTObserverCommandPolicy, ParsesNumberedSlotsAndRejectsUnnumberedBrokerSet
                                                      slot, property));
 }
 
+TEST(MQTTObserverCommandPolicy, MasksCredentialSettingsAndOnlySetLines) {
+  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set wifi.pwd hunter2"));
+  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("  set mqtt1.password secret"));
+  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt2.token abc"));
+  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.username bob"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting(nullptr));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set wifi.ssid home"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.server mqtt://x"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.port 1883"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt.iata SEA"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.passwordless x"));
+  // over-mask a mistyped slot rather than risk leaking the value into the log
+  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt3.password x"));
+  // get lines only ever echo configured/not-set state; leave them visible
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("get mqtt1.password"));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("get wifi.pwd"));
+}
+
 TEST(MQTTObserverQueuePolicy, FlushesOnlyAfterLongDisconnectAndRetriesBoundedly) {
   EXPECT_FALSE(MQTTObserverQueuePolicy::shouldFlushDisconnected(60099, 100));
   EXPECT_TRUE(MQTTObserverQueuePolicy::shouldFlushDisconnected(60100, 100));
@@ -316,6 +334,15 @@ TEST(MQTTObserverFormat, RawStatusAndTruncationAreBounded) {
   EXPECT_FALSE(MQTTObserverFormat::buildRaw("node", "AABB", "timestamp", raw, sizeof(raw),
                                             short_json, sizeof(short_json), written));
   EXPECT_EQ(short_json[0], 0);
+}
+
+TEST(MQTTObserverFormat, ClientVersionIsSharedByStatusAndClaims) {
+  char version[96];
+  ASSERT_TRUE(MQTTObserverFormat::buildClientVersion("1.2.3", version, sizeof(version)));
+  EXPECT_STREQ(version, "meshcore-jhuebert/1.2.3");
+  char tiny[8];
+  EXPECT_FALSE(MQTTObserverFormat::buildClientVersion("1.2.3-abcdef", tiny, sizeof(tiny)));
+  EXPECT_FALSE(MQTTObserverFormat::buildClientVersion(nullptr, version, sizeof(version)));
 }
 
 int main(int argc, char** argv) {

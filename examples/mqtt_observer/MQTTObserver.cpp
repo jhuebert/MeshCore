@@ -3,6 +3,7 @@
 #include "MQTTObserver.h"
 #include "MQTTObserverFormat.h"
 #include "MQTTObserverRecord.h"
+#include "../simple_repeater/CliUtil.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <mbedtls/base64.h>
@@ -274,22 +275,21 @@ void MQTTObserver::setRadio(float freq, float bw, uint8_t sf, uint8_t cr) {
 }
 
 void MQTTObserver::loop() {
-  char origin[sizeof(_origin)];
   portENTER_CRITICAL(&_config_mux);
   const char* configured_origin = _config.origin[0] ? _config.origin :
                                   (_origin_source ? _origin_source : "");
+  char origin[sizeof(_origin)];
   strncpy(origin, configured_origin, sizeof(origin) - 1);
   origin[sizeof(origin) - 1] = 0;
-  portEXIT_CRITICAL(&_config_mux);
-  portENTER_CRITICAL(&_config_mux);
   if (strncmp(_origin, origin, sizeof(_origin)) != 0) memcpy(_origin, origin, sizeof(_origin));
   portEXIT_CRITICAL(&_config_mux);
   if (_save_state.due()) saveConfig();
 }
 
 void MQTTObserver::stageRaw(float snr, float rssi, const uint8_t raw[], int len) {
-  if (len <= 0) _raw_stager.stage(nullptr, 0, snr, rssi);
-  else _raw_stager.stage(raw, static_cast<size_t>(len), snr, rssi);
+  // stage() rejects a zero length on its own, so a missing frame simply leaves
+  // the next capture to report its packet without raw bytes.
+  _raw_stager.stage(raw, len > 0 ? static_cast<size_t>(len) : 0, snr, rssi);
 }
 
 void MQTTObserver::capture(mesh::Packet* packet, float score) {
@@ -341,6 +341,22 @@ void MQTTObserver::flushQueue() {
   if (discarded) _disconnected_drops.fetch_add(discarded, std::memory_order_relaxed);
 }
 
+// One worker-pass step for every state in which no connected broker will drain
+// the queue this pass: time the outage, and flush once it exceeds the stale
+// threshold. An emptied queue resets the timer, and 0 means "not timing yet" —
+// millis() itself is never stored, so a wrap cannot fake a stale timestamp.
+void MQTTObserver::trackDisconnectedQueue(uint32_t now) {
+  if (queueSize() == 0) {
+    _queue_disconnected_since = 0;
+    return;
+  }
+  if (_queue_disconnected_since != 0 &&
+      MQTTObserverQueuePolicy::shouldFlushDisconnected(now, _queue_disconnected_since)) {
+    flushQueue();
+  }
+  if (_queue_disconnected_since == 0) _queue_disconnected_since = now ? now : 1;
+}
+
 size_t MQTTObserver::queueSize() {
   portENTER_CRITICAL(&_queue_mux);
   size_t count = _queue.size();
@@ -366,8 +382,9 @@ bool MQTTObserver::createJwt(size_t slot, const MQTTObserverBrokerConfig& config
   owner[sizeof(owner) - 1] = 0;
   for (char* p = owner; *p; p++) if (*p >= 'a' && *p <= 'f') *p -= 'a' - 'A';
   char client_version[96], escaped_client[193], escaped_email[129];
-  snprintf(client_version, sizeof(client_version), "meshcore-jhuebert/%s", FIRMWARE_VERSION);
-  if (!jsonEscape(client_version, escaped_client, sizeof(escaped_client)) ||
+  if (!MQTTObserverFormat::buildClientVersion(FIRMWARE_VERSION, client_version,
+                                              sizeof(client_version)) ||
+      !jsonEscape(client_version, escaped_client, sizeof(escaped_client)) ||
       !jsonEscape(config.email, escaped_email, sizeof(escaped_email))) return false;
   char owner_field[80] = {}, email_field[160] = {};
   if (owner[0] && snprintf(owner_field, sizeof(owner_field), ",\"owner\":\"%s\"", owner) >=
@@ -504,15 +521,7 @@ void MQTTObserver::worker() {
       }
       runtime_config_initialized = false;
       _state.store(STATE_CONFIG, std::memory_order_relaxed);
-      if (queueSize()) {
-        if (!_queue_disconnected_since) _queue_disconnected_since = now ? now : 1;
-        else if (MQTTObserverQueuePolicy::shouldFlushDisconnected(now, _queue_disconnected_since)) {
-          flushQueue();
-          _queue_disconnected_since = now ? now : 1;
-        }
-      } else {
-        _queue_disconnected_since = 0;
-      }
+      trackDisconnectedQueue(now);
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
@@ -548,13 +557,7 @@ void MQTTObserver::worker() {
           _brokers[i].state.store(STATE_WIFI, std::memory_order_relaxed);
       }
       _state.store(STATE_WIFI, std::memory_order_relaxed);
-      if (queueSize()) {
-        if (!_queue_disconnected_since) _queue_disconnected_since = now ? now : 1;
-        else if (MQTTObserverQueuePolicy::shouldFlushDisconnected(now, _queue_disconnected_since)) {
-          flushQueue();
-          _queue_disconnected_since = now ? now : 1;
-        }
-      }
+      trackDisconnectedQueue(now);
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -677,15 +680,7 @@ void MQTTObserver::worker() {
     else if (any_connecting) _state.store(STATE_CONNECTING, std::memory_order_relaxed);
     else _state.store(STATE_RETRY, std::memory_order_relaxed);
 
-    if (queueSize() == 0) {
-      _queue_disconnected_since = 0;
-    } else if (!any_connected) {
-      if (!_queue_disconnected_since) _queue_disconnected_since = now ? now : 1;
-      else if (MQTTObserverQueuePolicy::shouldFlushDisconnected(now, _queue_disconnected_since)) {
-        flushQueue();
-        _queue_disconnected_since = now ? now : 1;
-      }
-    } else {
+    if (any_connected) {
       _queue_disconnected_since = 0;
       typename MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::Entry queued;
       bool have_event = false;
@@ -707,6 +702,8 @@ void MQTTObserver::worker() {
         if (retry.action == MQTTObserverQueuePolicy::RetryAction::Drop)
           _publish_drops.fetch_add(1, std::memory_order_relaxed);
       }
+    } else {
+      trackDisconnectedQueue(now);
     }
     vTaskDelay(pdMS_TO_TICKS(queueSize() ? 5 : 50));
   }
@@ -865,14 +862,14 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     if (strcmp(common_property, "iata") == 0) {
       char iata[sizeof(_config.iata)];
       if (strlen(common_value) >= sizeof(iata)) {
-        snprintf(reply, 160, "Err - IATA must be 3 letters/digits; XXX is reserved");
+        snprintf(reply, CLI_REPLY_MAX, "Err - IATA must be 3 letters/digits; XXX is reserved");
         return true;
       }
       for (size_t i = 0; i <= strlen(common_value); i++)
         iata[i] = common_value[i] >= 'a' && common_value[i] <= 'z' ?
                   common_value[i] - 'a' + 'A' : common_value[i];
       if (!MQTTObserverConfigCodec::validIata(iata)) {
-        snprintf(reply, 160, "Err - IATA must be 3 letters/digits; XXX is reserved");
+        snprintf(reply, CLI_REPLY_MAX, "Err - IATA must be 3 letters/digits; XXX is reserved");
         return true;
       }
       portENTER_CRITICAL(&_config_mux);
@@ -881,7 +878,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       portEXIT_CRITICAL(&_config_mux);
     } else if (strcmp(common_property, "origin") == 0) {
       if (strlen(common_value) >= sizeof(_config.origin)) {
-        snprintf(reply, 160, "Err - origin too long");
+        snprintf(reply, CLI_REPLY_MAX, "Err - origin too long");
         return true;
       }
       portENTER_CRITICAL(&_config_mux);
@@ -892,7 +889,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       const char* ntp = strcmp(common_value, "none") == 0 ? "" : common_value;
       if (!MQTTObserverConfigCodec::validNtpServer(ntp) ||
           strlen(ntp) >= sizeof(_config.ntp_server)) {
-        snprintf(reply, 160, "Err - invalid NTP server");
+        snprintf(reply, CLI_REPLY_MAX, "Err - invalid NTP server");
         return true;
       }
       portENTER_CRITICAL(&_config_mux);
@@ -902,7 +899,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     } else if (strcmp(common_property, "interval") == 0) {
       unsigned minutes;
       if (!parseUnsigned(common_value, 1, 60, minutes)) {
-        snprintf(reply, 160, "Err - interval must be 1-60 minutes");
+        snprintf(reply, CLI_REPLY_MAX, "Err - interval must be 1-60 minutes");
         return true;
       }
       portENTER_CRITICAL(&_config_mux);
@@ -911,7 +908,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       portEXIT_CRITICAL(&_config_mux);
     } else {
       if (!parseToggle(common_value, toggle)) {
-        snprintf(reply, 160, "Err - expected on or off");
+        snprintf(reply, CLI_REPLY_MAX, "Err - expected on or off");
         return true;
       }
       portENTER_CRITICAL(&_config_mux);
@@ -924,7 +921,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       portEXIT_CRITICAL(&_config_mux);
     }
     if (changed) markDirty();
-    snprintf(reply, 160, "OK - MQTT setting saved");
+    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT setting saved");
     return true;
   }
 
@@ -943,7 +940,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   if (MQTT_PROP_IS("enabled")) {
     uint8_t enabled;
     if (!parseToggle(value ? value : "", enabled)) {
-      snprintf(reply, 160, "Err - expected on or off");
+      snprintf(reply, CLI_REPLY_MAX, "Err - expected on or off");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -951,7 +948,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     _config.brokers[slot].enabled = enabled;
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
-    snprintf(reply, 160, "OK - MQTT%u %s", static_cast<unsigned>(slot + 1),
+    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u %s", static_cast<unsigned>(slot + 1),
              enabled ? "enabled" : "disabled");
     return true;
   }
@@ -959,7 +956,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   if (MQTT_PROP_IS("port")) {
     unsigned port;
     if (!parseUnsigned(value, 1, 65535, port)) {
-      snprintf(reply, 160, "Err - port must be 1-65535");
+      snprintf(reply, CLI_REPLY_MAX, "Err - port must be 1-65535");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -967,7 +964,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     _config.brokers[slot].port = static_cast<uint16_t>(port);
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
-    snprintf(reply, 160, "OK - MQTT%u port saved", static_cast<unsigned>(slot + 1));
+    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u port saved", static_cast<unsigned>(slot + 1));
     return true;
   }
 
@@ -986,14 +983,14 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     else if (MQTT_PROP_IS("token")) { capacity = sizeof(_config.brokers[slot].token); validation = TOPIC; }
     else if (MQTT_PROP_IS("owner")) { capacity = sizeof(_config.brokers[slot].owner); validation = OWNER; }
     else { capacity = sizeof(_config.brokers[slot].email); validation = EMAIL; }
-    const char* setting = validation == SERVER && !*value ? "" : value;
+    const char* setting = value;   // empty value clears the setting
     if (strlen(setting) >= capacity ||
         (validation == SERVER && *setting && !MQTTObserverConfigCodec::validServer(setting)) ||
         (validation == AUDIENCE && !MQTTObserverConfigCodec::validAudience(setting)) ||
         (validation == TOPIC && !MQTTObserverConfigCodec::validTopic(setting)) ||
         (validation == OWNER && !MQTTObserverConfigCodec::validOwner(setting)) ||
         (validation == EMAIL && !MQTTObserverConfigCodec::validEmail(setting))) {
-      snprintf(reply, 160, "Err - invalid or oversized MQTT setting");
+      snprintf(reply, CLI_REPLY_MAX, "Err - invalid or oversized MQTT setting");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -1010,9 +1007,9 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
     if (MQTT_PROP_IS("password") || MQTT_PROP_IS("token"))
-      snprintf(reply, 160, "OK - credential saved");
+      snprintf(reply, CLI_REPLY_MAX, "OK - credential saved");
     else
-      snprintf(reply, 160, "OK - MQTT%u setting saved", static_cast<unsigned>(slot + 1));
+      snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u setting saved", static_cast<unsigned>(slot + 1));
     return true;
   }
 #undef MQTT_PROP_IS
@@ -1024,7 +1021,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     else if (strcmp(ps, "none") == 0) power_save = 1;
     else if (strcmp(ps, "max") == 0) power_save = 2;
     else {
-      snprintf(reply, 160, "Err - expected none, min, or max");
+      snprintf(reply, CLI_REPLY_MAX, "Err - expected none, min, or max");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -1032,7 +1029,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     _config.wifi_power_save = power_save;
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
-    snprintf(reply, 160, "OK - WiFi power save saved");
+    snprintf(reply, CLI_REPLY_MAX, "OK - WiFi power save saved");
     return true;
   }
 
@@ -1050,7 +1047,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   }
   if (wifi_value) {
     if (strlen(wifi_value) >= wifi_capacity) {
-      snprintf(reply, 160, "Err - setting too long");
+      snprintf(reply, CLI_REPLY_MAX, "Err - setting too long");
       return true;
     }
     portENTER_CRITICAL(&_config_mux);
@@ -1058,17 +1055,17 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
     if (changed) setString(wifi_field, wifi_capacity, wifi_value);
     portEXIT_CRITICAL(&_config_mux);
     if (changed) markDirty();
-    snprintf(reply, 160, wifi_secret ? "OK - credential saved" : "OK - WiFi SSID saved");
+    snprintf(reply, CLI_REPLY_MAX, "%s", wifi_secret ? "OK - credential saved" : "OK - WiFi SSID saved");
     return true;
   }
 
-  snprintf(reply, 160, "Err - unsupported MQTT/WiFi setting");
+  snprintf(reply, CLI_REPLY_MAX, "Err - unsupported MQTT/WiFi setting");
   return true;
 }
 
 bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
   if (strcmp(command, "get mqtt.status") == 0) {
-    formatStatus(reply, 160);
+    formatStatus(reply, CLI_REPLY_MAX);
     return true;
   }
   if (strcmp(command, "get wifi.powersave") == 0 || strcmp(command, "get wifi.ssid") == 0 ||
@@ -1081,13 +1078,13 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
     else if (strcmp(command, "get wifi.ssid") == 0)
       value = _config.wifi_ssid[0] ? _config.wifi_ssid : "not set";
     else value = _config.wifi_password[0] ? "configured" : "not set";
-    snprintf(reply, 160, "%s", value);
+    snprintf(reply, CLI_REPLY_MAX, "%s", value);
     portEXIT_CRITICAL(&_config_mux);
     return true;
   }
   if (strcmp(command, "get wifi.status") == 0) {
     IPAddress ip = WiFi.localIP();
-    snprintf(reply, 160, "wifi %s ip:%u.%u.%u.%u rssi:%d",
+    snprintf(reply, CLI_REPLY_MAX, "wifi %s ip:%u.%u.%u.%u rssi:%d",
              WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
              static_cast<unsigned>(ip[0]), static_cast<unsigned>(ip[1]),
              static_cast<unsigned>(ip[2]), static_cast<unsigned>(ip[3]),
@@ -1127,7 +1124,7 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
       default: common_value[0] = 0; break;
     }
     portEXIT_CRITICAL(&_config_mux);
-    snprintf(reply, 160, "%s", common_value);
+    snprintf(reply, CLI_REPLY_MAX, "%s", common_value);
     return true;
   }
 
@@ -1161,12 +1158,12 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
   portEXIT_CRITICAL(&_config_mux);
 
   if (result) {
-    snprintf(reply, 160, "%s", result);
+    snprintf(reply, CLI_REPLY_MAX, "%s", result);
     return true;
   }
   if (MQTT_GET_IS("status")) {
     BrokerRuntime& runtime = _brokers[slot];
-    snprintf(reply, 160, "mqtt%u %s wifi:%s q:%u",
+    snprintf(reply, CLI_REPLY_MAX, "mqtt%u %s wifi:%s q:%u",
              static_cast<unsigned>(slot + 1), stateName(runtime.state.load(std::memory_order_relaxed)),
              WiFi.status() == WL_CONNECTED ? "up" : "down", static_cast<unsigned>(queueSize()));
     return true;

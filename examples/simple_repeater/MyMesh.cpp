@@ -1415,21 +1415,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 static void execCliLine(void* ctx, const char* key, char* line, char* reply) {
   // logged before dispatch: the handlers tokenise the line in place
 #ifdef WITH_MQTT_OBSERVER
-  const char* logged_line = line;
-  while (*logged_line == ' ') logged_line++;
-  const char* setting = logged_line;
-  while (*setting && *setting != ' ') setting++;
-  while (*setting == ' ') setting++;
-  bool mqtt_credential = false;
-  if (strncmp(setting, "mqtt", 4) == 0) {
-    const char* field = setting + 4;
-    while (*field >= '0' && *field <= '9') field++;
-    if (*field == '.') field++;
-    mqtt_credential = strncmp(field, "password ", 9) == 0 ||
-                      strncmp(field, "username ", 9) == 0 ||
-                      strncmp(field, "token ", 6) == 0;
-  }
-  if (strncmp(logged_line, "set wifi.pwd ", 13) == 0 || mqtt_credential) {
+  if (MQTTObserverCommandPolicy::isCredentialSetting(line)) {
     Serial.printf("cli[%s] <credential setting>\n", key);
   } else
 #endif

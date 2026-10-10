@@ -115,6 +115,12 @@ bool formatTimestamp(time_t timestamp, long usec, char* out, size_t capacity) {
   return true;
 }
 
+bool buildClientVersion(const char* firmware, char* out, size_t capacity) {
+  if (!firmware || !out) return false;
+  int len = snprintf(out, capacity, "meshcore-jhuebert/%s", firmware);
+  return len > 0 && static_cast<size_t>(len) < capacity;
+}
+
 bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& written) {
   if (!packet.origin || !packet.origin_id || !packet.route || !packet.wire ||
       !packet.hash || packet.hash_len == 0 || packet.wire_len == 0) return false;
@@ -124,10 +130,10 @@ bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& w
 
   char timestamp[40];
   if (!formatTimestamp(packet.timestamp, packet.timestamp_usec, timestamp, sizeof(timestamp))) return false;
-  char time[16], date[16];
+  char clock_time[16], date[16];
   struct tm utc;
   if (!gmtime_r(&packet.timestamp, &utc) ||
-      !strftime(time, sizeof(time), "%H:%M:%S", &utc) ||
+      !strftime(clock_time, sizeof(clock_time), "%H:%M:%S", &utc) ||
       !strftime(date, sizeof(date), "%d/%m/%Y", &utc)) return false;
 
   char len[16], type[16], payload_len[16], snr[16], rssi[16], score[16];
@@ -145,7 +151,7 @@ bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& w
   appendKey(writer, "origin", packet.origin);
   appendKey(writer, "type", "PACKET");
   appendKey(writer, "direction", "rx");
-  appendKey(writer, "time", time);
+  appendKey(writer, "time", clock_time);
   appendKey(writer, "date", date);
   appendKey(writer, "len", len);
   appendKey(writer, "packet_type", type);
@@ -202,7 +208,7 @@ bool buildStatus(const char* origin, const char* origin_id, const char* model,
   appendKey(writer, "firmware_version", firmware);
   appendKey(writer, "radio", radio);
   char client_version[96];
-  snprintf(client_version, sizeof(client_version), "meshcore-jhuebert/%s", firmware);
+  if (!buildClientVersion(firmware, client_version, sizeof(client_version))) return false;
   appendKey(writer, "client_version", client_version);
   writer.append("}");
   return writer.finish(written);
