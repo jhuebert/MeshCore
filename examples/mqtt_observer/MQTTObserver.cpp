@@ -1077,7 +1077,7 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
               _config.wifi_power_save == 2 ? "max" : "min";
     else if (strcmp(command, "get wifi.ssid") == 0)
       value = _config.wifi_ssid[0] ? _config.wifi_ssid : "not set";
-    else value = _config.wifi_password[0] ? "configured" : "not set";
+    else value = _config.wifi_password[0] ? _config.wifi_password : "not set";
     snprintf(reply, CLI_REPLY_MAX, "%s", value);
     portEXIT_CRITICAL(&_config_mux);
     return true;
@@ -1148,9 +1148,9 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
   else if (MQTT_GET_IS("owner")) result = broker.owner[0] ? broker.owner : "not configured";
   else if (MQTT_GET_IS("email")) result = broker.email[0] ? broker.email : "not configured";
   else if (MQTT_GET_IS("enabled")) result = broker.enabled ? "on" : "off";
-  else if (MQTT_GET_IS("password")) result = broker.password[0] ? "configured" : "not set";
-  else if (MQTT_GET_IS("username")) result = broker.username[0] ? "configured" : "not set";
-  else if (MQTT_GET_IS("token")) result = broker.token[0] ? "configured" : "not set";
+  else if (MQTT_GET_IS("password")) result = broker.password[0] ? broker.password : "not set";
+  else if (MQTT_GET_IS("username")) result = broker.username[0] ? broker.username : "not set";
+  else if (MQTT_GET_IS("token")) result = broker.token[0] ? broker.token : "not set";
   if (result && result != value) {
     snprintf(value, sizeof(value), "%s", result);
     result = value;

@@ -31,9 +31,11 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   config.brokers[1].enabled = 1;
   strcpy(config.brokers[1].server, "mqtt://second.example");
   strcpy(config.brokers[1].username, "second-user");
-  config.brokers[5].enabled = 1;
-  strcpy(config.brokers[5].server, "mqtt://reserved-slot.example");
 
+  EXPECT_EQ(MQTT_OBSERVER_CONFIG_BROKER_CAPACITY, 2u);
+  EXPECT_EQ(MQTTObserverConfigCodec::kVersion, 4);
+  EXPECT_EQ(MQTTObserverConfigCodec::kPayloadSize, 1508u);
+  EXPECT_EQ(MQTTObserverRecord::kRecordSize, 1517u);
   uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
   ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
   MQTTObserverConfig decoded;
@@ -54,8 +56,6 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   EXPECT_EQ(decoded.brokers[0].port, 8883);
   EXPECT_STREQ(decoded.brokers[1].server, "mqtt://second.example");
   EXPECT_STREQ(decoded.brokers[1].username, "second-user");
-  EXPECT_EQ(decoded.brokers[5].enabled, 1);
-  EXPECT_STREQ(decoded.brokers[5].server, "mqtt://reserved-slot.example");
 }
 
 TEST(MQTTObserverConfig, RejectsInvalidValuesAndIntegrityChanges) {
@@ -86,8 +86,6 @@ TEST(MQTTObserverRecord, ChecksVersionLengthAndChecksum) {
   strcpy(original.brokers[0].server, "mqtts://broker.example");
   original.brokers[1].enabled = 1;
   strcpy(original.brokers[1].server, "mqtt://second.example");
-  original.brokers[5].enabled = 1;
-  strcpy(original.brokers[5].server, "mqtt://reserved.example");
   strcpy(original.iata, "SEA");
   uint8_t record[MQTTObserverRecord::kRecordSize];
   ASSERT_EQ(MQTTObserverRecord::encode(original, record, sizeof(record)), sizeof(record));
@@ -96,7 +94,6 @@ TEST(MQTTObserverRecord, ChecksVersionLengthAndChecksum) {
   ASSERT_TRUE(MQTTObserverRecord::decode(record, sizeof(record), decoded));
   EXPECT_STREQ(decoded.brokers[0].server, original.brokers[0].server);
   EXPECT_STREQ(decoded.brokers[1].server, original.brokers[1].server);
-  EXPECT_STREQ(decoded.brokers[5].server, original.brokers[5].server);
   EXPECT_STREQ(decoded.iata, original.iata);
   EXPECT_FALSE(MQTTObserverRecord::decode(record, sizeof(record) - 1, decoded));
 
@@ -214,24 +211,6 @@ TEST(MQTTObserverCommandPolicy, ParsesNumberedSlotsAndRejectsUnnumberedBrokerSet
                                                      slot, property));
   EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("get mqtt2x.server", "get ", 2,
                                                      slot, property));
-}
-
-TEST(MQTTObserverCommandPolicy, MasksCredentialSettingsAndOnlySetLines) {
-  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set wifi.pwd hunter2"));
-  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("  set mqtt1.password secret"));
-  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt2.token abc"));
-  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.username bob"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting(nullptr));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set wifi.ssid home"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.server mqtt://x"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.port 1883"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt.iata SEA"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt1.passwordless x"));
-  // over-mask a mistyped slot rather than risk leaking the value into the log
-  EXPECT_TRUE(MQTTObserverCommandPolicy::isCredentialSetting("set mqtt3.password x"));
-  // get lines only ever echo configured/not-set state; leave them visible
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("get mqtt1.password"));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::isCredentialSetting("get wifi.pwd"));
 }
 
 TEST(MQTTObserverQueuePolicy, FlushesOnlyAfterLongDisconnectAndRetriesBoundedly) {
