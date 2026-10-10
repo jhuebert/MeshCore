@@ -204,7 +204,7 @@ get_observer_envs() {
   printf '%s' "$PIO_CONFIG_JSON" | python3 -c '
 import json, sys
 for section, _ in json.load(sys.stdin):
-    if section.startswith("env:") and section.endswith("_repeater_observer_mqtt"):
+    if section.startswith("env:") and section.endswith("_repeater_observer"):
         print(section[4:])
 '
 }

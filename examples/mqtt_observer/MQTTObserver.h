@@ -23,7 +23,6 @@ class MQTTObserver {
     uint16_t raw_len;
     time_t timestamp;
     long timestamp_usec;
-    uint32_t received_ms;
     float snr;
     float rssi;
     float score;
@@ -34,7 +33,30 @@ class MQTTObserver {
     STATE_CONNECTED, STATE_RETRY, STATE_ERROR
   };
 
-  static const size_t kQueueCapacity = 4;
+  struct BrokerRuntime {
+    PsychicMqttClient* client;
+    char server_uri[sizeof(MQTTObserverBrokerConfig::server) + 16];
+    char username[65];
+    char password[65];
+    char jwt_username[3 + 2 * PUB_KEY_SIZE + 1];
+    char jwt_token[1024];
+    uint32_t jwt_expiry;
+    uint32_t next_connect_ms;
+    uint32_t attempt_started;
+    std::atomic<uint32_t> connected_at;
+    uint32_t last_status_ms;
+    uint32_t status_retry_ms;
+    uint8_t backoff_index;
+    bool status_retry_pending;
+    bool client_started;
+    bool configured;
+    std::atomic<bool> connected;
+    std::atomic<bool> status_pending;
+    std::atomic<State> state;
+
+    BrokerRuntime();
+  };
+
   static const uint32_t kMinimumValidTime = 1735689600UL;
   static const uint32_t kJwtLifetimeSeconds = 86400;
 
@@ -47,28 +69,22 @@ class MQTTObserver {
   uint8_t _radio_sf;
   uint8_t _radio_cr;
   MQTTObserverConfig _config;
+  MQTTObserverConfig _runtime_config;
+  MQTTObserverConfig _work_config;
+  MQTTObserverConfig _io_config;
   uint8_t _save_record[MQTTObserverRecord::kRecordSize];
+  uint8_t _load_record[MQTTObserverRecord::kRecordSize];
   mutable portMUX_TYPE _config_mux;
   portMUX_TYPE _queue_mux;
-  MQTTObserverLiveQueue<Event, kQueueCapacity> _queue;
+  MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY> _queue;
   MQTTObserverRawStager _raw_stager;
-  PsychicMqttClient* _client;
-  TaskHandle_t _task;
-  MQTTObserverConfig _runtime_config;
-  char _device_id[2 * PUB_KEY_SIZE + 1];
-  // PsychicMqttClient keeps the URI pointer in its client config across async connects.
-  char _server_uri[sizeof(_config.server) + 16];
-  char _jwt_username[3 + 2 * PUB_KEY_SIZE + 1];
-  char _jwt_token[1024];
-  char _json[2048];
-  bool _connected;
-  bool _status_pending;
+  BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
-  bool _client_started;
-  uint32_t _next_connect_ms;
-  uint32_t _last_status_ms;
-  uint32_t _jwt_expiry;
-  uint8_t _backoff_index;
+  TaskHandle_t _task;
+  uint32_t _queue_disconnected_since;
+  uint32_t _last_ntp_request;
+  char _device_id[2 * PUB_KEY_SIZE + 1];
+  char _json[2048];
   std::atomic<State> _state;
   LazySave _save_state;
   std::atomic<uint32_t> _received;
@@ -80,22 +96,25 @@ class MQTTObserver {
   static void taskEntry(void* context);
   void worker();
   void copyConfig(MQTTObserverConfig& config);
-  bool ready(const MQTTObserverConfig& config) const;
-  bool configureClient(const MQTTObserverConfig& config);
-  bool createJwt(char* token, size_t capacity, uint32_t& expires_at);
+  bool ready(const MQTTObserverConfig& config, size_t slot) const;
+  bool configureClient(size_t slot, const MQTTObserverBrokerConfig& config);
+  bool createJwt(size_t slot, const MQTTObserverBrokerConfig& config, uint32_t& expires_at);
   bool publishEvent(const Event& event);
-  bool publishStatus();
-  void clearQueueOnDisconnect();
+  bool publishStatus(size_t slot);
+  void disconnectBroker(size_t slot);
+  void flushQueue();
   size_t queueSize();
   void markDirty();
   bool saveConfig();
   static bool writeRecord(File& file, void* context);
   static bool validateRecord(File& file, void* context);
-  static bool readRecord(File& file, MQTTObserverConfig& config);
+  bool readRecord(File& file, MQTTObserverConfig& config);
   bool handleSetCommand(char* command, char* reply);
   bool handleGetCommand(const char* command, char* reply);
   bool setString(char* destination, size_t capacity, const char* value);
-  const char* stateName() const;
+  const char* stateName(State state) const;
+  bool commandSlot(const char* command, const char* operation, size_t& slot,
+                   const char*& property) const;
 
 public:
   MQTTObserver();
