@@ -146,7 +146,7 @@ struct FilterRule {
   // v7: the writer forces it and the reader refuses a v7 record that has it
   // set, so a future field can take the byte the way type_mask_hi took 186
   uint32_t hits;           // match counter (forward/drop telemetry + validation)
-  uint32_t air_ms;         // estimated on-air time (ms) billed by this rule's
+  uint64_t air_ms;         // estimated on-air time (ms) billed by this rule's
                            // DROP decisions; RAM-only stat, after `hits` so it
                            // is never persisted (persist ends at offsetof(hits))
   // RAM-only throttle state — never persisted (persist ends at offsetof(hits));

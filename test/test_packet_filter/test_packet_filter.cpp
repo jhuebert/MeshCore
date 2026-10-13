@@ -3546,8 +3546,10 @@ TEST_F(FilterTest, AirSavedPercentageUsesWideCounters) {
   filter.checkPacket(&adv, 0, nullptr, UINT32_MAX);
   EXPECT_EQ(filter.getAirSavedMs(), uint64_t(UINT32_MAX) * 2);
   EXPECT_EQ(filter.getAirEvaluatedMs(), uint64_t(UINT32_MAX) * 3);
+  EXPECT_EQ(filter.getRule(0)->air_ms, uint64_t(UINT32_MAX) * 2);
   EXPECT_EQ(filter.getAirSavedPercent(), 67u);
   EXPECT_NE(cli(filter, "stats").find("air:8589934s:67%;"), std::string::npos);
+  EXPECT_NE(cli(filter, "get 0").find("air=8589934s"), std::string::npos);
 }
 
 TEST_F(FilterTest, AirSavedPercentageCountsContentOnce) {
