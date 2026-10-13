@@ -4,7 +4,6 @@
 #include "PacketFilter.h"
 #include "CliUtil.h"
 #include "AdvertRateLimiter.h"
-#include <inttypes.h>
 #include <helpers/TxtDataHelpers.h>
 
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
@@ -1471,7 +1470,7 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (r->prob) radd(&out, &remain, " prob=%u", r->prob);
   if (r->throttle) radd(&out, &remain, " throttle=%u pass=%lu", r->throttle, (unsigned long)r->throttle_pass);
   radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
-  radd(&out, &remain, " air=%lu", (unsigned long)r->air_ms);
+  radd(&out, &remain, " air=%lus", (unsigned long)(r->air_ms / 1000));
 }
 
 static void cliStats(FilterRules& filter, char* reply) {
@@ -1479,9 +1478,9 @@ static void cliStats(FilterRules& filter, char* reply) {
   int remain = CLI_REPLY_MAX;
   // globals first, per-rule hits last: if the reply truncates, hits detail
   // (recoverable via `get N`) is sacrificed before the summary counters
-  radd(&out, &remain, "lim:%lu abort:%lu air:%" PRIu64 ":%u%%; hits:",
+  radd(&out, &remain, "lim:%lu abort:%lu air:%lus:%u%%; hits:",
        (unsigned long)filter.getLimiterDrops(), (unsigned long)filter.getBudgetAborts(),
-       filter.getAirSavedMs(), filter.getAirSavedPercent());
+       (unsigned long)(filter.getAirSavedMs() / 1000), filter.getAirSavedPercent());
   for (int i = 0; i < filter.getNumRules(); i++) {
     radd(&out, &remain, " %d:%lu", i, (unsigned long)filter.getRule(i)->hits);
   }

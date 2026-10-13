@@ -3519,7 +3519,7 @@ TEST_F(FilterTest, AirSavedRamOnly) {
 
 TEST_F(FilterTest, AirSavedPercentageWeightsAirtimeAndRounds) {
   EXPECT_EQ(filter.getAirSavedPercent(), 0u);
-  EXPECT_NE(cli(filter, "stats").find("air:0:0%;"), std::string::npos);
+  EXPECT_NE(cli(filter, "stats").find("air:0s:0%;"), std::string::npos);
   mesh::Packet adv = makeAdvert(AIR_KEY);
   filter.checkPacket(&adv, 0, nullptr, 1800);
   EXPECT_EQ(filter.getAirSavedPercent(), 0u);
@@ -3527,7 +3527,7 @@ TEST_F(FilterTest, AirSavedPercentageWeightsAirtimeAndRounds) {
   filter.checkPacket(&adv, 0, nullptr, 1000);
   EXPECT_EQ(filter.getAirEvaluatedMs(), 2800u);
   EXPECT_EQ(filter.getAirSavedPercent(), 36u);
-  EXPECT_NE(cli(filter, "stats").find("air:1000:36%;"), std::string::npos);
+  EXPECT_NE(cli(filter, "stats").find("air:1s:36%;"), std::string::npos);
   filter.checkPacket(&adv, 0, nullptr, 0);
   EXPECT_EQ(filter.getAirSavedPercent(), 36u);
   filter.setEnabled(false);
@@ -3547,7 +3547,7 @@ TEST_F(FilterTest, AirSavedPercentageUsesWideCounters) {
   EXPECT_EQ(filter.getAirSavedMs(), uint64_t(UINT32_MAX) * 2);
   EXPECT_EQ(filter.getAirEvaluatedMs(), uint64_t(UINT32_MAX) * 3);
   EXPECT_EQ(filter.getAirSavedPercent(), 67u);
-  EXPECT_NE(cli(filter, "stats").find("air:8589934590:67%;"), std::string::npos);
+  EXPECT_NE(cli(filter, "stats").find("air:8589934s:67%;"), std::string::npos);
 }
 
 TEST_F(FilterTest, AirSavedPercentageCountsContentOnce) {
@@ -3600,15 +3600,15 @@ TEST_F(FilterTest, AirSavedPercentageSummarySurvivesHitTruncation) {
   filterCLI(filter, "stats", reply, nullptr);
   EXPECT_EQ(reply[CLI_REPLY_MAX], '!');
   EXPECT_LT(strlen(reply), size_t(CLI_REPLY_MAX));
-  EXPECT_NE(std::string(reply).find("air:8589934590:100%; hits:"), std::string::npos);
+  EXPECT_NE(std::string(reply).find("air:8589934s:100%; hits:"), std::string::npos);
 }
 
 TEST_F(FilterTest, AirSavedShownInCli) {
   expectOk(filter, "add type=advert");
   mesh::Packet adv = makeAdvert(AIR_KEY);
-  filter.checkPacket(&adv, 0, nullptr, EST_AIR);
-  EXPECT_NE(cli(filter, "stats").find(" air:337:100%;"), std::string::npos);
-  EXPECT_NE(cli(filter, "get 0").find(" air=337"), std::string::npos);
+  filter.checkPacket(&adv, 0, nullptr, 1337);
+  EXPECT_NE(cli(filter, "stats").find(" air:1s:100%;"), std::string::npos);
+  EXPECT_NE(cli(filter, "get 0").find(" air=1s"), std::string::npos);
 }
 
 // ============================================================
@@ -4122,7 +4122,7 @@ TEST_F(FilterTest, ListAndStatsOutput) {
   EXPECT_EQ(list.find("on 1/32: 0eD"), 0);   // enabled + Drop digest line
 
   std::string stats = cli(filter, "stats");
-  EXPECT_EQ(stats.find("lim:0 abort:0 air:0:0%; hits: 0:3"), 0);
+  EXPECT_EQ(stats.find("lim:0 abort:0 air:0s:0%; hits: 0:3"), 0);
 }
 
 // ---------------------------------------------------------------- channel store

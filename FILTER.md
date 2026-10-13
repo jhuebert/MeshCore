@@ -351,11 +351,11 @@ message per minute through and drop the rest:
 ```text
 filter add chan=#test sender="^bob" throttle=60
 filter get 0
-# r0 en drop chan=#test sender="^bob" throttle=60 pass=12 hits=5 air=2140
+# r0 en drop chan=#test sender="^bob" throttle=60 pass=12 hits=5 air=2s
 ```
 
 Reading that line: `pass=12` messages got through (one per minute), `hits=5`
-excess messages were dropped, and `air=2140` is the retransmit airtime those
+excess messages were dropped, and `air=2s` is the retransmit airtime those
 drops saved. Like every `sender=` rule, this matches the message *text*, not a
 verified identity — a renamed sender evades it (the honest limit of content
 matching on group text).
@@ -747,19 +747,19 @@ Two things to remember:
   the earlier rule matches first and the drop never fires.
 
 The probe's worth is also visible in **RF terms**: `filter stats` includes
-`air:<ms>:<percent>%` — an *estimate* of the time-on-air the packets dropped so
-far would have consumed had they been relayed (rule drops and rate-limiter
-drops). It is the repeater's own airtime estimate applied to the received packet
-length, not a measurement of what the channel was doing, and not a count of
-confirmed transmissions. Treat it as a comparative figure between "with the rule"
-and "without it", not as a channel-utilisation figure. `filter get <idx>` shows the
-per-rule share as `air=<ms>`. A shadow `forward` probe itself bills nothing
-(`air=0`, since its packets are still relayed) — flip it to `drop` and those
-same hits start accumulating the estimate, which is usually the number that
-matters on a shared channel:
+`air:<seconds>s:<percent>%` — an *estimate* of the time-on-air the packets dropped so
+far would have consumed had they been relayed (rule drops and rate-limiter drops).
+The displayed seconds are rounded down from the repeater's millisecond estimate
+applied to the received packet length, not a measurement of what the channel was
+doing, and not a count of confirmed transmissions. Treat it as a comparative figure
+between "with the rule" and "without it", not as a channel-utilisation figure.
+`filter get <idx>` shows the per-rule share as `air=<seconds>s`. A shadow `forward`
+probe itself bills nothing (`air=0s`, since its packets are still relayed) — flip it
+to `drop` and those same hits start accumulating the estimate, which is usually the
+number that matters on a shared channel:
 
 ```text
-filter stats           # e.g. lim:118 abort:0 air:214500:36%; hits: 0:42
+filter stats           # e.g. lim:118 abort:0 air:214s:36%; hits: 0:42
 ```
 
 The percentage is saved airtime divided by total estimated airtime evaluated
