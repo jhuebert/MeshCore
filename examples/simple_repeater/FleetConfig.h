@@ -71,7 +71,10 @@
 // --- acknowledgements ---
 
 #ifndef FLEET_REPLY_WINDOW_MS
-  #define FLEET_REPLY_WINDOW_MS 60000UL   // !ack reply jitter window (default)
+  #define FLEET_REPLY_WINDOW_MS 15000UL   // !ack reply jitter window (default):
+                                          // sized for a small fleet; widen with
+                                          // `fleet reply <secs>` as the fleet grows
+                                          // (rule of thumb: ~5 s per repeater)
 #endif
 
 #ifndef FLEET_REPLY_WINDOW_MAX_MS

@@ -233,12 +233,16 @@ Protocol guarantees, by construction:
    (unscoped otherwise).
 
 **Storm control:** the reply is scheduled at a uniform-random instant in a
-jitter window (default 60 s, node-tunable via `fleet reply <secs>`, 1–600 s)
-measured from when the script *finishes running*. With N nodes in window W and
-~1 s packets, W = 60 s keeps a 10-node fleet essentially collision-free;
-**widen W for denser fleets**. Pending replies (2 slots) are RAM-only: a
-reboot wipes them, so a re-sent `!ack` job after a reboot re-runs *and*
-re-replies. A full reply store drops and counts the reply (`refused`); no
+jitter window (default 15 s, node-tunable via `fleet reply <secs>`, 1–600 s)
+measured from when the script *finishes running*. A reply storm is N
+near-simultaneous packets that all flood and are relayed, so the window has to
+be wide enough to spread them out: **rule of thumb ≈ 5 s per repeater**. A
+3-node fleet is fine at the default; a 10-node fleet wants ~50 s and a
+20-node fleet ~100 s. Widening costs only latency, while a
+too-narrow window costs collisions — when in doubt, widen. Set it per node, or
+fleet-wide from a script (`fleet reply 50`). Pending replies (2 slots) are
+RAM-only: a reboot wipes them, so a re-sent `!ack` job after a reboot re-runs
+*and* re-replies. A full reply store drops and counts the reply (`refused`); no
 reply cooldown in v1 — per-key dedupe already bounds each script to one reply.
 
 ## Inline pauses (`!delay <ms>`)
@@ -335,7 +339,7 @@ All commands begin with `fleet`.
 | `fleet tag del <tag>` | `OK - tag xiao deleted` / `Err - tag xiao not set` |
 | `fleet tag list` | `tags: xiao siteA` or `tags: (none) - broadcast scripts only` |
 | `fleet tag clear` | `OK - tags cleared` |
-| `fleet reply [<secs>]` | Query or set the `!ack` jitter window (1–600 s; default 60) |
+| `fleet reply [<secs>]` | Query or set the `!ack` jitter window (1–600 s; default 15) |
 | `fleet seen` | How many job keys are remembered: `seen 2/32` |
 | `fleet seen <key>` | `OK - key <key> seen` / `Err - key <key> not seen` — did this job run here? |
 | `fleet forget <key>` | `OK - key forgotten` — re-arm one job for a deliberate re-run |
@@ -592,6 +596,7 @@ so it can't be orphaned from a fleet cutover by its own battery state.
 | Pending scripts | 2 — a third before the queue drains is refused, but **not** marked seen; a re-send reaches it |
 | Armed `!at` scripts | 2 (RAM-only; a reboot wipes them) |
 | Pending acknowledgements | 2 (RAM-only; a full store drops and counts) |
+| `!ack` reply window | 1–600 s; default 15 s (~5 s per repeater) |
 | Seen job keys | last 32 per boot (RAM-only; a 33rd evicts the oldest and re-arms it) |
 | `!id` key | 1–32 chars of `[A-Za-z0-9._-]` |
 | Tags | up to 8 on a repeater; up to 8 per `!tags` list; 1–16 chars each |

@@ -84,7 +84,7 @@ class FleetManager {
                              // valid only when psk_len > 0
   char tags[FLEET_MAX_TAGS][FLEET_TAG_LEN + 1];
   int tag_count;
-  uint32_t reply_window_ms;  // !ack reply jitter window (default 60 s)
+  uint32_t reply_window_ms;  // !ack reply jitter window (default 15 s)
   CliScriptRunner runner;    // script queue + seen ring + counters
 
   // armed !at scripts (RAM-only, FLEET_SCHED_STORE entries): a reboot forgets

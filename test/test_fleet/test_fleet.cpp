@@ -1284,7 +1284,7 @@ TEST_F(FleetHooksTest, TagCommands) {
 }
 
 TEST_F(FleetHooksTest, ReplyWindowCommands) {
-  EXPECT_EQ(cli(fleet, "reply"), "reply window 60s");
+  EXPECT_EQ(cli(fleet, "reply"), "reply window 15s");
   EXPECT_EQ(cli(fleet, "reply 90"), "OK - reply window 90s");
   EXPECT_EQ(fleet.getReplyWindowMs(), (uint32_t)90000);
   EXPECT_EQ(cli(fleet, "reply"), "reply window 90s");
