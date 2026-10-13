@@ -59,6 +59,13 @@ group text on that channel:
 set path.hash.mode 1
 ```
 
+**One job = one message.** A job's commands are the *lines of a single group
+text* — write them with line breaks inside one message, not as several
+successive messages. Only a message's first line is checked for the `!id`
+marker, so a bare command sent on its own is treated as ordinary chat and does
+nothing. If you genuinely want two separate things, give each its own `!id`
+key: they are then two independent jobs.
+
 Check it landed:
 
 ```text
@@ -119,6 +126,12 @@ The script is the **text of an ordinary group text message** — companions that
 auto-prepend `name: ` work unchanged, since the script is everything after the
 first `": "`. Only **plain** group text (txt_type 0) can be a script; any other
 text type on the channel is ignored.
+
+**A job is exactly one message.** Every command in the job is a line of *that
+same message*; a job cannot be split across messages. Each message is checked
+for the `!id` marker independently, so `set txdelay 2` followed by a second
+message `set rxdelay 3` is two messages, neither of them a job — the commands
+must be sent together, one line each, in a single message.
 
 ```text
 !id <key>              # line 1, always
@@ -510,6 +523,7 @@ cli[2026-06-12-preset2-cfg] set radio 869.650,62.5,9,5
 | Symptom | Check | Usual cause |
 |---|---|---|
 | Job never ran anywhere | `fleet seen <key>` per node; `noid` counter | Message sent without the `!id` first line, or on the wrong channel |
+| Commands did nothing when sent one at a time | `noid` counter climbing | A job is one message: only the first line is checked for `!id`, so a lone command is ordinary chat; re-send the commands together in one message |
 | Some nodes ran it, some didn't | `refused` counter on the stragglers | Their pending queue was full (a third job arrived before the first drained); re-send the job |
 | Script targets nobody | `fleet tag list` on the nodes | Tag typo (exact matching: `xiao ` ≠ `xiao`); or all nodes lack the tag and `!tags` was present |
 | No `!ack` reply arrived | `ackq` on the node; window too long? | Reply still jittering (up to `reply window` s); store was full (`refused`); or the channel changed between receipt and send |
