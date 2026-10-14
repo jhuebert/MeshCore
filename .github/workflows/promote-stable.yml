@@ -1,0 +1,173 @@
+name: Promote Stable
+
+# manual only: publishes filter commits onto repeater-filter-stable without
+# syncing upstream or cutting a release. Run it from the Actions UI or
+# `gh workflow run promote-stable.yml`. Use Filter Release (channel: stable)
+# afterwards to tag the promoted revision.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Branch to promote filter commits from (default repeater-filter)
+        required: false
+        type: string
+        default: ""
+      skip_gate:
+        description: Publish even if the native test gate fails (deliberate override)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: filter-sync
+  cancel-in-progress: false
+
+jobs:
+
+  promote:
+    name: Promote filter commits to repeater-filter-stable
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Build Environment
+        # the promotion gate runs the native suites, and this runner has no
+        # PlatformIO of its own: without this the gate could only ever fail
+        uses: ./.github/actions/setup-build-environment
+
+      - name: Promote repeater-filter-stable
+        id: promote
+        uses: actions/github-script@v8
+        env:
+          STABLE_SOURCE: ${{ inputs.source }}
+          SKIP_GATE: ${{ inputs.skip_gate }}
+        with:
+          script: |
+            const { spawnSync } = require('child_process');
+            const fs = require('fs');
+            const path = require('path');
+            const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
+            const run = (...args) => {
+              const r = git(...args);
+              if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${(r.stderr || '').trim()}`);
+              return r.stdout;
+            };
+
+            // Filter commits are the ones on the source branch that are not
+            // part of upstream dev. Fetch it fresh (without moving any branch)
+            // so a stale fork mirror can never misclassify a merged upstream
+            // commit as a filter commit.
+            run('remote', 'add', 'upstream', 'https://github.com/meshcore-dev/MeshCore.git');
+            run('fetch', 'upstream', 'dev');
+
+            const source = process.env.STABLE_SOURCE || 'repeater-filter';
+            const resolved = git('rev-parse', '--verify', `refs/remotes/origin/${source}`);
+            if (resolved.status !== 0) {
+              core.setFailed(`No such branch to promote from: ${source}`);
+              return;
+            }
+            const sourceSha = resolved.stdout.trim();
+            // git cherry and `git checkout <rev> -- README.md` both work from the
+            // verified revision directly. Resolving it to a SHA is what keeps a
+            // source branch that exists only as origin/<name> from failing the
+            // cherry: the branch may well be the one checked out here, and a
+            // `git branch --force` for it would be refused.
+            const stableBefore = run('rev-parse', 'refs/remotes/origin/repeater-filter-stable').trim();
+
+            // Everything happens on a scratch branch. The real stable branch is
+            // touched exactly once, at the end, and only if the whole series
+            // applied AND the gate passed. A half-applied series is never published.
+            const stage = `promote-${run('rev-parse', '--short', 'HEAD').trim()}`;
+            run('checkout', '-B', stage, stableBefore);
+
+            // cherry-pick the filter commits not yet on stable (git cherry matches
+            // by patch-id, so already-picked commits are skipped); oldest first.
+            // git cherry is called through run(): a git error must never be
+            // mistaken for a genuine "nothing to pick", which would publish a
+            // promotion silently containing none of its commits.
+            const toPick = run('cherry', 'HEAD', sourceSha, 'upstream/dev')
+              .split('\n')
+              .filter((line) => line.startsWith('+'))
+              .map((line) => line.split(/\s+/)[1])
+              .filter(Boolean);
+            let pickCount = 0;
+            for (const pick of toPick) {
+              // skip fork-owned-README-only commits; the README is synced below
+              const touched = run('show', '--pretty=format:', '--name-only', pick)
+                .split('\n').filter((line) => line.trim() && line !== 'README.md');
+              if (touched.length === 0) continue;
+              const pickResult = git('cherry-pick', pick);
+              if (pickResult.status !== 0) {
+                fs.writeFileSync('stable-conflicted-files.txt',
+                  git('diff', '--name-only', '--diff-filter=U').stdout);
+                run('cherry-pick', '--abort');
+                core.setOutput('conflict', 'true');
+                // A stable conflict is a failure, not a warning. The previous
+                // stable is still intact on the remote; nothing was pushed.
+                // The failure is raised by the issue step below.
+                return;
+              }
+              pickCount += 1;
+            }
+
+            // keep the fork-owned README in step with the source branch
+            run('checkout', sourceSha, '--', 'README.md');
+            run('add', '-A');
+            if (git('diff', '--cached', '--quiet').status !== 0) {
+              run('commit', '-m', 'docs: sync fork README');
+            }
+            core.setOutput('picked', String(pickCount));
+
+            // ---- quality gate: never publish something that does not pass ----
+            if (process.env.SKIP_GATE !== 'true') {
+              const onPath = (cmd) => (process.env.PATH || '').split(':')
+                .some((dir) => fs.existsSync(path.join(dir, cmd)));
+              if (!process.env.PIO && !onPath('pio')) {
+                core.setFailed('pio is not available; cannot run the gate (or set skip_gate)');
+                return;
+              }
+              const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
+                '-e', 'native_packet_filter', '-e', 'native_battery_gate', '-e', 'native_fleet'],
+                { stdio: 'inherit' });
+              if (gate.status !== 0) {
+                core.setFailed('native test gate failed; stable is unchanged');
+                return;
+              }
+            } else {
+              core.warning('skip_gate set: publishing without the native test gate');
+            }
+
+            // ---- publish: once, and never force ----
+            // An ordinary non-fast-forward rejection is the correct outcome if
+            // something else moved stable while this ran: run() throws on it and
+            // the previous stable stays as it is on the remote.
+            run('checkout', '-B', 'repeater-filter-stable');
+            run('reset', '--hard', stage);
+            run('push', 'origin', 'repeater-filter-stable');
+            const stableAfter = run('ls-remote', 'origin', 'refs/heads/repeater-filter-stable')
+              .trim().split('\t')[0];
+            core.setOutput('pushed', stableBefore !== stableAfter ? 'true' : 'false');
+
+      - name: Open stable-promote conflict issue
+        if: steps.promote.outputs.conflict == 'true'
+        uses: ./.github/actions/open-conflict-issue
+        with:
+          marker: '[filter-sync-conflict-stable]'
+          files-file: stable-conflicted-files.txt
+          title: Promotion conflict in repeater-filter-stable
+          intro: 'Promoting filter commits onto `repeater-filter-stable` failed with conflicts. Stable was not changed.'
+          closing: 'Resolve the conflicts locally, push the branch, then close this issue.'
+          failure-message: 'Promotion conflict in repeater-filter-stable; resolve locally, push the branch, then close this issue.'

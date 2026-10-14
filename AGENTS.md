@@ -104,16 +104,19 @@ file type has no default constructor).
 only; the firmware assets are built locally with
 `scripts/local-release-build.sh` and uploaded to the release with `gh`
 (CI no longer builds firmware — the 155-target runner fan-out got Actions
-shut down). `sync-upstream.yml` merges upstream and promotes stable, run
-only on manual dispatch — never on a schedule. Upstream's own docs live in
-`docs/` (MeshCore protocol/CLI generally) — not fork-filter documentation.
+shut down). `sync-upstream.yml` merges upstream into the chosen channel branch
+and `promote-stable.yml` cherry-picks the filter commits from `repeater-filter`
+onto `repeater-filter-stable`; both are manual-dispatch only (never on a
+schedule) and neither cuts a release — use Filter Release for that. Upstream's
+own docs live in `docs/` (MeshCore protocol/CLI generally) — not fork-filter
+documentation.
 
 ## Branch model
 
 - `repeater-filter` — dev release channel; the integration branch for all
   filter work. Default branch of the fork.
 - `repeater-filter-stable` — stable release channel; updated from
-  `repeater-filter` deliberately, not automatically.
+  `repeater-filter` deliberately via `promote-stable.yml`, not automatically.
 - Work branches: `repeater-filter-<topic>` cut from `repeater-filter`, merged
   back with `--no-ff` (keep feature commits traceable).
 - Upstream is tracked via the manually-dispatched `sync-upstream.yml`
@@ -129,7 +132,8 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`
-- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-release.yml`, `sync-upstream.yml`
+- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-release.yml`, `sync-upstream.yml`,
+  `.github/workflows/promote-stable.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
 — a reviewer should see a handful of lines, not a fork interleaved into
