@@ -106,13 +106,26 @@ jobs:
             // shell syntax
             if (process.env.BRANCH_INPUT) branch = process.env.BRANCH_INPUT;
 
-            // upstream base: last companion-v* tag reachable from HEAD, X.Y.Z only
-            // (companion-v1.17.1-25-g6df98abe -> v1.17.1)
-            const desc = spawnSync('git', ['describe', '--tags', '--match', 'companion-v*', 'HEAD'],
-              { encoding: 'utf8' });
+            // upstream base version, X.Y.Z only. Upstream tags each release on
+            // the main merge commit (companion-v1.18.0 -> main's "Merge branch
+            // 'dev'"), which is NOT reachable from the dev-based channel branch,
+            // so the reachable companion-v* tag is the *previous* release. The
+            // '* version X.Y.Z' commit the tag mirrors IS reachable, so prefer
+            // it (v1.18.0); fall back to the tag for trees that lack it.
             let upstreamVersion = 'untagged';
-            if (desc.status === 0 && desc.stdout.trim()) {
-              upstreamVersion = desc.stdout.trim().replace(/^companion-/, '').split('-')[0];
+            const versionCommit = git('log', '--format=%s', 'HEAD')
+              .split('\n')
+              .map((s) => s.trim())
+              .find((s) => /^\* version \d+\.\d+\.\d+$/.test(s));
+            if (versionCommit) {
+              upstreamVersion = `v${versionCommit.replace(/^\* version /, '')}`;
+            } else {
+              // (companion-v1.17.1-25-g6df98abe -> v1.17.1)
+              const desc = spawnSync('git', ['describe', '--tags', '--match', 'companion-v*', 'HEAD'],
+                { encoding: 'utf8' });
+              if (desc.status === 0 && desc.stdout.trim()) {
+                upstreamVersion = desc.stdout.trim().replace(/^companion-/, '').split('-')[0];
+              }
             }
 
             let releaseTag, displayVersion, releaseTitle, firmwareVersion, prevTag;
