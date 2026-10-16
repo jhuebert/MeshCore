@@ -704,6 +704,9 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
                           const uint8_t *app_data, size_t app_data_len) {
   mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len); // chain to super impl
 
+  // mesh clock sync: one vote per signature-verified advert source
+  meshClock.onAdvert(timestamp, id.pub_key, getRTCClock()->getCurrentTime());
+
   // if this a zero hop advert (and not via 'Share'), add it to neighbours
   if (packet->getPathHashCount() == 0 && !isShare(packet)) {
     AdvertDataParser parser(app_data, app_data_len);
@@ -1001,6 +1004,10 @@ static uint32_t fleetClock(void* ctx) {
   return ((MyMesh*)ctx)->getRTCClock()->getCurrentTime();
 }
 
+static void meshClockSet(void* ctx, uint32_t epoch) {
+  ((MyMesh*)ctx)->getRTCClock()->setCurrentTime(epoch);
+}
+
 static uint32_t fleetJitter(void* ctx, uint32_t window) {
   return ((MyMesh*)ctx)->getRNG()->nextInt(0, window);
 }
@@ -1051,6 +1058,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   fleet.setJitter(fleetJitter, this);
   fleet.setSender(fleetReplySend, this);
   fleet.begin(fs);
+  meshClock.setClockFn(meshClockSet, this);
+  meshClock.begin(fs);
   // TODO: key_store.begin();
   region_map.load(_fs);
 
@@ -1402,6 +1411,11 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 5;
     while (*sub == ' ') sub++;
     fleetCLI(fleet, sub, reply);
+  } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+    // before the common CLI's bare "clock" prefix match, which would swallow it
+    const char* sub = command + 10;
+    while (*sub == ' ') sub++;
+    meshClockCLI(meshClock, sub, reply);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1469,6 +1483,9 @@ void MyMesh::loop() {
   mqttObserver.setRadio(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   mqttObserver.loop();
 #endif
+
+  // lazy dirty-flag save for the mesh clock sync config
+  meshClock.loop(_fs);
 
   // fleet config save + script drain (one per pass, after mesh::Mesh::loop()
   // and outside the receive bracket that produced it — never while the filter

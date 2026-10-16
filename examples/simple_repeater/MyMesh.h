@@ -39,6 +39,7 @@
 #include "PacketFilter.h"
 #include "BatteryGate.h"
 #include "FleetManager.h"
+#include "MeshClockSync.h"
 #ifdef WITH_MQTT_OBSERVER
 #include "../mqtt_observer/MQTTObserver.h"
 #endif
@@ -105,6 +106,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FilterRules filter;
   BatteryGate battGate;
   FleetManager fleet;
+  MeshClockSync meshClock;
 #ifdef WITH_MQTT_OBSERVER
   MQTTObserver mqttObserver;
 #endif
