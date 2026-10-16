@@ -155,6 +155,13 @@ public:
   // delivered GroupChannel and for handing core a decrypt candidate
   const uint8_t* getChanSecret() const { return psk; }
 
+  // Originate an alert as a plain group text on the configured fleet channel,
+  // same on-air format as an !ack reply (the sender prepends the node name and
+  // floods). Returns false and sends nothing when fleet is off, has no channel,
+  // or no sender is wired; the body must not start with "!id " so no receiver
+  // can parse an alert as a script.
+  bool sendAlert(const char* body);
+
   // this repeater's tag set (exact string identity; no wildcards)
   int getTagCount() const { return tag_count; }
   const char* getTag(int idx) const { return tags[idx]; }

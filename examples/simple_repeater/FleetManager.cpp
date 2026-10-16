@@ -294,6 +294,12 @@ void FleetManager::sendDueReplies() {
   }
 }
 
+bool FleetManager::sendAlert(const char* body) {
+  if (!enabled || psk_len == 0 || send_fn == NULL) return false;
+  send_fn(send_ctx, psk, chan_hash, body);
+  return true;
+}
+
 // ---------------------------------------------------------------- relay side
 
 bool FleetManager::checkForward(const mesh::Packet* packet) {

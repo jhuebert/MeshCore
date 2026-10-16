@@ -999,6 +999,40 @@ TEST_F(FleetHooksTest, ReplyWindowFromConfig) {
   EXPECT_EQ(env.last_window, (uint32_t)90000);
 }
 
+TEST_F(FleetHooksTest, SendAlertUsesTheConfiguredChannel) {
+  ASSERT_TRUE(fleet.sendAlert("BATT SUSPEND 3300mV"));
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].body, "BATT SUSPEND 3300mV");
+  EXPECT_EQ(env.sent[0].hash, fleet.getChanHash());
+  EXPECT_EQ(memcmp(env.sent[0].secret, chan.secret, PUB_KEY_SIZE), 0);
+}
+
+TEST_F(FleetHooksTest, SendAlertSuppressedWhenFleetOffOrChannelless) {
+  fleet.setEnabled(false);
+  EXPECT_FALSE(fleet.sendAlert("BATT SUSPEND 3300mV"));
+
+  fleet.setEnabled(true);
+  fleet.clearChannel();
+  EXPECT_FALSE(fleet.sendAlert("BATT SUSPEND 3300mV"));
+
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+}
+
+TEST_F(FleetHooksTest, SendAlertUnwiredSenderIsSilent) {
+  fleet.setSender(NULL, NULL);
+  EXPECT_FALSE(fleet.sendAlert("BATT RESUME 3700mV"));
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+}
+
+TEST_F(FleetHooksTest, AlertIsNotAScript) {
+  // the alert body does not start with "!id ", so a receiver counts it as
+  // ordinary chat (noid) and never queues it
+  deliver("BATT SUSPEND 3300mV");
+  EXPECT_EQ(fleet.getOffered(), (uint32_t)0);
+  EXPECT_EQ(fleet.getScripts().getNoId(), (uint32_t)1);
+  EXPECT_EQ(fleet.getScripts().getPendingCount(), 0);
+}
+
 TEST_F(FleetHooksTest, AtStaleRefused) {
   char script[64];
   snprintf(script, sizeof(script), "!id k1\n!at %u\nreset", (unsigned)(env.clock_now - FLEET_AT_STALE_SECS - 1));
