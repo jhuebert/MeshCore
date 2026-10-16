@@ -23,23 +23,18 @@ uint32_t MeshClockSync::buildFloor() {
   return meshclock::buildEpoch();
 }
 
-// The state a fresh node starts in, and the baseline load() resets to before it
-// reads the file: disabled, empty batch, no decision yet. One definition, so
-// construction and reload cannot drift apart.
-void MeshClockSync::resetToDefaults() {
+MeshClockSync::MeshClockSync() {
+  reset();
+}
+
+// The state a fresh node starts in: disabled, empty batch, no decision yet. One
+// definition, so construction and reload cannot drift apart.
+void MeshClockSync::reset() {
   memset(samples, 0, sizeof(samples));
   count = 0;
   enabled = false;
   last_result = IDLE;
   last_delta = 0;
-}
-
-MeshClockSync::MeshClockSync() {
-  reset();
-}
-
-void MeshClockSync::reset() {
-  resetToDefaults();
   save_flag.reset();   // a reset supersedes any edit still waiting to be written
 }
 

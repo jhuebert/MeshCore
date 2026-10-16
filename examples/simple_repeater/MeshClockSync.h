@@ -70,7 +70,8 @@ public:
   // PUB_KEY_SIZE origin key, local_now this node's RTC now.
   void onAdvert(uint32_t advert_ts, const uint8_t* pub_key, uint32_t local_now);
 
-  // Back to a freshly constructed sync (disabled, empty batch), for tests.
+  // Back to a freshly constructed sync: disabled, empty batch, nothing pending
+  // to save. Used by construction and load(), and directly by tests.
   void reset();
 
   // --- status for the CLI ---
@@ -78,8 +79,8 @@ public:
   Result getLastResult() const { return last_result; }
   int32_t getLastDeltaSecs() const { return last_delta; }   // signed for display
 
-  // Lower plausibility bound for an advert timestamp, derived from the build
-  // epoch. Exposed for a boundary test.
+  // Lower plausibility bound for an advert timestamp: this firmware's build
+  // epoch. Adverts dated earlier are refused. Exposed for the boundary test.
   static uint32_t buildFloor();
 
 private:
@@ -95,8 +96,6 @@ private:
   void (*set_fn)(void*, uint32_t) = NULL;
   void* set_ctx = NULL;
 
-  // state of a fresh node, and the baseline load() resets to before it reads
-  void resetToDefaults();
   bool hasSource(const uint8_t* fp) const;
   void clear() { count = 0; }
   void evaluate(uint32_t local_now);
