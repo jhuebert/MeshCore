@@ -1511,7 +1511,7 @@ TEST_F(FilterTest, ExtraTokensAreRejectedBeforeAnythingChanges) {
   const Case cases[] = {
     { "on junk",          "Err - usage: on" },
     { "off junk",         "Err - usage: off" },
-    { "list junk",        "Err - usage: list" },
+    { "list junk",        "Err - usage: list [<start-idx>]" },
     { "clear junk",       "Err - usage: clear" },
     { "get 0 junk",       "Err - usage: get <idx>" },
     { "enable 0 junk",    "Err - usage: enable|disable <idx>" },
@@ -2983,36 +2983,33 @@ TEST_F(FilterTest, ProbParseRejectsInvalid) {
   EXPECT_EQ(filter.getNumRules(), 0);   // no half-added rules
 }
 
-TEST_F(FilterTest, ProbShownInGetAndChangesDigest) {
+TEST_F(FilterTest, ProbShownInGetAndPersists) {
   expectOk(filter, "add type=advert");
   expectOk(filter, "add type=advert prob=50");
   EXPECT_EQ(cli(filter, "get 0").find(" prob="), std::string::npos);
   EXPECT_NE(cli(filter, "get 1").find(" prob=50"), std::string::npos);
 
-  // digest covers the record through hits, so prob is part of it
-  std::string list = cli(filter, "list");
-  size_t colon = list.find(':');
-  size_t sp1 = list.find(' ', colon + 1), sp2 = list.find(' ', sp1 + 1);
-  ASSERT_NE(sp1, std::string::npos);
-  if (sp2 == std::string::npos) sp2 = list.size();
-  std::string tok0 = list.substr(sp1 + 1, sp2 - sp1 - 1);
-  std::string tok1 = list.substr(sp2 + 1);
-  ASSERT_EQ(tok0.size(), 6u);
-  ASSERT_EQ(tok1.size(), 6u);
-  EXPECT_NE(tok0, tok1);
+  // prob lands in the persisted record, so two otherwise-identical rules' saved
+  // bytes differ (the header is 7 bytes, each v7 record FILTER_RULE_V7_BYTES)
+  filter.save(&fs);
+  const std::vector<uint8_t>& cfg = fs.files[CFG_FILE];
+  ASSERT_GE(cfg.size(), (size_t)(7 + 2 * FILTER_RULE_V7_BYTES));
+  EXPECT_NE(memcmp(&cfg[7], &cfg[7 + FILTER_RULE_V7_BYTES], FILTER_RULE_V7_BYTES), 0);
 }
 
 TEST_F(FilterTest, ProbPersistsRoundtrip) {
   expectOk(filter, "add type=advert prob=75");
   filter.save(&fs);
-  std::string digest_before = cli(filter, "list");
+  std::vector<uint8_t> saved = fs.files[CFG_FILE];
 
   FilterRules restored;
   restored.begin(&fs);
   ASSERT_EQ(restored.getNumRules(), 1);
   EXPECT_EQ(restored.getRule(0)->prob, 75);
-  std::string digest_after = cli(restored, "list");
-  EXPECT_EQ(digest_after, digest_before);   // padding canary: byte-identical record
+  // re-saving what loaded reproduces the exact bytes (padding included):
+  // round-tripping the record normalizes nothing
+  restored.save(&fs);
+  EXPECT_EQ(fs.files[CFG_FILE], saved);
 }
 
 TEST_F(FilterTest, ProbAlwaysDecides) {
@@ -3737,20 +3734,14 @@ TEST_F(FilterTest, RepeatedChanPredicateReplaces) {
 TEST_F(FilterTest, RepeatedPathPredicateReplacesWholesale) {
   // replacing a long chain with a short one must leave no stale path bytes
   // behind, so it must be indistinguishable from adding the short chain
-  // directly — including the rule digest, which covers the path bytes
+  // directly — down to the saved rule record, which carries the path bytes
   ASSERT_EQ(cli(filter, "add path=^11223344>55667788$ path=^11$"), "OK - rule 0 added");
   ASSERT_EQ(cli(filter, "add path=^11$"), "OK - rule 1 added");
 
-  // `filter list` prints "<idx><e|d><D|F><3 hex digest>" per rule after the header
-  std::string l = cli(filter, "list");
-  std::vector<std::string> toks;
-  for (const std::string& t : splitOnSpace(l.substr(l.find(':') + 1))) {
-    if (!t.empty()) toks.push_back(t);
-  }
-  ASSERT_EQ(toks.size(), 2u);
-  std::string d0 = toks[0].substr(toks[0].size() - 3);
-  std::string d1 = toks[1].substr(toks[1].size() - 3);
-  EXPECT_EQ(d0, d1);
+  filter.save(&fs);
+  const std::vector<uint8_t>& cfg = fs.files[CFG_FILE];
+  ASSERT_GE(cfg.size(), (size_t)(7 + 2 * FILTER_RULE_V7_BYTES));
+  EXPECT_EQ(memcmp(&cfg[7], &cfg[7 + FILTER_RULE_V7_BYTES], FILTER_RULE_V7_BYTES), 0);
 }
 
 TEST_F(FilterTest, FailedLaterValueRollsBackAutoProvisionedChan) {
@@ -3947,21 +3938,18 @@ TEST_F(FilterTest, ThrottleCliRoundTrip) {
   std::string g1 = cli(filter, "get 1");
   EXPECT_EQ(g0.find(" throttle="), std::string::npos);   // unset: no tokens at all
   EXPECT_EQ(g0.find(" pass="), std::string::npos);
-  EXPECT_NE(g1.find(" throttle=60 pass=0"), std::string::npos);   // echo round-trips
+  EXPECT_NE(g1.find(" throttle=60"), std::string::npos);   // echo round-trips
+  EXPECT_NE(g1.find(" pass=0"), std::string::npos);        // pass= now rides the stats tail
   filter.getRule(1)->throttle_pass = 3;
-  EXPECT_NE(cli(filter, "get 1").find(" throttle=60 pass=3"), std::string::npos);
+  std::string g1b = cli(filter, "get 1");
+  EXPECT_NE(g1b.find(" throttle=60"), std::string::npos);
+  EXPECT_NE(g1b.find(" pass=3"), std::string::npos);
 
-  // digest covers the record through hits, so throttle is part of it
-  std::string list = cli(filter, "list");
-  size_t colon = list.find(':');
-  size_t sp1 = list.find(' ', colon + 1), sp2 = list.find(' ', sp1 + 1);
-  ASSERT_NE(sp1, std::string::npos);
-  if (sp2 == std::string::npos) sp2 = list.size();
-  std::string tok0 = list.substr(sp1 + 1, sp2 - sp1 - 1);
-  std::string tok1 = list.substr(sp2 + 1);
-  ASSERT_EQ(tok0.size(), 6u);
-  ASSERT_EQ(tok1.size(), 6u);
-  EXPECT_NE(tok0, tok1);
+  // throttle lands in the persisted record, so the two rules' saved bytes differ
+  filter.save(&fs);
+  const std::vector<uint8_t>& cfg = fs.files[CFG_FILE];
+  ASSERT_GE(cfg.size(), (size_t)(7 + 2 * FILTER_RULE_V7_BYTES));
+  EXPECT_NE(memcmp(&cfg[7], &cfg[7 + FILTER_RULE_V7_BYTES], FILTER_RULE_V7_BYTES), 0);
 }
 
 TEST_F(FilterTest, ThrottleCliRejects) {
@@ -3985,8 +3973,8 @@ TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
   std::string reply = cli(filter, "get 0");
   EXPECT_EQ(reply.size(), (size_t)160 - 1);   // pinned truncation (CLI_REPLY_MAX - 1)
   EXPECT_NE(reply.find("prob=50"), std::string::npos);
-  EXPECT_EQ(reply.find("throttle=65535"), std::string::npos);   // tail truncates away
-  EXPECT_EQ(reply.find("air="), std::string::npos);
+  EXPECT_NE(reply.find("throttle=65535"), std::string::npos);   // predicates now all fit
+  EXPECT_EQ(reply.find("air="), std::string::npos);             // the stats tail truncates
 }
 
 TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
@@ -4086,7 +4074,7 @@ TEST_F(FilterTest, RuleIdxRejectsNegativeHexAndHuge) {
   EXPECT_EQ(cli(filter, "get 0x10").substr(0, 5), "Err -");   // must not atoi() down to rule 0
   EXPECT_EQ(cli(filter, "get 99999").substr(0, 5), "Err -");
   EXPECT_EQ(cli(filter, "disable 99999999999999").substr(0, 5), "Err -");   // overflows int
-  EXPECT_EQ(cli(filter, "get 0").find("r0 "), 0);   // genuine rule 0 still reachable
+  EXPECT_EQ(cli(filter, "get 0").find("drop type=advert"), 0);   // genuine rule 0 still reachable
 }
 
 TEST_F(FilterTest, ChanAddRejectsBareHash) {
@@ -4098,12 +4086,14 @@ TEST_F(FilterTest, ChanAddRejectsBareHash) {
 
 TEST_F(FilterTest, GetEnableDisableDelClear) {
   expectOk(filter, "add type=advert");
-  EXPECT_EQ(cli(filter, "get 0").find("r0 en drop type=advert"), 0);
+  EXPECT_EQ(cli(filter, "get 0").find("drop type=advert"), 0);   // enabled is implicit
 
   EXPECT_EQ(cli(filter, "disable 0"), "OK - rule 0 disabled");
   EXPECT_FALSE(filter.getRule(0)->enabled);
+  EXPECT_EQ(cli(filter, "get 0").find("disabled drop type=advert"), 0);
   EXPECT_EQ(cli(filter, "enable 0"), "OK - rule 0 enabled");
   EXPECT_TRUE(filter.getRule(0)->enabled);
+  EXPECT_EQ(cli(filter, "get 0").find("drop type=advert"), 0);
 
   EXPECT_EQ(cli(filter, "get 5"), "Err - no such rule");
   EXPECT_EQ(cli(filter, "del 5"), "Err - no such rule");
@@ -4120,11 +4110,104 @@ TEST_F(FilterTest, GetEnableDisableDelClear) {
 TEST_F(FilterTest, ListAndStatsOutput) {
   expectOk(filter, "add type=advert");
   filter.getRule(0)->hits = 3;
-  std::string list = cli(filter, "list");
-  EXPECT_EQ(list.find("on 1/32: 0eD"), 0);   // enabled + Drop digest line
+  EXPECT_EQ(cli(filter, "list"), "0: drop type=advert");   // no header, no stats
 
   std::string stats = cli(filter, "stats");
   EXPECT_EQ(stats.find("lim:0 abort:0 air:0s:0%; hits: 0:3"), 0);
+}
+
+TEST_F(FilterTest, ListEmpty) {
+  EXPECT_EQ(cli(filter, "list"), "no rules");
+}
+
+TEST_F(FilterTest, ListRejectsBadStart) {
+  expectOk(filter, "add type=advert");
+  EXPECT_EQ(cli(filter, "list 1"), "Err - start index 1 is past the last rule (0)");
+  EXPECT_EQ(cli(filter, "list 99").substr(0, 5), "Err -");   // past the rule capacity
+  EXPECT_EQ(cli(filter, "list -1").substr(0, 5), "Err -");
+  EXPECT_EQ(cli(filter, "list junk"), "Err - usage: list [<start-idx>]");
+}
+
+TEST_F(FilterTest, ListOmitsEnabledAndShowsDisabled) {
+  expectOk(filter, "add type=advert");
+  EXPECT_EQ(cli(filter, "list"), "0: drop type=advert");           // enabled is silent
+  expectOk(filter, "disable 0");
+  EXPECT_EQ(cli(filter, "list"), "0: disabled drop type=advert");  // only the rarer state spends a word
+}
+
+TEST_F(FilterTest, ListEntryBodyMatchesGetBody) {
+  expectOk(filter, "add chan=#test sender=^bob throttle=60");
+  filter.getRule(0)->hits = 5;
+  filter.getRule(0)->throttle_pass = 12;
+  std::string list = cli(filter, "list");
+  std::string get = cli(filter, "get 0");
+  ASSERT_EQ(list.substr(0, 3), "0: ");
+  // the list entry is exactly the get line's body, before the stats tail
+  EXPECT_EQ(list.substr(3), get.substr(0, get.find(" hits=")));
+  EXPECT_EQ(list.find("hits="), std::string::npos);   // list never shows counters
+}
+
+TEST_F(FilterTest, ListAbbreviatesOversizedRuleAtFieldBoundary) {
+  // every predicate set, throttle= at max width: the body cannot fit a page
+  ASSERT_EQ(cli(filter, "add type=txt route=flood hops=1 len=1 snr=0 path=^10$ "
+                        "hsize=1 chan=#t chanhash=AA region=TestNorth sender=\"^X\" "
+                        "text=\"^y\" prob=50 throttle=65535"),
+            "OK - rule 0 added");
+  std::string page = cli(filter, "list");
+  EXPECT_NE(page.find("prob=50"), std::string::npos);          // the last field that fits, whole
+  EXPECT_EQ(page.find("throttle=65535"), std::string::npos);   // cut at its boundary, not partially
+  ASSERT_GE(page.size(), 2u);
+  EXPECT_EQ(page.compare(page.size() - 2, 2, ".."), 0);        // the in-rule abbreviation marker
+
+  // get still shows the whole rule (only the stats tail truncates)
+  std::string full = cli(filter, "get 0");
+  EXPECT_NE(full.find("throttle=65535"), std::string::npos);
+}
+
+TEST_F(FilterTest, ListPaginatesAndTerminates) {
+  // rules long enough that five cannot fit one reply
+  const std::string s(20, 'a'), t(20, 'b');
+  for (int i = 0; i < 5; i++) expectOk(filter, ("add sender=" + s + " text=" + t).c_str());
+
+  std::string page = cli(filter, "list");
+  ASSERT_GT(page.size(), 0u);
+  EXPECT_EQ(page.compare(page.size() - 3, 3, "..."), 0) << "five long rules must not fit one page";
+
+  std::vector<int> seen;
+  std::vector<std::string> pages{ page };
+  while (true) {
+    size_t marker = page.rfind("\n...");
+    if (marker == std::string::npos) break;
+    // resume at the first index not shown on this page
+    size_t last_nl = page.rfind('\n', marker - 1);
+    int resume = atoi(page.substr(last_nl + 1, marker - last_nl - 1).c_str()) + 1;
+    page = cli(filter, ("list " + std::to_string(resume)).c_str());
+    pages.push_back(page);
+    ASSERT_LT(pages.size(), (size_t)20) << "pagination never terminates";
+  }
+
+  // together the pages name every rule exactly once, in order
+  for (const std::string& p : pages) {
+    std::string body = p;
+    if (body.size() >= 3 && body.compare(body.size() - 3, 3, "...") == 0) body.resize(body.size() - 3);
+    while (!body.empty() && body.back() == '\n') body.pop_back();
+    for (size_t pos = 0; pos <= body.size();) {
+      size_t nl = body.find('\n', pos);
+      std::string line = body.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+      size_t colon = line.find(": ");
+      ASSERT_NE(colon, std::string::npos) << line;
+      int idx = atoi(line.substr(0, colon).c_str());
+      EXPECT_EQ(std::find(seen.begin(), seen.end(), idx), seen.end()) << "repeated index " << idx;
+      seen.push_back(idx);
+      if (nl == std::string::npos) break;
+      pos = nl + 1;
+    }
+  }
+  ASSERT_EQ(seen.size(), 5u);
+  for (int i = 0; i < 5; i++) EXPECT_EQ(seen[i], i) << "coverage gap at " << i;
+
+  // the final page carried no continuation marker
+  EXPECT_EQ(pages.back().find("..."), std::string::npos);
 }
 
 // ---------------------------------------------------------------- channel store
@@ -4754,24 +4837,21 @@ TEST_F(FilterTest, LegacyByteLoadsAsForward) {
   EXPECT_EQ(restored.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, channelFromStore(restored, 0),
                                   payload.data, payload.len, nullptr),
             FILTER_ACT_FORWARD);
-  EXPECT_EQ(cli(restored, "get 0").find("r0 en forward"), 0);
+  EXPECT_EQ(cli(restored, "get 0").find("forward sender=^Alice"), 0);
 
-  // digest identical to the same rule added via the new CLI
+  // byte-identical to the same rule added via the new CLI
   NativeFS fs2;
   FilterRules fresh;
   fresh.begin(&fs2);
   expectOk(fresh, "add sender=^Alice action=forward");
   fresh.save(&fs2);
-  FilterRules freshRestored;
-  freshRestored.begin(&fs2);
-  EXPECT_EQ(cli(restored, "list"), cli(freshRestored, "list"));
+  EXPECT_EQ(fs2.files[CFG_FILE], fs.files[CFG_FILE]);
 }
 
 TEST_F(FilterTest, ListAndGetShowForward) {
   expectOk(filter, "add sender=^Alice action=forward");
-  std::string list = cli(filter, "list");
-  EXPECT_EQ(list.find("on 1/32: 0eF"), 0);   // F = forward, no L anymore
-  EXPECT_EQ(cli(filter, "get 0").find("r0 en forward"), 0);
+  EXPECT_EQ(cli(filter, "list"), "0: forward sender=^Alice");   // readable, no L/code
+  EXPECT_EQ(cli(filter, "get 0").find("forward sender=^Alice"), 0);
 }
 
 // ---------------------------------------------------------------- filter move

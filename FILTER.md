@@ -256,7 +256,7 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 | `filter` | Status line, e.g. `on; rules 1/32; chans 2/32; ratelimit advert 0h; cache 0/512; limiter 0; aborted 0` — filter on/off, rules used out of 32, channels stored out of 32, advert rate-limit window and cache fill, limiter and regex-abort counters |
 | `filter on` / `filter off` | Enable/disable the whole filter (rules are kept) |
 | `filter add <cond>=<val> ...` | Add a rule (space-separated conditions, see [What you can match on](#what-you-can-match-on)) |
-| `filter list` | One line per rule, e.g. `on 1/32: 0eDBE9` — see below for how to read it |
+| `filter list [<start-idx>]` | One readable line per rule, e.g. `0: drop advert`; a listing cut for space ends with a `...` line — re-run with the index it implies (see below). State and rule count come from `filter`, per-rule counters from `filter stats` |
 | `filter stats` | Totals: limiter drops, regex aborts, airtime saved, and a per-rule hit count |
 | `filter stats reset` | Zero the counters above (per-rule hits, airtime saved, limiter drops, regex aborts). Rate state is **not** reset: a throttled rule gets no free pass, and advert history is kept |
 | `filter get <idx>` | Full detail of one rule, including its `throttle=`/`pass=` rate gate, hit count and saved-airtime stat |
@@ -275,26 +275,33 @@ admin (see [Managing the repeater remotely](#managing-the-repeater-remotely)).
 
 Notes:
 
-- **Reading `filter list` output.** The line starts with the filter state and
-  rule count (`on 1/32` = on, 1 rule of max 32), followed by one token per
-  rule. Each token packs four facts:
+- **Reading `filter list` output.** Each line is one rule, written the way you
+  would type it after `filter add` (minus the verb), numbered by index:
 
   ```text
-  0eDBE9
-  │││└─ 3 hex digits: digest of the rule's content (changes whenever
-  │││     any part of the rule changes; identical rules always match)
-  ││└─── D = drop, F = forward
-  │└──── e = enabled, d = disabled
-  └────── rule index (0-based position)
+  0: drop advert
+  1: forward chan=#weather
+  2: disabled drop chan=#test sender=^bob throttle=60
   ```
 
-  The digest is handy as a change indicator: if a rule's digest is the same
-  before and after a reboot or re-add, its stored content is unchanged.
-- **Commands that take a rule number want the rule's index**, not the whole
-  `filter list` token. Indexes count from **0**: the first rule added
-  is rule 0, the second rule 1, and so on. The repeater prints the index when
-  you add a rule (`OK - rule 0 added`). So `filter get 0` is correct;
-  `filter get 0eDBE9` is not — the token is for display only.
+  The number before `: ` is the rule's index, and the rest is its action
+  (`drop`/`forward`) plus its conditions, in evaluation order. An enabled rule
+  says nothing about its state — enabled is the default — while a disabled rule
+  prints `disabled`. `filter get <idx>` shows the same line for one rule plus
+  its counters (`hits=`, `pass=` when `throttle=` is set, and `air=`);
+  `filter list` never shows counters, so use `filter` for the on/off state and
+  rule count and `filter stats` for per-rule hits.
+
+  A rule too large for one line is cut at a condition boundary and marked with
+  `..` (two dots); `filter get <idx>` shows more of it. When the listing itself
+  does not fit one reply, it ends with a line containing only `...` (three
+  dots): run `filter list <last-index + 1>` — the index right after the last one
+  shown — to continue. `filter list` with no argument starts at rule 0.
+- **Commands that take a rule number want the rule's index** — the number
+  before the `:` in `filter list` — not the whole line. Indexes count from
+  **0**: the first rule added is rule 0, the second rule 1, and so on. The
+  repeater prints the index when you add a rule (`OK - rule 0 added`). So
+  `filter get 0` is correct; `filter get 0: drop advert` is not.
 - Deleting a rule shifts later rules down: delete rule 1 of 3 and the old
   rules 2 and 3 become 1 and 2. Re-check `filter list` after deletions.
 - The repeater replies with short lines; `filter get <idx>` gives the most
@@ -302,6 +309,10 @@ Notes:
 - Counters (`filter stats`) and per-rule rate state reset to zero on reboot —
   the rate state means each [`throttle=`](#throttle) rule grants one free pass
   after a reboot; the rules themselves do not.
+- `filter list` and `filter get` changed shape in 2026-10: the packed
+  `<idx><e|d><D|F><digest>` listing and the `r0 en`/`r0 dis` prefix are gone,
+  and a rule's digest is no longer printed anywhere. Rule indexes are unchanged,
+  so anything that only passes an index keeps working.
 
 ## Common setups
 
@@ -351,7 +362,7 @@ message per minute through and drop the rest:
 ```text
 filter add chan=#test sender="^bob" throttle=60
 filter get 0
-# r0 en drop chan=#test sender="^bob" throttle=60 pass=12 hits=5 air=2s
+# drop chan=#test sender=^bob throttle=60 hits=5 pass=12 air=2s
 ```
 
 Reading that line: `pass=12` messages got through (one per minute), `hits=5`
@@ -422,7 +433,7 @@ Added the exception after the drop? Reorder without retyping it —
 `filter move <from> <to>` moves a rule so it ends up **at** the target index:
 
 ```text
-filter list                    # the drop (rule 0) sits above Alice's rule (rule 1)
+filter list                    # rule 0 is the catch-all drop, rule 1 Alice's forward
 filter move 1 0                # Alice's rule ends up at index 0, above the drop
 ```
 
@@ -1113,6 +1124,7 @@ filter stats
 |---|---|
 | Typo in a command did nothing | Nothing is ignored any more: a command with an unexpected extra word, unbalanced quotes, or an over-long line is refused with a usage line and changes nothing |
 | A channel is missing from `filter chan list` | The store holds more than fits one reply — the listing ends with `next=N`; run `filter chan list N` for the rest |
+| `filter list` stops at a `...` line, or a rule ends with `..` | The listing did not fit one reply: run `filter list <last-index + 1>` (the number after the last line shown) for the rest. A rule ending in `..` was too large for its line — `filter get <idx>` shows more of it |
 | Rule gets no hits | Is the filter on (`filter on`)? Is the rule enabled? Did an earlier rule match first? |
 | Sender/text never matches | Can the repeater decrypt the channel? Is it group text? Are you matching the right field (sender without colon, text without name)? |
 | Matches too broadly | Add `^`/`$` anchors; escape literal dots; remember `sender=Bot` matches `MyBot2` |
