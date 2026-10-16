@@ -39,6 +39,7 @@ should not need to explore beyond them before making a change.
   stop for anything about the fleet feature.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
+- `MESHCLOCK.md` — mesh clock sync behavior, CLI, defaults and caveats.
 
 **When behavior changes, the matching guide section is updated in the same
 commit** — the guides are user-facing API documentation, not optional docs.
@@ -74,6 +75,8 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `CliUtil.h` — shared CLI helpers (`nextToken`, `radd`, `CLI_REPLY_MAX`)
   used by filter and battery CLIs alike.
 - `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI.
+- `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h` — advert
+  sample collection, median/quorum decision, enabled-flag persistence and CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
   dispatch, lazy-save loop, the `execCliLine` script-execution trampoline and
@@ -84,14 +87,15 @@ commit** — the guides are user-facing API documentation, not optional docs.
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
 PatternMatch), `test/test_fleet/` (82 cases: runner grammar, tag targeting,
 acknowledgements, scheduling, persistence, CLI surface, the battery
-exemption contract) and `test/test_battery_gate/`. Test-only shims:
+exemption contract), `test/test_battery_gate/`, and `test/test_mesh_clock/` (24
+behavior-level cases). Test-only shims:
 `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
 `FilterTestHelpers.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` / `-e native_fleet` (host-native, no hardware), plus
-`-e native_packet_filter_san` / `-e native_battery_gate_san` /
-`-e native_fleet_san` for ASan+UBSan;
+native_battery_gate` / `-e native_fleet` / `-e native_mesh_clock` (host-native,
+no hardware), plus `-e native_packet_filter_san` / `-e native_battery_gate_san` /
+`-e native_fleet_san` / `-e native_mesh_clock_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 `build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
 target being `Xiao_S3_WIO_repeater`. **Compile-check every filesystem
@@ -131,9 +135,12 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/PatternMatch.h/.cpp`
 - `examples/simple_repeater/CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
-- `test/test_packet_filter/`, `test/test_battery_gate/`
-- `FILTER.md`, `FLEET.md`, `.github/workflows/filter-release.yml`, `sync-upstream.yml`,
-  `.github/workflows/promote-stable.yml`
+- `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
+  `BuildEpoch.h`
+- `test/test_packet_filter/`, `test/test_battery_gate/`,
+  `test/test_mesh_clock/`
+- `FILTER.md`, `FLEET.md`, `MESHCLOCK.md`, `.github/workflows/filter-release.yml`,
+  `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
 — a reviewer should see a handful of lines, not a fork interleaved into
