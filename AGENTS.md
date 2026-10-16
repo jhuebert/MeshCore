@@ -88,9 +88,9 @@ commit** — the guides are user-facing API documentation, not optional docs.
   drain).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
-**Tests:** `test/test_packet_filter/` (295 behavior-level cases: matching,
+**Tests:** `test/test_packet_filter/` (301 behavior-level cases: matching,
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
-PatternMatch), `test/test_fleet/` (82 cases: runner grammar, tag targeting,
+PatternMatch), `test/test_fleet/` (112 cases: runner grammar, tag targeting,
 acknowledgements, scheduling, persistence, CLI surface, the battery
 exemption contract), `test/test_battery_gate/`, and `test/test_mesh_clock/` (24
 behavior-level cases). Test-only shims:
@@ -281,8 +281,8 @@ FILTER.md:
   fails any release target whose `src/`/`examples/` code holds a frame
   >= 2 KB (formerly a filter-release.yml CI check) — keep new frames well
   under it.
-- Pure refactors keep both suites green **unchanged** — the suites (295 filter,
-  82 fleet, 44 battery) are the safety net that proves no behavior slipped.
+- Pure refactors keep both suites green **unchanged** — the suites (301 filter,
+  112 fleet, 50 battery) are the safety net that proves no behavior slipped.
 - Run both suites, then re-read the diff:
 
 ```
