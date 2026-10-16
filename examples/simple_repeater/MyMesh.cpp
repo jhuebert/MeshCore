@@ -1042,6 +1042,18 @@ static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   if (pkt) m->sendFleetReply(pkt);
 }
 
+// Announce battery-gate transitions on the fleet channel: one packet per
+// suspend/resume, as an ordinary "<name>: BATT ..." group text. sendAlert
+// enforces "fleet on + channel set", so no policy lives here.
+static void batteryAlerts(BatteryGate& gate, FleetManager& fleet) {
+  bool sus; uint16_t mv;
+  while (gate.takeStateChange(&sus, &mv)) {
+    char body[48];
+    snprintf(body, sizeof(body), "BATT %s %umV", sus ? "SUSPEND" : "RESUME", (unsigned)mv);
+    fleet.sendAlert(body);
+  }
+}
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
@@ -1442,6 +1454,7 @@ void MyMesh::loop() {
   // the receive that follows must see this loop's reading, not the previous one.
   // One sample per interval, not one per packet.
   battGate.loop(_fs, board);
+  batteryAlerts(battGate, fleet);
 
   mesh::Mesh::loop();
 
