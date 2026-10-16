@@ -18,8 +18,14 @@ GPS, NTP, or set the clock with the `time` command, you do not need this.
 
 ## Behaviour
 
-Every advert carries a signed Unix-epoch timestamp from its sender. When mesh
-clock sync is **on**, each distinct source contributes **one vote** per batch.
+Every advert carries a signed Unix-epoch timestamp from its sender. An advert
+is eligible only when its timestamp is **at or after this firmware's build
+epoch** (`__DATE__`/`__TIME__`, interpreted as UTC). There is no grace period:
+an older timestamp is rejected and never enters the batch. The comparison is
+wrap-safe. The compiler supplies local build time, so sites whose build host uses
+a non-UTC timezone may conservatively reject some otherwise-current adverts.
+
+When mesh clock sync is **on**, each distinct source contributes **one vote** per batch.
 When the batch fills, the repeater takes the **median** of the sources' predicted
 "now" and counts how many sources agree with it:
 
@@ -45,9 +51,11 @@ collected over hours and its samples still cluster within seconds.
   not N independent operators. The quorum filters broken clocks, nothing more. On
   a mesh where anyone can inject keys, this is not a security boundary; treat the
   result as "plausible", not "authoritative".
-- A dense, long-lived mesh may hold stale signed adverts that happen to agree and
-  look like consensus. The build-date floor and the batch size bound the worst
-  case; do not enable this where a wrong clock has serious consequences.
+- A dense, long-lived mesh may hold stale signed adverts dated on or after this
+  firmware's build epoch that happen to agree and look like consensus. The strict
+  build-time floor rejects pre-build timestamps, but advert signatures prove
+  authorship, not freshness; do not enable this where a wrong clock has serious
+  consequences.
 
 ## CLI reference
 
@@ -114,6 +122,9 @@ recommended.
   the clock while a batch is filling and enough stale samples are already held,
   the batch can commit a clock that is off by the step. Not a concern if mesh
   clock sync is the node's only clock source.
+- The build epoch comes from the compiler's local `__DATE__`/`__TIME__`,
+  interpreted as UTC. A non-UTC build host can make the strict floor conservative
+  by its timezone offset.
 - A 4-byte source fingerprint can collide, dropping the second key's vote for one
   batch. Rare; accepted to keep RAM tiny.
 - Modular (32-bit) arithmetic keeps timestamps correct across 2038/2106; the only

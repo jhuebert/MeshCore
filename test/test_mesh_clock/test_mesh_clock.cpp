@@ -84,7 +84,7 @@ TEST(ClockSyncBuildEpoch, ParsesAReasonableDate) {
   const uint32_t e = meshclock::buildEpoch();
   EXPECT_GT(e, 1735689600UL);   // after 2025-01-01
   EXPECT_LT(e, 4102444800UL);   // before 2100-01-01
-  EXPECT_LE(MeshClockSync::buildFloor(), e);
+  EXPECT_EQ(MeshClockSync::buildFloor(), e);
 }
 
 // ------------------------------------------------------------ persistence

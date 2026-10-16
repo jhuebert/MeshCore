@@ -15,15 +15,12 @@
 // (rare; accepted rather than widening the fingerprint and spending RAM).
 static const uint8_t MESHCLOCK_KEY_OFFSETS[4] = { 8, 14, 20, 26 };
 
-// The plausibility floor: an advert timestamped before the firmware existed is
-// not trusted. buildEpoch() parses the compiler's local __DATE__/__TIME__, so a
-// grace absorbs the local-vs-UTC difference; a malformed/absent __DATE__ would
-// yield a tiny value, so fall back to a hardcoded date rather than admitting
-// everything by accident. 2025-01-01 UTC matches the fleet feature's floor.
+// Strict plausibility floor: an advert timestamp before this firmware's build
+// timestamp cannot contribute a vote. buildEpoch() interprets the compiler's
+// local __DATE__/__TIME__ as UTC; no grace is subtracted, so earlier timestamps
+// are always refused.
 uint32_t MeshClockSync::buildFloor() {
-  uint32_t e = meshclock::buildEpoch();
-  if (e < 1500000000UL) e = 1735689600UL;
-  return e > MESHCLOCK_BUILD_GRACE_SECS ? e - MESHCLOCK_BUILD_GRACE_SECS : e;
+  return meshclock::buildEpoch();
 }
 
 // The state a fresh node starts in, and the baseline load() resets to before it

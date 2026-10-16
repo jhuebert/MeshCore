@@ -33,14 +33,6 @@
   #define MESHCLOCK_MIN_DIFF_SECS 60
 #endif
 
-// The build epoch is a plausibility floor only (rejects adverts timestamped
-// before the firmware could have existed). It is parsed from the compiler's
-// local __DATE__/__TIME__ with no build-system change, so this grace absorbs
-// the up-to-~1 day local-vs-UTC difference and the date/time granularity.
-#ifndef MESHCLOCK_BUILD_GRACE_SECS
-  #define MESHCLOCK_BUILD_GRACE_SECS 86400UL
-#endif
-
 // persisted enabled flag (see MeshClockSync.cpp for the record)
 #ifndef MESHCLOCK_CFG_FILE
   #define MESHCLOCK_CFG_FILE "/meshclock"

@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream automatically (synced weekly) and adds three repeater-focused
+It tracks upstream automatically (synced weekly) and adds four repeater-focused
 capabilities on top of stock firmware. Everything else — supported boards,
 clients, protocols, build system — is identical to upstream; see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
@@ -33,6 +33,17 @@ recovers it resumes automatically. Debounce + hysteresis keep it from
 flapping, and the admin can check voltage and tune thresholds over the mesh.
 
 → Full guide: **[BATTERY.md](./BATTERY.md)**
+
+### 🕒 Mesh clock sync
+
+A repeater with no GPS, NTP, or battery-backed RTC can estimate UTC from signed
+adverts it hears. When enabled (`clock mesh on`), it waits for a batch of distinct
+sources to agree on the median before stepping the RTC; it is off by default.
+Advert timestamps earlier than the firmware build timestamp are rejected and
+never enter the batch. Public adverts are not a root of trust, so this is for
+plausible time on clockless nodes, not authoritative timekeeping.
+
+→ Full guide: **[MESHCLOCK.md](./MESHCLOCK.md)**
 
 ### 🛰️ Fleet management (remote CLI scripts)
 

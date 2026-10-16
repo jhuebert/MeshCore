@@ -4,10 +4,9 @@
 // it is trivially removable. The parse is `inline` rather than `constexpr`
 // because the ESP32/nRF52 toolchains build as C++11, where a constexpr body
 // must be a single return statement; the input is a string literal, so the
-// optimizer folds it to a constant anyway. It uses the compiler's local time;
-// callers treat it as a lower plausibility bound and absorb the up-to-~1 day
-// local-vs-UTC difference with their own grace (see
-// MESHCLOCK_BUILD_GRACE_SECS), never as an exact comparison.
+// optimizer folds it to a constant anyway. The compiler's local build time is
+// interpreted as UTC. MeshClockSync uses this strict timestamp as its floor,
+// so an advert timestamp earlier than this value cannot enter the batch.
 
 #ifndef _BUILD_EPOCH_H
 #define _BUILD_EPOCH_H
