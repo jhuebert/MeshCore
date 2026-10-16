@@ -751,10 +751,9 @@ struct GroupTextPayload {
   size_t len;
 };
 
-static GroupTextPayload makeGroupText(const char* sender, const char* text) {
+static GroupTextPayload makeGroupTextTs(const char* sender, const char* text, uint32_t ts) {
   GroupTextPayload p;
   memset(&p, 0, sizeof(p));
-  uint32_t ts = 12345;
   memcpy(p.data, &ts, 4);
   p.data[4] = TXT_TYPE_PLAIN;
   size_t off = 5;
@@ -768,6 +767,10 @@ static GroupTextPayload makeGroupText(const char* sender, const char* text) {
   off += tlen;
   p.len = off;
   return p;
+}
+
+static GroupTextPayload makeGroupText(const char* sender, const char* text) {
+  return makeGroupTextTs(sender, text, 12345);
 }
 
 // The packet the core hands onGroupDataRecv(): the payload is the channel hash
@@ -791,11 +794,21 @@ static void groupRecv(FleetManager& f, uint8_t type, const mesh::GroupChannel& c
   f.onGroupData(&pkt, type, c, p.data, p.len);
 }
 
+// replay a neighbour repeater's rebroadcast of a sent packet, arriving at
+// `hops` hops (the relay appends a path hash; the hash comparison ignores it)
+static void hearRepeat(FleetManager& f, const mesh::Packet& sent, uint8_t hops = 1) {
+  mesh::Packet copy = sent;
+  copy.setPathHashCount(hops);
+  f.onHeardPacket(&copy);
+}
+
 // what the send callback saw
 struct SentReply {
   uint8_t secret[PUB_KEY_SIZE];
-  uint8_t hash;
+  uint8_t hash;                        // channel hash
+  uint32_t ts = 0;                     // group-text timestamp
   std::string body;
+  mesh::Packet pkt;                    // the packet the callback claimed to send
 };
 
 // injected device services, recording what they were given
@@ -804,6 +817,7 @@ struct HookEnv {
   uint32_t clock_now = 1800000000UL;   // a fixed epoch above the clock floor
   uint32_t jitter = 12345;
   uint32_t last_window = 0;
+  bool next_send_fails = false;        // make the sender refuse the next packet
   ExecRecorder rec;
 
   static uint32_t timeFn(void* ctx) { return ((HookEnv*)ctx)->clock_now; }
@@ -812,13 +826,22 @@ struct HookEnv {
     e->last_window = window;
     return e->jitter;
   }
-  static void sendFn(void* ctx, const uint8_t* secret, uint8_t hash, const char* body) {
+  static bool sendFn(void* ctx, const uint8_t* secret, uint8_t hash, uint32_t ts,
+                     const char* body, uint8_t* out_pkt_hash) {
     auto* e = (HookEnv*)ctx;
+    if (e->next_send_fails) { e->next_send_fails = false; return false; }
     SentReply r;
     r.hash = hash;
+    r.ts = ts;
     r.body = body;
     memcpy(r.secret, secret, PUB_KEY_SIZE);
+    // compose the same packet MyMesh would, so a replayed rebroadcast of it has
+    // an identical calculatePacketHash()
+    GroupTextPayload p = makeGroupTextTs("xiao", body, ts);
+    r.pkt = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, hash, p);
+    if (out_pkt_hash) r.pkt.calculatePacketHash(out_pkt_hash);
     e->sent.push_back(r);
+    return true;
   }
 };
 
@@ -938,6 +961,178 @@ TEST_F(FleetHooksTest, AckAlwaysRepliesJitteredInChannel) {
   EXPECT_EQ(fleet.getReplyCount(), 0);
   // the jitter window came from the (default) config
   EXPECT_EQ(env.last_window, (uint32_t)FLEET_REPLY_WINDOW_MS);
+}
+
+// --- ack repeat confirmation ---------------------------------------------
+
+#if FLEET_ACK_RETRY
+
+// A heard repeat of the reply cancels the retry: the reply is confirmed and
+// dropped, and no second send is issued.
+TEST_F(FleetHooksTest, AckConfirmedByRepeatCancelsRetry) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());   // runs, schedules the ack
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  ASSERT_EQ(fleet.getAwaitingCount(), 1);
+  EXPECT_EQ(fleet.getReplyCount(), 0);   // a sent reply is no longer "queued"
+
+  hearRepeat(fleet, env.sent[0].pkt);    // a neighbour relayed it
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);
+
+  // the window passes with no further repeat: already confirmed, nothing sent
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)0);
+}
+
+// No repeat within the window: exactly one byte-identical resend, then stop.
+TEST_F(FleetHooksTest, AckNotRepeatedRetriesExactlyOnce) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  ASSERT_EQ(fleet.getAwaitingCount(), 1);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)2);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);   // the retry is the last event
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);    // no third send
+}
+
+// The retry is byte-identical: same timestamp, same body, same packet hash, so
+// every node that already relayed attempt 1 suppresses the copy.
+TEST_F(FleetHooksTest, AckRetryIsByteIdentical) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)2);
+
+  EXPECT_EQ(env.sent[0].ts, env.sent[1].ts);
+  EXPECT_EQ(env.sent[0].body, env.sent[1].body);
+  ASSERT_EQ(env.sent[0].pkt.payload_len, env.sent[1].pkt.payload_len);
+  EXPECT_EQ(memcmp(env.sent[0].pkt.payload, env.sent[1].pkt.payload,
+                   env.sent[0].pkt.payload_len), 0);
+  uint8_t h0[MAX_HASH_SIZE], h1[MAX_HASH_SIZE];
+  env.sent[0].pkt.calculatePacketHash(h0);
+  env.sent[1].pkt.calculatePacketHash(h1);
+  EXPECT_EQ(memcmp(h0, h1, MAX_HASH_SIZE), 0);
+}
+
+// A zero-hop echo (bridge/mirror of the raw bytes) is not a relay: it must not
+// confirm, so the retry still fires.
+TEST_F(FleetHooksTest, AckZeroHopEchoDoesNotConfirm) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  hearRepeat(fleet, env.sent[0].pkt, /*hops=*/0);
+  EXPECT_EQ(fleet.getAwaitingCount(), 1);   // still awaiting
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);    // retry issued
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
+}
+
+// A packet whose content differs (different hash) is not our reply.
+TEST_F(FleetHooksTest, AckWrongHashDoesNotConfirm) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  mesh::Packet other = env.sent[0].pkt;
+  other.setPathHashCount(1);                            // a real relay...
+  other.payload[other.payload_len - 1] ^= 0xFF;         // ...of different content
+  fleet.onHeardPacket(&other);
+  EXPECT_EQ(fleet.getAwaitingCount(), 1);               // not confirmed
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);
+}
+
+// A refused first send used no attempt: the deadline slides by the backoff and
+// the retry schedule is measured from the eventual successful send.
+TEST_F(FleetHooksTest, AckSendRefusalUsesNoAttempt) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  env.next_send_fails = true;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);   // no attempt used
+
+  g_mock_millis += FLEET_ACK_RETRY_BACKOFF_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(fleet.getAwaitingCount(), 1);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);    // exactly one retry
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
+}
+
+#else
+
+// Off switch: the reply is dropped the instant the first send succeeds —
+// today's fire-and-forget behavior, byte-for-byte.
+TEST_F(FleetHooksTest, AckRetryOffDropsOnSend) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)0);
+}
+
+#endif   // FLEET_ACK_RETRY
+
+// The kill switch clears queued and awaiting acknowledgements alike.
+TEST_F(FleetHooksTest, FleetOffCancelsQueuedAndAwaitingAcks) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // k1 sent, awaiting a repeat
+#if FLEET_ACK_RETRY
+  ASSERT_EQ(fleet.getAwaitingCount(), 1);
+#else
+  ASSERT_EQ(fleet.getAwaitingCount(), 0);   // opt-out: dropped on send
+#endif
+
+  deliver("!id k2\n!ack\nset a");
+  ASSERT_TRUE(pass());                            // k2 queued, not yet due
+  EXPECT_EQ(fleet.getReplyCount(), 1);
+
+  fleet.setEnabled(false);                        // kill switch
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // applied
+  EXPECT_EQ(fleet.getReplyCount(), 0);
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);          // nothing further sent
 }
 
 TEST_F(FleetHooksTest, AckErrSilentOnSuccessRepliesOnError) {
@@ -1246,11 +1441,42 @@ TEST_F(FleetHooksTest, StatusLine) {
   EXPECT_NE(r.find("pending 0/2"), std::string::npos);
   EXPECT_NE(r.find("sched 0/2"), std::string::npos);
   EXPECT_NE(r.find("seen 0/32"), std::string::npos);
-  EXPECT_NE(r.find("ackq 0/2"), std::string::npos);
+  EXPECT_NE(r.find("ackq 0/2 await 0 rtx 0"), std::string::npos);
   EXPECT_NE(r.find("badline 0"), std::string::npos);
   // the psk is never echoed
   EXPECT_EQ(r.find("00010203"), std::string::npos);
 }
+
+// onHeardPacket is inert while the fleet is off.
+TEST_F(FleetHooksTest, HeardPacketInertWhileDisabled) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+
+  fleet.setEnabled(false);
+  int awaiting = fleet.getAwaitingCount();   // whatever the retry config leaves
+  mesh::Packet p;
+  memset(&p, 0, sizeof(p));
+  p.setPathHashCount(2);
+  fleet.onHeardPacket(&p);   // inert while off: touches nothing, must not crash
+  EXPECT_EQ(fleet.getAwaitingCount(), awaiting);
+}
+
+#if FLEET_ACK_RETRY
+// The status line reports sent-awaiting and retried counts.
+TEST_F(FleetHooksTest, StatusShowsAwaitAndRetries) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // sent, awaiting a repeat
+  EXPECT_NE(cli(fleet, "").find("await 1 rtx 0"), std::string::npos);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // missed: one retry
+  EXPECT_NE(cli(fleet, "").find("await 0 rtx 1"), std::string::npos);
+}
+#endif
 
 TEST_F(FleetHooksTest, StatusCountsSkippedLines) {
   // an over-long command line is skipped at run time and shows in the status.

@@ -27,6 +27,7 @@ void FleetManager::resetToDefaults() {
   reply_count = 0;
   offered = 0;
   matched = 0;
+  reply_retries = 0;
   // device services are deliberately NOT reset here: they are wiring (set by
   // MyMesh::begin() before load()), not config state — they have in-class
   // initializers and survive every resetToDefaults()/load() call
@@ -246,6 +247,10 @@ void FleetManager::runScripts(CliExecFn fn, void* exec_ctx) {
     runner.abortPending();
     memset(sched, 0, sizeof(sched));
     sched_count = 0;
+    // queued + awaiting acknowledgements die with the fleet too (today a due
+    // ack survived `fleet off`; that inconsistency is closed here)
+    memset(replies, 0, sizeof(replies));
+    reply_count = 0;
   }
 
   // scheduled scripts that have come due move to the run queue; one that
@@ -273,30 +278,92 @@ void FleetManager::runScripts(CliExecFn fn, void* exec_ctx) {
     scheduleAckIfNeeded(res);
   }
 
-  sendDueReplies();
+  serviceReplies();
 }
 
-void FleetManager::sendDueReplies() {
+int FleetManager::getAwaitingCount() const {
+  int n = 0;
+  for (int i = 0; i < reply_count; i++) {
+    if (replies[i].awaiting) n++;
+  }
+  return n;
+}
+
+void FleetManager::removeReply(int idx) {
+  memmove(&replies[idx], &replies[idx + 1], (reply_count - idx - 1) * sizeof(replies[0]));
+  memset(&replies[reply_count - 1], 0, sizeof(replies[0]));
+  reply_count--;
+}
+
+void FleetManager::serviceReplies() {
   for (int i = 0; i < reply_count;) {
-    // signed difference: the deadline is at most one jitter window away, so
-    // the subtraction only wraps when millis() itself does
-    if ((int32_t)(millis() - replies[i].deadline_ms) < 0) { i++; continue; }
-    if (send_fn != NULL) {
-      char body[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key>\n<summary>"
-      snprintf(body, sizeof(body), "%s\n%s", replies[i].key, replies[i].summary);
-      // the captured channel goes back out as-is; if the send cannot happen
-      // (packet pool empty), the reply is skipped silently
-      send_fn(send_ctx, replies[i].chan_secret, replies[i].chan_hash, body);
+    FleetReply& r = replies[i];
+    // signed difference: the deadline is at most one jitter window (or retry
+    // window/backoff) away, so it only wraps when millis() itself does
+    if ((int32_t)(millis() - r.deadline_ms) < 0) { i++; continue; }
+
+    char body[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key>\n<summary>"
+    snprintf(body, sizeof(body), "%s\n%s", r.key, r.summary);
+
+    if (r.awaiting) {
+      // window elapsed with no repeater heard repeating the reply: one
+      // byte-identical resend. Same ts => same packet hash, so every node that
+      // already relayed attempt 1 suppresses this copy — no duplicate on air.
+      if (send_fn != NULL) {
+        send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, body, NULL);
+      }
+      reply_retries++;   // the miss count: the first attempt drew no repeat
+      removeReply(i);
+      continue;
     }
-    memmove(&replies[i], &replies[i + 1], (reply_count - i - 1) * sizeof(replies[0]));
-    memset(&replies[reply_count - 1], 0, sizeof(replies[0]));
-    reply_count--;
+
+    // first attempt: stamp it now, remember the ts and hash for a possible retry
+    uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
+    uint8_t hash[MAX_HASH_SIZE];
+    bool sent = send_fn != NULL &&
+                send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, body, hash);
+    if (!sent) {
+      // packet pool refused the send: no attempt used, try again shortly
+      r.deadline_ms = millis() + FLEET_ACK_RETRY_BACKOFF_MS;
+      i++;
+      continue;
+    }
+    if (!FLEET_ACK_RETRY) {   // off switch: today's fire-and-forget
+      removeReply(i);
+      continue;
+    }
+    r.tx_ts = ts;
+    memcpy(r.pkt_hash, hash, MAX_HASH_SIZE);
+    r.awaiting = 1;
+    r.deadline_ms = millis() + FLEET_ACK_REPEAT_WINDOW_MS;
+    i++;
+  }
+}
+
+void FleetManager::onHeardPacket(const mesh::Packet* packet) {
+  if (!enabled || reply_count == 0) return;   // cheap gate: no SHA in the common case
+  // a repeat can only arrive via a repeater's relay, which appends a path hash;
+  // a zero-hop mirror/bridge echo of the raw bytes is not a repeat
+  if (packet->getPathHashCount() == 0) return;
+
+  // calculatePacketHash() covers payload type + payload (path excluded), so the
+  // origin's outbound copy and any hop's rebroadcast hash identically; a
+  // foreign reply differs in payload. The 8-byte SHA-256 prefix makes a false
+  // positive negligible.
+  uint8_t hash[MAX_HASH_SIZE];
+  packet->calculatePacketHash(hash);
+  for (int i = 0; i < reply_count; i++) {
+    if (replies[i].awaiting && memcmp(replies[i].pkt_hash, hash, MAX_HASH_SIZE) == 0) {
+      removeReply(i);   // confirmed: a repeater relayed our reply
+      return;
+    }
   }
 }
 
 bool FleetManager::sendAlert(const char* body) {
   if (!enabled || psk_len == 0 || send_fn == NULL) return false;
-  send_fn(send_ctx, psk, chan_hash, body);
+  uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
+  send_fn(send_ctx, psk, chan_hash, ts, body, NULL);   // one-shot: no retry
   return true;
 }
 
@@ -471,7 +538,9 @@ static void fleetStatus(FleetManager& fleet, char* reply) {
   radd(&out, &remain, "; pending %d/%d", s.getPendingCount(), FLEET_CLI_QUEUE_DEPTH);
   radd(&out, &remain, "; sched %d/%d", fleet.getSchedCount(), FLEET_SCHED_STORE);
   radd(&out, &remain, "; seen %d/%d", s.getSeenCount(), FLEET_CLI_SEEN_SIZE);
-  radd(&out, &remain, "; ackq %d/%d", fleet.getReplyCount(), FLEET_REPLY_STORE);
+  radd(&out, &remain, "; ackq %d/%d await %d rtx %lu",
+       fleet.getReplyCount(), FLEET_REPLY_STORE, fleet.getAwaitingCount(),
+       (unsigned long)fleet.getReplyRetries());
   radd(&out, &remain, "; badline %lu", (unsigned long)s.getBadLines());
 }
 

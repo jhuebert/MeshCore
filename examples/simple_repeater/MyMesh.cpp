@@ -522,6 +522,7 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.capture(pkt, score);
 #endif
+  fleet.onHeardPacket(pkt);   // ack repeat confirmation (pre-dedup receive hook)
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 1) {
     bridge.sendPacket(pkt);
@@ -1016,9 +1017,12 @@ static uint32_t fleetJitter(void* ctx, uint32_t window) {
 // captured channel, with the repeater's own name as the sender — companions
 // and other fleet members see an ordinary "<name>: <text>" message. The body
 // starts with the job key (charset [A-Za-z0-9._-], never '!'), so no fleet
-// member can ever parse a reply as a script.
-static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
-                           const char* body) {
+// member can ever parse a reply as a script. Returns true iff a packet was
+// created and queued, and reports its hash so FleetManager can recognise a
+// neighbour's relay of it. `ts` is caller-supplied so a retry reproduces the
+// exact same packet (hash).
+static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
+                           uint32_t ts, const char* body, uint8_t* out_pkt_hash) {
   MyMesh* m = (MyMesh*)ctx;
   mesh::GroupChannel chan;
   memset(&chan, 0, sizeof(chan));
@@ -1030,16 +1034,18 @@ static void fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   // "<name>: " + body must fit one packet's data limit (168 B): bound the
   // composition so a long name truncates the tail rather than refusing the send
   uint8_t msg[FLEET_REPLY_DATA_MAX + 1];
-  uint32_t ts = m->getRTCClock()->getCurrentTime();
   memcpy(msg, &ts, 4);
   msg[4] = 0;   // TXT_TYPE_PLAIN
   snprintf((char*)&msg[5], sizeof(msg) - 5, "%s: %s", m->getNodeName(), body);
   mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg,
                                              5 + strlen((char*)&msg[5]));
+  if (!pkt) return false;   // pool empty: FleetManager retries later
+  if (out_pkt_hash) pkt->calculatePacketHash(out_pkt_hash);
   // flood is the only reply route (group texts carry no pubkey); the hook
   // method applies the repeater's configured path-hash size and its default
   // flood scope when set (unscoped otherwise)
-  if (pkt) m->sendFleetReply(pkt);
+  m->sendFleetReply(pkt);
+  return true;
 }
 
 // Announce battery-gate transitions on the fleet channel: one packet per

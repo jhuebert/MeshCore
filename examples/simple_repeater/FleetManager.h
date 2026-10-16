@@ -34,12 +34,16 @@
 // them in begin(); the native tests stub them.
 //   clock: unix epoch seconds (the node RTC)
 //   jitter: a uniform random value in [0, window) for ack reply scheduling
-//   sender: sends `body` as a plain group text (txt_type 0x00) on the captured
-//           channel, with the repeater's own name as the sender
+//   sender: composes `body` as a plain group text (txt_type 0x00) on the
+//           captured channel with the repeater's own name as sender and `ts`
+//           as the group timestamp, then floods it. Writes the resulting
+//           packet's MAX_HASH_SIZE-byte hash to `out_pkt_hash` when non-NULL.
+//           Returns true iff a packet was created and queued. `ts` is
+//           caller-supplied so a retry can reproduce the exact same packet.
 typedef uint32_t (*FleetTimeFn)(void* ctx);
 typedef uint32_t (*FleetJitterFn)(void* ctx, uint32_t window);
-typedef void (*FleetSendFn)(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
-                            const char* body);
+typedef bool (*FleetSendFn)(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
+                            uint32_t ts, const char* body, uint8_t* out_pkt_hash);
 
 // ---------------------------------------------------------------- /fleet_cfg
 
@@ -110,13 +114,20 @@ class FleetManager {
 
   // pending acknowledgements (RAM-only, FLEET_REPLY_STORE entries): summary +
   // captured channel move here when a script finishes, and the reply is sent
-  // once its jitter deadline passes
+  // once its jitter deadline passes. A sent reply stays in the store until a
+  // repeater is heard repeating it (confirmed) or the repeat window elapses
+  // (then a single byte-identical resend, or nothing when FLEET_ACK_RETRY is 0)
   struct FleetReply {
     char key[FLEET_CLI_KEY_LEN + 1];
     char summary[FLEET_REPLY_SUMMARY_LEN];
     uint8_t chan_secret[PUB_KEY_SIZE];
     uint8_t chan_hash;
-    uint32_t deadline_ms;                // absolute millis(); wrap-safe compare
+    uint32_t deadline_ms;                // awaiting==0: jitter deadline;
+                                         // awaiting==1: retry deadline
+    uint32_t tx_ts;                      // frozen group-text timestamp, so the
+                                         // retry is byte-identical
+    uint8_t pkt_hash[MAX_HASH_SIZE];     // hash of the sent packet (repeat identity)
+    uint8_t awaiting;                    // 0 = queued (pre-jitter); 1 = sent
   };
   FleetReply replies[FLEET_REPLY_STORE];
   int reply_count;
@@ -124,6 +135,9 @@ class FleetManager {
   // RAM-only telemetry: scripts offered/matched on the fleet channel
   uint32_t offered;
   uint32_t matched;
+  // byte-identical resends issued: a reply whose first attempt was not heard
+  // repeated in time (the "not propagating" signal)
+  uint32_t reply_retries;
 
   LazySave save_flag;        // needs save, written back by loop()
 
@@ -182,7 +196,11 @@ public:
   uint32_t getOffered() const { return offered; }
   uint32_t getMatched() const { return matched; }
   int getSchedCount() const { return sched_count; }
-  int getReplyCount() const { return reply_count; }
+  // replies queued, waiting to be sent (unsent); sent ones awaiting a repeat
+  // occupy a store slot but are counted by getAwaitingCount()
+  int getReplyCount() const { return reply_count - getAwaitingCount(); }
+  int getAwaitingCount() const;                        // sent, awaiting a repeat
+  uint32_t getReplyRetries() const { return reply_retries; }
 
   // device service wiring (MyMesh::begin); see the typedefs above
   void setClock(FleetTimeFn fn, void* ctx) { time_fn = fn; time_ctx = ctx; }
@@ -197,6 +215,12 @@ public:
   // is the relay exemption's identity; see checkForward()).
   void onGroupData(const mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel,
                    const uint8_t* data, size_t len);
+
+  // Receive-side repeat detector: called from MyMesh::logRx() for every RX
+  // packet, before the core's dedup gate. A packet whose hash matches an
+  // outstanding reply's sent packet, and which travelled at least one hop,
+  // confirms (drops) that reply — a neighbour repeater relayed it.
+  void onHeardPacket(const mesh::Packet* packet);
 
   // Relay-side hook (MyMesh::allowPacketForward): returns true — meaning "let
   // the battery gate decide", not "allow" — except for the GRP_TXT/GRP_DATA
@@ -237,7 +261,11 @@ private:
   void scheduleAckIfNeeded(const CliRunResult& res);
   // a script with this key is armed or queued: a re-send must not run it twice
   bool inFlight(const char* key) const;
-  void sendDueReplies();
+  // send every due acknowledgement, and issue a repeat-confirmation retry when
+  // a sent reply's window elapses without its repeat being heard
+  void serviceReplies();
+  // shared detach: drop replies[idx], shifting the tail down
+  void removeReply(int idx);
 };
 
 // CLI command handler: invoke with the command after "fleet" (prefix removed).
