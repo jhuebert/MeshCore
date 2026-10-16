@@ -1089,6 +1089,30 @@ TEST_F(FleetHooksTest, AckSendRefusalUsesNoAttempt) {
   EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
 }
 
+// A refused retry was not sent: keep the reply queued for retry and do not
+// count it until the packet is actually accepted by the sender.
+TEST_F(FleetHooksTest, AckRetryRefusalDoesNotConsumeRetry) {
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  env.next_send_fails = true;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)0);
+  EXPECT_EQ(fleet.getReplyCount(), 0);
+  EXPECT_EQ(fleet.getAwaitingCount(), 1);
+
+  g_mock_millis += FLEET_ACK_RETRY_BACKOFF_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);
+}
+
 #else
 
 // Off switch: the reply is dropped the instant the first send succeeds —
@@ -1215,6 +1239,12 @@ TEST_F(FleetHooksTest, SendAlertSuppressedWhenFleetOffOrChannelless) {
 
 TEST_F(FleetHooksTest, SendAlertUnwiredSenderIsSilent) {
   fleet.setSender(NULL, NULL);
+  EXPECT_FALSE(fleet.sendAlert("BATT RESUME 3700mV"));
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+}
+
+TEST_F(FleetHooksTest, SendAlertReportsPacketPoolRefusal) {
+  env.next_send_fails = true;
   EXPECT_FALSE(fleet.sendAlert("BATT RESUME 3700mV"));
   EXPECT_EQ(env.sent.size(), (size_t)0);
 }

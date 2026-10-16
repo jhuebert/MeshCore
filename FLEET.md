@@ -256,9 +256,12 @@ exactly one reply per node. "Heard a repeat" proves a repeater relayed the
 reply; it does **not** prove the operator's companion received it — there is no
 end-to-end ack for flood group text. Each such miss is counted as `rtx` on the
 status line; a climbing `rtx` means replies are not being repeated — likely no
-neighbouring repeater in range, or heavy loss. The retry is build-time tunable
-(`FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`), never persisted; build with
-`FLEET_ACK_RETRY=0` to restore the single fire-and-forget send.
+neighbouring repeater in range, or heavy loss. If the packet pool refuses an
+initial send or retry, it is tried again after the configured backoff; `rtx`
+increments only when the retry is queued. The retry is build-time tunable
+(`FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`, and
+`FLEET_ACK_RETRY_BACKOFF_MS`), never persisted; build with `FLEET_ACK_RETRY=0`
+to restore the single fire-and-forget send.
 
 ## Inline pauses (`!delay <ms>`)
 

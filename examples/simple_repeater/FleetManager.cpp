@@ -309,8 +309,17 @@ void FleetManager::serviceReplies() {
       // window elapsed with no repeater heard repeating the reply: one
       // byte-identical resend. Same ts => same packet hash, so every node that
       // already relayed attempt 1 suppresses this copy — no duplicate on air.
-      if (send_fn != NULL) {
-        send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, body, NULL);
+      if (send_fn == NULL) {
+        removeReply(i);
+        continue;
+      }
+      bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, body, NULL);
+      if (!sent) {
+        // packet pool refused the retry: it was not sent, so retain the slot and
+        // try again after the same bounded backoff as an initial-send refusal.
+        r.deadline_ms = millis() + FLEET_ACK_RETRY_BACKOFF_MS;
+        i++;
+        continue;
       }
       reply_retries++;   // the miss count: the first attempt drew no repeat
       removeReply(i);
@@ -318,10 +327,13 @@ void FleetManager::serviceReplies() {
     }
 
     // first attempt: stamp it now, remember the ts and hash for a possible retry
+    if (send_fn == NULL) {
+      removeReply(i);
+      continue;
+    }
     uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
     uint8_t hash[MAX_HASH_SIZE];
-    bool sent = send_fn != NULL &&
-                send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, body, hash);
+    bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, body, hash);
     if (!sent) {
       // packet pool refused the send: no attempt used, try again shortly
       r.deadline_ms = millis() + FLEET_ACK_RETRY_BACKOFF_MS;
@@ -363,8 +375,7 @@ void FleetManager::onHeardPacket(const mesh::Packet* packet) {
 bool FleetManager::sendAlert(const char* body) {
   if (!enabled || psk_len == 0 || send_fn == NULL) return false;
   uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
-  send_fn(send_ctx, psk, chan_hash, ts, body, NULL);   // one-shot: no retry
-  return true;
+  return send_fn(send_ctx, psk, chan_hash, ts, body, NULL);   // one-shot: no retry
 }
 
 // ---------------------------------------------------------------- relay side
