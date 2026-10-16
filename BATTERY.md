@@ -72,6 +72,30 @@ and group content alike. Everything the node originates on its own behalf
 - **CLI access**: unaffected — replies are originated, not forwarded. You can
   always log in and look.
 
+## Alerts
+
+When the gate changes state the node announces it on the **fleet channel**, so
+an operator learns about battery trouble from the mesh instead of having to
+poll every node. There is no separate toggle: an alert is emitted on every
+suspend and resume whenever the fleet is **enabled and has a channel set**
+(see [FLEET.md](./FLEET.md#battery-supersession)). With no fleet channel
+configured the gate behaves exactly as before and stays silent.
+
+- **When:** on a suspend transition (`BATT SUSPEND`) and on a resume
+  transition (`BATT RESUME`). Operator-driven `battery off` / `battery <mV>` and
+  a reboot are not battery-state transitions and never alert.
+- **Format:** a plain group text on the fleet channel, flooded, with the
+  repeater's own name as sender, e.g. `xiao: BATT SUSPEND 3300mV` or
+  `xiao: BATT RESUME 3650mV`. The voltage is the reading that triggered the
+  transition. The body does not begin with `!id `, so no fleet member can parse
+  an alert as a script; peers count it as ordinary chat in their `noid` counter.
+- **Reach:** because the alert is sent under the fleet PSK it relays while
+  suspended, on the same exemption as any other fleet traffic — a suspended node
+  can still be heard.
+- **RAM-only:** the pending alert is never persisted, so a reboot cannot replay
+  a stale one. Events are naturally rare (two-reading debounce plus hysteresis),
+  so no rate limiting is applied.
+
 ## Persistence
 
 Thresholds (and the enabled flag) persist in **`/batt_cfg`**. The suspended

@@ -563,6 +563,11 @@ exempt for the fleet channel:
   battery on a response. A battery report from a *low* node is the most
   valuable one.
 
+Fleet members also **emit battery alerts** on the channel: a suspend or resume
+transition is announced as an ordinary `<name>: BATT SUSPEND|RESUME <mV>` group
+text, and these relay while suspended like any other fleet traffic. See
+[BATTERY.md](./BATTERY.md#alerts).
+
 Normal user traffic stays gated exactly as BATTERY.md describes. Decryption is
 unaffected by the gate in the first place; a script executed while suspended
 runs with full serial privilege, and what its commands *send* is governed by
