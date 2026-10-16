@@ -1402,12 +1402,13 @@ static void cliList(FilterRules& filter, char* reply) {
   }
 }
 
-static void cliGet(FilterRules& filter, int idx, char* reply) {
-  if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return; }
-  auto r = filter.getRule(idx);
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  radd(&out, &remain, "r%d %s %s", idx, r->enabled ? "en" : "dis",
+// The per-rule detail shared by `filter get` and `filter list`: the enabled and
+// action words plus every predicate, in `filter add` syntax. Bounded by `sz`
+// (NUL included). Carries no rule index, so a caller can prefix its own.
+static void formatRuleBody(FilterRules& filter, const FilterRule* r, char* dest, size_t sz) {
+  char* out = dest;
+  int remain = (int)sz;
+  radd(&out, &remain, "%s %s", r->enabled ? "en" : "dis",
        r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
   const uint16_t type_all = ruleTypeMask(r);
@@ -1469,8 +1470,33 @@ static void cliGet(FilterRules& filter, int idx, char* reply) {
   }
   if (r->prob) radd(&out, &remain, " prob=%u", r->prob);
   if (r->throttle) radd(&out, &remain, " throttle=%u pass=%lu", r->throttle, (unsigned long)r->throttle_pass);
-  radd(&out, &remain, " hits=%lu", (unsigned long)r->hits);
+}
+
+// The per-rule counter tail (`filter get` only), appended after the body.
+static void formatRuleStats(const FilterRule* r, char* dest, size_t sz) {
+  char* out = dest;
+  int remain = (int)sz;
+  radd(&out, &remain, "hits=%lu", (unsigned long)r->hits);
   radd(&out, &remain, " air=%lus", (unsigned long)(r->air_ms / 1000));
+}
+
+static void cliGet(FilterRules& filter, int idx, char* reply) {
+  if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return; }
+  auto r = filter.getRule(idx);
+  char* out = reply;
+  int remain = CLI_REPLY_MAX;
+  radd(&out, &remain, "r%d ", idx);
+  // formatRuleBody() writes a NUL-terminated suffix at `out`; advance past it
+  // (its length is the byte count, since radd's parts were all emitted whole
+  // unless the reply ran out).
+  formatRuleBody(filter, r, out, (size_t)remain);
+  int n = (int)strlen(out);
+  out += n;
+  remain -= n;
+  if (remain > 0) {
+    radd(&out, &remain, " ");
+    formatRuleStats(r, out, (size_t)remain);
+  }
 }
 
 static void cliStats(FilterRules& filter, char* reply) {
