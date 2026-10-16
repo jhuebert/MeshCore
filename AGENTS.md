@@ -51,7 +51,8 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `FleetManager.h/.cpp` — the fleet feature: one PSK-backed channel, the
   repeater's tag set, `fleetCLI`, the receive-side hook (`onGroupData`), the
   relay-side battery exemption (`checkForward`), acknowledgements (jittered,
-  sent on the captured channel), unsolicited alerts (`sendAlert`, on the
+  one byte-identical retry until a repeat is heard, sent on the captured
+  channel), unsolicited alerts (`sendAlert`, on the
   configured channel), scheduled `!at` jobs (RAM-only store), and the
   `/fleet_cfg` persistence (v1 with a whole-payload CRC-16). Owns a
   `CliScriptRunner`.
@@ -80,7 +81,8 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h` — advert
   sample collection, median/quorum decision, enabled-flag persistence and CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
-  (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
+  (`allowPacketForward`, `onGroupDataRecv`, `logRx` (ack repeat detector),
+  `searchChannelsByHash`, CLI
   dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
   the fleet device-service injections and the `batteryAlerts` transition
   drain).
