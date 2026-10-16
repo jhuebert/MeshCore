@@ -31,6 +31,9 @@ void BatteryGate::resetToDefaults() {
   resume_mV = 0;
   low_count = 0;
   drops = 0;
+  change_pending = false;
+  change_suspended = false;
+  change_mv = 0;
   last_sample_ms = millis();
   sample_pending = true;   // sample immediately on the first loop()
 }
@@ -75,16 +78,26 @@ void BatteryGate::sample(mesh::MainBoard& board) {
   if (suspended) {
     if (mV >= resume_mV) {
       suspended = false;   // hysteresis: recovered past the resume threshold
+      change_pending = true; change_suspended = false; change_mv = mV;
     }
     low_count = 0;
   } else if (mV < suspend_mV) {
     if (++low_count >= BATT_DEBOUNCE_READINGS) {
       suspended = true;    // two consecutive low readings: stop repeating
+      change_pending = true; change_suspended = true; change_mv = mV;
       low_count = 0;
     }
   } else {
     low_count = 0;
   }
+}
+
+bool BatteryGate::takeStateChange(bool* suspended_now, uint16_t* mv) {
+  if (!change_pending) return false;
+  change_pending = false;
+  if (suspended_now) *suspended_now = change_suspended;
+  if (mv) *mv = change_mv;
+  return true;
 }
 
 void BatteryGate::loop(FILESYSTEM* fs, mesh::MainBoard& board) {

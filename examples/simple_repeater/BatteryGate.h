@@ -38,6 +38,13 @@ class BatteryGate {
   uint16_t resume_mV;         // resume when voltage rises to this (hysteresis)
   uint8_t low_count;          // consecutive low readings (debounce)
   uint32_t drops;             // packets gated while suspended (RAM-only)
+  // One-shot state-change readout (RAM-only, never persisted): set at a
+  // suspend/resume flip in sample() and consumed by takeStateChange(). One slot
+  // suffices because loop() samples at most once per pass and the drain follows
+  // immediately.
+  bool change_pending;
+  bool change_suspended;      // the state after the transition
+  uint16_t change_mv;         // the reading that triggered it
   // Sampling schedule: an explicit "sample next loop" flag plus the time of the
   // last sample. A deadline stored as an absolute millis() value cannot tell a
   // wrapped deadline from an unarmed timer, and 0 as a sentinel conflates the
@@ -58,6 +65,12 @@ public:
   uint16_t getSuspendMilliVolts() const { return suspend_mV; }
   uint16_t getResumeMilliVolts() const { return resume_mV; }
   uint32_t getDropCount() const { return drops; }
+
+  // Take the pending suspend/resume transition, if any: writes the new state
+  // and the reading that caused it to the out-params (either may be NULL),
+  // consumes it, and returns true. Returns false when no transition is pending.
+  // RAM-only; a reload or reset clears any pending event so it never alerts late.
+  bool takeStateChange(bool* suspended_now, uint16_t* mv);
 
   // Packet-path hook: returns false when forwarding is suspended, counting the
   // gated packet. Reads the cached flag only — no ADC access on the packet path.

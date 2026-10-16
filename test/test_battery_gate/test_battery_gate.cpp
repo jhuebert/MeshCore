@@ -151,6 +151,106 @@ TEST_F(BatteryGateTest, InterveningGoodReadingResetsDebounce) {
 }
 
 // ============================================================
+// STATE-CHANGE EVENTS
+// ============================================================
+
+// A suspend raises exactly one event, carrying the reading that triggered it;
+// the next read is empty.
+TEST_F(BatteryGateTest, SuspendRaisesOneStateChange) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 3300;
+  gate.loop(&fs, board);   // low #1: not yet a transition
+  bool sus; uint16_t mv;
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // low #2: suspend
+  ASSERT_TRUE(gate.takeStateChange(&sus, &mv));
+  EXPECT_TRUE(sus);
+  EXPECT_EQ(mv, 3300);
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));   // consumed
+}
+
+// A resume raises exactly one event with suspended_now=false.
+TEST_F(BatteryGateTest, ResumeRaisesOneStateChange) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 3300;
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // suspend
+  bool sus = false; uint16_t mv = 0;
+  ASSERT_TRUE(gate.takeStateChange(&sus, &mv));    // drain the suspend
+  EXPECT_TRUE(sus);
+
+  board.mV = 3650;
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // resume
+  ASSERT_TRUE(gate.takeStateChange(&sus, &mv));
+  EXPECT_FALSE(sus);
+  EXPECT_EQ(mv, 3650);
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+}
+
+// Disabling the gate forces suspended=false, but that is not a battery-state
+// change: no event may fire.
+TEST_F(BatteryGateTest, OffWhileSuspendedRaisesNoStateChange) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 3300;
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // suspend
+  bool sus; uint16_t mv;
+  ASSERT_TRUE(gate.takeStateChange(&sus, &mv));    // drain the suspend
+
+  cli(gate, board, "off");
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+}
+
+// Reconfiguring thresholds is a config change, not a battery transition: no
+// event until the next sample actually flips the state.
+TEST_F(BatteryGateTest, ReconfiguringThresholdsRaisesNoStateChange) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 4000;
+  gate.loop(&fs, board);   // healthy
+  bool sus; uint16_t mv;
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+
+  EXPECT_TRUE(gate.setThresholds(3400, 3700));
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+}
+
+// A reload must drop any pending event so a stale transition never alerts late.
+TEST_F(BatteryGateTest, LoadClearsPendingStateChange) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 3300;
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // pending suspend event, deliberately not drained
+
+  gate.load(&fs);          // nothing on disk: resets to defaults
+  bool sus; uint16_t mv;
+  EXPECT_FALSE(gate.takeStateChange(&sus, &mv));
+}
+
+// Either out-param may be NULL; the event is still consumed exactly once.
+TEST_F(BatteryGateTest, TakeStateChangeWithNullOutParams) {
+  gate.setThresholds(3400, 3600);
+  board.mV = 3300;
+  gate.loop(&fs, board);
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // suspend
+  EXPECT_TRUE(gate.takeStateChange(NULL, NULL));
+  EXPECT_FALSE(gate.takeStateChange(NULL, NULL));
+
+  board.mV = 3700;
+  g_mock_millis += SAMPLE_INTERVAL_MS;
+  gate.loop(&fs, board);   // resume
+  bool sus = true;
+  EXPECT_TRUE(gate.takeStateChange(&sus, NULL));
+  EXPECT_FALSE(sus);
+}
+
+// ============================================================
 // SAMPLING CADENCE
 // ============================================================
 
