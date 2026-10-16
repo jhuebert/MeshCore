@@ -51,8 +51,9 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `FleetManager.h/.cpp` — the fleet feature: one PSK-backed channel, the
   repeater's tag set, `fleetCLI`, the receive-side hook (`onGroupData`), the
   relay-side battery exemption (`checkForward`), acknowledgements (jittered,
-  sent on the captured channel), scheduled `!at` jobs (RAM-only store), and
-  the `/fleet_cfg` persistence (v1 with a whole-payload CRC-16). Owns a
+  sent on the captured channel), unsolicited alerts (`sendAlert`, on the
+  configured channel), scheduled `!at` jobs (RAM-only store), and the
+  `/fleet_cfg` persistence (v1 with a whole-payload CRC-16). Owns a
   `CliScriptRunner`.
 - `CliScript.h/.cpp` — the fleet script runner: `!id` parse, the
   `!tags`/`!ack`/`!at` directive block, inline `!delay` with resumable run,
@@ -74,13 +75,15 @@ commit** — the guides are user-facing API documentation, not optional docs.
   wrapper over the vendored engine.
 - `CliUtil.h` — shared CLI helpers (`nextToken`, `radd`, `CLI_REPLY_MAX`)
   used by filter and battery CLIs alike.
-- `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI.
+- `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI, and a
+  RAM-only one-shot suspend/resume transition readout (`takeStateChange`).
 - `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h` — advert
   sample collection, median/quorum decision, enabled-flag persistence and CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `searchChannelsByHash`, CLI
-  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline and
-  the fleet device-service injections).
+  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
+  the fleet device-service injections and the `batteryAlerts` transition
+  drain).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
 **Tests:** `test/test_packet_filter/` (295 behavior-level cases: matching,
@@ -208,8 +211,9 @@ FILTER.md:
   equality via `!tags` (absent = broadcast), the fleet channel is a single
   unnamed PSK that supersedes the battery gate (scripts run, fleet traffic
   relays, acks send while suspended), armed `!at` jobs and pending acks are
-  RAM-only, and script execution is deferred out of the receive path.
-  Changing them is a breaking decision, not a refactor side effect.
+  RAM-only, battery alerts are emitted on the fleet channel only when it is
+  enabled and configured, and script execution is deferred out of the receive
+  path. Changing them is a breaking decision, not a refactor side effect.
 - **New pattern syntax must not silently change the meaning of an
   already-storable pattern.** If it would, either ship an escape (`\|`) or
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
