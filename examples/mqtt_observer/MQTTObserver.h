@@ -98,6 +98,7 @@ class MQTTObserver {
   void worker();
   void copyConfig(MQTTObserverConfig& config);
   bool ready(const MQTTObserverConfig& config, size_t slot) const;
+  bool hasConnectHeadroom(bool secure) const;
   bool configureClient(size_t slot, const MQTTObserverBrokerConfig& config);
   bool createJwt(size_t slot, const MQTTObserverBrokerConfig& config, uint32_t& expires_at);
   bool publishEvent(const Event& event, const MQTTObserverConfig& config);

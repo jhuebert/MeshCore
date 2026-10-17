@@ -197,6 +197,13 @@ no connected broker. No packet event, queue entry, or offline history is written
 to flash or replayed after reboot. Waiting for valid time also expires queued
 events, and a flush starts a fresh expiry window for newly captured events.
 Publish work, TLS, NTP, and reconnects run outside the receive and forwarding path.
+Before opening a broker connection the worker checks internal-heap headroom
+(free and largest contiguous block); a secure slot needs considerably more than
+a plaintext one. When the heap is too fragmented to start a client the connect
+is deferred and retried every 30 seconds, so a second TLS slot on a low-memory
+board waits for room instead of aborting the device. This check is never
+terminal: a broker that could not be reached during a heap squeeze is retried
+indefinitely, including after a long outage.
 
 Both connected slots are offered each queued event. Following the reference
 observer's queue policy, the event is considered delivered when any connected

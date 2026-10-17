@@ -6,6 +6,7 @@
 #include "../simple_repeater/CliUtil.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/platform.h>
 #if defined(BOARD_HAS_PSRAM)
@@ -204,6 +205,12 @@ bool MQTTObserver::ready(const MQTTObserverConfig& config, size_t slot) const {
   return broker.enabled && config.wifi_ssid[0] && broker.server[0] &&
          (!needs_iata || (config.iata[0] && strcmp(config.iata, "XXX") != 0)) &&
          MQTTObserverConfigCodec::valid(config);
+}
+
+bool MQTTObserver::hasConnectHeadroom(bool secure) const {
+  return MQTTObserverConnectionPolicy::hasConnectHeadroom(
+      secure, heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
 bool MQTTObserver::readRecord(File& file, MQTTObserverConfig& config) {
@@ -643,10 +650,18 @@ void MQTTObserver::worker() {
         runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
       }
       if (!runtime.client_started && static_cast<int32_t>(now - runtime.next_connect_ms) >= 0) {
-        runtime.client->connect();
-        runtime.client_started = true;
-        runtime.attempt_started = now;
-        runtime.state.store(STATE_CONNECTING, std::memory_order_relaxed);
+        if (hasConnectHeadroom(secureUri(runtime.server_uri))) {
+          runtime.client->connect();
+          runtime.client_started = true;
+          runtime.attempt_started = now;
+          runtime.state.store(STATE_CONNECTING, std::memory_order_relaxed);
+        } else {
+          // A second TLS client started without a contiguous internal-heap
+          // allocation can abort the device. Defer and retry indefinitely
+          // (never a terminal state) until the heap recovers.
+          runtime.next_connect_ms = now + 30000;
+          runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
+        }
       }
       State state = runtime.state.load(std::memory_order_relaxed);
       any_connecting = any_connecting || state == STATE_CONNECTING || state == STATE_RETRY;

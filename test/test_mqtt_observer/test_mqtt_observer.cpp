@@ -199,6 +199,23 @@ TEST(MQTTObserverConnectionPolicy, RenewsBeforeReconnectAsWellAsWhileConnected) 
   EXPECT_TRUE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(2000, 1300));
 }
 
+TEST(MQTTObserverConnectionPolicy, RequiresInternalHeapHeadroomToConnect) {
+  using namespace MQTTObserverConnectionPolicy;
+  // Exactly at both secure thresholds is allowed.
+  EXPECT_TRUE(hasConnectHeadroom(true, kSecureFreeInternalBytes, kSecureLargestInternalBytes));
+  // One byte short of either secure threshold defers the connect.
+  EXPECT_FALSE(hasConnectHeadroom(true, kSecureFreeInternalBytes - 1, kSecureLargestInternalBytes));
+  EXPECT_FALSE(hasConnectHeadroom(true, kSecureFreeInternalBytes, kSecureLargestInternalBytes - 1));
+  // Plaintext brokers need less: the secure floor clears the plain thresholds.
+  EXPECT_TRUE(hasConnectHeadroom(false, kSecureFreeInternalBytes, kSecureLargestInternalBytes));
+  EXPECT_TRUE(hasConnectHeadroom(false, kPlainFreeInternalBytes, kPlainLargestInternalBytes));
+  EXPECT_FALSE(hasConnectHeadroom(false, kPlainFreeInternalBytes - 1, kPlainLargestInternalBytes));
+  EXPECT_FALSE(hasConnectHeadroom(false, kPlainFreeInternalBytes, kPlainLargestInternalBytes - 1));
+  // An empty heap never admits a client.
+  EXPECT_FALSE(hasConnectHeadroom(true, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(false, 0, 0));
+}
+
 TEST(MQTTObserverQueuePolicy, RestartsStaleWindowAfterFlushAndHandlesWrap) {
   uint32_t since = 0;
   EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(100, false, since));
