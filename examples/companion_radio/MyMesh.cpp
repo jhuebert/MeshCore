@@ -2247,6 +2247,19 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
 
+  // Toggle the repeat flag without touching radio params: the app gates repeat
+  // enable behind a client-repeat frequency whitelist, this CLI does not.
+  if (memcmp(command, "set repeat ", 11) == 0) {
+    _prefs.setRepeatEn(memcmp(&command[11], "off", 3) != 0);
+    savePrefs();
+    strcpy(reply, _prefs.isRepeatEn() ? "OK - repeat is now ON" : "OK - repeat is now OFF");
+    return true;
+  }
+  if (strcmp(command, "get repeat") == 0) {
+    sprintf(reply, "> %s", _prefs.isRepeatEn() ? "on" : "off");
+    return true;
+  }
+
   return false;  // not handled
 }
 
