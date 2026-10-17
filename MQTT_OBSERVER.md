@@ -67,7 +67,11 @@ and leave its `audience` empty. JWT mode takes precedence when that slot has an
 audience configured; it uses username `v1_<PUBLIC_KEY_HEX>` and a 24-hour Ed25519-signed token. The
 worker waits for valid time before connecting and renews tokens before expiry.
 Expired tokens are also renewed before reconnecting after an outage.
-Optional per-slot `owner` and `email` values are included in JWT claims. Set
+The token payload follows the reference observer: `publicKey`, `aud`, `iat`,
+`exp`, `client` (the `meshcore-jhuebert/<version>` string), and optional `owner`
+and `email` claims, with the Ed25519 signature hex-encoded after the header and
+payload (the MeshCore observer convention, not base64url). Optional per-slot
+`owner` and `email` values are included in JWT claims. Set
 replies do not echo credentials; get replies and fleet-script logs can expose them.
 
 A server may be configured as a hostname and port separately. Use `mqtts://`
@@ -149,7 +153,10 @@ seconds after a change. The experimental `/mqtt_prefs` record is version 5 and
 CRC-checked; the two broker records make its payload 1,509 bytes (1,518 bytes
 including the record header and CRC). No migration from earlier prototype
 formats is included because this observer has not been deployed and there are
-no device configs to preserve. Credential values are returned by `get` commands
+no device configs to preserve. The record magic (`MQO1`) is distinct from the
+other MeshCore observer forks, so flashing between forks rejects their
+`/mqtt_prefs` by magic and starts from defaults rather than misreading it.
+Credential values are returned by `get` commands
 and appear in fleet-script serial logs; protect CLI access and logs accordingly.
 The filesystem is not encrypted; an administrator with filesystem or firmware
 access can recover credentials. Commands pass through the repeater's existing
@@ -235,7 +242,10 @@ radio frame parsed. Invalid frames are excluded. The repeater currently uses a
 reached. This build does not change packet-pool reservation or outbound relay
 policy, and hardware saturation testing remains outstanding. Observation is
 independent of later forwarding decisions, but not of successful parsing or
-packet-pool availability.
+packet-pool availability. The receive hook also runs before mesh de-duplication,
+so the same packet heard on more than one repeat can be published more than once
+— useful for per-reception RF analysis, but it means packet counts are
+receptions, not unique packets.
 
 ## Build measurements and remaining validation
 
