@@ -102,7 +102,8 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       state(STATE_OFF) {}
 
 MQTTObserver::MQTTObserver()
-    : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _firmware{},
+    : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _model{},
+      _firmware{}, _status_stats_fn(nullptr), _status_stats_ctx(nullptr),
       _radio_freq(0), _radio_bw(0), _radio_sf(0), _radio_cr(0), _config{},
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
@@ -117,7 +118,8 @@ MQTTObserver::MQTTObserver()
 }
 
 void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const char* origin,
-                         const char* firmware, float freq, float bw, uint8_t sf, uint8_t cr) {
+                         const char* model, const char* firmware, float freq, float bw,
+                         uint8_t sf, uint8_t cr) {
   _fs = fs;
   _identity = identity;
   _origin_source = origin;
@@ -135,6 +137,8 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
   _radio_cr = cr;
   strncpy(_origin, origin ? origin : "", sizeof(_origin) - 1);
   _origin[sizeof(_origin) - 1] = 0;
+  strncpy(_model, model && *model ? model : "unknown", sizeof(_model) - 1);
+  _model[sizeof(_model) - 1] = 0;
   strncpy(_firmware, firmware && *firmware ? firmware : "unknown", sizeof(_firmware) - 1);
   _firmware[sizeof(_firmware) - 1] = 0;
   mesh::Utils::toHex(_device_id, identity->pub_key, PUB_KEY_SIZE);
@@ -157,6 +161,11 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
 
   if (xTaskCreatePinnedToCore(taskEntry, "mqttObserver", 8192, this, 1, nullptr, 0) != pdPASS)
     _state.store(STATE_ERROR, std::memory_order_relaxed);
+}
+
+void MQTTObserver::setStatusStatsFn(StatusStatsFn fn, void* context) {
+  _status_stats_fn = fn;
+  _status_stats_ctx = context;
 }
 
 void MQTTObserver::taskEntry(void* context) {
@@ -743,8 +752,10 @@ bool MQTTObserver::buildStatusMessage(char* out, size_t capacity, size_t& writte
   char timestamp[40];
   if (!MQTTObserverFormat::formatTimestamp(now.tv_sec, now.tv_usec, timestamp,
                                            sizeof(timestamp))) return false;
-  return MQTTObserverFormat::buildStatus(origin, _device_id, "MeshCore Repeater",
-                                         _firmware, radio, timestamp,
+  MQTTObserverFormat::StatusStats stats{};
+  if (_status_stats_fn) _status_stats_fn(_status_stats_ctx, stats);
+  return MQTTObserverFormat::buildStatus(origin, _device_id, _model,
+                                         _firmware, radio, timestamp, stats,
                                          out, capacity, written);
 }
 

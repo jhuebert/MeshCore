@@ -1063,14 +1063,25 @@ static void batteryAlerts(BatteryGate& gate, FleetManager& fleet) {
   }
 }
 
+#ifdef WITH_MQTT_OBSERVER
+void MyMesh::mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& stats) {
+  MyMesh* self = static_cast<MyMesh*>(context);
+  stats.battery_mv = board.getBattMilliVolts();
+  stats.uptime_secs = static_cast<uint32_t>(self->uptime_millis / 1000);
+  stats.noise_floor = static_cast<int16_t>(self->_radio->getNoiseFloor());
+  stats.can_relay = !self->_prefs.disable_fwd;
+}
+#endif
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
 #ifdef WITH_MQTT_OBSERVER
-  mqttObserver.begin(_fs, &self_id, _prefs.node_name, FIRMWARE_VERSION,
-                     _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  mqttObserver.begin(_fs, &self_id, _prefs.node_name, board.getManufacturerName(),
+                     FIRMWARE_VERSION, _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  mqttObserver.setStatusStatsFn(mqttStatusStats, this);
 #endif
   acl.load(_fs, self_id);
   filter.begin(fs);

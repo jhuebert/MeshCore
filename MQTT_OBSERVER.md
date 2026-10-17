@@ -314,9 +314,15 @@ Publish `status: "online"` (QoS 1, non-retained) on connect and every
 
 ```json
 {"status":"online","timestamp":"2026-10-16T20:05:00.123456+00:00","origin":"Roof Repeater",
- "origin_id":"<UPPERHEX-PUBKEY>","model":"MeshCore Repeater","firmware_version":"...",
- "radio":"869.525,62.5,8,5","client_version":"meshcore-jhuebert/<version>"}
+ "origin_id":"<UPPERHEX-PUBKEY>","model":"Station G2","firmware_version":"...",
+ "radio":"869.525,62.5,8,5","client_version":"meshcore-jhuebert/<version>","repeat":true,
+ "stats":{"battery_mv":4050,"uptime_secs":86400,"noise_floor":-110}}
 ```
+
+`model` is the board name (`getManufacturerName()`, e.g. `Station G2`) and `repeat` is
+this node's relay state, so analyzers that key off `repeat` show the node as a
+repeater. `stats` carries the live device readings: `battery_mv` (0 when the board
+reports no battery), `uptime_secs`, and `noise_floor` (dBm).
 
 Status messages report online on connect and periodically. The observer does not
 publish an offline message when a broker connection drops; consumers should

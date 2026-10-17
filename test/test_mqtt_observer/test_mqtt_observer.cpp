@@ -433,15 +433,31 @@ TEST(MQTTObserverFormat, RawStatusAndTruncationAreBounded) {
   EXPECT_EQ(std::string(json, written),
             "{\"origin\":\"node\",\"origin_id\":\"AABB\","
             "\"timestamp\":\"timestamp\",\"type\":\"RAW\",\"data\":\"0012AB\"}");
+  MQTTObserverFormat::StatusStats stats{3900, 1234, -110, true};
   ASSERT_TRUE(MQTTObserverFormat::buildStatus("node", "AABB", "MeshCore", "1.0", "radio",
-                                               "timestamp", json, sizeof(json), written));
+                                               "timestamp", stats, json, sizeof(json), written));
   EXPECT_NE(std::string(json, written).find("\"status\":\"online\""), std::string::npos);
   EXPECT_NE(std::string(json, written).find("\"origin_id\":\"AABB\""), std::string::npos);
+  EXPECT_NE(std::string(json, written).find("\"model\":\"MeshCore\""), std::string::npos);
   EXPECT_NE(std::string(json, written).find("\"client_version\":\"meshcore-jhuebert/1.0\""), std::string::npos);
   char short_json[8];
   EXPECT_FALSE(MQTTObserverFormat::buildRaw("node", "AABB", "timestamp", raw, sizeof(raw),
                                             short_json, sizeof(short_json), written));
   EXPECT_EQ(short_json[0], 0);
+}
+
+TEST(MQTTObserverFormat, StatusReportsRelayAndDeviceStats) {
+  char json[512];
+  size_t written = 0;
+  MQTTObserverFormat::StatusStats stats{0, 0, -95, false};
+  ASSERT_TRUE(MQTTObserverFormat::buildStatus("node", "AABB", "Station G2", "1.2",
+                                               "910.525,62.5,7,5", "timestamp", stats,
+                                               json, sizeof(json), written));
+  std::string payload(json, written);
+  EXPECT_NE(payload.find("\"model\":\"Station G2\""), std::string::npos);
+  EXPECT_NE(payload.find("\"repeat\":false"), std::string::npos);
+  EXPECT_NE(payload.find("\"stats\":{\"battery_mv\":0,\"uptime_secs\":0,\"noise_floor\":-95}"),
+            std::string::npos);
 }
 
 TEST(MQTTObserverFormat, ClientVersionIsSharedByStatusAndClaims) {

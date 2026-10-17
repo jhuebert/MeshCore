@@ -12,6 +12,7 @@
 
 #include "../simple_repeater/PersistUtil.h"
 #include "MQTTObserverConfig.h"
+#include "MQTTObserverFormat.h"
 #include "MQTTObserverPolicy.h"
 #include "MQTTObserverRecord.h"
 
@@ -63,11 +64,19 @@ class MQTTObserver {
   static const uint32_t kMinimumValidTime = 1735689600UL;
   static const uint32_t kJwtLifetimeSeconds = 86400;
 
+  // Supplies live device stats for the periodic status message; the repeater
+  // registers this so the observer reports battery/uptime/noise floor and the
+  // relay flag like other MeshCore observers.
+  using StatusStatsFn = void (*)(void* context, MQTTObserverFormat::StatusStats& stats);
+
   FILESYSTEM* _fs;
   mesh::LocalIdentity* _identity;
   const char* _origin_source;
   char _origin[33];
+  char _model[33];
   char _firmware[64];
+  StatusStatsFn _status_stats_fn;
+  void* _status_stats_ctx;
   float _radio_freq;
   float _radio_bw;
   uint8_t _radio_sf;
@@ -129,7 +138,8 @@ public:
   MQTTObserver();
 
   void begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const char* origin,
-             const char* firmware, float freq, float bw, uint8_t sf, uint8_t cr);
+             const char* model, const char* firmware, float freq, float bw, uint8_t sf, uint8_t cr);
+  void setStatusStatsFn(StatusStatsFn fn, void* context);
   void loop();
   void setRadio(float freq, float bw, uint8_t sf, uint8_t cr);
   bool needsAwake() const;

@@ -83,6 +83,14 @@ void appendKey(JsonWriter& writer, const char* key, const char* value, bool comm
   writer.string(value);
 }
 
+// Emits "key":raw where raw is a pre-rendered literal (a number or true/false).
+void appendRaw(JsonWriter& writer, const char* key, const char* raw, bool comma = true) {
+  if (comma) writer.append(",");
+  writer.string(key);
+  writer.append(":");
+  writer.append(raw);
+}
+
 }  // namespace
 
 bool appendEscaped(const char* text, char* out, size_t capacity, size_t& length) {
@@ -220,7 +228,7 @@ bool buildRaw(const char* origin, const char* origin_id, const char* timestamp,
 
 bool buildStatus(const char* origin, const char* origin_id, const char* model,
                  const char* firmware, const char* radio, const char* timestamp,
-                 char* out, size_t capacity, size_t& written) {
+                 const StatusStats& stats, char* out, size_t capacity, size_t& written) {
   if (!origin || !origin_id || !model || !firmware || !radio || !timestamp) return false;
   JsonWriter writer(out, capacity);
   writer.append("{");
@@ -234,7 +242,16 @@ bool buildStatus(const char* origin, const char* origin_id, const char* model,
   char client_version[96];
   if (!buildClientVersion(firmware, client_version, sizeof(client_version))) return false;
   appendKey(writer, "client_version", client_version);
-  writer.append("}");
+  appendRaw(writer, "repeat", stats.can_relay ? "true" : "false");
+  char number[16];
+  writer.append(",\"stats\":{");
+  snprintf(number, sizeof(number), "%u", static_cast<unsigned>(stats.battery_mv));
+  appendRaw(writer, "battery_mv", number, false);
+  snprintf(number, sizeof(number), "%lu", static_cast<unsigned long>(stats.uptime_secs));
+  appendRaw(writer, "uptime_secs", number);
+  snprintf(number, sizeof(number), "%d", static_cast<int>(stats.noise_floor));
+  appendRaw(writer, "noise_floor", number);
+  writer.append("}}");
   return writer.finish(written);
 }
 

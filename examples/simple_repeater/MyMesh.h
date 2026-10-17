@@ -109,6 +109,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   MeshClockSync meshClock;
 #ifdef WITH_MQTT_OBSERVER
   MQTTObserver mqttObserver;
+  // supplies the observer's status-message stats from live node state
+  static void mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& stats);
 #endif
   uint32_t pending_discover_tag;
   unsigned long pending_discover_until;

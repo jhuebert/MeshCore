@@ -38,8 +38,19 @@ bool appendEscaped(const char* text, char* out, size_t capacity, size_t& length)
 bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& written);
 bool buildRaw(const char* origin, const char* origin_id, const char* timestamp,
               const uint8_t* bytes, size_t len, char* out, size_t capacity, size_t& written);
+
+// Live device stats for the periodic status message. Reported under "stats"
+// (battery/uptime/noise floor) plus the top-level "repeat" relay flag, matching
+// the schema other MeshCore observers publish.
+struct StatusStats {
+  uint16_t battery_mv;
+  uint32_t uptime_secs;
+  int16_t noise_floor;
+  bool can_relay;
+};
+
 bool buildStatus(const char* origin, const char* origin_id, const char* model,
                  const char* firmware, const char* radio, const char* timestamp,
-                 char* out, size_t capacity, size_t& written);
+                 const StatusStats& stats, char* out, size_t capacity, size_t& written);
 
 }  // namespace MQTTObserverFormat
