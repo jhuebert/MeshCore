@@ -16,6 +16,13 @@
 #include <stdlib.h>
 #include <new>
 
+// arduino-esp32 2.x's esp_crt_bundle.h declares only its own bundle shim, which
+// verifies nothing until a bundle is loaded; the ESP-IDF attach uses the
+// certificate bundle embedded in the binary, so use it on IDF < 5.
+#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR < 5
+extern "C" esp_err_t esp_crt_bundle_attach(void *conf);
+#endif
+
 namespace {
 
 const char kConfigPath[] = "/mqtt_prefs";
@@ -457,7 +464,14 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
   if (mqtt_config) mqtt_config->buffer.out_size = 1280;
 #endif
   runtime.client->setCleanSession(true);
+#if ESP_IDF_VERSION_MAJOR == 5
   runtime.client->attachArduinoCACertBundle(secureUri(runtime.server_uri));
+#else
+  if (mqtt_config) {
+    mqtt_config->crt_bundle_attach =
+        secureUri(runtime.server_uri) ? esp_crt_bundle_attach : nullptr;
+  }
+#endif
   if (mqtt_config) {
 #if ESP_IDF_VERSION_MAJOR == 5
     mqtt_config->credentials.username = nullptr;

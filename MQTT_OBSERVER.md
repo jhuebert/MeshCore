@@ -73,8 +73,8 @@ existing node to one of those may require a merged image and can reset
 filesystem-backed settings — back up anything you care about first.
 
 The MIT-licensed PsychicMqttClient is pinned to commit
-`9e3005571918fdd83a2521243c501d1af137b0b6`. TLS uses the ESP32 Arduino CA bundle
-with certificate validation on, which needs a valid device clock (the observer
+`9e3005571918fdd83a2521243c501d1af137b0b6`. TLS uses the CA bundle embedded in
+the firmware with certificate validation on, which needs a valid device clock (the observer
 syncs NTP itself).
 
 ---
