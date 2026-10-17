@@ -1,9 +1,10 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream automatically (synced weekly) and adds four repeater-focused
-capabilities on top of stock firmware. Everything else — supported boards,
-clients, protocols, build system — is identical to upstream; see the
+It tracks upstream automatically (synced weekly) and adds five
+repeater-focused capabilities on top of stock firmware. Everything else —
+supported boards, clients, protocols, build system — is identical to upstream;
+see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
 general project, hardware support, and getting-started guide.
 
@@ -65,6 +66,20 @@ forwarding.
 → Full guide, including recipes, the two-phase and scheduled-cutover
 patterns, and the security model: **[FLEET.md](./FLEET.md)**
 
+### 📶 MQTT observer
+
+An optional firmware build that publishes the traffic a repeater hears to one
+or two MQTT brokers, turning the node into a live feed for map, coverage, and
+packet-analysis tools — no computer or companion app attached to it. It
+captures **before** the packet filter and battery gate, so it observes packets
+the node will not forward, and it uplinks its own adverts by default so the
+node appears in the feed. ESP32 boards only; two broker slots with
+Ed25519-signed JWT or username/password auth, TLS with a valid clock, and a
+bounded best-effort queue that rides out broker outages.
+
+→ Full guide, including the build targets, broker setup, CLI reference, and the
+message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
+
 ## Why run this instead of stock repeater firmware?
 
 Stock repeaters forward everything they hear, until the battery dies. This
@@ -95,5 +110,7 @@ Prebuilt binaries for all supported boards are on the
 | stable | `repeater-filter-stable` | upstream `main` releases | `filter-v*` |
 
 Flash as you would stock firmware, then follow
-[FILTER.md](./FILTER.md) to set your first rules over the CLI, and
-[FLEET.md](./FLEET.md) if you are running a fleet.
+[FILTER.md](./FILTER.md) to set your first rules over the CLI,
+[FLEET.md](./FLEET.md) if you are running a fleet, or
+[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
+Observer builds ship in the same releases as the plain repeater firmware.

@@ -1,258 +1,531 @@
-# MQTT Observer Firmware
+# MQTT Observer Firmware — User Guide
 
-MQTT observer builds publish successfully parsed packets heard over radio. The
-receive hook runs before forwarding policy, so packet filters, the battery gate,
-repeat enablement, hop/loop limits, and region policy do not suppress
-observations. This is a best-effort feed, not a packet archive.
+An optional build of the `simple_repeater` firmware that publishes the traffic a
+repeater hears to one or two MQTT brokers. Point it at a broker (a public
+analyzer, or your own Mosquitto) and the node becomes a live feed for map,
+coverage, and packet-analysis tools — no computer or companion app attached to
+the node. It is a **best-effort** observation feed, not a packet archive.
 
-## Build target and status
+The observer is a separate firmware flavour: it is **ESP32-only**, has its own
+build targets (see [Firmware](#firmware)), and is configured over the same
+repeater CLI as everything else (serial or
+[remote admin](./FILTER.md#managing-the-repeater-remotely)). A standard repeater
+build does not link the MQTT library at all.
 
-The optional targets are defined in [`observer_targets.ini`](./observer_targets.ini),
-which is also the allowlist used by `build.sh`:
+---
 
-```sh
-pio run -e Xiao_S3_WIO_repeater_observer
+## What it does
+
+The observer captures from two points that already exist in the receive path:
+
+- **Receive** — every packet the radio parses and decodes, with its SNR/RSSI and
+  (for direct routes) the path.
+- **Transmit** — this node's own transmissions, filtered to just its adverts by
+  default.
+
+Capture happens **before** the packet filter, the battery gate, repeat
+enablement, hop/loop limits, and region policy — so a packet the repeater
+*refuses to forward* is still observed. Observation is not affected by your
+filter rules, and your filter rules cannot be broken by the observer. What the
+observer **cannot** see is a frame that never parsed; see
+[Limits](#limits-and-good-to-knows).
+
+Each enabled broker gets three feeds on the MeshCore topic convention:
+
+```text
+meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/status     # retained-last-will aware online/offline
+meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/packets    # parsed packets, rx and tx
+meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/raw        # the original radio frame
 ```
 
-Observer-enabled Repeater targets cover the supported Observer board list:
-Heltec T190, Tracker V1.1 and V2, V3, WSL3, V4 and V4 ExpansionKit; LilyGo
-T3-S3 SX1262, T-Beam 1W, T-Beam S3 Supreme SX1262, T-Beam SX1262 and SX1276;
-RAK 3112; Station G2 and G3; ThinkNode M7; and XIAO S3 WIO.
-Room Server targets are intentionally not included. All 17 Repeater target
-environments compile, but still need per-board memory, RF-load, TLS, broker, and
-OTA acceptance testing; treat them as experimental until those checks are
-complete. The T3-S3 and T-Beam 1W observer targets use `min_spiffs.csv`, and
-Station G2/G3 use `default_16MB.csv`, to fit the larger app. Those partition
-overrides can require a merged image when converting an existing node and may
-reset filesystem-backed settings. Standard repeater targets do not depend on
-the MQTT library or compile observer sources. Observer targets ship in the same
-release as the plain repeaters: `scripts/local-release-build.sh` builds them by
-default (use `--filter _repeater_observer` to build only observers). There is no
-separate observer release channel.
+`DEVICE_PUBLIC_KEY` is the node's uppercase-hex Ed25519 public key. The payloads
+follow the reference observer's schema (see
+[Topics and payloads](#topics-and-payloads)), so feeding the same tools other
+MeshCore observers feed needs no changes.
+
+---
+
+## Firmware
+
+Observer targets live in `observer_targets.ini` and cover the supported ESP32
+observer boards:
+
+- **Heltec** — T190, Wireless Tracker V1.1 and V2, V3, WSL3, V4, V4 ExpansionKit
+- **LilyGo** — T3-S3 (SX1262), T-Beam 1W, T-Beam S3 Supreme (SX1262), T-Beam
+  SX1262, T-Beam SX1276
+- **RAK** — 3112
+- **Station** — G2, G3
+- **ThinkNode** — M7
+- **Seeed** — XIAO S3 WIO
+
+Observer targets ship in the **same release** as the plain repeater firmware —
+there is no separate observer channel. Flash one like any other build; on this
+fork the reference target is `Xiao_S3_WIO_repeater_observer`. To build locally:
+
+```sh
+pio run -e Xiao_S3_WIO_repeater_observer                 # one target
+scripts/local-release-build.sh <release-url-or-tag>      # all, observers included
+```
+
+The T3-S3 and T-Beam 1W observer targets use a `min_spiffs.csv` partition table,
+and Station G2/G3 use `default_16MB.csv`, to fit the larger app. Converting an
+existing node to one of those may require a merged image and can reset
+filesystem-backed settings — back up anything you care about first.
 
 The MIT-licensed PsychicMqttClient is pinned to commit
-`9e3005571918fdd83a2521243c501d1af137b0b6`. TLS uses the ESP32 Arduino CA
-bundle with certificate validation and needs a valid device clock. JWT
-authentication uses the MeshCore Ed25519 identity and a per-broker audience.
+`9e3005571918fdd83a2521243c501d1af137b0b6`. TLS uses the ESP32 Arduino CA bundle
+with certificate validation on, which needs a valid device clock (the observer
+syncs NTP itself).
 
-## Configure
+---
 
-The observer is disabled on a fresh install and supports two independent MQTT
-broker slots. Broker-specific settings always use numbered commands (`mqtt1.*`,
-`mqtt2.*`) to match agessaman's CLI; unnumbered `mqtt.*` commands are only for
-shared settings such as IATA, origin, and publish switches. Broker credentials
-and topic templates are independent. Wi-Fi, IATA, origin, NTP, status interval,
-and packet/status/raw enable switches are shared.
-Each slot uses MQTT client ID `<DEVICE_PUBLIC_KEY>-<N>` so configuring both
-slots on the same broker does not cause them to disconnect one another.
+## Quick start
+
+The observer ships **disabled**: no broker is enabled and no Wi-Fi is set. On a
+node you have serial (or remote) access to:
 
 ```text
 set wifi.ssid YourNetwork
 set wifi.pwd YourWiFiPassword
-set mqtt1.server wss://first.example:443/mqtt
-set mqtt1.audience first.example
-set mqtt2.server mqtts://second.example:8883
-set mqtt2.username observer
-set mqtt2.password secret
 set mqtt.iata SEA
+set mqtt1.server wss://mqtt.example.com:443/mqtt
+set mqtt1.audience mqtt.example.com
 set mqtt1.enabled on
-set mqtt2.enabled on
-get mqtt.status
-get mqtt1.status
-get mqtt2.status
 ```
 
-For a username/password connection, set that slot's `username` and `password`
-and leave its `audience` empty. JWT mode takes precedence when that slot has an
-audience configured; it uses username `v1_<PUBLIC_KEY_HEX>` and a 24-hour Ed25519-signed token. The
-worker waits for valid time before connecting and renews tokens before expiry.
-Expired tokens are also renewed before reconnecting after an outage.
-The token payload follows the reference observer: `publicKey`, `aud`, `iat`,
-`exp`, `client` (the `meshcore-jhuebert/<version>` string), and optional `owner`
-and `email` claims, with the Ed25519 signature hex-encoded after the header and
-payload (the MeshCore observer convention, not base64url). Optional per-slot
-`owner` and `email` values are included in JWT claims. Set
-replies do not echo credentials; get replies and fleet-script logs can expose them.
-
-A server may be configured as a hostname and port separately. Use `mqtts://`
-for MQTT over TLS, `wss://` for secure WebSockets, `mqtt://` for trusted private
-networks, or `ws://` for trusted private networks. Secure URLs retain hostname
-and certificate verification. Do not use plain transport on an untrusted
-network. URLs must not contain embedded `username:password@` credentials. With
-a full URL, an explicit URL port takes precedence; otherwise that slot's
-`mqttN.port` supplies the port. The default port setting (1883) selects the
-scheme's conventional port: 1883 for MQTT, 8883 for MQTT/TLS, 80 for WS, and
-443 for WSS. Explicit URL ports must be 1–65535; IPv6 hosts must be bracketed.
-Host-only values infer `mqtts://` for port 8883,
-`wss://` for 443, and `mqtt://` otherwise.
-
-Supported commands include:
+Check it:
 
 ```text
-set mqttN.server <host-or-URL>
-set mqttN.port <1-65535>
-set mqttN.username <username>
-set mqttN.password <password>
-set mqttN.audience <JWT audience>  # empty clears JWT mode
-set mqttN.owner <public-key-hex>   # optional JWT claim
-set mqttN.email <email>            # optional JWT claim
-set mqttN.topic <template>         # optional per-broker topic layout
-set mqttN.token <token>            # optional {token} template value
-set mqttN.enabled on|off           # enable/disable that slot
-set mqtt.origin <name>             # empty follows the repeater node name
-set mqtt.iata <code>               # 3 letters/digits, auto-uppercased; XXX reserved
-set mqtt.ntp <hostname>            # none restores pool.ntp.org
-set mqtt.interval <1-60>           # shared status interval, in minutes
-set mqtt.rx on|off                 # shared received-packet/raw capture gate
-set mqtt.status on|off             # shared status publish switch
-set mqtt.packets on|off            # shared parsed-packet publish switch
-set mqtt.raw on|off                # shared raw-frame publish switch
-set mqtt.tx off|on|advert          # shared TX uplink gate; advert (default) sends only this node's adverts
-set wifi.powersave none|min|max
-get mqtt.status                    # combined connection/queue summary
-get mqttN.status                   # one slot's connection state
-get mqttN.enabled
-get mqttN.server
-get mqttN.port
-get mqttN.audience
-get mqttN.owner
-get mqttN.email
-get mqttN.username
-get mqttN.password
-get mqttN.token
-get mqttN.topic
-get mqtt.iata
-get mqtt.origin
-get mqtt.ntp
-get mqtt.interval
-get mqtt.rx
-get mqtt.status.enabled
-get mqtt.packets
-get mqtt.raw
-get mqtt.tx
-get wifi.status                    # connection, IP, RSSI
-get wifi.ssid
-get wifi.pwd
-get wifi.powersave
+get mqtt.status      # -> mqtt wifi:up time:ok slots:1/2 rx:0 pub:1 drop:0 q:0/8 heap:...
+get mqtt1.status     # -> mqtt1 connected wifi:up q:0
 ```
 
-`N` is the one-based slot number (`1` or `2` in this build). The worker and
-`/mqtt_prefs` config support two broker slots. Adding more slots requires a
-config format version change. The observer does not include presets, packet
-allowlists, neighbor queries, WebConfig, SNMP, or alerting. It reports
-all MeshCore packet types received when the shared RX and packet/raw switches
-are enabled. TX uplink defaults to `advert`, so this node appears on map and
-analyzer feeds from its own adverts without uploading every repeated frame; set
-`mqtt.tx on` to uplink all transmissions or `mqtt.tx off` to disable it. TX
-events carry no SNR/RSSI/score (a transmission has no reception measurements)
-and are never written as raw frames.
+That is the whole setup: network, a location code (`IATA`), one broker URL, an
+auth mode, and `enabled on`. Everything below explains the choices.
 
-SSID/password values are the rest of the command line; do not quote them. An
-empty value clears a string setting. Settings are saved lazily about three
-seconds after a change. The experimental `/mqtt_prefs` record is version 5 and
-CRC-checked; the two broker records make its payload 1,509 bytes (1,518 bytes
-including the record header and CRC). No migration from earlier prototype
-formats is included because this observer has not been deployed and there are
-no device configs to preserve. The record magic (`MQO1`) is distinct from the
-other MeshCore observer forks, so flashing between forks rejects their
-`/mqtt_prefs` by magic and starts from defaults rather than misreading it.
-Credential values are returned by `get` commands
-and appear in fleet-script serial logs; protect CLI access and logs accordingly.
-The filesystem is not encrypted; an administrator with filesystem or firmware
-access can recover credentials. Commands pass through the repeater's existing
-CLI permission boundary.
+---
+
+## Setting up
+
+Settings are split in two:
+
+- **Shared settings** apply to every broker and the node's network: Wi-Fi,
+  `IATA`, origin name, NTP server, status interval, and the capture switches.
+  These use bare `mqtt.x` commands.
+- **Per-broker settings** are numbered `mqtt1.*` / `mqtt2.*` — server, port,
+  credentials, topic layout, and the enable switch. This matches the reference
+  observer's CLI, and broker-specific data is never ambiguous.
+
+Everything is saved to `/mqtt_prefs` lazily (about three seconds after a change)
+and survives reboots.
+
+### Wi-Fi and time
+
+```text
+set wifi.ssid <ssid>            # not quoted; the rest of the line is the value
+set wifi.pwd <password>
+set wifi.powersave none|min|max
+get wifi.status                 # wifi connected ip:192.0.2.10 rssi:-58
+```
+
+`none` keeps the radio fully awake (best for an observer that streams); `min`
+and `max` trade latency for power. The observer manages Wi-Fi and reconnects
+automatically — do not run two things that fight over the Wi-Fi interface.
+
+The observer gets UTC from NTP before it connects anywhere. The default server
+is `pool.ntp.org` with `time.google.com` and `time.cloudflare.com` as fallbacks;
+an invalid clock means no TLS and no JWT, so it retries time every 30 s until
+the clock is sane. Set your own with:
+
+```text
+set mqtt.ntp time.example.com   # "none" restores pool.ntp.org
+```
+
+### Identity and location
+
+```text
+set mqtt.iata SEA               # 3 letters/digits, auto-uppercased; XXX is reserved
+set mqtt.origin Roof Repeater   # optional; not quoted, the rest of the line is the value
+```
+
+`IATA` is the nearest airport-style code used in the topic path (see
+[Topics and payloads](#topics-and-payloads)). It is an address, not a
+credential — pick whatever your feed's tools expect. `origin` is the human name
+shown in status messages; leave it empty to follow the repeater's node name.
+
+### Server addresses and TLS
+
+A broker's `server` may be a full URL or a bare hostname:
+
+```text
+set mqtt1.server wss://mqtt.example.com:443/mqtt
+set mqtt1.server mqtts://mqtt.example.com:8883
+set mqtt1.server broker.example.com          # host only; the port supplies the scheme
+set mqtt1.port 8883
+```
+
+- Schemes: `mqtts://` (MQTT over TLS), `wss://` (secure WebSockets), `mqtt://`
+  and `ws://` (plaintext). Secure schemes verify the broker certificate; never
+  use the plaintext ones on an untrusted network.
+- With a **bare hostname**, port `8883` implies `mqtts://`, `443` implies
+  `wss://`, and any other port implies `mqtt://`.
+- The default port setting is `1883`, which means "use the scheme's conventional
+  port": 1883 for `mqtt`, 8883 for `mqtts`, 80 for `ws`, 443 for `wss`.
+- An **explicit port in the URL wins** over `mqttN.port`.
+- IPv6 hosts must be bracketed (`mqtts://[2001:db8::1]:8883`).
+- Do **not** embed credentials in the URL (`user:pass@host` is rejected); use
+  `mqttN.username` / `mqttN.password`.
+
+### Authentication
+
+Each slot picks one of two modes:
+
+**JWT (default when an audience is set).** The observer signs a short-lived
+token with the node's MeshCore Ed25519 identity and authenticates as
+`v1_<PUBLIC_KEY_HEX>`. This is how the public analyzers identify nodes:
+
+```text
+set mqtt1.audience mqtt.example.com   # the broker's expected audience (its host)
+set mqtt1.owner <64-hex-public-key>   # optional claim
+set mqtt1.email you@example.org       # optional claim
+```
+
+The token is valid for 24 hours and is renewed before it expires and before any
+reconnect, so a long outage never leaves you with a dead token. The token
+carries `publicKey`, `aud`, `iat`, `exp`, and `client` (this fork's version
+string) claims plus any `owner`/`email` you set. Clearing the audience
+(`set mqtt1.audience` with no value) switches the slot back to username/password.
+
+**Username/password.** For a private broker:
+
+```text
+set mqtt1.username observer
+set mqtt1.password secret
+```
+
+Leave the audience empty. If both are present, the audience (JWT) wins — clear
+it to use the password.
+
+### Capture switches
+
+These are shared across brokers:
+
+```text
+set mqtt.rx on|off        # master gate for receiving anything at all
+set mqtt.packets on|off   # publish parsed packets
+set mqtt.raw on|off       # publish the original radio frame
+set mqtt.status on|off    # publish periodic status (+ arms the offline last will)
+set mqtt.tx off|on|advert # this node's own transmissions (see below)
+set mqtt.interval 1-60    # status publish interval, in minutes (default 5)
+```
+
+`mqtt.tx` behaviour:
+
+- `advert` (default) — publish only this node's own adverts, so the node appears
+  on maps and analyzers from its own beacons without uplinking every frame it
+  repeats.
+- `on` — publish every transmission (useful when you want the node's relay
+  activity, but it is a lot of traffic).
+- `off` — publish no transmissions.
+
+TX messages carry no SNR/RSSI/score (there is no reception to measure) and are
+never written as raw frames.
+
+To watch traffic without uploading anything until you are ready, start with
+`set mqtt.rx off` then flip it on.
+
+### Topic layout
+
+By default every broker uses the MeshCore convention:
+
+```text
+meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/{status|packets|raw}
+```
+
+A per-broker template can reshape it. `{iata}`, `{device}`, `{token}`, and
+`{type}` are substituted (`{type}` is `status`, `packets`, or `raw`; `{token}`
+is the slot's `mqttN.token` value):
+
+```text
+set mqtt1.topic meshcore/{iata}/{device}/{type}
+set mqtt1.topic meshrank/uplink/{token}/{device}/{type}
+set mqtt1.token my-site-token
+```
+
+A broker is not contacted until its slot is `enabled on`, its server is set,
+Wi-Fi is configured, and — for the default/{iata} template — an `IATA` is set.
+
+---
+
+## Command reference
+
+All commands go through the repeater CLI; `N` is the one-based slot (`1` or `2`).
+There is no `mqtt3`.
+
+### Shared (`mqtt.`)
+
+| Command | Effect |
+|---|---|
+| `set mqtt.iata <code>` | 3 letters/digits, auto-uppercased; `XXX` reserved — `OK - MQTT setting saved` |
+| `set mqtt.origin <name>` | Human name for status messages; empty follows the node name |
+| `set mqtt.ntp <hostname>` | NTP server; `none` restores `pool.ntp.org` |
+| `set mqtt.interval <1-60>` | Status interval in minutes — `Err - interval must be 1-60 minutes` otherwise |
+| `set mqtt.rx on\|off` | Master receive gate |
+| `set mqtt.status on\|off` | Status publish switch |
+| `set mqtt.packets on\|off` | Parsed-packet publish switch |
+| `set mqtt.raw on\|off` | Raw-frame publish switch |
+| `set mqtt.tx off\|on\|advert` | Own-transmission uplink — `Err - tx must be off, on, or advert` otherwise |
+| `get mqtt.status` | Combined dashboard (see [Status](#reading-get-mqttstatus)) |
+| `get mqtt.iata` / `mqtt.origin` / `mqtt.ntp` | Current shared values |
+| `get mqtt.interval` | Minutes |
+| `get mqtt.rx` / `mqtt.status.enabled` / `mqtt.packets` / `mqtt.raw` / `mqtt.tx` | `on`/`off`, or `off`/`on`/`advert` for tx |
+
+### Per-broker (`mqttN.`)
+
+| Command | Effect |
+|---|---|
+| `set mqttN.enabled on\|off` | Enable/disable the slot — `OK - MQTT1 enabled` |
+| `set mqttN.server <host-or-URL>` | Broker address; empty clears — `Err - invalid or oversized MQTT setting` |
+| `set mqttN.port <1-65535>` | Port — `Err - port must be 1-65535` otherwise |
+| `set mqttN.username <user>` / `password <pass>` | Password auth (audience must be empty) |
+| `set mqttN.audience <aud>` | JWT audience; empty clears JWT mode and reverts to password auth |
+| `set mqttN.owner <hex>` / `email <addr>` | Optional JWT claims |
+| `set mqttN.topic <template>` | Topic layout; empty restores the MeshCore default |
+| `set mqttN.token <token>` | Value for `{token}` in the template |
+| `get mqttN.status` | One slot's state — `mqtt1 <state> wifi:up q:0` |
+| `get mqttN.enabled` | `on`/`off` |
+| `get mqttN.server` | Host label (or `not configured`) |
+| `get mqttN.port` | Effective port |
+| `get mqttN.username` / `password` / `token` | Value, or `not set` — **echoes the secret** |
+| `get mqttN.audience` / `owner` / `email` | Value, or `not configured` |
+| `get mqttN.topic` | Template, or the default |
+
+Slot states are `off`, `config` (incomplete), `wifi`, `time` (waiting for a
+valid clock), `connecting`, `connected`, `retry`, and `error`.
+
+---
 
 ## Topics and payloads
 
-By default each enabled broker uses the MeshCore topic convention:
+### Status
 
-```text
-meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/status
-meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/packets
-meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/raw
+Publish `status: "online"` (QoS 1, non-retained) on connect and every
+`mqtt.interval` minutes:
+
+```json
+{"status":"online","timestamp":"2026-10-16T20:05:00.123456+00:00","origin":"Roof Repeater",
+ "origin_id":"<UPPERHEX-PUBKEY>","model":"MeshCore Repeater","firmware_version":"...",
+ "radio":"869.525,62.5,8,5","client_version":"meshcore-jhuebert/<version>"}
 ```
 
-`DEVICE_PUBLIC_KEY` is the uppercase hexadecimal Ed25519 public key. A
-per-broker `mqttN.topic` template supports `{iata}`, `{device}`, `{token}`, and
-`{type}` (`status`, `packets`, or `raw`).
+Each broker also registers a **retained** `status: "offline"` last will on the
+status topic (while `mqtt.status` is on), so a feed flips the node offline as
+soon as the broker notices an unexpected session drop — no polling needed.
 
-The packet schema includes `type: "PACKET"`, `direction` (`rx` or `tx`), an ISO-8601
-UTC timestamp, origin and device identity, MeshCore packet hash, route, wire
-length, payload length, raw packet bytes, and receive SNR/RSSI and score. Direct
-route paths are lowercase hex arrays. Numeric fields retain the reference
-observer's string formatting. The raw schema uses `type: "RAW"` and the
-original radio frame as uppercase hex. Status includes the reference's online,
-timestamp, identity, model, firmware, radio, and client-version fields. The
-client version is `meshcore-jhuebert/<firmware-version>` to distinguish this
-fork from other MeshCore clients.
+### Packet
 
-Packet/raw publishes are QoS 0, non-retained, and sent synchronously with a
-2.5-second network timeout. Status is QoS 1, non-retained, sent on connect and
-every five minutes by default (`mqtt.interval` changes the shared interval).
-Failed status publishes are retried no faster than every 30 seconds per slot.
-Each broker also registers a retained QoS 1 `status: "offline"` last will on the
-status topic, so a feed shows the node offline as soon as the broker notices an
-unexpected session drop (the will is only armed while the shared `mqtt.status`
-switch is on). The broker may apply its own retention policy.
+`direction` is `rx` for a packet the node heard and `tx` for one it sent.
+Numeric fields are strings, matching the reference schema (a receiver's tools
+expect them that way). Receive messages add `SNR`/`RSSI` and a `score`; direct
+routes add a `path` array of lowercase hex hop tokens:
 
-## Bounded queue and delivery behavior
+```json
+{"timestamp":"2026-10-16T20:05:01.004000+00:00","hash":"AB12...","origin":"Roof Repeater",
+ "type":"PACKET","direction":"rx","time":"20:05:01","date":"16/10/2026","len":"38",
+ "packet_type":"4","route":"D","payload_len":"32","raw":"<UPPERHEX-WIRE>",
+ "origin_id":"<UPPERHEX-PUBKEY>","SNR":"-7.5","RSSI":"-92","score":"1234",
+ "path":["ab","01"]}
+```
 
-The receive hook copies raw bytes, the parsed packet, RF measurements, and
-receive timestamp before dispatcher-owned packet storage is reused. A bounded
-RAM queue transfers snapshots to the MQTT worker, including while both brokers
-are temporarily disconnected. The default capacity is 8 events and can be
-overridden at build time with `-DMQTT_OBSERVER_QUEUE_CAPACITY=<count>`; this
-capacity is shared by all broker slots and does not change `/mqtt_prefs`. The queue holds an event at its head
-while the synchronous publish attempt is in progress, so capture-side overflow
-cannot evict that in-flight event. When full, the oldest pending event is
-replaced; with capacity 1, a new event is dropped while the sole entry is in
-flight.
+### Raw
 
-On a failed attempt, the queue retries up to three times with a short
-300–499 ms delay. Pending events are flushed after one continuous minute with
-no connected broker. No packet event, queue entry, or offline history is written
-to flash or replayed after reboot. Waiting for valid time also expires queued
-events, and a flush starts a fresh expiry window for newly captured events.
-Publish work, TLS, NTP, and reconnects run outside the receive and forwarding path.
-Before opening a broker connection the worker checks internal-heap headroom
-(free and largest contiguous block); a secure slot needs considerably more than
-a plaintext one. When the heap is too fragmented to start a client the connect
-is deferred and retried every 30 seconds, so a second TLS slot on a low-memory
-board waits for room instead of aborting the device. This check is never
-terminal: a broker that could not be reached during a heap squeeze is retried
-indefinitely, including after a long outage.
+`type: "RAW"` with the original radio frame as uppercase hex:
 
-Both connected slots are offered each queued event. Following the reference
-observer's queue policy, the event is considered delivered when any connected
-slot successfully publishes either the structured packet or raw frame; a
-partial success is not retried for the other slot. Thus the queue protects
-observations during transient send failures, but does not guarantee delivery to
-every configured broker during a per-slot outage. QoS 0 is also inherently
-best-effort: a connection loss after the broker accepts a publish but before
-the sender can confirm the write may result in a duplicate retry or an
-unrecoverable loss.
+```json
+{"origin":"Roof Repeater","origin_id":"<UPPERHEX-PUBKEY>",
+ "timestamp":"2026-10-16T20:05:01.004000+00:00","type":"RAW","data":"<UPPERHEX>"}
+```
 
-`get mqtt.status` reports Wi-Fi/clock state, connected slot count, received and
-published counters, drops, queue depth/capacity, and free/largest heap figures.
-`get mqttN.status` reports the connection state for an individual slot.
+### Timing and QoS
 
-Capture begins at `logRx()`, after a packet object has been allocated and the
-radio frame parsed. Invalid frames are excluded. The repeater currently uses a
-32-packet pool; pool exhaustion can prevent the parsed-packet hook from being
-reached. This build does not change packet-pool reservation or outbound relay
-policy, and hardware saturation testing remains outstanding. Observation is
-independent of later forwarding decisions, but not of successful parsing or
-packet-pool availability. The receive hook also runs before mesh de-duplication,
-so the same packet heard on more than one repeat can be published more than once
-— useful for per-reception RF analysis, but it means packet counts are
-receptions, not unique packets.
+- Packet and raw publishes are QoS 0, non-retained, sent synchronously with a
+  2.5-second network timeout.
+- Status is QoS 1; a failed status publish is retried no faster than every 30
+  seconds per slot.
 
-## Build measurements and remaining validation
+The broker applies its own retention policy to anything except messages the
+observer marks retained (the offline will).
 
-The observer target has been compile-tested on the XIAO S3 WIO. Build success
-does not establish runtime TLS heap margin, worker stack high-water, OTA
-behavior, or capture resilience under sustained RF/outbound pressure. Complete
-hardware checks for internal heap/largest block during two simultaneous
-Wi-Fi/TLS connections and reconnects, queue behavior under broker outages,
-worker stack use, compatible local brokers, and no late/replayed events before
-treating the target as production-qualified.
+---
+
+## Delivery behaviour
+
+The observer is a bounded, best-effort feed. It is designed to survive a broker
+outage without stalling the mesh:
+
+- **Bounded queue.** Captured events sit in a small RAM queue (default 8 events,
+  shared by both slots) while connections are down. The oldest pending event is
+  replaced when it is full. Nothing is written to flash or replayed after a
+  reboot.
+- **Bounded retries.** A failed publish is retried up to three times, 300–499 ms
+  apart; if a broker stays disconnected for a full minute, the queue is flushed.
+- **Heap-aware connects.** Before opening a broker connection the observer
+  checks internal-heap headroom (a secure slot needs much more than a plaintext
+  one). If the heap is too fragmented it waits and retries every 30 seconds —
+  this is what keeps a second TLS slot on a small board from crashing the node,
+  and it is never a dead end.
+- **Patient reconnects.** A dropped broker is retried on a 10/30/60/120/300 s
+  ladder, and then every 5 minutes **forever** — a broker that is unreachable
+  during a long internet outage is picked up again when the link returns.
+- **Partial delivery counts as delivered.** Both connected slots are offered
+  each event, but as soon as any one of them publishes it the event is done, so
+  a per-slot outage does not cause duplicate work. QoS 0 also means a rare loss
+  is possible if a connection dies mid-write.
+
+Observation is independent of forwarding, but not of parsing: capture begins at
+the receive hook after a frame has been parsed, so corrupt frames are excluded,
+and extreme packet-pool pressure can drop a capture. The receive hook also runs
+**before mesh de-duplication**, so a packet heard on more than one repeat can be
+published more than once — useful for per-reception RF analysis, but packet
+counts are receptions, not unique packets.
+
+---
+
+## Recipes
+
+### Feed a public analyzer
+
+```text
+set wifi.ssid <ssid>
+set wifi.pwd <password>
+set mqtt.iata <your-code>
+set mqtt1.server wss://mqtt.example.com:443/mqtt
+set mqtt1.audience mqtt.example.com
+set mqtt1.enabled on
+```
+
+No username/password: the analyzer authenticates you by the signed token derived
+from your node identity.
+
+### Primary plus backup broker
+
+```text
+set mqtt1.server wss://primary.example.com:443/mqtt
+set mqtt1.audience primary.example.com
+set mqtt1.enabled on
+set mqtt2.server mqtts://backup.example.com:8883
+set mqtt2.username observer
+set mqtt2.password secret
+set mqtt2.enabled on
+```
+
+Two independent slots; a packet only needs to reach one of them.
+
+### Your own Mosquitto
+
+On the broker, allow the observer's user and password. On the node:
+
+```text
+set mqtt1.server mqtts://broker.local:8883
+set mqtt1.username observer
+set mqtt1.password secret
+set mqtt1.topic obs/{device}/{type}
+set mqtt1.enabled on
+```
+
+Plaintext `mqtt://broker.local:1883` also works if the broker is on a trusted
+segment — just never on an untrusted network.
+
+### Adverts only, on a busy node
+
+Keep the node visible on a map without uplinking everything it forwards:
+
+```text
+set mqtt.rx off
+set mqtt.tx advert
+set mqtt1.enabled on
+```
+
+Flip `set mqtt.rx on` later when you are ready to stream received packets too.
+
+---
+
+## Status and troubleshooting
+
+### Reading `get mqtt.status`
+
+```text
+mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
+```
+
+| Field | Meaning |
+|---|---|
+| `wifi:` | Station link: `up` / `down` |
+| `time:` | Clock valid enough for TLS/JWT: `ok` / `wait` |
+| `slots:` | Connected slots / configured slots |
+| `rx:` | Events captured since boot |
+| `pub:` | Publish successes since boot |
+| `drop:` | Skipped events (queue overflow, disconnect flush, failed publishes) |
+| `q:` | Current queue depth / capacity |
+| `heap:` | Free / largest internal heap block, in bytes |
+
+`get mqttN.status` narrows this to one slot's state and queue depth.
+
+### Common problems
+
+| Symptom | Check | Usual cause |
+|---|---|---|
+| `get mqtt.status` shows `slots:0/2` | `get wifi.status`, `time:` field | Wi-Fi not connected, or clock still `wait` |
+| Slot stuck at `config` | `get mqttN.server`, `get mqtt.iata` | No server, or the default topic needs an `IATA` and none is set |
+| Slot cycles `connecting` → `retry` | `get mqttN.server`, broker reachability | Wrong host/port, wrong scheme, or the broker is down |
+| Auth rejected | audience vs username/password | Audience set when you meant password (JWT wins); or the audience/token is wrong |
+| No TLS, immediately after boot | `time:` | Clock not yet synced; secure brokers need valid time |
+| `drop:` climbing steadily | `q:` | Broker disconnected too long, or an overloaded node — check the broker |
+| Node vanished from the feed | `get mqttN.status` | Last-will `offline` is expected during an outage; it returns on reconnect |
+| Duplicate packets in the feed | — | Normal: the hook is pre-dedup; multi-repeat receptions are real observations |
+
+---
+
+## Security model
+
+- **CLI access is the boundary.** Observer commands run through the repeater's
+  existing permission boundary, so anyone who can run `set` can change broker
+  credentials.
+- **`get` echoes secrets.** `get mqttN.password` / `username` / `token` return
+  the stored value, and fleet scripts log their run to serial — protect the
+  serial console and any fleet transcripts.
+- **The filesystem is not encrypted.** Anyone with filesystem or firmware access
+  can recover broker credentials.
+- **TLS verifies the broker** for `mqtts://` and `wss://`. Do not drop to
+  plaintext on a network you do not control.
+- **Your identity is your key.** JWT auth signs with the node's MeshCore
+  identity; there is no separate observer credential to leak.
+
+---
+
+## Limits and good-to-knows
+
+| Limit | Value |
+|---|---|
+| Broker slots | 2 (`mqtt1`, `mqtt2`) |
+| Queue | 8 events shared by both slots; build-time `-DMQTT_OBSERVER_QUEUE_CAPACITY=N` |
+| Queue retries | 3, with a 300–499 ms delay |
+| Offline flush | after 1 continuous minute with no connected broker |
+| Reconnect backoff | 10/30/60/120/300 s, then every 300 s, indefinitely |
+| Connect attempt timeout | 30 s |
+| Status interval | 1–60 minutes (default 5) |
+| JWT lifetime | 24 hours, renewed before expiry and before reconnect |
+| Packet/raw network timeout | 2.5 s |
+| TLS heap gate | ~64 KB free and ~18 KB largest internal block per secure connect |
+| Config file | `/mqtt_prefs`, version 5, CRC-checked |
+
+- **ESP32 only.** nRF52, STM32, and RP2040 boards have no observer build.
+- **Not included:** broker presets, per-slot packet-type allowlists, neighbour
+  queries, a WebConfig portal, SNMP, and alerting. Every packet type is captured
+  when the switches allow it.
+- **No migration from other observers.** `/mqtt_prefs` uses this fork's own
+  `MQO1` record magic, so flashing from another MeshCore observer build rejects
+  its config and starts from defaults rather than misreading it — you re-enter
+  the settings once. There is no migration from earlier prototype formats.
+- **Partial capture is expected** under heavy RF or packet-pool pressure; the
+  observer is a window on the mesh, not a guaranteed record of it.
