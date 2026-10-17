@@ -6,7 +6,7 @@ import unittest
 
 
 class ReleaseTargetsTest(unittest.TestCase):
-    def test_default_listing_preserves_existing_repeater_variants(self):
+    def test_default_listing_includes_all_repeater_variants(self):
         script = Path(__file__).resolve().parents[1] / "local-release-build.sh"
         with tempfile.TemporaryDirectory(prefix="meshcore-release-") as directory:
             Path(directory, "build.sh").write_text(
@@ -20,9 +20,11 @@ class ReleaseTargetsTest(unittest.TestCase):
                 env={**os.environ, "WORKER_DIR": directory},
                 check=True, capture_output=True, text=True,
             )
+            # Observer targets ship in the same release as the plain repeaters.
             self.assertEqual(result.stdout.splitlines(), [
                 "Board_repeater", "Board_repeater_bridge_espnow",
                 "Board_repeater_", "Board_repeater_ethernet",
+                "Board_repeater_observer",
             ])
 
 

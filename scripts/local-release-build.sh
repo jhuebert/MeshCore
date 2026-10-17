@@ -13,8 +13,7 @@
 #
 #     -j, --jobs N        parallel build workers (default: 4)
 #     --targets LIST      comma/space/newline-separated target list
-#                         (default: every standard repeater target)
-#     --observers         build the optional targets from observer_targets.ini
+#                         (default: every repeater target, observers included)
 #     --filter REGEX      build only targets matching REGEX (subset of default)
 #     --no-upload         build and collect artifacts only
 #     --no-warmup         skip the serial first-build-per-platform phase (faster
@@ -30,7 +29,8 @@
 #      names (target_commitish) so file versions match the release body.
 #   2. Checks that commit out into a persistent git worktree — reused between
 #      runs of the same tag, so .pio/build makes reruns incremental.
-#   3. Lists the release tree's repeater targets with build.sh (155 today).
+#   3. Lists the release tree's repeater targets with build.sh (observers
+#      included, so every release ships the full set).
 #   4. Builds them N at a time, mirroring build.sh's per-target logic (it cannot
 #      be called directly in parallel: it wipes out/ on every invocation).
 #   5. Uploads each target's artifacts as soon as it finishes (a small capped
@@ -95,17 +95,12 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0
 # environment already prepared by the orchestrator (venv PATH). Target listing,
 # platform mapping and building share one code path.
 
-# repeater targets of the checked-out tree (the selection filter-release.yml
-# used to make before firmware builds moved local)
+# every repeater target of the checked-out tree, including the optional MQTT
+# observer targets, so each release ships the full set (no separate observer
+# channel). build.sh list already covers envs from observer_targets.ini.
 if [[ ${1:-} == __list ]]; then
   cd "$WORKER_DIR"
-  bash build.sh list | grep -i repeater | grep -v '_repeater_observer$'
-  exit 0
-fi
-
-if [[ ${1:-} == __list_observers ]]; then
-  cd "$WORKER_DIR"
-  bash build.sh get-observer-firmwares-to-build
+  bash build.sh list | grep -i repeater
   exit 0
 fi
 
@@ -243,7 +238,6 @@ UPLOAD=1
 WARMUP=1
 DRY_RUN=0
 TARGETS_INPUT=""
-OBSERVER_INPUT=0
 FILTER_ARG=""
 BUILD_DIR_BASE="${MESH_RELEASE_BUILD_DIR:-$HOME/.cache/meshcore-release-build}"
 RELEASE_ARG=""
@@ -254,7 +248,6 @@ while [[ $# -gt 0 ]]; do
     --no-upload) UPLOAD=0; shift;;
     --no-warmup) WARMUP=0; shift;;
     --targets) TARGETS_INPUT=$2; shift 2;;
-    --observers) OBSERVER_INPUT=1; shift;;
     --filter) FILTER_ARG=$2; shift 2;;
     --build-dir) BUILD_DIR_BASE=$2; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
@@ -366,15 +359,10 @@ run_tool() {
 command -v python3 >/dev/null || die "python3 is required"
 
 # ---------------------------------------------------------- targets ----
-if [[ -n $TARGETS_INPUT && $OBSERVER_INPUT == 1 ]]; then
-  die "--targets and --observers cannot be combined"
-elif [[ -n $TARGETS_INPUT ]]; then
+if [[ -n $TARGETS_INPUT ]]; then
   mapfile -t targets < <(tr ' ,\n' '\n' <<<"$TARGETS_INPUT" | sed '/^$/d')
-elif [[ $OBSERVER_INPUT == 1 ]]; then
-  info "listing observer targets from observer_targets.ini"
-  mapfile -t targets < <(run_tool __list_observers)
 else
-  info "listing standard repeater targets in the release tree"
+  info "listing repeater targets (observers included) in the release tree"
   mapfile -t targets < <(run_tool __list)
 fi
 if [[ -n $FILTER_ARG ]]; then

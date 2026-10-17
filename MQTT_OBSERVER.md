@@ -25,9 +25,10 @@ complete. The T3-S3 and T-Beam 1W observer targets use `min_spiffs.csv`, and
 Station G2/G3 use `default_16MB.csv`, to fit the larger app. Those partition
 overrides can require a merged image when converting an existing node and may
 reset filesystem-backed settings. Standard repeater targets do not depend on
-the MQTT library or compile observer sources. Optional release builds can be
-selected separately with
-`scripts/local-release-build.sh --observers <release-url-or-tag>`.
+the MQTT library or compile observer sources. Observer targets ship in the same
+release as the plain repeaters: `scripts/local-release-build.sh` builds them by
+default (use `--filter _repeater_observer` to build only observers). There is no
+separate observer release channel.
 
 The MIT-licensed PsychicMqttClient is pinned to commit
 `9e3005571918fdd83a2521243c501d1af137b0b6`. TLS uses the ESP32 Arduino CA
