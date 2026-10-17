@@ -215,13 +215,6 @@ public:
     _staged.rssi = rssi;
   }
 
-  bool consume(Snapshot& snapshot) {
-    if (!_valid) return false;
-    snapshot = _staged;
-    _valid = false;
-    return true;
-  }
-
   bool consume(uint8_t* bytes, size_t capacity, uint16_t& length, float& snr, float& rssi) {
     if (!_valid) return false;
     if (!bytes || _staged.length > capacity) {

@@ -6,6 +6,7 @@
 #include "../simple_repeater/CliUtil.h"
 #include <Utils.h>
 #include <WiFi.h>
+#include <freertos/task.h>
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
 #include <mbedtls/base64.h>
@@ -98,7 +99,7 @@ MQTTObserver::MQTTObserver()
       _radio_freq(0), _radio_bw(0), _radio_sf(0), _radio_cr(0), _config{},
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
-      _queue(), _raw_stager(), _brokers{}, _wifi_started(false), _task(nullptr),
+      _queue(), _raw_stager(), _brokers{}, _wifi_started(false),
       _queue_disconnected_since(0), _last_ntp_request(0), _device_id{}, _json{},
       _state(STATE_OFF), _save_state(), _received(0), _published(0),
       _disconnected_drops(0), _queue_drops(0), _publish_drops(0) {
@@ -147,10 +148,8 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
     }
   }
 
-  if (xTaskCreatePinnedToCore(taskEntry, "mqttObserver", 8192, this, 1, &_task, 0) != pdPASS) {
-    _task = nullptr;
+  if (xTaskCreatePinnedToCore(taskEntry, "mqttObserver", 8192, this, 1, nullptr, 0) != pdPASS)
     _state.store(STATE_ERROR, std::memory_order_relaxed);
-  }
 }
 
 void MQTTObserver::taskEntry(void* context) {

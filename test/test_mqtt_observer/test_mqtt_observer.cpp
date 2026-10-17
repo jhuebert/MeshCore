@@ -267,29 +267,33 @@ TEST(MQTTObserverConfig, ExpandsReferenceTopicTemplate) {
 TEST(MQTTObserverRawStager, ConsumesOnlyTheImmediatelyStagedFrame) {
   MQTTObserverRawStager stager;
   uint8_t first[] = {1, 2, 3};
-  MQTTObserverRawStager::Snapshot snapshot;
+  uint8_t copied[MQTTObserverRawStager::kCapacity];
+  uint16_t copied_len = 0;
+  float copied_snr = 0, copied_rssi = 0;
+
   stager.stage(first, sizeof(first), -4.5f, -91.0f);
-  ASSERT_TRUE(stager.consume(snapshot));
-  EXPECT_EQ(snapshot.length, sizeof(first));
-  EXPECT_EQ(snapshot.bytes[2], 3);
-  EXPECT_FLOAT_EQ(snapshot.snr, -4.5f);
-  EXPECT_FLOAT_EQ(snapshot.rssi, -91.0f);
-  EXPECT_FALSE(stager.consume(snapshot));
+  ASSERT_TRUE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
+  EXPECT_EQ(copied_len, sizeof(first));
+  EXPECT_EQ(copied[2], 3);
+  EXPECT_FLOAT_EQ(copied_snr, -4.5f);
+  EXPECT_FLOAT_EQ(copied_rssi, -91.0f);
+  EXPECT_FALSE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
 
   uint8_t second[] = {9};
   stager.stage(second, sizeof(second), 2.0f, -40.0f);
   stager.stage(nullptr, 0, 0.0f, 0.0f);
-  EXPECT_FALSE(stager.consume(snapshot));
+  EXPECT_FALSE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
 
   stager.stage(first, sizeof(first), 1.5f, -80.0f);
-  uint8_t copied[MQTTObserverRawStager::kCapacity];
-  uint16_t copied_len = 0;
-  float copied_snr = 0, copied_rssi = 0;
   ASSERT_TRUE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
-  EXPECT_EQ(copied_len, sizeof(first));
   EXPECT_EQ(copied[0], 1);
   EXPECT_FLOAT_EQ(copied_snr, 1.5f);
   EXPECT_FLOAT_EQ(copied_rssi, -80.0f);
+
+  stager.stage(first, sizeof(first), 1.5f, -80.0f);
+  uint8_t too_small[sizeof(first) - 1];
+  EXPECT_FALSE(stager.consume(too_small, sizeof(too_small), copied_len, copied_snr, copied_rssi));
+  EXPECT_EQ(copied_len, 0);
   EXPECT_FALSE(stager.consume(copied, sizeof(copied), copied_len, copied_snr, copied_rssi));
 }
 

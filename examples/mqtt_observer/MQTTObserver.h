@@ -9,7 +9,6 @@
 #include <PsychicMqttClient.h>
 #include <atomic>
 #include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
 #include "../simple_repeater/PersistUtil.h"
 #include "MQTTObserverConfig.h"
@@ -85,7 +84,6 @@ class MQTTObserver {
   MQTTObserverRawStager _raw_stager;
   BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
-  TaskHandle_t _task;
   uint32_t _queue_disconnected_since;
   uint32_t _last_ntp_request;
   char _device_id[2 * PUB_KEY_SIZE + 1];
