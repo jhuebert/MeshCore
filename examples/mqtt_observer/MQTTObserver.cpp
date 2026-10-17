@@ -151,6 +151,11 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
   _fs = fs;
   _identity = identity;
   _origin_source = origin;
+  // The broker and the feed only need the connection state, not the library's
+  // transport logs; keep them off the shared CLI console.
+  esp_log_level_set("MQTT_CLIENT", ESP_LOG_NONE);
+  esp_log_level_set("esp-tls", ESP_LOG_NONE);
+  esp_log_level_set("\xf0\x9f\x90\x99", ESP_LOG_NONE);   // PsychicMqttClient's tag
 #if defined(BOARD_HAS_PSRAM)
   if (psramFound()) mbedtls_platform_set_calloc_free(observerMbedtlsCalloc, observerMbedtlsFree);
 #endif
