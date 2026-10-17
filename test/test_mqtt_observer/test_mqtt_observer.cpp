@@ -462,6 +462,108 @@ TEST(MQTTObserverFormat, ClientVersionIsSharedByStatusAndClaims) {
   EXPECT_FALSE(MQTTObserverFormat::buildClientVersion(nullptr, version, sizeof(version)));
 }
 
+TEST(MQTTObserverConfig, DefaultsAreEnabledAndSafeForAFreshInstall) {
+  MQTTObserverConfig config;
+  MQTTObserverConfigCodec::setDefaults(config);
+  EXPECT_EQ(config.status_enabled, 1);
+  EXPECT_EQ(config.packets_enabled, 1);
+  EXPECT_EQ(config.raw_enabled, 1);
+  EXPECT_EQ(config.rx_enabled, 1);
+  EXPECT_EQ(config.tx_enabled, 2);            // own adverts
+  EXPECT_EQ(config.status_interval_minutes, 5);
+  EXPECT_EQ(config.wifi_power_save, 1);
+  for (size_t i = 0; i < MQTT_OBSERVER_CONFIG_BROKER_CAPACITY; i++) {
+    EXPECT_EQ(config.brokers[i].port, 1883);
+    EXPECT_EQ(config.brokers[i].enabled, 0);
+    EXPECT_EQ(config.brokers[i].server[0], 0);
+  }
+  EXPECT_TRUE(MQTTObserverConfigCodec::valid(config));
+}
+
+TEST(MQTTObserverConfig, ValidatorsRejectHostileStrings) {
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopic("bad+topic"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopic("bad#topic"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopic("has space"));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validTopic("meshcore/{iata}/{device}/{type}"));
+
+  EXPECT_TRUE(MQTTObserverConfigCodec::validOwner(""));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validOwner(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validOwner("0123"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validOwner(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
+
+  EXPECT_TRUE(MQTTObserverConfigCodec::validNtpServer(""));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validNtpServer("time.example.com"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validNtpServer("time example"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validNtpServer("time:123"));
+
+  EXPECT_TRUE(MQTTObserverConfigCodec::validAudience("broker.example"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validAudience("bad audience"));
+
+  EXPECT_TRUE(MQTTObserverConfigCodec::validEmail(""));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validEmail("line\nbreak"));
+}
+
+TEST(MQTTObserverConfig, IataAcceptsEmptyAndRejectsWrongShape) {
+  EXPECT_TRUE(MQTTObserverConfigCodec::validIata(""));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validIata("AB1"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validIata("abc"));    // lowercase
+  EXPECT_FALSE(MQTTObserverConfigCodec::validIata("AB"));     // too short
+  EXPECT_FALSE(MQTTObserverConfigCodec::validIata("ABCD"));   // too long
+}
+
+TEST(MQTTObserverConfig, TopicTemplateKeepsLiteralTextAndDefaultsWhenEmpty) {
+  MQTTObserverConfig config;
+  MQTTObserverConfigCodec::setDefaults(config);
+  strcpy(config.iata, "SEA");
+  char topic[160];
+  // No {type}: the template is emitted verbatim.
+  strcpy(config.brokers[0].topic, "static/feed");
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, config.brokers[0], "AABB",
+                                                  "packets", topic, sizeof(topic)));
+  EXPECT_STREQ(topic, "static/feed");
+  // Empty template falls back to the MeshCore convention.
+  config.brokers[0].topic[0] = 0;
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildTopic(config, config.brokers[0], "AABB",
+                                                  "status", topic, sizeof(topic)));
+  EXPECT_STREQ(topic, "meshcore/SEA/AABB/status");
+}
+
+TEST(MQTTObserverConfig, SchemeLessHostInfersSchemeFromPort) {
+  MQTTObserverConfig config;
+  MQTTObserverConfigCodec::setDefaults(config);
+  MQTTObserverBrokerConfig& broker = config.brokers[0];
+  char uri[128];
+  strcpy(broker.server, "broker.example");
+  broker.port = 443;
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(broker, uri, sizeof(uri)));
+  EXPECT_STREQ(uri, "wss://broker.example:443");
+  broker.port = 1883;
+  ASSERT_TRUE(MQTTObserverConfigCodec::buildServerUri(broker, uri, sizeof(uri)));
+  EXPECT_STREQ(uri, "mqtt://broker.example:1883");
+}
+
+TEST(MQTTObserverCommandPolicy, ParseSlotRejectsZeroAndTrailingGarbage) {
+  size_t slot = 99;
+  const char* property = nullptr;
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("set mqtt0.server x", "set ", 2, slot, property));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("set mqtt1server x", "set ", 2, slot, property));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("get mqtt1", "get ", 2, slot, property));
+  EXPECT_FALSE(MQTTObserverCommandPolicy::parseSlot("get xmqtt1.p", "get ", 2, slot, property));
+}
+
+TEST(MQTTObserverQueuePolicy, RetryScheduleStaysWithinJitterWindow) {
+  using namespace MQTTObserverQueuePolicy;
+  RetryDecision first = retryDecision(false, 0, 1000);
+  ASSERT_EQ(first.action, RetryAction::Schedule);
+  EXPECT_EQ(first.retry_attempts, 1);
+  EXPECT_GE(first.delay_ms, kRetryDelayBaseMs);
+  EXPECT_LT(first.delay_ms, kRetryDelayBaseMs + kRetryDelayJitterMs);
+  EXPECT_EQ(first.next_retry_ms, 1000u + first.delay_ms);
+  EXPECT_EQ(retryDecision(false, kMaxQos0RetryAttempts, 1000).action, RetryAction::Drop);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
