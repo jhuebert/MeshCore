@@ -38,8 +38,6 @@ class MQTTObserver {
     PsychicMqttClient* client;
     char server_uri[sizeof(MQTTObserverBrokerConfig::server) + 16];
     char client_id[2 * PUB_KEY_SIZE + 3];
-    char status_topic[128];
-    char offline_payload[512];   // retained last-will body (setWill keeps the pointer)
     char username[65];
     char password[65];
     char jwt_username[3 + 2 * PUB_KEY_SIZE + 1];
@@ -108,7 +106,7 @@ class MQTTObserver {
   bool createJwt(size_t slot, const MQTTObserverBrokerConfig& config, uint32_t& expires_at);
   bool publishEvent(const Event& event, const MQTTObserverConfig& config);
   bool publishStatus(size_t slot, const MQTTObserverConfig& config);
-  bool buildStatusMessage(bool online, char* out, size_t capacity, size_t& written);
+  bool buildStatusMessage(char* out, size_t capacity, size_t& written);
   void disconnectBroker(size_t slot);
   void trackDisconnectedQueue(uint32_t now);
   void flushQueue();

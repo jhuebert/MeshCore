@@ -33,7 +33,7 @@ observer **cannot** see is a frame that never parsed; see
 Each enabled broker gets three feeds on the MeshCore topic convention:
 
 ```text
-meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/status     # retained-last-will aware online/offline
+meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/status     # online status
 meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/packets    # parsed packets, rx and tx
 meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/raw        # the original radio frame
 ```
@@ -214,7 +214,7 @@ These are shared across brokers:
 set mqtt.rx on|off        # master gate for receiving anything at all
 set mqtt.packets on|off   # publish parsed packets
 set mqtt.raw on|off       # publish the original radio frame
-set mqtt.status on|off    # publish periodic status (+ arms the offline last will)
+set mqtt.status on|off    # publish periodic status
 set mqtt.tx off|on|advert # this node's own transmissions (see below)
 set mqtt.interval 1-60    # status publish interval, in minutes (default 5)
 ```
@@ -318,9 +318,9 @@ Publish `status: "online"` (QoS 1, non-retained) on connect and every
  "radio":"869.525,62.5,8,5","client_version":"meshcore-jhuebert/<version>"}
 ```
 
-Each broker also registers a **retained** `status: "offline"` last will on the
-status topic (while `mqtt.status` is on), so a feed flips the node offline as
-soon as the broker notices an unexpected session drop — no polling needed.
+Status messages report online on connect and periodically. The observer does not
+publish an offline message when a broker connection drops; consumers should
+expire stale status based on their own timeout or broker presence information.
 
 ### Packet
 
@@ -353,8 +353,7 @@ routes add a `path` array of lowercase hex hop tokens:
 - Status is QoS 1; a failed status publish is retried no faster than every 30
   seconds per slot.
 
-The broker applies its own retention policy to anything except messages the
-observer marks retained (the offline will).
+The broker applies its own retention policy to published messages.
 
 ---
 
@@ -481,7 +480,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | Auth rejected | audience vs username/password | Audience set when you meant password (JWT wins); or the audience/token is wrong |
 | No TLS, immediately after boot | `time:` | Clock not yet synced; secure brokers need valid time |
 | `drop:` climbing steadily | `q:` | Broker disconnected too long, or an overloaded node — check the broker |
-| Node vanished from the feed | `get mqttN.status` | Last-will `offline` is expected during an outage; it returns on reconnect |
+| Node disappeared from the feed | `get mqttN.status` | Status is online-only; expire stale status in the consumer |
 | Duplicate packets in the feed | — | Normal: the hook is pre-dedup; multi-repeat receptions are real observations |
 
 ---

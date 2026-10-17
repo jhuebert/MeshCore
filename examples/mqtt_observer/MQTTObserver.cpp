@@ -123,8 +123,7 @@ bool sameBrokerConnection(const MQTTObserverBrokerConfig& a,
 }  // namespace
 
 MQTTObserver::BrokerRuntime::BrokerRuntime()
-    : client(nullptr), server_uri{}, client_id{}, status_topic{}, offline_payload{},
-      username{}, password{}, jwt_username{},
+    : client(nullptr), server_uri{}, client_id{}, username{}, password{}, jwt_username{},
       jwt_token{}, jwt_expiry(0),
       next_connect_ms(0), attempt_started(0), connected_at(0), last_status_ms(0),
       status_retry_ms(0), backoff_index(0), status_retry_pending(false),
@@ -524,17 +523,6 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
     runtime.client->setCredentials(runtime.username[0] ? runtime.username : nullptr,
                                    runtime.password[0] ? runtime.password : nullptr);
   }
-  // A retained last will flips the node offline on the feed as soon as the
-  // broker notices the session drop. The topic and body must outlive connect()
-  // (the library keeps the pointers), so they live in BrokerRuntime.
-  if (config.status_enabled &&
-      MQTTObserverConfigCodec::buildTopic(config, broker, _device_id, "status",
-                                          runtime.status_topic, sizeof(runtime.status_topic))) {
-    size_t will_len = 0;
-    if (buildStatusMessage(false, runtime.offline_payload, sizeof(runtime.offline_payload), will_len))
-      runtime.client->setWill(runtime.status_topic, 1, true, runtime.offline_payload,
-                              static_cast<int>(will_len));
-  }
   return true;
 }
 
@@ -764,7 +752,7 @@ void MQTTObserver::worker() {
   }
 }
 
-bool MQTTObserver::buildStatusMessage(bool online, char* out, size_t capacity, size_t& written) {
+bool MQTTObserver::buildStatusMessage(char* out, size_t capacity, size_t& written) {
   char radio[64];
   char origin[sizeof(_origin)];
   float freq, bw;
@@ -785,7 +773,7 @@ bool MQTTObserver::buildStatusMessage(bool online, char* out, size_t capacity, s
                                            sizeof(timestamp))) return false;
   return MQTTObserverFormat::buildStatus(origin, _device_id, "MeshCore Repeater",
                                          _firmware, radio, timestamp,
-                                         out, capacity, written, online);
+                                         out, capacity, written);
 }
 
 bool MQTTObserver::publishStatus(size_t slot, const MQTTObserverConfig& config) {
@@ -797,7 +785,7 @@ bool MQTTObserver::publishStatus(size_t slot, const MQTTObserverConfig& config) 
   if (!MQTTObserverConfigCodec::buildTopic(config, broker, _device_id, "status",
                                            topic, sizeof(topic))) return false;
   size_t written = 0;
-  if (!buildStatusMessage(true, _json, sizeof(_json), written)) return false;
+  if (!buildStatusMessage(_json, sizeof(_json), written)) return false;
   return runtime.client->publish(topic, 1, false, _json, written, true) >= 0;
 }
 
