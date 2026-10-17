@@ -150,7 +150,7 @@ bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& w
   writer.hexString(packet.hash, packet.hash_len);
   appendKey(writer, "origin", packet.origin);
   appendKey(writer, "type", "PACKET");
-  appendKey(writer, "direction", "rx");
+  appendKey(writer, "direction", packet.is_tx ? "tx" : "rx");
   appendKey(writer, "time", clock_time);
   appendKey(writer, "date", date);
   appendKey(writer, "len", len);
@@ -160,11 +160,16 @@ bool buildPacket(const PacketView& packet, char* out, size_t capacity, size_t& w
   writer.append(",\"raw\":");
   writer.hexString(packet.wire, packet.wire_len);
   appendKey(writer, "origin_id", packet.origin_id);
-  appendKey(writer, "SNR", snr);
-  appendKey(writer, "RSSI", rssi);
-  if (!isnan(packet.score)) {
-    snprintf(score, sizeof(score), "%d", static_cast<int>(packet.score * 1000));
-    appendKey(writer, "score", score);
+  if (!packet.is_tx) {
+    // RF measurements describe a reception; a transmission has none, so the
+    // reference schema omits SNR/RSSI/score for TX rather than reporting stale
+    // values left over from the last received frame.
+    appendKey(writer, "SNR", snr);
+    appendKey(writer, "RSSI", rssi);
+    if (!isnan(packet.score)) {
+      snprintf(score, sizeof(score), "%d", static_cast<int>(packet.score * 1000));
+      appendKey(writer, "score", score);
+    }
   }
   if (packet.path_count) {
     writer.append(",\"path\":[");

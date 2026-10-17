@@ -26,6 +26,7 @@ class MQTTObserver {
     float snr;
     float rssi;
     float score;
+    bool is_tx;
   };
 
   enum State : uint8_t {
@@ -98,6 +99,7 @@ class MQTTObserver {
   void worker();
   void copyConfig(MQTTObserverConfig& config);
   bool ready(const MQTTObserverConfig& config, size_t slot) const;
+  bool hasEnabledBrokerLocked() const;   // caller holds _config_mux
   bool hasConnectHeadroom(bool secure) const;
   bool configureClient(size_t slot, const MQTTObserverBrokerConfig& config);
   bool createJwt(size_t slot, const MQTTObserverBrokerConfig& config, uint32_t& expires_at);
@@ -129,6 +131,7 @@ public:
   bool needsAwake() const;
   void stageRaw(float snr, float rssi, const uint8_t raw[], int len);
   void capture(mesh::Packet* packet, float score);
+  void captureTx(mesh::Packet* packet);
   bool handleCommand(char* command, char* reply);
   void formatStatus(char* reply, size_t capacity);
 };

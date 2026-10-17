@@ -17,6 +17,7 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   strcpy(config.ntp_server, "192.168.1.1");
   config.status_interval_minutes = 12;
   config.wifi_power_save = 2;
+  config.tx_enabled = 1;
   config.brokers[0].enabled = 1;
   strcpy(config.brokers[0].server, "wss://mqtt.example:443/mqtt");
   strcpy(config.brokers[0].username, "v1_public-key");
@@ -33,9 +34,9 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   strcpy(config.brokers[1].username, "second-user");
 
   EXPECT_EQ(MQTT_OBSERVER_CONFIG_BROKER_CAPACITY, 2u);
-  EXPECT_EQ(MQTTObserverConfigCodec::kVersion, 4);
-  EXPECT_EQ(MQTTObserverConfigCodec::kPayloadSize, 1508u);
-  EXPECT_EQ(MQTTObserverRecord::kRecordSize, 1517u);
+  EXPECT_EQ(MQTTObserverConfigCodec::kVersion, 5);
+  EXPECT_EQ(MQTTObserverConfigCodec::kPayloadSize, 1509u);
+  EXPECT_EQ(MQTTObserverRecord::kRecordSize, 1518u);
   uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
   ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
   MQTTObserverConfig decoded;
@@ -47,6 +48,7 @@ TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   EXPECT_STREQ(decoded.ntp_server, "192.168.1.1");
   EXPECT_EQ(decoded.status_interval_minutes, 12);
   EXPECT_EQ(decoded.wifi_power_save, 2);
+  EXPECT_EQ(decoded.tx_enabled, 1);
   EXPECT_EQ(decoded.brokers[0].enabled, 1);
   EXPECT_STREQ(decoded.brokers[0].server, "wss://mqtt.example:443/mqtt");
   EXPECT_STREQ(decoded.brokers[0].password, "broker-secret");
@@ -77,6 +79,22 @@ TEST(MQTTObserverConfig, RejectsInvalidValuesAndIntegrityChanges) {
   EXPECT_FALSE(MQTTObserverConfigCodec::decode(payload, sizeof(payload), config));
   EXPECT_EQ(config.status_enabled, 1);
   EXPECT_FALSE(MQTTObserverConfigCodec::decode(payload, sizeof(payload) - 1, config));
+}
+
+TEST(MQTTObserverConfig, TxDefaultsToAdvertAndRejectsUnknownModes) {
+  MQTTObserverConfig config;
+  MQTTObserverConfigCodec::setDefaults(config);
+  EXPECT_EQ(config.tx_enabled, 2);   // own adverts by default
+  uint8_t payload[MQTTObserverConfigCodec::kPayloadSize];
+  ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
+  config.tx_enabled = 3;
+  EXPECT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), 0u);
+  // decoding an out-of-range mode falls back to defaults rather than trusting it
+  config.tx_enabled = 2;
+  ASSERT_EQ(MQTTObserverConfigCodec::encode(config, payload, sizeof(payload)), sizeof(payload));
+  payload[4] = 9;   // tx_enabled sits after status/packets/raw/rx
+  EXPECT_FALSE(MQTTObserverConfigCodec::decode(payload, sizeof(payload), config));
+  EXPECT_EQ(config.tx_enabled, 2);   // defaults restored
 }
 
 TEST(MQTTObserverRecord, ChecksVersionLengthAndChecksum) {
@@ -360,7 +378,7 @@ TEST(MQTTObserverFormat, PacketMessageMatchesObserverSchema) {
   const uint8_t path[] = {0xab, 0x01};
   MQTTObserverFormat::PacketView packet = {
     "Roof \"Repeater\"", "001122", 0, 123456, wire, sizeof(wire), 4,
-    "D", 3, -4.5f, -91.0f, 1.234f, hash, sizeof(hash), path, 2, 1
+    "D", 3, -4.5f, -91.0f, 1.234f, hash, sizeof(hash), path, 2, 1, false
   };
   char json[1024];
   size_t written = 0;
@@ -378,6 +396,28 @@ TEST(MQTTObserverFormat, PacketMessageMatchesObserverSchema) {
   EXPECT_NE(payload.find("\"RSSI\":\"-91\""), std::string::npos);
   EXPECT_NE(payload.find("\"score\":\"1234\""), std::string::npos);
   EXPECT_NE(payload.find("\"path\":[\"ab\",\"01\"]"), std::string::npos);
+}
+
+TEST(MQTTObserverFormat, TxPacketOmitsReceiveMeasurements) {
+  const uint8_t wire[] = {0xa5, 0x00, 0xff};
+  const uint8_t hash[] = {0xab, 0xcd};
+  MQTTObserverFormat::PacketView packet = {
+    "node", "001122", 0, 0, wire, sizeof(wire), 4,
+    "F", 3, 0.0f, 0.0f, 0.0f, hash, sizeof(hash), nullptr, 0, 0, true
+  };
+  char json[1024];
+  size_t written = 0;
+  ASSERT_TRUE(MQTTObserverFormat::buildPacket(packet, json, sizeof(json), written));
+  std::string payload(json, written);
+  EXPECT_NE(payload.find("\"direction\":\"tx\""), std::string::npos);
+  // A transmission has no reception measurements to report.
+  EXPECT_EQ(payload.find("\"SNR\""), std::string::npos);
+  EXPECT_EQ(payload.find("\"RSSI\""), std::string::npos);
+  EXPECT_EQ(payload.find("\"score\""), std::string::npos);
+  EXPECT_EQ(payload.find("\"path\""), std::string::npos);
+  // The wire frame and identity are still present.
+  EXPECT_NE(payload.find("\"raw\":\"A500FF\""), std::string::npos);
+  EXPECT_NE(payload.find("\"origin_id\":\"001122\""), std::string::npos);
 }
 
 TEST(MQTTObserverFormat, RawStatusAndTruncationAreBounded) {

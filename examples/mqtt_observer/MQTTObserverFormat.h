@@ -24,6 +24,7 @@ struct PacketView {
   const uint8_t* path;
   uint8_t path_count;
   uint8_t path_hash_size;
+  bool is_tx;
 };
 
 bool formatTimestamp(time_t timestamp, long usec, char* out, size_t capacity);

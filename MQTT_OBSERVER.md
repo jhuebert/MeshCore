@@ -102,6 +102,7 @@ set mqtt.rx on|off                 # shared received-packet/raw capture gate
 set mqtt.status on|off             # shared status publish switch
 set mqtt.packets on|off            # shared parsed-packet publish switch
 set mqtt.raw on|off                # shared raw-frame publish switch
+set mqtt.tx off|on|advert          # shared TX uplink gate; advert (default) sends only this node's adverts
 set wifi.powersave none|min|max
 get mqtt.status                    # combined connection/queue summary
 get mqttN.status                   # one slot's connection state
@@ -123,6 +124,7 @@ get mqtt.rx
 get mqtt.status.enabled
 get mqtt.packets
 get mqtt.raw
+get mqtt.tx
 get wifi.status                    # connection, IP, RSSI
 get wifi.ssid
 get wifi.pwd
@@ -132,14 +134,18 @@ get wifi.powersave
 `N` is the one-based slot number (`1` or `2` in this build). The worker and
 `/mqtt_prefs` config support two broker slots. Adding more slots requires a
 config format version change. The observer does not include presets, packet
-allowlists, TX uplink, neighbor queries, WebConfig, SNMP, or alerting. It reports
+allowlists, neighbor queries, WebConfig, SNMP, or alerting. It reports
 all MeshCore packet types received when the shared RX and packet/raw switches
-are enabled.
+are enabled. TX uplink defaults to `advert`, so this node appears on map and
+analyzer feeds from its own adverts without uploading every repeated frame; set
+`mqtt.tx on` to uplink all transmissions or `mqtt.tx off` to disable it. TX
+events carry no SNR/RSSI/score (a transmission has no reception measurements)
+and are never written as raw frames.
 
 SSID/password values are the rest of the command line; do not quote them. An
 empty value clears a string setting. Settings are saved lazily about three
-seconds after a change. The experimental `/mqtt_prefs` record is version 4 and
-CRC-checked; the two broker records make its payload 1,508 bytes (1,517 bytes
+seconds after a change. The experimental `/mqtt_prefs` record is version 5 and
+CRC-checked; the two broker records make its payload 1,509 bytes (1,518 bytes
 including the record header and CRC). No migration from earlier prototype
 formats is included because this observer has not been deployed and there are
 no device configs to preserve. Credential values are returned by `get` commands
@@ -162,7 +168,7 @@ meshcore/{IATA}/{DEVICE_PUBLIC_KEY}/raw
 per-broker `mqttN.topic` template supports `{iata}`, `{device}`, `{token}`, and
 `{type}` (`status`, `packets`, or `raw`).
 
-The packet schema includes `type: "PACKET"`, `direction: "rx"`, an ISO-8601
+The packet schema includes `type: "PACKET"`, `direction` (`rx` or `tx`), an ISO-8601
 UTC timestamp, origin and device identity, MeshCore packet hash, route, wire
 length, payload length, raw packet bytes, and receive SNR/RSSI and score. Direct
 route paths are lowercase hex arrays. Numeric fields retain the reference

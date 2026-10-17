@@ -280,6 +280,14 @@ void MQTTObserver::loop() {
   if (_save_state.due()) saveConfig();
 }
 
+bool MQTTObserver::hasEnabledBrokerLocked() const {
+  for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
+    const MQTTObserverBrokerConfig& broker = _config.brokers[i];
+    if (broker.enabled && broker.server[0]) return true;
+  }
+  return false;
+}
+
 void MQTTObserver::stageRaw(float snr, float rssi, const uint8_t raw[], int len) {
   // stage() rejects a zero length on its own, so a missing frame simply leaves
   // the next capture to report its packet without raw bytes.
@@ -291,12 +299,8 @@ void MQTTObserver::capture(mesh::Packet* packet, float score) {
   _received.fetch_add(1, std::memory_order_relaxed);
   bool should_capture = false;
   portENTER_CRITICAL(&_config_mux);
-  if (_config.rx_enabled && (_config.packets_enabled || _config.raw_enabled)) {
-    for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
-      const MQTTObserverBrokerConfig& broker = _config.brokers[i];
-      if (broker.enabled && broker.server[0]) { should_capture = true; break; }
-    }
-  }
+  if (_config.rx_enabled && (_config.packets_enabled || _config.raw_enabled))
+    should_capture = hasEnabledBrokerLocked();
   portEXIT_CRITICAL(&_config_mux);
   if (!should_capture) return;
 
@@ -318,6 +322,48 @@ void MQTTObserver::capture(mesh::Packet* packet, float score) {
   event.timestamp = now.tv_sec;
   event.timestamp_usec = now.tv_usec;
   event.score = score;
+
+  portENTER_CRITICAL(&_queue_mux);
+  MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::OfferResult result =
+      _queue.offer(event);
+  portEXIT_CRITICAL(&_queue_mux);
+  if (result != MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::QUEUED)
+    _queue_drops.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MQTTObserver::captureTx(mesh::Packet* packet) {
+  if (!packet) return;
+  uint8_t mode = 0;
+  bool should_capture = false;
+  portENTER_CRITICAL(&_config_mux);
+  mode = _config.tx_enabled;
+  should_capture = mode != 0 && hasEnabledBrokerLocked();
+  portEXIT_CRITICAL(&_config_mux);
+  if (!should_capture) return;
+  if (mode == 2) {
+    // Own adverts only: the advert payload begins with the originator's public
+    // key, so a match identifies the frame this node sent.
+    bool self_advert = _identity && packet->getPayloadType() == PAYLOAD_TYPE_ADVERT &&
+        packet->payload_len >= PUB_KEY_SIZE &&
+        memcmp(packet->payload, _identity->pub_key, PUB_KEY_SIZE) == 0;
+    if (!self_advert) return;
+  }
+
+  struct timeval now;
+  gettimeofday(&now, nullptr);
+  if (now.tv_sec < kMinimumValidTime) {
+    _publish_drops.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  Event event{};
+  event.packet = *packet;
+  event.raw_len = 0;   // no received frame applies to our own transmission
+  event.snr = 0;
+  event.rssi = 0;
+  event.score = 0;
+  event.is_tx = true;
+  event.timestamp = now.tv_sec;
+  event.timestamp_usec = now.tv_usec;
 
   portENTER_CRITICAL(&_queue_mux);
   MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::OfferResult result =
@@ -774,7 +820,7 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
         event.packet.isRouteDirect() ? "D" : "F", event.packet.payload_len,
         event.snr, event.rssi, event.score, hash, sizeof(hash), event.packet.path,
         event.packet.isRouteDirect() ? event.packet.getPathHashCount() : 0,
-        event.packet.getPathHashSize()
+        event.packet.getPathHashSize(), event.is_tx
       };
       if (MQTTObserverConfigCodec::buildTopic(config, broker, _device_id,
                                               "packets", topic, sizeof(topic)) &&
@@ -850,6 +896,7 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
   else if ((common_value = commandValue(command, "set mqtt.status"))) common_property = "status";
   else if ((common_value = commandValue(command, "set mqtt.packets"))) common_property = "packets";
   else if ((common_value = commandValue(command, "set mqtt.raw"))) common_property = "raw";
+  else if ((common_value = commandValue(command, "set mqtt.tx"))) common_property = "tx";
   else if ((common_value = commandValue(command, "set mqtt.interval"))) common_property = "interval";
   if (common_property) {
     if (strcmp(common_property, "iata") == 0) {
@@ -898,6 +945,19 @@ bool MQTTObserver::handleSetCommand(char* command, char* reply) {
       portENTER_CRITICAL(&_config_mux);
       changed = _config.status_interval_minutes != minutes;
       _config.status_interval_minutes = static_cast<uint8_t>(minutes);
+      portEXIT_CRITICAL(&_config_mux);
+    } else if (strcmp(common_property, "tx") == 0) {
+      uint8_t mode;
+      if (strcmp(common_value, "off") == 0) mode = 0;
+      else if (strcmp(common_value, "on") == 0) mode = 1;
+      else if (strcmp(common_value, "advert") == 0) mode = 2;
+      else {
+        snprintf(reply, CLI_REPLY_MAX, "Err - tx must be off, on, or advert");
+        return true;
+      }
+      portENTER_CRITICAL(&_config_mux);
+      changed = _config.tx_enabled != mode;
+      _config.tx_enabled = mode;
       portEXIT_CRITICAL(&_config_mux);
     } else {
       if (!parseToggle(common_value, toggle)) {
@@ -1086,7 +1146,8 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
   }
 
   enum CommonGet { COMMON_NONE, COMMON_IATA, COMMON_ORIGIN, COMMON_NTP, COMMON_RX,
-                   COMMON_STATUS, COMMON_PACKETS, COMMON_RAW, COMMON_INTERVAL } common = COMMON_NONE;
+                   COMMON_STATUS, COMMON_PACKETS, COMMON_RAW, COMMON_TX,
+                   COMMON_INTERVAL } common = COMMON_NONE;
   if (strcmp(command, "get mqtt.iata") == 0) common = COMMON_IATA;
   else if (strcmp(command, "get mqtt.origin") == 0) common = COMMON_ORIGIN;
   else if (strcmp(command, "get mqtt.ntp") == 0) common = COMMON_NTP;
@@ -1094,6 +1155,7 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
   else if (strcmp(command, "get mqtt.status.enabled") == 0) common = COMMON_STATUS;
   else if (strcmp(command, "get mqtt.packets") == 0) common = COMMON_PACKETS;
   else if (strcmp(command, "get mqtt.raw") == 0) common = COMMON_RAW;
+  else if (strcmp(command, "get mqtt.tx") == 0) common = COMMON_TX;
   else if (strcmp(command, "get mqtt.interval") == 0) common = COMMON_INTERVAL;
   if (common != COMMON_NONE) {
     char common_value[160];
@@ -1113,6 +1175,8 @@ bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
       case COMMON_STATUS: snprintf(common_value, sizeof(common_value), "%s", _config.status_enabled ? "on" : "off"); break;
       case COMMON_PACKETS: snprintf(common_value, sizeof(common_value), "%s", _config.packets_enabled ? "on" : "off"); break;
       case COMMON_RAW: snprintf(common_value, sizeof(common_value), "%s", _config.raw_enabled ? "on" : "off"); break;
+      case COMMON_TX: snprintf(common_value, sizeof(common_value), "%s",
+                               _config.tx_enabled == 2 ? "advert" : _config.tx_enabled == 1 ? "on" : "off"); break;
       case COMMON_INTERVAL: snprintf(common_value, sizeof(common_value), "%u", static_cast<unsigned>(_config.status_interval_minutes)); break;
       default: common_value[0] = 0; break;
     }

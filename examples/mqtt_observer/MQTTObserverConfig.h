@@ -39,6 +39,7 @@ struct MQTTObserverConfig {
   uint8_t packets_enabled;
   uint8_t raw_enabled;
   uint8_t rx_enabled;
+  uint8_t tx_enabled;            // 0 = off, 1 = all, 2 = own adverts only
   uint8_t status_interval_minutes;
   uint8_t wifi_power_save;
   char wifi_ssid[33];
@@ -51,8 +52,8 @@ struct MQTTObserverConfig {
 
 namespace MQTTObserverConfigCodec {
 
-static const uint8_t kVersion = 4;
-static const size_t kCommonPayloadSize = 6 + 33 + 65 + 4 + 33 + 65;
+static const uint8_t kVersion = 5;
+static const size_t kCommonPayloadSize = 7 + 33 + 65 + 4 + 33 + 65;
 static const size_t kBrokerPayloadSize = 1 + 2 + 129 + 65 + 65 + 65 + 129 + 65 + 65 + 65;
 static const size_t kPayloadSize = kCommonPayloadSize +
                                    MQTT_OBSERVER_CONFIG_BROKER_CAPACITY * kBrokerPayloadSize;
@@ -63,6 +64,7 @@ inline void setDefaults(MQTTObserverConfig& config) {
   config.packets_enabled = 1;
   config.raw_enabled = 1;
   config.rx_enabled = 1;
+  config.tx_enabled = 2;
   config.status_interval_minutes = 5;
   config.wifi_power_save = 1;
   for (size_t i = 0; i < MQTT_OBSERVER_CONFIG_BROKER_CAPACITY; i++)
@@ -206,7 +208,8 @@ inline bool validBroker(const MQTTObserverBrokerConfig& broker) {
 
 inline bool valid(const MQTTObserverConfig& config) {
   if (config.status_enabled > 1 || config.packets_enabled > 1 || config.raw_enabled > 1 ||
-      config.rx_enabled > 1 || config.status_interval_minutes < 1 ||
+      config.rx_enabled > 1 || config.tx_enabled > 2 ||
+      config.status_interval_minutes < 1 ||
       config.status_interval_minutes > 60 || config.wifi_power_save > 2) return false;
   if (!memchr(config.wifi_ssid, 0, sizeof(config.wifi_ssid)) ||
       !memchr(config.wifi_password, 0, sizeof(config.wifi_password)) ||
@@ -226,6 +229,7 @@ inline size_t encode(const MQTTObserverConfig& config, uint8_t* out, size_t capa
   out[pos++] = config.packets_enabled;
   out[pos++] = config.raw_enabled;
   out[pos++] = config.rx_enabled;
+  out[pos++] = config.tx_enabled;
   out[pos++] = config.status_interval_minutes;
   out[pos++] = config.wifi_power_save;
 #define MQTT_OBSERVER_COPY_GLOBAL(field) \
@@ -266,6 +270,7 @@ inline bool decode(const uint8_t* data, size_t len, MQTTObserverConfig& config) 
   config.packets_enabled = data[pos++];
   config.raw_enabled = data[pos++];
   config.rx_enabled = data[pos++];
+  config.tx_enabled = data[pos++];
   config.status_interval_minutes = data[pos++];
   config.wifi_power_save = data[pos++];
 #define MQTT_OBSERVER_READ_GLOBAL(field) \
