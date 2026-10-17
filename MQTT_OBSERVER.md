@@ -182,7 +182,10 @@ Packet/raw publishes are QoS 0, non-retained, and sent synchronously with a
 2.5-second network timeout. Status is QoS 1, non-retained, sent on connect and
 every five minutes by default (`mqtt.interval` changes the shared interval).
 Failed status publishes are retried no faster than every 30 seconds per slot.
-The broker may apply its own retention policy.
+Each broker also registers a retained QoS 1 `status: "offline"` last will on the
+status topic, so a feed shows the node offline as soon as the broker notices an
+unexpected session drop (the will is only armed while the shared `mqtt.status`
+switch is on). The broker may apply its own retention policy.
 
 ## Bounded queue and delivery behavior
 

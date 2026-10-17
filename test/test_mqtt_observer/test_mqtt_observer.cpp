@@ -440,6 +440,19 @@ TEST(MQTTObserverFormat, RawStatusAndTruncationAreBounded) {
   EXPECT_EQ(short_json[0], 0);
 }
 
+TEST(MQTTObserverFormat, OfflineStatusIsARetainedLastWillBody) {
+  char json[512];
+  size_t written = 0;
+  ASSERT_TRUE(MQTTObserverFormat::buildStatus("node", "AABB", "MeshCore", "1.0", "radio",
+                                              "timestamp", json, sizeof(json), written, false));
+  std::string payload(json, written);
+  EXPECT_NE(payload.find("\"status\":\"offline\""), std::string::npos);
+  EXPECT_EQ(payload.find("\"status\":\"online\""), std::string::npos);
+  // Same identity/version fields as the online status message.
+  EXPECT_NE(payload.find("\"origin_id\":\"AABB\""), std::string::npos);
+  EXPECT_NE(payload.find("\"client_version\":\"meshcore-jhuebert/1.0\""), std::string::npos);
+}
+
 TEST(MQTTObserverFormat, ClientVersionIsSharedByStatusAndClaims) {
   char version[96];
   ASSERT_TRUE(MQTTObserverFormat::buildClientVersion("1.2.3", version, sizeof(version)));

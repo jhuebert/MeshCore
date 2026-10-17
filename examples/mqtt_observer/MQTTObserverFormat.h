@@ -34,6 +34,6 @@ bool buildRaw(const char* origin, const char* origin_id, const char* timestamp,
               const uint8_t* bytes, size_t len, char* out, size_t capacity, size_t& written);
 bool buildStatus(const char* origin, const char* origin_id, const char* model,
                  const char* firmware, const char* radio, const char* timestamp,
-                 char* out, size_t capacity, size_t& written);
+                 char* out, size_t capacity, size_t& written, bool online = true);
 
 }  // namespace MQTTObserverFormat

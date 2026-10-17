@@ -201,11 +201,11 @@ bool buildRaw(const char* origin, const char* origin_id, const char* timestamp,
 
 bool buildStatus(const char* origin, const char* origin_id, const char* model,
                  const char* firmware, const char* radio, const char* timestamp,
-                 char* out, size_t capacity, size_t& written) {
+                 char* out, size_t capacity, size_t& written, bool online) {
   if (!origin || !origin_id || !model || !firmware || !radio || !timestamp) return false;
   JsonWriter writer(out, capacity);
   writer.append("{");
-  appendKey(writer, "status", "online", false);
+  appendKey(writer, "status", online ? "online" : "offline", false);
   appendKey(writer, "timestamp", timestamp);
   appendKey(writer, "origin", origin);
   appendKey(writer, "origin_id", origin_id);
