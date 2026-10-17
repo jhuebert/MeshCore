@@ -2135,6 +2135,13 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
 
+  if (strcmp(command, "start ota") == 0) {
+    if (!board.startOTAUpdate(_prefs.node_name, reply)) {
+      strcpy(reply, "Error");
+    }
+    return true;
+  }
+
   if (memcmp(command, "set name ", 9) == 0) {
     if (AdvertDataParser::isValidName(&command[9])) {
       StrHelper::strncpy(_prefs.node_name, &command[9], sizeof(_prefs.node_name));
