@@ -10,7 +10,6 @@
 #include <string.h>
 
 #include "MeshClockSync.h"
-#include "BuildEpoch.h"
 #include "CliUtil.h"
 
 // Two plausible-but-wrong clocks: the node's own is far behind, and the true
@@ -81,10 +80,13 @@ TEST_F(ClockTest, DefaultsAreDisabledAndEmpty) {
 // ------------------------------------------------------------ build epoch
 
 TEST(ClockSyncBuildEpoch, ParsesAReasonableDate) {
-  const uint32_t e = meshclock::buildEpoch();
+  // Read the value through buildFloor(), buildEpoch()'s sole production caller.
+  // Calling buildEpoch() directly here expands this TU's own __TIME__, which can
+  // differ from MeshClockSync.cpp's by a second when the two TUs compile apart
+  // (each call is folded per-TU at -O1).
+  const uint32_t e = MeshClockSync::buildFloor();
   EXPECT_GT(e, 1735689600UL);   // after 2025-01-01
   EXPECT_LT(e, 4102444800UL);   // before 2100-01-01
-  EXPECT_EQ(MeshClockSync::buildFloor(), e);
 }
 
 // ------------------------------------------------------------ persistence
