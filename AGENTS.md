@@ -1,10 +1,12 @@
 # Agent Guide — jhuebert/MeshCore (personal fork)
 
-This is my personal fork of `meshcore-dev/MeshCore`. The fork-specific feature
-is the **repeater packet filter** (`filter ...` CLI, drop/forward rules, advert
-rate limiter) carried on the `repeater-filter*` branches, plus firmware release
-channels released by `.github/workflows/filter-release.yml` (tag + release
-object; firmware assets are built locally).
+This is my personal fork of `meshcore-dev/MeshCore`. The fork-specific features
+are the **repeater packet filter** (`filter ...` CLI, drop/forward rules, advert
+rate limiter), the battery gate, mesh clock sync, fleet management, and an
+optional **MQTT observer** firmware — all carried on the `repeater-filter*`
+branches — plus firmware release channels released by
+`.github/workflows/filter-release.yml` (tag + release object; firmware assets are
+built locally).
 
 Remotes: `origin` = upstream `meshcore-dev/MeshCore` (never push there),
 `fork` = `jhuebert/MeshCore` (push here). Upstream has **no** AGENTS.md, so this
@@ -40,6 +42,10 @@ should not need to explore beyond them before making a change.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
 - `MESHCLOCK.md` — mesh clock sync behavior, CLI, defaults and caveats.
+- `MQTT_OBSERVER.md` — the optional MQTT observer firmware's user manual:
+  build targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS),
+  topic templates and the status/packet/raw schemas, the capture and delivery
+  model, recipes, troubleshooting and limits.
 
 **When behavior changes, the matching guide section is updated in the same
 commit** — the guides are user-facing API documentation, not optional docs.
@@ -82,28 +88,50 @@ commit** — the guides are user-facing API documentation, not optional docs.
   sample collection, median/quorum decision, enabled-flag persistence and CLI.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `logRx` (ack repeat detector),
-  `searchChannelsByHash`, CLI
+  `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`, CLI
   dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
   the fleet device-service injections and the `batteryAlerts` transition
   drain).
 - `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
 
+**Code (`examples/mqtt_observer/`, compiled only under `WITH_MQTT_OBSERVER`):**
+- `MQTTObserver.h/.cpp` — the ESP32-only observer: Wi-Fi/NTP, up to two broker
+  slots, Ed25519 JWT or user/pass auth, the receive/TX capture hooks, a bounded
+  RAM event queue, the heap-headroom connect gate, the retained offline last
+  will, and the `mqtt*`/`wifi*` CLI.
+- `MQTTObserverConfig.h` — the config model + `MQTTObserverConfigCodec`
+  (`/mqtt_prefs` payload v5; `MQTT_OBSERVER_MAX_BROKERS`, queue capacity).
+- `MQTTObserverRecord.h` — the `/mqtt_prefs` record framing (magic `MQO1`,
+  CRC-16 over the payload) and its header/version/checksum checks.
+- `MQTTObserverPolicy.h` — pure host-tested policies: command/slot parsing, JWT
+  renewal, the queue/retry rules, the connect-admission heap gate, and the raw
+  frame stager.
+- `MQTTObserverFormat.h/.cpp` — pure host-tested JSON builders for the status,
+  packet and raw messages (the reference observer schema).
+`observer_targets.ini` (repo root) defines the optional `*_repeater_observer`
+PlatformIO environments and is the allowlist `build.sh` / the release builder use.
+
 **Tests:** `test/test_packet_filter/` (301 behavior-level cases: matching,
 content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
 PatternMatch), `test/test_fleet/` (112 cases: runner grammar, tag targeting,
 acknowledgements, scheduling, persistence, CLI surface, the battery
-exemption contract), `test/test_battery_gate/`, and `test/test_mesh_clock/` (24
-behavior-level cases). Test-only shims:
+exemption contract), `test/test_battery_gate/`, `test/test_mesh_clock/` (24
+behavior-level cases), and `test/test_mqtt_observer/` (31 cases: config codec +
+record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
+connect heap gate, queue/retry policy, and the status/packet/raw JSON schema).
+Test-only shims:
 `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
 `FilterTestHelpers.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` / `-e native_fleet` / `-e native_mesh_clock` (host-native,
-no hardware), plus `-e native_packet_filter_san` / `-e native_battery_gate_san` /
-`-e native_fleet_san` / `-e native_mesh_clock_san` for ASan+UBSan;
+native_battery_gate` / `-e native_fleet` / `-e native_mesh_clock` / `-e
+native_mqtt_observer` (host-native, no hardware), plus `-e
+native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_fleet_san` /
+`-e native_mesh_clock_san` / `-e native_mqtt_observer_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 `build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
-target being `Xiao_S3_WIO_repeater`. **Compile-check every filesystem
+target being `Xiao_S3_WIO_repeater` (observer builds add
+`Xiao_S3_WIO_repeater_observer`). **Compile-check every filesystem
 family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
 `RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_repeater` — host-native
 tests cannot catch a platform-specific API difference, and one did (the nRF52
@@ -111,7 +139,9 @@ file type has no default constructor).
 `.github/workflows/filter-release.yml` cuts release channels (dev →
 `repeater-filter`, stable → `repeater-filter-stable`) — tag + release object
 only; the firmware assets are built locally with
-`scripts/local-release-build.sh` and uploaded to the release with `gh`
+`scripts/local-release-build.sh` (the default target set includes the observer
+targets, so they ship in the same release — no separate observer channel) and
+uploaded to the release with `gh`
 (CI no longer builds firmware — the 155-target runner fan-out got Actions
 shut down). `sync-upstream.yml` merges upstream into the chosen channel branch
 and `promote-stable.yml` cherry-picks the filter commits from `repeater-filter`
@@ -143,8 +173,10 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
 - `test/test_packet_filter/`, `test/test_battery_gate/`,
-  `test/test_mesh_clock/`
-- `FILTER.md`, `FLEET.md`, `MESHCLOCK.md`, `.github/workflows/filter-release.yml`,
+  `test/test_mesh_clock/`, `test/test_mqtt_observer/`
+- `examples/mqtt_observer/`, `observer_targets.ini`
+- `FILTER.md`, `FLEET.md`, `MESHCLOCK.md`, `MQTT_OBSERVER.md`,
+  `.github/workflows/filter-release.yml`,
   `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
 
 Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
@@ -216,6 +248,12 @@ FILTER.md:
   RAM-only, battery alerts are emitted on the fleet channel only when it is
   enabled and configured, and script execution is deferred out of the receive
   path. Changing them is a breaking decision, not a refactor side effect.
+  The observer's observable surface is compatibility too: capture happens before
+  forwarding policy (a packet the node drops is still observed), the feed is
+  best-effort (no flash replay, no delivery guarantee), TX uplinks this node's
+  own adverts by default, the topic template and the status/packet/raw schemas
+  follow the reference observer, and `/mqtt_prefs` (v5, magic `MQO1`) is the
+  fork's own format, deliberately not migrated from the other observers.
 - **New pattern syntax must not silently change the meaning of an
   already-storable pattern.** If it would, either ship an escape (`\|`) or
   reject the ambiguous form with an error. Deliberate exception: `|` became OR
@@ -281,21 +319,24 @@ FILTER.md:
   fails any release target whose `src/`/`examples/` code holds a frame
   >= 2 KB (formerly a filter-release.yml CI check) — keep new frames well
   under it.
-- Pure refactors keep both suites green **unchanged** — the suites (301 filter,
-  112 fleet, 50 battery) are the safety net that proves no behavior slipped.
-- Run both suites, then re-read the diff:
+- Pure refactors keep the suites green **unchanged** — the suites (301 filter,
+  112 fleet, 50 battery, 24 mesh-clock, 31 observer) are the safety net that
+  proves no behavior slipped.
+- Run the feature suites, then re-read the diff:
 
 ```
 pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + persistence
 pio test -e native_battery_gate     # battery gate
 pio test -e native_fleet            # fleet manager + runner + CLI + persistence
+pio test -e native_mesh_clock       # mesh clock sync
+pio test -e native_mqtt_observer    # observer config/format/policy
 ```
 
-All green, and every touched line required — together with the full five-env
+All green, and every touched line required — together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_mesh_clock -e native_mqtt_observer
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks
