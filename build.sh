@@ -56,7 +56,7 @@ EOF
 
 # get a list of pio env names that start with "env:"
 get_pio_envs() {
-  pio project config | grep 'env:' | sed 's/env://'
+  pio project config | grep '^env:' | sed 's/env://'
 }
 
 # Catch cries for help before doing anything else.
