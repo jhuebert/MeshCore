@@ -41,21 +41,13 @@ public:
   }
 
   void string(const char* text) {
-    static const char hex[] = "0123456789abcdef";
-    append("\"");
-    if (!text) text = "";
-    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p && _valid; p++) {
-      if (*p == '"' || *p == '\\') {
-        append("\\");
-        appendChar(static_cast<char>(*p));
-      } else if (*p < 0x20) {
-        char escaped[7] = {'\\', 'u', '0', '0', hex[*p >> 4], hex[*p & 0x0f], 0};
-        append(escaped);
-      } else {
-        appendChar(static_cast<char>(*p));
-      }
+    if (!_valid) return;
+    appendChar('"');
+    if (_valid && !appendEscaped(text, _out, _capacity, _length)) {
+      _valid = false;
+      return;
     }
-    append("\"");
+    appendChar('"');
   }
 
   void hexString(const uint8_t* bytes, size_t len, bool lowercase = false) {
@@ -92,6 +84,33 @@ void appendKey(JsonWriter& writer, const char* key, const char* value, bool comm
 }
 
 }  // namespace
+
+bool appendEscaped(const char* text, char* out, size_t capacity, size_t& length) {
+  static const char hex[] = "0123456789abcdef";
+  if (!out || capacity == 0 || length >= capacity) return false;
+  if (!text) text = "";
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; p++) {
+    char escaped[6];
+    size_t len;
+    if (*p == '"' || *p == '\\') {
+      escaped[0] = '\\';
+      escaped[1] = static_cast<char>(*p);
+      len = 2;
+    } else if (*p < 0x20) {
+      escaped[0] = '\\'; escaped[1] = 'u'; escaped[2] = '0'; escaped[3] = '0';
+      escaped[4] = hex[*p >> 4]; escaped[5] = hex[*p & 0x0f];
+      len = 6;
+    } else {
+      escaped[0] = static_cast<char>(*p);
+      len = 1;
+    }
+    if (length + len + 1 > capacity) return false;
+    memcpy(out + length, escaped, len);
+    length += len;
+    out[length] = 0;
+  }
+  return true;
+}
 
 bool formatTimestamp(time_t timestamp, long usec, char* out, size_t capacity) {
   if (!out || capacity < 1) return false;

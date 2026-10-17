@@ -29,6 +29,8 @@ class MQTTObserver {
     bool is_tx;
   };
 
+  using EventQueue = MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>;
+
   enum State : uint8_t {
     STATE_OFF, STATE_CONFIG, STATE_WIFI, STATE_TIME, STATE_CONNECTING,
     STATE_CONNECTED, STATE_RETRY, STATE_ERROR
@@ -79,7 +81,7 @@ class MQTTObserver {
   uint8_t _load_record[MQTTObserverRecord::kRecordSize];
   mutable portMUX_TYPE _config_mux;
   portMUX_TYPE _queue_mux;
-  MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY> _queue;
+  EventQueue _queue;
   MQTTObserverRawStager _raw_stager;
   BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
@@ -111,6 +113,8 @@ class MQTTObserver {
   void trackDisconnectedQueue(uint32_t now);
   void flushQueue();
   size_t queueSize();
+  bool stampEvent(Event& event);
+  void enqueueEvent(const Event& event);
   void markDirty();
   bool saveConfig();
   static bool writeRecord(File& file, void* context);

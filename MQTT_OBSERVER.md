@@ -462,7 +462,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | `wifi:` | Station link: `up` / `down` |
 | `time:` | Clock valid enough for TLS/JWT: `ok` / `wait` |
 | `slots:` | Connected slots / configured slots |
-| `rx:` | Events captured since boot |
+| `rx:` | Frames heard since boot (counted before the receive gate) |
 | `pub:` | Publish successes since boot |
 | `drop:` | Skipped events (queue overflow, disconnect flush, failed publishes) |
 | `q:` | Current queue depth / capacity |

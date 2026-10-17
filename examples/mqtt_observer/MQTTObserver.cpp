@@ -4,14 +4,12 @@
 #include "MQTTObserverFormat.h"
 #include "MQTTObserverRecord.h"
 #include "../simple_repeater/CliUtil.h"
+#include <Utils.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_heap_caps.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/platform.h>
-#if defined(BOARD_HAS_PSRAM)
-#include <esp_heap_caps.h>
-#endif
 #include <sys/time.h>
 #include <time.h>
 #include <stdlib.h>
@@ -21,15 +19,6 @@ namespace {
 
 const char kConfigPath[] = "/mqtt_prefs";
 const uint32_t kBackoffMs[] = {10000, 30000, 60000, 120000, 300000};
-
-void bytesToHex(const uint8_t* bytes, size_t len, char* out, bool lowercase = false) {
-  const char* digits = lowercase ? "0123456789abcdef" : "0123456789ABCDEF";
-  for (size_t i = 0; i < len; i++) {
-    out[2 * i] = digits[bytes[i] >> 4];
-    out[2 * i + 1] = digits[bytes[i] & 0x0f];
-  }
-  out[2 * len] = 0;
-}
 
 bool startsWith(const char* text, const char* prefix) {
   return text && strncmp(text, prefix, strlen(prefix)) == 0;
@@ -66,34 +55,8 @@ bool base64Url(const uint8_t* input, size_t input_len, char* output, size_t capa
 }
 
 bool jsonEscape(const char* input, char* output, size_t capacity) {
-  if (!input || !output || capacity == 0) return false;
   size_t used = 0;
-  static const char hex[] = "0123456789abcdef";
-  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(input); *p; p++) {
-    char escaped[6];
-    const char* value = nullptr;
-    size_t len = 0;
-    if (*p == '"' || *p == '\\') {
-      escaped[0] = '\\';
-      escaped[1] = static_cast<char>(*p);
-      value = escaped;
-      len = 2;
-    } else if (*p < 0x20) {
-      escaped[0] = '\\'; escaped[1] = 'u'; escaped[2] = '0'; escaped[3] = '0';
-      escaped[4] = hex[*p >> 4]; escaped[5] = hex[*p & 0x0f];
-      value = escaped;
-      len = 6;
-    } else {
-      escaped[0] = static_cast<char>(*p);
-      value = escaped;
-      len = 1;
-    }
-    if (used + len >= capacity) return false;
-    memcpy(output + used, value, len);
-    used += len;
-  }
-  output[used] = 0;
-  return true;
+  return MQTTObserverFormat::appendEscaped(input, output, capacity, used);
 }
 
 void* observerMbedtlsCalloc(size_t count, size_t size) {
@@ -166,7 +129,7 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
   _origin[sizeof(_origin) - 1] = 0;
   strncpy(_firmware, firmware && *firmware ? firmware : "unknown", sizeof(_firmware) - 1);
   _firmware[sizeof(_firmware) - 1] = 0;
-  bytesToHex(identity->pub_key, PUB_KEY_SIZE, _device_id);
+  mesh::Utils::toHex(_device_id, identity->pub_key, PUB_KEY_SIZE);
 
   char path[64];
   PersistLoadSource source = chooseConfigToLoad(fs, kConfigPath, validateRecord, this,
@@ -297,6 +260,28 @@ void MQTTObserver::stageRaw(float snr, float rssi, const uint8_t raw[], int len)
   _raw_stager.stage(raw, len > 0 ? static_cast<size_t>(len) : 0, snr, rssi);
 }
 
+bool MQTTObserver::stampEvent(Event& event) {
+  // A frame the feed cannot place on a timeline is not worth publishing, so a
+  // capture before the clock is valid is dropped and counted.
+  struct timeval now;
+  gettimeofday(&now, nullptr);
+  if (now.tv_sec < kMinimumValidTime) {
+    _publish_drops.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  event.timestamp = now.tv_sec;
+  event.timestamp_usec = now.tv_usec;
+  return true;
+}
+
+void MQTTObserver::enqueueEvent(const Event& event) {
+  portENTER_CRITICAL(&_queue_mux);
+  EventQueue::OfferResult result = _queue.offer(event);
+  portEXIT_CRITICAL(&_queue_mux);
+  if (result != EventQueue::QUEUED)
+    _queue_drops.fetch_add(1, std::memory_order_relaxed);
+}
+
 void MQTTObserver::capture(mesh::Packet* packet, float score) {
   if (!packet) return;
   _received.fetch_add(1, std::memory_order_relaxed);
@@ -310,28 +295,15 @@ void MQTTObserver::capture(mesh::Packet* packet, float score) {
   Event event{};
   bool has_raw = _raw_stager.consume(event.raw, sizeof(event.raw), event.raw_len,
                                      event.snr, event.rssi);
-  struct timeval now;
-  gettimeofday(&now, nullptr);
-  if (now.tv_sec < kMinimumValidTime) {
-    _publish_drops.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
+  if (!stampEvent(event)) return;
   event.packet = *packet;
   if (!has_raw) {
     event.raw_len = 0;
     event.snr = packet->getSNR();
     event.rssi = 0;
   }
-  event.timestamp = now.tv_sec;
-  event.timestamp_usec = now.tv_usec;
   event.score = score;
-
-  portENTER_CRITICAL(&_queue_mux);
-  MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::OfferResult result =
-      _queue.offer(event);
-  portEXIT_CRITICAL(&_queue_mux);
-  if (result != MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::QUEUED)
-    _queue_drops.fetch_add(1, std::memory_order_relaxed);
+  enqueueEvent(event);
 }
 
 void MQTTObserver::captureTx(mesh::Packet* packet) {
@@ -352,28 +324,15 @@ void MQTTObserver::captureTx(mesh::Packet* packet) {
     if (!self_advert) return;
   }
 
-  struct timeval now;
-  gettimeofday(&now, nullptr);
-  if (now.tv_sec < kMinimumValidTime) {
-    _publish_drops.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
   Event event{};
+  if (!stampEvent(event)) return;
   event.packet = *packet;
   event.raw_len = 0;   // no received frame applies to our own transmission
   event.snr = 0;
   event.rssi = 0;
   event.score = 0;
   event.is_tx = true;
-  event.timestamp = now.tv_sec;
-  event.timestamp_usec = now.tv_usec;
-
-  portENTER_CRITICAL(&_queue_mux);
-  MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::OfferResult result =
-      _queue.offer(event);
-  portEXIT_CRITICAL(&_queue_mux);
-  if (result != MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::QUEUED)
-    _queue_drops.fetch_add(1, std::memory_order_relaxed);
+  enqueueEvent(event);
 }
 
 void MQTTObserver::flushQueue() {
@@ -405,7 +364,7 @@ bool MQTTObserver::createJwt(size_t slot, const MQTTObserverBrokerConfig& config
   if (now < static_cast<time_t>(kMinimumValidTime)) return false;
 
   char public_key[2 * PUB_KEY_SIZE + 1];
-  bytesToHex(_identity->pub_key, PUB_KEY_SIZE, public_key);
+  mesh::Utils::toHex(public_key, _identity->pub_key, PUB_KEY_SIZE);
   snprintf(runtime.jwt_username, sizeof(runtime.jwt_username), "v1_%s", public_key);
   const char header_json[] = "{\"alg\":\"Ed25519\",\"typ\":\"JWT\"}";
   unsigned long issued_at = static_cast<unsigned long>(now);
@@ -441,7 +400,7 @@ bool MQTTObserver::createJwt(size_t slot, const MQTTObserverBrokerConfig& config
   uint8_t signature[64];
   _identity->sign(signature, reinterpret_cast<const uint8_t*>(_json), signing_len);
   char signature_hex[129];
-  bytesToHex(signature, sizeof(signature), signature_hex);
+  mesh::Utils::toHex(signature_hex, signature, sizeof(signature));
   size_t token_len = header_len + 1 + encoded_payload_len + 1 + sizeof(signature_hex) - 1;
   if (token_len >= sizeof(runtime.jwt_token)) {
     runtime.jwt_token[0] = 0;
@@ -725,7 +684,7 @@ void MQTTObserver::worker() {
 
     if (any_connected) {
       _queue_disconnected_since = 0;
-      typename MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>::Entry queued;
+      EventQueue::Entry queued;
       bool have_event = false;
       portENTER_CRITICAL(&_queue_mux);
       have_event = _queue.beginAttempt(millis(), queued);

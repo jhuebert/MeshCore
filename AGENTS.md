@@ -97,8 +97,7 @@ commit** — the guides are user-facing API documentation, not optional docs.
 **Code (`examples/mqtt_observer/`, compiled only under `WITH_MQTT_OBSERVER`):**
 - `MQTTObserver.h/.cpp` — the ESP32-only observer: Wi-Fi/NTP, up to two broker
   slots, Ed25519 JWT or user/pass auth, the receive/TX capture hooks, a bounded
-  RAM event queue, the heap-headroom connect gate, the retained offline last
-  will, and the `mqtt*`/`wifi*` CLI.
+  RAM event queue, the heap-headroom connect gate, and the `mqtt*`/`wifi*` CLI.
 - `MQTTObserverConfig.h` — the config model + `MQTTObserverConfigCodec`
   (`/mqtt_prefs` payload v5; `MQTT_OBSERVER_MAX_BROKERS`, queue capacity).
 - `MQTTObserverRecord.h` — the `/mqtt_prefs` record framing (magic `MQO1`,
@@ -116,7 +115,7 @@ content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
 PatternMatch), `test/test_fleet/` (112 cases: runner grammar, tag targeting,
 acknowledgements, scheduling, persistence, CLI surface, the battery
 exemption contract), `test/test_battery_gate/`, `test/test_mesh_clock/` (24
-behavior-level cases), and `test/test_mqtt_observer/` (31 cases: config codec +
+behavior-level cases), and `test/test_mqtt_observer/` (30 cases: config codec +
 record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
 connect heap gate, queue/retry policy, and the status/packet/raw JSON schema).
 Test-only shims:
