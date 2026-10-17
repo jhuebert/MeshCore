@@ -17,10 +17,6 @@
 #include <stdlib.h>
 #include <new>
 
-#ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "unknown"
-#endif
-
 namespace {
 
 const char kConfigPath[] = "/mqtt_prefs";
@@ -136,7 +132,7 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       state(STATE_OFF) {}
 
 MQTTObserver::MQTTObserver()
-    : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{},
+    : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _firmware{},
       _radio_freq(0), _radio_bw(0), _radio_sf(0), _radio_cr(0), _config{},
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
@@ -151,7 +147,7 @@ MQTTObserver::MQTTObserver()
 }
 
 void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const char* origin,
-                         float freq, float bw, uint8_t sf, uint8_t cr) {
+                         const char* firmware, float freq, float bw, uint8_t sf, uint8_t cr) {
   _fs = fs;
   _identity = identity;
   _origin_source = origin;
@@ -164,6 +160,8 @@ void MQTTObserver::begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const ch
   _radio_cr = cr;
   strncpy(_origin, origin ? origin : "", sizeof(_origin) - 1);
   _origin[sizeof(_origin) - 1] = 0;
+  strncpy(_firmware, firmware && *firmware ? firmware : "unknown", sizeof(_firmware) - 1);
+  _firmware[sizeof(_firmware) - 1] = 0;
   bytesToHex(identity->pub_key, PUB_KEY_SIZE, _device_id);
 
   char path[64];
@@ -413,7 +411,7 @@ bool MQTTObserver::createJwt(size_t slot, const MQTTObserverBrokerConfig& config
   owner[sizeof(owner) - 1] = 0;
   for (char* p = owner; *p; p++) if (*p >= 'a' && *p <= 'f') *p -= 'a' - 'A';
   char client_version[96], escaped_client[193], escaped_email[129];
-  if (!MQTTObserverFormat::buildClientVersion(FIRMWARE_VERSION, client_version,
+  if (!MQTTObserverFormat::buildClientVersion(_firmware, client_version,
                                               sizeof(client_version)) ||
       !jsonEscape(client_version, escaped_client, sizeof(escaped_client)) ||
       !jsonEscape(config.email, escaped_email, sizeof(escaped_email))) return false;
@@ -781,7 +779,7 @@ bool MQTTObserver::buildStatusMessage(bool online, char* out, size_t capacity, s
   if (!MQTTObserverFormat::formatTimestamp(now.tv_sec, now.tv_usec, timestamp,
                                            sizeof(timestamp))) return false;
   return MQTTObserverFormat::buildStatus(origin, _device_id, "MeshCore Repeater",
-                                         FIRMWARE_VERSION, radio, timestamp,
+                                         _firmware, radio, timestamp,
                                          out, capacity, written, online);
 }
 

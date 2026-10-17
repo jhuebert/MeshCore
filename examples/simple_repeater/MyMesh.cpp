@@ -1069,7 +1069,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // load persisted prefs
   _cli.loadPrefs(_fs);
 #ifdef WITH_MQTT_OBSERVER
-  mqttObserver.begin(_fs, &self_id, _prefs.node_name,
+  mqttObserver.begin(_fs, &self_id, _prefs.node_name, FIRMWARE_VERSION,
                      _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
 #endif
   acl.load(_fs, self_id);

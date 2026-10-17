@@ -68,6 +68,7 @@ class MQTTObserver {
   mesh::LocalIdentity* _identity;
   const char* _origin_source;
   char _origin[33];
+  char _firmware[64];
   float _radio_freq;
   float _radio_bw;
   uint8_t _radio_sf;
@@ -128,7 +129,7 @@ public:
   MQTTObserver();
 
   void begin(FILESYSTEM* fs, mesh::LocalIdentity* identity, const char* origin,
-             float freq, float bw, uint8_t sf, uint8_t cr);
+             const char* firmware, float freq, float bw, uint8_t sf, uint8_t cr);
   void loop();
   void setRadio(float freq, float bw, uint8_t sf, uint8_t cr);
   bool needsAwake() const;
