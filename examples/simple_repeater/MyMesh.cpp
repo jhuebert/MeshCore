@@ -523,6 +523,7 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
   mqttObserver.capture(pkt, score);
 #endif
   fleet.onHeardPacket(pkt);   // ack repeat confirmation (pre-dedup receive hook)
+
 #ifdef WITH_BRIDGE
   if (_prefs.bridge_pkt_src == 1) {
     bridge.sendPacket(pkt);
