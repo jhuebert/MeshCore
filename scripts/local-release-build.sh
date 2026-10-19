@@ -33,6 +33,8 @@
 #      included, so every release ships the full set).
 #   4. Builds them N at a time, mirroring build.sh's per-target logic (it cannot
 #      be called directly in parallel: it wipes out/ on every invocation).
+#      A target that fails on a transient registry/toolchain download is
+#      retried automatically; a compile or link error fails at once.
 #   5. Uploads each target's artifacts as soon as it finishes (a small capped
 #      pool of gh release upload --clobber runs beside the build pool).
 #
@@ -237,6 +239,7 @@ JOBS=4
 UPLOAD=1
 WARMUP=1
 DRY_RUN=0
+BUILD_ATTEMPTS=3   # total tries for a target whose failure looks transient
 TARGETS_INPUT=""
 FILTER_ARG=""
 BUILD_DIR_BASE="${MESH_RELEASE_BUILD_DIR:-$HOME/.cache/meshcore-release-build}"
@@ -398,20 +401,46 @@ for line in "${platform_lines[@]}"; do
   fi
 done
 
+# only retry failures that look like a download/network problem: a compiler or
+# linker error will not match, and must keep failing on the first attempt
+transient_build_error() {  # transient_build_error <log>
+  grep -qE \
+    -e 'HTTPClientError' \
+    -e 'GitClientError' \
+    -e 'Could not (install|download|resolve host)' \
+    -e '(Error|Failed) (downloading|to (install|download))' \
+    -e 'Connection (reset|timed out)' \
+    -e 'Read timed out' \
+    -e 'SSL certificate problem' \
+    -e 'unable to access' \
+    -e 'The remote end hung up' \
+    "$1"
+}
+
 run_one() {  # run_one <target> <platform> — build, record artifacts, queue upload
   local t=$1
   local log="$state_dir/logs/$t.log"
+  local attempt=1
   # WORKER_PLATFORM: the caller passes the platform from the map computed once
   # up front; re-deriving it per worker would mean 155 extra pio config runs
   # write to a temp file and rename: the done marker must never be visible
   # while the file list is still empty
-  if WORKER_PLATFORM=$2 run_tool __worker "$t" >"$state_dir/files/$t.tmp" 2>"$log"; then
-    mv "$state_dir/files/$t.tmp" "$state_dir/files/$t"
-    : >"$state_dir/done/$t"
-  else
-    : >"$state_dir/failed/$t"
-    info "FAILED: $t (log: $log)"
-  fi
+  while :; do
+    if WORKER_PLATFORM=$2 run_tool __worker "$t" >"$state_dir/files/$t.tmp" 2>"$log"; then
+      mv "$state_dir/files/$t.tmp" "$state_dir/files/$t"
+      : >"$state_dir/done/$t"
+      return
+    fi
+    if ((attempt >= BUILD_ATTEMPTS)) || ! transient_build_error "$log"; then
+      : >"$state_dir/failed/$t"
+      info "FAILED: $t (log: $log)"
+      return
+    fi
+    attempt=$((attempt + 1))
+    info "transient build error, retrying $t (attempt $attempt/$BUILD_ATTEMPTS)"
+    # jitter: workers that hit the same registry limit must not retry in lockstep
+    sleep $((attempt * 15 + RANDOM % 15))
+  done
 }
 
 upload_one() {  # upload_one <target> — runs in the release's build dir
