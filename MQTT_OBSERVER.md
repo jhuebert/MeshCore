@@ -380,6 +380,13 @@ outage without stalling the mesh:
   MQTT/lwIP buffers. A secure slot needs much more than a plaintext one. If the
   pool is too fragmented it waits and retries every 30 seconds — this keeps a
   TLS slot on a small board from crashing the node, and it is never a dead end.
+- **Liveness probes.** Every status message is QoS 1, so a status-enabled node
+  already proves its broker session each interval. With `mqtt.status off`, at
+  most one packets/raw publish per broker per interval is promoted to QoS 1
+  instead. If a probe is not acknowledged within 60 seconds while the slot
+  still reports connected, the broker is force-stopped and reconnected on the
+  normal backoff ladder. A promoted packet can be delivered twice, and a slot
+  with no traffic sends no probe.
 - **Patient reconnects.** A dropped broker is retried on a 10/30/60/120/300 s
   ladder, and then every 5 minutes **forever** — a broker that is unreachable
   during a long internet outage is picked up again when the link returns.
@@ -522,6 +529,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | Status interval | 1–60 minutes (default 5) |
 | JWT lifetime | 24 hours, renewed before expiry and before reconnect |
 | Packet/raw network timeout | 2.5 s |
+| Liveness probe | status message (or one packet/raw per interval when status is off); 60 s PUBACK timeout |
 | TLS heap gate | ~64 KB free and ~18 KB largest block in the TLS pool (PSRAM when present, otherwise internal), plus ~24 KB free and ~8 KB largest internal for a secure connect |
 | Config file | `/mqtt_prefs`, version 5, CRC-checked |
 

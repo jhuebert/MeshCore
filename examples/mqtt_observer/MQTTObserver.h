@@ -57,8 +57,17 @@ class MQTTObserver {
     std::atomic<bool> connected;
     std::atomic<bool> status_pending;
     std::atomic<State> state;
+    std::atomic<int> probe_msg_id;
+    std::atomic<uint32_t> probe_sent_ms;
+    uint32_t last_probe_ms;
 
     BrokerRuntime();
+
+    // One outstanding QoS 1 liveness probe per broker; a PUBACK for it clears
+    // the outstanding marker, and starting a new one only happens when none is
+    // in flight.
+    void noteProbe(int msg_id);
+    void notePuback(int msg_id);
   };
 
   static const uint32_t kMinimumValidTime = 1735689600UL;
@@ -117,6 +126,7 @@ class MQTTObserver {
   bool publishStatus(size_t slot, const MQTTObserverConfig& config);
   bool buildStatusMessage(char* out, size_t capacity, size_t& written);
   void disconnectBroker(size_t slot);
+  void deferReconnect(size_t slot, uint32_t now);
   void trackDisconnectedQueue(uint32_t now);
   void flushQueue();
   size_t queueSize();

@@ -246,6 +246,31 @@ TEST(MQTTObserverConnectionPolicy, RequiresHeadroomInThePoolThatServesTls) {
   EXPECT_FALSE(hasConnectHeadroom(false, false, 0, 0, 0, 0));
 }
 
+TEST(MQTTObserverConnectionPolicy, PromotesAtMostOnePacketProbePerInterval) {
+  using namespace MQTTObserverConnectionPolicy;
+  const uint32_t kIntervalMs = 5u * 60000u;
+  // Status is the probe while it is enabled: never promote packets.
+  EXPECT_FALSE(livenessProbeDue(true, 0, 1000, 0, kIntervalMs));
+  // One probe at a time; the next packet is QoS 0 while one is in flight.
+  EXPECT_FALSE(livenessProbeDue(false, 42, 1000, 0, kIntervalMs));
+  // A fresh connect probes on its first publish.
+  EXPECT_TRUE(livenessProbeDue(false, 0, 1000, 0, kIntervalMs));
+  // Afterwards the cadence is mqtt.interval, wrap-safe.
+  EXPECT_FALSE(livenessProbeDue(false, 0, kIntervalMs, 1000, kIntervalMs));
+  EXPECT_TRUE(livenessProbeDue(false, 0, kIntervalMs + 1000, 1000, kIntervalMs));
+  EXPECT_TRUE(livenessProbeDue(false, 0, 100, 200, kIntervalMs));
+}
+
+TEST(MQTTObserverConnectionPolicy, TimesOutAnUnacknowledgedPacketProbe) {
+  using namespace MQTTObserverConnectionPolicy;
+  const uint32_t kTimeoutMs = kLivenessProbeTimeoutMs;
+  EXPECT_FALSE(livenessProbeTimedOut(0, 1000, 1000));
+  EXPECT_FALSE(livenessProbeTimedOut(42, 1000, 0));
+  EXPECT_FALSE(livenessProbeTimedOut(42, 1000 + kTimeoutMs - 1, 1000));
+  EXPECT_TRUE(livenessProbeTimedOut(42, 1000 + kTimeoutMs, 1000));
+  EXPECT_TRUE(livenessProbeTimedOut(42, 100, 200));
+}
+
 TEST(MQTTObserverQueuePolicy, RestartsStaleWindowAfterFlushAndHandlesWrap) {
   uint32_t since = 0;
   EXPECT_FALSE(MQTTObserverQueuePolicy::trackDisconnected(100, false, since));

@@ -73,6 +73,30 @@ inline bool hasConnectHeadroom(bool secure, bool tls_in_psram,
          largest_internal >= kPlainLargestInternalBytes;
 }
 
+// Liveness probing. A QoS 1 publish proves the broker session is alive: the
+// status message is the probe while status is enabled, and with status off at
+// most one packets/raw publish per interval is promoted to QoS 1. An
+// unacknowledged probe means the session is dead even though the local flag
+// still reports connected, because keepalive timers are refreshed by outbound
+// writes on half-open sockets. The cadence follows mqtt.interval so there is
+// one setting for "how often we prove the connection".
+static const uint32_t kLivenessProbeTimeoutMs = 60000UL;
+
+inline bool livenessProbeDue(bool status_enabled, int outstanding_msg_id,
+                             uint32_t now, uint32_t last_probe_ms,
+                             uint32_t interval_ms) {
+  if (status_enabled || outstanding_msg_id != 0 || interval_ms == 0) return false;
+  // A slot that has never probed (fresh connect) probes on its first publish;
+  // afterwards it waits a full interval.
+  return last_probe_ms == 0 || now - last_probe_ms >= interval_ms;
+}
+
+inline bool livenessProbeTimedOut(int outstanding_msg_id, uint32_t now,
+                                  uint32_t probe_sent_ms) {
+  if (outstanding_msg_id == 0 || probe_sent_ms == 0) return false;
+  return now - probe_sent_ms >= kLivenessProbeTimeoutMs;
+}
+
 }  // namespace MQTTObserverConnectionPolicy
 
 namespace MQTTObserverQueuePolicy {

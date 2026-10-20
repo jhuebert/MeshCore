@@ -99,7 +99,24 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       next_connect_ms(0), attempt_started(0), connected_at(0), last_status_ms(0),
       status_retry_ms(0), backoff_index(0), status_retry_pending(false),
       client_started(false), configured(false), connected(false), status_pending(false),
-      state(STATE_OFF) {}
+      state(STATE_OFF), probe_msg_id(0), probe_sent_ms(0), last_probe_ms(0) {}
+
+void MQTTObserver::BrokerRuntime::noteProbe(int msg_id) {
+  if (msg_id <= 0) return;
+  int expected = 0;
+  if (!probe_msg_id.compare_exchange_strong(expected, msg_id, std::memory_order_relaxed))
+    return;
+  uint32_t now = millis();
+  probe_sent_ms.store(now, std::memory_order_relaxed);
+  last_probe_ms = now;
+}
+
+void MQTTObserver::BrokerRuntime::notePuback(int msg_id) {
+  if (msg_id <= 0) return;
+  int expected = msg_id;
+  if (probe_msg_id.compare_exchange_strong(expected, 0, std::memory_order_relaxed))
+    probe_sent_ms.store(0, std::memory_order_relaxed);
+}
 
 MQTTObserver::MQTTObserver()
     : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _model{},
@@ -465,6 +482,9 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
     runtime.client->onError([this, slot](esp_mqtt_error_codes_t) {
       _brokers[slot].state.store(STATE_ERROR, std::memory_order_relaxed);
     });
+    runtime.client->onPublish([this, slot](int msg_id) {
+      _brokers[slot].notePuback(msg_id);
+    });
   }
   if (!MQTTObserverConfigCodec::buildServerUri(broker, runtime.server_uri,
                                                  sizeof(runtime.server_uri)) ||
@@ -530,6 +550,19 @@ void MQTTObserver::disconnectBroker(size_t slot) {
   runtime.client_started = false;
   runtime.connected.store(false, std::memory_order_relaxed);
   runtime.status_pending.store(false, std::memory_order_relaxed);
+  runtime.probe_msg_id.store(0, std::memory_order_relaxed);
+  runtime.probe_sent_ms.store(0, std::memory_order_relaxed);
+  runtime.last_probe_ms = 0;
+}
+
+void MQTTObserver::deferReconnect(size_t slot, uint32_t now) {
+  if (slot >= MQTT_OBSERVER_MAX_BROKERS) return;
+  BrokerRuntime& runtime = _brokers[slot];
+  disconnectBroker(slot);
+  uint8_t index = runtime.backoff_index < 5 ? runtime.backoff_index : 4;
+  runtime.next_connect_ms = now + kBackoffMs[index];
+  if (runtime.backoff_index < 4) runtime.backoff_index++;
+  runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
 }
 
 void MQTTObserver::worker() {
@@ -664,6 +697,15 @@ void MQTTObserver::worker() {
         if (static_cast<uint32_t>(now - runtime.connected_at.load(std::memory_order_relaxed)) >= 120000)
           runtime.backoff_index = 0;
 
+        if (MQTTObserverConnectionPolicy::livenessProbeTimedOut(
+                runtime.probe_msg_id.load(std::memory_order_relaxed), now,
+                runtime.probe_sent_ms.load(std::memory_order_relaxed))) {
+          // An unacknowledged QoS 1 probe is the one failure the local connected
+          // flag cannot see; reuse the reconnect ladder instead of looping.
+          deferReconnect(i, now);
+          continue;
+        }
+
         bool status_due = runtime.status_pending.exchange(false, std::memory_order_relaxed) ||
             runtime.status_retry_pending || !runtime.last_status_ms ||
             static_cast<uint32_t>(now - runtime.last_status_ms) >=
@@ -687,11 +729,7 @@ void MQTTObserver::worker() {
       runtime.connected.store(false, std::memory_order_relaxed);
       if (runtime.client_started &&
           static_cast<uint32_t>(now - runtime.attempt_started) >= 30000) {
-        disconnectBroker(i);
-        uint8_t index = runtime.backoff_index < 5 ? runtime.backoff_index : 4;
-        runtime.next_connect_ms = now + kBackoffMs[index];
-        if (runtime.backoff_index < 4) runtime.backoff_index++;
-        runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
+        deferReconnect(i, now);
       }
       if (!runtime.client_started && static_cast<int32_t>(now - runtime.next_connect_ms) >= 0) {
         if (hasConnectHeadroom(secureUri(runtime.server_uri))) {
@@ -782,7 +820,9 @@ bool MQTTObserver::publishStatus(size_t slot, const MQTTObserverConfig& config) 
                                            topic, sizeof(topic))) return false;
   size_t written = 0;
   if (!buildStatusMessage(_json, sizeof(_json), written)) return false;
-  return runtime.client->publish(topic, 1, false, _json, written, true) >= 0;
+  int msg_id = runtime.client->publish(topic, 1, false, _json, written, true);
+  if (msg_id >= 0) runtime.noteProbe(msg_id);
+  return msg_id >= 0;
 }
 
 bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& config) {
@@ -791,11 +831,20 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
   portENTER_CRITICAL(&_config_mux);
   memcpy(origin, _origin, sizeof(origin));
   portEXIT_CRITICAL(&_config_mux);
+  uint32_t now = millis();
 
   for (size_t slot = 0; slot < MQTT_OBSERVER_MAX_BROKERS; slot++) {
     BrokerRuntime& runtime = _brokers[slot];
     const MQTTObserverBrokerConfig& broker = config.brokers[slot];
     if (!broker.enabled || !runtime.client || !runtime.client->connected()) continue;
+    // With status off, a packet (else raw) publish doubles as the liveness
+    // probe; at most one QoS 1 message per broker is in flight at a time.
+    bool probe_due = MQTTObserverConnectionPolicy::livenessProbeDue(
+        config.status_enabled != 0, runtime.probe_msg_id.load(std::memory_order_relaxed),
+        now, runtime.last_probe_ms,
+        static_cast<uint32_t>(config.status_interval_minutes) * 60000UL);
+    int packet_qos = probe_due ? 1 : 0;
+    int raw_qos = probe_due && !config.packets_enabled ? 1 : 0;
     char topic[128];
     size_t written = 0;
     if (config.packets_enabled) {
@@ -829,7 +878,10 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
       if (MQTTObserverConfigCodec::buildTopic(config, broker, _device_id,
                                               "packets", topic, sizeof(topic)) &&
           MQTTObserverFormat::buildPacket(view, _json, sizeof(_json), written)) {
-        if (runtime.client->publish(topic, 0, false, _json, written, false) >= 0) {
+        int msg_id = runtime.client->publish(topic, packet_qos, false, _json,
+                                             written, false);
+        if (msg_id >= 0) {
+          if (packet_qos) runtime.noteProbe(msg_id);
           _published.fetch_add(1, std::memory_order_relaxed);
           any_published = true;
         } else {
@@ -848,7 +900,10 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
                                               "raw", topic, sizeof(topic)) &&
           MQTTObserverFormat::buildRaw(origin, _device_id, timestamp,
                                        event.raw, event.raw_len, _json, sizeof(_json), written)) {
-        if (runtime.client->publish(topic, 0, false, _json, written, false) >= 0) {
+        int msg_id = runtime.client->publish(topic, raw_qos, false, _json,
+                                             written, false);
+        if (msg_id >= 0) {
+          if (raw_qos) runtime.noteProbe(msg_id);
           _published.fetch_add(1, std::memory_order_relaxed);
           any_published = true;
         } else {
