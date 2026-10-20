@@ -375,10 +375,11 @@ outage without stalling the mesh:
 - **Bounded retries.** A failed publish is retried up to three times, 300–499 ms
   apart; if a broker stays disconnected for a full minute, the queue is flushed.
 - **Heap-aware connects.** Before opening a broker connection the observer
-  checks internal-heap headroom (a secure slot needs much more than a plaintext
-  one). If the heap is too fragmented it waits and retries every 30 seconds —
-  this is what keeps a second TLS slot on a small board from crashing the node,
-  and it is never a dead end.
+  checks headroom in the pool that will serve the TLS buffers — PSRAM when the
+  board has it, internal RAM otherwise — plus a small internal-RAM floor for the
+  MQTT/lwIP buffers. A secure slot needs much more than a plaintext one. If the
+  pool is too fragmented it waits and retries every 30 seconds — this keeps a
+  TLS slot on a small board from crashing the node, and it is never a dead end.
 - **Patient reconnects.** A dropped broker is retried on a 10/30/60/120/300 s
   ladder, and then every 5 minutes **forever** — a broker that is unreachable
   during a long internet outage is picked up again when the link returns.
@@ -521,7 +522,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | Status interval | 1–60 minutes (default 5) |
 | JWT lifetime | 24 hours, renewed before expiry and before reconnect |
 | Packet/raw network timeout | 2.5 s |
-| TLS heap gate | ~64 KB free and ~18 KB largest internal block per secure connect |
+| TLS heap gate | ~64 KB free and ~18 KB largest block in the TLS pool (PSRAM when present, otherwise internal), plus ~24 KB free and ~8 KB largest internal for a secure connect |
 | Config file | `/mqtt_prefs`, version 5, CRC-checked |
 
 - **ESP32 only.** nRF52, STM32, and RP2040 boards have no observer build.

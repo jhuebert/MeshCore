@@ -189,9 +189,22 @@ bool MQTTObserver::ready(const MQTTObserverConfig& config, size_t slot) const {
 }
 
 bool MQTTObserver::hasConnectHeadroom(bool secure) const {
+  bool tls_in_psram = false;
+  size_t free_psram = 0;
+  size_t largest_psram = 0;
+#if defined(BOARD_HAS_PSRAM)
+  // begin() installs the mbedTLS PSRAM hooks only when psramFound() is true,
+  // so that is also when the secure-pool numbers apply to PSRAM.
+  tls_in_psram = psramFound();
+  if (tls_in_psram) {
+    free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    largest_psram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  }
+#endif
   return MQTTObserverConnectionPolicy::hasConnectHeadroom(
-      secure, heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      secure, tls_in_psram, heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      free_psram, largest_psram);
 }
 
 bool MQTTObserver::readRecord(File& file, MQTTObserverConfig& config) {

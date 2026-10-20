@@ -47,21 +47,30 @@ inline bool jwtNeedsRenewal(int64_t epoch, uint32_t expiry) {
   return expiry != 0 && epoch + 300 >= expiry;
 }
 
-// A TLS client needs a contiguous mbedTLS allocation on the internal heap;
-// starting one without headroom aborts a non-PSRAM device, so connect() waits
-// for the heap to recover instead of crashing. The secure thresholds follow
-// the reference observers (roughly 60 KB free and one ~17 KB TLS record);
-// plaintext brokers need far less. Keeping the decision pure lets the host
-// suite cover it.
-static const size_t kSecureFreeInternalBytes = 64u * 1024u;
-static const size_t kSecureLargestInternalBytes = 18u * 1024u;
+// A TLS client needs a contiguous mbedTLS allocation; starting one without
+// headroom aborts a non-PSRAM device, so connect() waits for the heap to
+// recover instead of crashing. Without PSRAM those buffers come from internal
+// RAM. With PSRAM the observer redirects mbedTLS there, so the secure
+// thresholds apply to the PSRAM pool and internal RAM only needs the plaintext
+// floor for the MQTT/lwIP buffers. The secure thresholds follow the reference
+// observers (roughly 60 KB free and one ~17 KB TLS record). Keeping the
+// decision pure lets the host suite cover it.
+static const size_t kSecureFreeBytes = 64u * 1024u;
+static const size_t kSecureLargestBytes = 18u * 1024u;
 static const size_t kPlainFreeInternalBytes = 24u * 1024u;
 static const size_t kPlainLargestInternalBytes = 8u * 1024u;
 
-inline bool hasConnectHeadroom(bool secure, size_t free_internal, size_t largest_internal) {
-  const size_t free_needed = secure ? kSecureFreeInternalBytes : kPlainFreeInternalBytes;
-  const size_t block_needed = secure ? kSecureLargestInternalBytes : kPlainLargestInternalBytes;
-  return free_internal >= free_needed && largest_internal >= block_needed;
+inline bool hasConnectHeadroom(bool secure, bool tls_in_psram,
+                               size_t free_internal, size_t largest_internal,
+                               size_t free_psram, size_t largest_psram) {
+  if (!secure)
+    return free_internal >= kPlainFreeInternalBytes &&
+           largest_internal >= kPlainLargestInternalBytes;
+  if (!tls_in_psram)
+    return free_internal >= kSecureFreeBytes && largest_internal >= kSecureLargestBytes;
+  return free_psram >= kSecureFreeBytes && largest_psram >= kSecureLargestBytes &&
+         free_internal >= kPlainFreeInternalBytes &&
+         largest_internal >= kPlainLargestInternalBytes;
 }
 
 }  // namespace MQTTObserverConnectionPolicy

@@ -217,21 +217,33 @@ TEST(MQTTObserverConnectionPolicy, RenewsBeforeReconnectAsWellAsWhileConnected) 
   EXPECT_TRUE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(2000, 1300));
 }
 
-TEST(MQTTObserverConnectionPolicy, RequiresInternalHeapHeadroomToConnect) {
+TEST(MQTTObserverConnectionPolicy, RequiresHeadroomInThePoolThatServesTls) {
   using namespace MQTTObserverConnectionPolicy;
-  // Exactly at both secure thresholds is allowed.
-  EXPECT_TRUE(hasConnectHeadroom(true, kSecureFreeInternalBytes, kSecureLargestInternalBytes));
-  // One byte short of either secure threshold defers the connect.
-  EXPECT_FALSE(hasConnectHeadroom(true, kSecureFreeInternalBytes - 1, kSecureLargestInternalBytes));
-  EXPECT_FALSE(hasConnectHeadroom(true, kSecureFreeInternalBytes, kSecureLargestInternalBytes - 1));
-  // Plaintext brokers need less: the secure floor clears the plain thresholds.
-  EXPECT_TRUE(hasConnectHeadroom(false, kSecureFreeInternalBytes, kSecureLargestInternalBytes));
-  EXPECT_TRUE(hasConnectHeadroom(false, kPlainFreeInternalBytes, kPlainLargestInternalBytes));
-  EXPECT_FALSE(hasConnectHeadroom(false, kPlainFreeInternalBytes - 1, kPlainLargestInternalBytes));
-  EXPECT_FALSE(hasConnectHeadroom(false, kPlainFreeInternalBytes, kPlainLargestInternalBytes - 1));
+  // Without PSRAM the secure thresholds apply to the internal heap.
+  EXPECT_TRUE(hasConnectHeadroom(true, false, kSecureFreeBytes, kSecureLargestBytes, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(true, false, kSecureFreeBytes - 1, kSecureLargestBytes, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(true, false, kSecureFreeBytes, kSecureLargestBytes - 1, 0, 0));
+  // With PSRAM they apply to PSRAM; internal only needs the plaintext floor.
+  EXPECT_TRUE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes,
+                                 kSecureFreeBytes, kSecureLargestBytes));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes - 1, kPlainLargestInternalBytes,
+                                  kSecureFreeBytes, kSecureLargestBytes));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes - 1,
+                                  kSecureFreeBytes, kSecureLargestBytes));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes,
+                                  kSecureFreeBytes - 1, kSecureLargestBytes));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes,
+                                  kSecureFreeBytes, kSecureLargestBytes - 1));
+  // Plaintext brokers always use the internal heap, even on a PSRAM board.
+  EXPECT_TRUE(hasConnectHeadroom(false, false, kSecureFreeBytes, kSecureLargestBytes, 0, 0));
+  EXPECT_TRUE(hasConnectHeadroom(false, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(false, true, kPlainFreeInternalBytes - 1, kPlainLargestInternalBytes, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(false, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes - 1, 0, 0));
   // An empty heap never admits a client.
-  EXPECT_FALSE(hasConnectHeadroom(true, 0, 0));
-  EXPECT_FALSE(hasConnectHeadroom(false, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(true, false, 0, 0, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, 0, 0, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(true, true, kPlainFreeInternalBytes, kPlainLargestInternalBytes, 0, 0));
+  EXPECT_FALSE(hasConnectHeadroom(false, false, 0, 0, 0, 0));
 }
 
 TEST(MQTTObserverQueuePolicy, RestartsStaleWindowAfterFlushAndHandlesWrap) {
