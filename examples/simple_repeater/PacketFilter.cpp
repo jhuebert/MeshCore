@@ -204,11 +204,9 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
     candidate.secret_len = 16;
   } else {
     // exactly 16 or 32 bytes of hex; anything else is refused before decoding
-    size_t hex_len = strlen(psk_hex);
-    if (hex_len != 32 && hex_len != 64) return NULL;
-    int len = cliDecodeHex(psk_hex, hex_len, candidate.secret, sizeof(candidate.secret));
-    if (len != 16 && len != 32) return NULL;
-    candidate.secret_len = len;
+    int len = 0;
+    if (!cliDecodePskHex(psk_hex, candidate.secret, sizeof(candidate.secret), &len)) return NULL;
+    candidate.secret_len = (uint8_t)len;
   }
 
   mesh::Utils::sha256(&candidate.hash, sizeof(candidate.hash), candidate.secret, candidate.secret_len);
@@ -1088,27 +1086,44 @@ static bool setPattern(char* dest, size_t dest_sz, const char* pattern, const ch
 static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
                          const char* key, const char* val, char* reply) {
   if (strcmp(key, "chan") == 0) {
-    char names[80];
-    if (!cliCopyCommand(names, sizeof(names), val)) { strcpy(reply, "Err - chan list too long"); return false; }
+    // The name list is walked in place: the value is a token in the CLI's own
+    // scratch buffer, so the names are split without copying the whole list
+    // into a second buffer. That also drops the list's own length cap — the
+    // command's length is the only limit, and a rule can name every channel
+    // the store holds.
+    const char* np = val;
     uint32_t mask = 0;
-    char* np = names;
-    char* nm;
-    while ((nm = strsep(&np, ",")) != NULL) {
-      if (nm[0] == 0 || (nm[0] == '#' && nm[1] == 0)) { strcpy(reply, "Err - empty chan name"); return false; }
-      int idx = filter.indexOfChannel(nm);
-      if (idx < 0 && nm[0] == '#') {
-        filter.addChannel(nm, NULL);   // auto-provision '#' names with derived PSK
+    while (true) {
+      const char* comma = strchr(np, ',');
+      size_t n = comma ? (size_t)(comma - np) : strlen(np);
+      if (n == 0 || (n == 1 && np[0] == '#')) {
+        strcpy(reply, "Err - empty chan name");
+        return false;
+      }
+      // a stored name is at most FILTER_CHAN_NAME_LEN-1 chars, so a longer one
+      // cannot be in the store
+      char nm[FILTER_CHAN_NAME_LEN + 1];
+      int idx = -1;
+      if (n < FILTER_CHAN_NAME_LEN) {
+        memcpy(nm, np, n);
+        nm[n] = 0;
         idx = filter.indexOfChannel(nm);
+        if (idx < 0 && nm[0] == '#') {
+          filter.addChannel(nm, NULL);   // auto-provision '#' names with derived PSK
+          idx = filter.indexOfChannel(nm);
+        }
       }
       if (idx < 0) {
-        if (nm[0] == '#' && filter.getNumChannels() >= FILTER_MAX_CHANNELS) {
+        if (np[0] == '#' && filter.getNumChannels() >= FILTER_MAX_CHANNELS) {
           strcpy(reply, "Err - chan store full");
         } else {
-          snprintf(reply, CLI_REPLY_MAX, "Err - unknown chan '%s'", nm);
+          snprintf(reply, CLI_REPLY_MAX, "Err - unknown chan '%.*s'", (int)n, np);
         }
         return false;
       }
       mask |= (1u << idx);
+      if (comma == NULL) break;
+      np = comma + 1;
     }
     // a repeated chan= replaces the earlier list rather than accumulating it;
     // chanhash= is a separate predicate and its flag is left alone
@@ -1247,14 +1262,13 @@ static bool addRuleParam(FilterRules& filter, FilterRule* r, RegionMap* regions,
 // ---------------------------------------------------------------- CLI commands
 
 static void cliStatus(FilterRules& filter, char* reply) {
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  radd(&out, &remain, "%s; rules %d/%d; chans %d/%d; ratelimit advert %uh; cache %d/%d",
-       filter.isEnabled() ? "on" : "off", filter.getNumRules(), FILTER_MAX_RULES,
-       filter.getNumChannels(), FILTER_MAX_CHANNELS, filter.getAdvertRatelimit(),
-       filter.getAdvertRatelimit() ? filter.getAdvertCacheCount() : 0, FILTER_ADVERT_CACHE_SIZE);
-  radd(&out, &remain, "; limiter %lu; aborted %lu", (unsigned long)filter.getLimiterDrops(),
-       (unsigned long)filter.getBudgetAborts());
+  CliBuf buf(reply, CLI_REPLY_MAX);
+  buf.add("%s; rules %d/%d; chans %d/%d; ratelimit advert %uh; cache %d/%d",
+          filter.isEnabled() ? "on" : "off", filter.getNumRules(), FILTER_MAX_RULES,
+          filter.getNumChannels(), FILTER_MAX_CHANNELS, filter.getAdvertRatelimit(),
+          filter.getAdvertRatelimit() ? filter.getAdvertCacheCount() : 0, FILTER_ADVERT_CACHE_SIZE);
+  buf.add("; limiter %lu; aborted %lu", (unsigned long)filter.getLimiterDrops(),
+          (unsigned long)filter.getBudgetAborts());
 }
 
 // List channels from `start`. A full store does not fit the 160-byte reply, and
@@ -1276,29 +1290,27 @@ static void cliChanList(FilterRules& filter, int start, char* reply) {
 
   char entry[FILTER_CHAN_NAME_LEN + 16];   // "<idx>:<name>:<2 hex>", plus a leading space
   // pass 1: exactly the old listing, so a store that fits is unchanged
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
+  CliBuf buf(reply, CLI_REPLY_MAX);
   int i = start;
   bool complete = true;
   for (; i < n; i++) {
     auto ch = filter.getChannel(i);
     snprintf(entry, sizeof(entry), "%s%d:%s:%02X", (i > start) ? " " : "", i, ch->name, ch->hash);
-    if ((int)strlen(entry) >= remain) { complete = false; break; }
-    radd(&out, &remain, "%s", entry);
+    if ((int)strlen(entry) >= buf.remain()) { complete = false; break; }
+    buf.addStr(entry);
   }
   if (complete) return;
 
   // pass 2: re-list with room held back for the continuation marker
-  out = reply;
-  remain = CLI_REPLY_MAX;   // includes room held back for "; next=NN" + NUL
+  CliBuf page(reply, CLI_REPLY_MAX);   // includes room held back for "; next=NN" + NUL
   i = start;
   for (; i < n; i++) {
     auto ch = filter.getChannel(i);
     snprintf(entry, sizeof(entry), "%s%d:%s:%02X", (i > start) ? " " : "", i, ch->name, ch->hash);
-    if ((int)(strlen(entry) + 10) >= remain) break;   // keep room for the marker
-    radd(&out, &remain, "%s", entry);
+    if ((int)(strlen(entry) + 10) >= page.remain()) break;   // keep room for the marker
+    page.addStr(entry);
   }
-  radd(&out, &remain, "; next=%d", i);   // resume here
+  page.add("; next=%d", i);   // resume here
 }
 
 static void cliChanAdd(FilterRules& filter, char* params, char* reply) {
@@ -1401,90 +1413,112 @@ static void cliAdd(FilterRules& filter, RegionMap* regions, char* params, char* 
 #define FILTER_PRED_FIELD_MAX (FILTER_MAX_CHANNELS * FILTER_CHAN_NAME_LEN + 16)
 
 // Append an already-rendered predicate field only when it fits with its NUL;
-// returns false (leaving the buffer untouched) when it does not.
-static bool raddField(char** out, int* remain, const char* field) {
+// returns false (leaving the builder untouched) when it does not.
+static bool addField(CliBuf& buf, const char* field) {
   int n = (int)strlen(field);
-  if (n + 1 > *remain) return false;
-  memcpy(*out, field, (size_t)n + 1);
-  *out += n;
-  *remain -= n;
+  if (n + 1 > buf.remain()) return false;
+  buf.addStr(field);
   return true;
 }
 
 // Close a rule body cut at a field boundary: two dots, deliberately distinct
 // from the three-dot end-of-page marker. Returns false for the caller to relay.
-static bool abbreviateRuleBody(char** out, int* remain) {
-  radd(out, remain, "..");
+static bool abbreviateRuleBody(CliBuf& buf) {
+  buf.addStr("..");
   return false;
 }
 
+// Append a formatted piece to a field buffer that is being built up: the
+// snprintf return value is the length it *would* have written, so a truncated
+// write must be caught here — the caller would otherwise compute a negative
+// room and write past the buffer.
+static bool appendField(char* field, size_t cap, int* used, const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(field + *used, cap - (size_t)*used, fmt, ap);
+  va_end(ap);
+  if (n < 0 || (size_t)(*used + n) >= cap) return false;
+  *used += n;
+  return true;
+}
+
 // "[disabled ]<drop|forward> <predicates>" — one rule in `filter add` syntax,
-// the readable form shared by `filter get` and `filter list`. Writes a
-// NUL-terminated body into `dest` (bounded by `sz`, NUL included) and returns
-// true when the whole body fit. Otherwise it stops at the first predicate field
-// that would not fit, appends ".." at that field boundary, and returns false.
-static bool formatRuleBody(FilterRules& filter, const FilterRule* r, char* dest, size_t sz) {
-  char* out = dest;
-  int remain = (int)sz;
+// the readable form shared by `filter get` and `filter list`. Appends to the
+// builder and returns true when the whole body fit. Otherwise it stops at the
+// first predicate field that would not fit, appends ".." at that field
+// boundary, and returns false.
+static bool formatRuleBody(FilterRules& filter, const FilterRule* r, CliBuf& buf) {
   // State and action first: enabled is the default and stays silent, and an
   // abbreviated line must still say what the rule does.
-  radd(&out, &remain, "%s%s", r->enabled ? "" : "disabled ",
-       r->action == FILTER_ACT_DROP ? "drop" : "forward");
+  buf.add("%s%s", r->enabled ? "" : "disabled ",
+          r->action == FILTER_ACT_DROP ? "drop" : "forward");
 
   char field[FILTER_PRED_FIELD_MAX];
 
   const uint16_t type_all = ruleTypeMask(r);
   if (type_all) {
-    int n = snprintf(field, sizeof(field), " type=");
+    int n = 0;
+    if (!appendField(field, sizeof(field), &n, " type=")) return abbreviateRuleBody(buf);
     const char* sep = "";
     for (unsigned i = 0; i < FILTER_TYPE_NAME_COUNT; i++) {
       if (type_all & (1 << FILTER_TYPE_NAMES[i].type)) {
-        n += snprintf(field + n, sizeof(field) - (size_t)n, "%s%s", sep, FILTER_TYPE_NAMES[i].name);
+        if (!appendField(field, sizeof(field), &n, "%s%s", sep, FILTER_TYPE_NAMES[i].name)) {
+          return abbreviateRuleBody(buf);
+        }
         sep = ",";
       }
     }
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->route_mask) {
     snprintf(field, sizeof(field), " route=%s", (r->route_mask & FILTER_ROUTE_FLOOD) ? "flood" : "direct");
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   char ivs[24];
   if (r->hops.flags) {
     formatInterval(r->hops, ivs, sizeof(ivs), IV_UNSIGNED);
     snprintf(field, sizeof(field), " hops=%s", ivs);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->len.flags) {
     formatInterval(r->len, ivs, sizeof(ivs), IV_UNSIGNED);
     snprintf(field, sizeof(field), " len=%s", ivs);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->snr.flags) {
     formatInterval(r->snr, ivs, sizeof(ivs), IV_SNR_DB);
     snprintf(field, sizeof(field), " snr=%s", ivs);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->path.count) {
-    int n = snprintf(field, sizeof(field), " path=%s", (r->path.pos & FILTER_PATH_FIRST) ? "^" : "");
-    for (int e = 0; e < r->path.count; e++) {
-      n += snprintf(field + n, sizeof(field) - (size_t)n, "%s", e ? ">" : "");
-      for (int b = 0; b < r->path.len[e]; b++)
-        n += snprintf(field + n, sizeof(field) - (size_t)n, "%02X", r->path.bytes[e][b]);
+    int n = 0;
+    if (!appendField(field, sizeof(field), &n, " path=%s", (r->path.pos & FILTER_PATH_FIRST) ? "^" : "")) {
+      return abbreviateRuleBody(buf);
     }
-    n += snprintf(field + n, sizeof(field) - (size_t)n, "%s", (r->path.pos & FILTER_PATH_LAST) ? "$" : "");
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    for (int e = 0; e < r->path.count; e++) {
+      if (!appendField(field, sizeof(field), &n, "%s", e ? ">" : "")) return abbreviateRuleBody(buf);
+      for (int b = 0; b < r->path.len[e]; b++) {
+        if (!appendField(field, sizeof(field), &n, "%02X", r->path.bytes[e][b])) {
+          return abbreviateRuleBody(buf);
+        }
+      }
+    }
+    if (!appendField(field, sizeof(field), &n, "%s", (r->path.pos & FILTER_PATH_LAST) ? "$" : "")) {
+      return abbreviateRuleBody(buf);
+    }
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->hash_size_mask) {
-    int n = snprintf(field, sizeof(field), " hsize=");
+    int n = 0;
+    if (!appendField(field, sizeof(field), &n, " hsize=")) return abbreviateRuleBody(buf);
     const char* sep = "";
     for (int s = 1; s <= 4; s++) {
       if (r->hash_size_mask & (1 << (s - 1))) {
-        n += snprintf(field + n, sizeof(field) - (size_t)n, "%s%d", sep, s);
+        if (!appendField(field, sizeof(field), &n, "%s%d", sep, s)) return abbreviateRuleBody(buf);
         sep = ",";
       }
     }
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->chan_flags & FILTER_CHANFLG_MASK_SET) {
     // quote the whole value when a referenced name contains a space: nextToken
@@ -1494,53 +1528,56 @@ static bool formatRuleBody(FilterRules& filter, const FilterRule* r, char* dest,
     for (int c = 0; c < filter.getNumChannels(); c++) {
       if ((r->chan_mask & (1u << c)) && strchr(filter.getChannel(c)->name, ' ')) quote = true;
     }
-    int n = snprintf(field, sizeof(field), " chan=%s", quote ? "\"" : "");
+    int n = 0;
+    if (!appendField(field, sizeof(field), &n, " chan=%s", quote ? "\"" : "")) {
+      return abbreviateRuleBody(buf);
+    }
     const char* sep = "";
     for (int c = 0; c < filter.getNumChannels(); c++) {
       if (r->chan_mask & (1u << c)) {
-        n += snprintf(field + n, sizeof(field) - (size_t)n, "%s%s", sep, filter.getChannel(c)->name);
+        if (!appendField(field, sizeof(field), &n, "%s%s", sep, filter.getChannel(c)->name)) {
+          return abbreviateRuleBody(buf);
+        }
         sep = ",";
       }
     }
-    n += snprintf(field + n, sizeof(field) - (size_t)n, "%s", quote ? "\"" : "");
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!appendField(field, sizeof(field), &n, "%s", quote ? "\"" : "")) return abbreviateRuleBody(buf);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->chan_flags & FILTER_CHANFLG_HASH_SET) {
     snprintf(field, sizeof(field), " chanhash=%02X", r->chan_hash);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->regions[0]) {
     snprintf(field, sizeof(field), " region=%s", r->regions);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->sender[0]) {
     if (strchr(r->sender, ' ')) snprintf(field, sizeof(field), " sender=\"%s\"", r->sender);
     else snprintf(field, sizeof(field), " sender=%s", r->sender);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->text[0]) {
     if (strchr(r->text, ' ')) snprintf(field, sizeof(field), " text=\"%s\"", r->text);
     else snprintf(field, sizeof(field), " text=%s", r->text);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->prob) {
     snprintf(field, sizeof(field), " prob=%u", r->prob);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   if (r->throttle) {
     snprintf(field, sizeof(field), " throttle=%u", r->throttle);
-    if (!raddField(&out, &remain, field)) return abbreviateRuleBody(&out, &remain);
+    if (!addField(buf, field)) return abbreviateRuleBody(buf);
   }
   return true;
 }
 
 // The per-rule counter tail (`filter get` only), appended after the body.
-static void formatRuleStats(const FilterRule* r, char* dest, size_t sz) {
-  char* out = dest;
-  int remain = (int)sz;
-  radd(&out, &remain, "hits=%lu", (unsigned long)r->hits);
-  if (r->throttle) radd(&out, &remain, " pass=%lu", (unsigned long)r->throttle_pass);
-  radd(&out, &remain, " air=%lus", (unsigned long)(r->air_ms / 1000));
+static void formatRuleStats(const FilterRule* r, CliBuf& buf) {
+  buf.add("hits=%lu", (unsigned long)r->hits);
+  if (r->throttle) buf.add(" pass=%lu", (unsigned long)r->throttle_pass);
+  buf.add(" air=%lus", (unsigned long)(r->air_ms / 1000));
 }
 
 // One `filter list` line: "<idx>: " + the rule body, bounded so the whole line
@@ -1548,7 +1585,8 @@ static void formatRuleStats(const FilterRule* r, char* dest, size_t sz) {
 // the body was cut at a field boundary with "..").
 static bool formatListEntry(FilterRules& filter, int idx, char* entry, size_t entry_sz) {
   int pfx = snprintf(entry, entry_sz, "%d: ", idx);
-  return formatRuleBody(filter, filter.getRule(idx), entry + pfx, entry_sz - (size_t)pfx);
+  CliBuf buf(entry + pfx, entry_sz - (size_t)pfx);
+  return formatRuleBody(filter, filter.getRule(idx), buf);
 }
 
 // List rules from `start`, one "<idx>: <body>" line each. A page that runs out
@@ -1564,48 +1602,42 @@ static void cliList(FilterRules& filter, int start, char* reply) {
   }
 
   char entry[CLI_REPLY_MAX];
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
+  CliBuf buf(reply, CLI_REPLY_MAX);
   int i = start;
   for (; i < n; i++) {
     int sep = (i > start) ? 1 : 0;
     // every entry must leave the marker line's room intact, so a cut-off page
     // can always name where to resume
-    int cap = remain - sep - FILTER_LIST_MARKER;   // chars this entry may use
+    int cap = buf.remain() - sep - FILTER_LIST_MARKER;   // chars this entry may use
     if (cap < 8) break;                            // not enough left for a line: cut here
     bool whole = formatListEntry(filter, i, entry, (size_t)cap + 1);   // cap chars + NUL
     if (!whole && i != start) break;   // needs a full line, and the page is not empty
-    radd(&out, &remain, "%s%s", sep ? "\n" : "", entry);
+    buf.add("%s%s", sep ? "\n" : "", entry);
     if (!whole) { i++; break; }   // an oversized first rule: show the ".." cut, then stop
   }
-  if (i < n) radd(&out, &remain, "\n...");
+  if (i < n) buf.add("\n...");
 }
 
 static void cliGet(FilterRules& filter, int idx, char* reply) {
   if (idx < 0 || idx >= filter.getNumRules()) { strcpy(reply, "Err - no such rule"); return; }
   auto r = filter.getRule(idx);
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  formatRuleBody(filter, r, out, (size_t)remain);
-  int n = (int)strlen(out);
-  out += n;
-  remain -= n;
-  if (remain > 0) {
-    radd(&out, &remain, " ");
-    formatRuleStats(r, out, (size_t)remain);
+  CliBuf buf(reply, CLI_REPLY_MAX);
+  formatRuleBody(filter, r, buf);
+  if (buf.remain() > 0) {
+    buf.addStr(" ");
+    formatRuleStats(r, buf);
   }
 }
 
 static void cliStats(FilterRules& filter, char* reply) {
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
+  CliBuf buf(reply, CLI_REPLY_MAX);
   // globals first, per-rule hits last: if the reply truncates, hits detail
   // (recoverable via `get N`) is sacrificed before the summary counters
-  radd(&out, &remain, "lim:%lu abort:%lu air:%lus:%u%%; hits:",
-       (unsigned long)filter.getLimiterDrops(), (unsigned long)filter.getBudgetAborts(),
-       (unsigned long)(filter.getAirSavedMs() / 1000), filter.getAirSavedPercent());
+  buf.add("lim:%lu abort:%lu air:%lus:%u%%; hits:",
+          (unsigned long)filter.getLimiterDrops(), (unsigned long)filter.getBudgetAborts(),
+          (unsigned long)(filter.getAirSavedMs() / 1000), filter.getAirSavedPercent());
   for (int i = 0; i < filter.getNumRules(); i++) {
-    radd(&out, &remain, " %d:%lu", i, (unsigned long)filter.getRule(i)->hits);
+    buf.add(" %d:%lu", i, (unsigned long)filter.getRule(i)->hits);
   }
 }
 
@@ -1624,10 +1656,9 @@ void filterCLI(FilterRules& filter, const char* command, char* reply, RegionMap*
   // An oversized command is refused whole rather than acted on as a prefix, and
   // unbalanced quotes are an error rather than a silent misparse. Both are
   // checked before anything is touched.
-  char buf[MAX_PACKET_PAYLOAD + 1];
-  if (!cliQuotesBalanced(command)) { strcpy(reply, "Err - unbalanced quotes"); return; }
-  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
-  char* p = buf;
+  char scratch[MAX_PACKET_PAYLOAD + 1];
+  if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
+  char* p = scratch;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {

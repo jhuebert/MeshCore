@@ -80,8 +80,11 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `PatternMatch.h/.cpp` — the user-facing pattern language: top-level `|`
   alternation, structural validation (empty alternative, alternative cap); thin
   wrapper over the vendored engine.
-- `CliUtil.h` — shared CLI helpers (`nextToken`, `radd`, `CLI_REPLY_MAX`)
-  used by filter and battery CLIs alike.
+- `CliUtil.h` — shared CLI helpers (`nextToken`, `CliBuf`, `cliPrepare`,
+  `cliCutReply`, `cliIsErrorReply`, `CLI_REPLY_MAX`) used by the filter,
+  battery, fleet and clock CLIs alike: the bounded reply writer, the command
+  entry point, the marked cut, and the one place that knows what a failing
+  reply looks like (the fork's `Err - ...` and the core's own vocabulary).
 - `BatteryGate.h/.cpp` — low-battery forward suspension, `battery` CLI, and a
   RAM-only one-shot suspend/resume transition readout (`takeStateChange`).
 - `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h` — advert
@@ -92,7 +95,7 @@ commit** — the guides are user-facing API documentation, not optional docs.
   dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
   the fleet device-service injections and the `batteryAlerts` transition
   drain).
-- `main.cpp` — serial CLI entry (upstream + fork's buffer-hardening lines).
+- `main.cpp` — upstream's serial CLI entry (no fork lines).
 
 **Code (`examples/mqtt_observer/`, compiled only under `WITH_MQTT_OBSERVER`):**
 - `MQTTObserver.h/.cpp` — the ESP32-only observer: Wi-Fi/NTP, up to two broker
@@ -103,28 +106,40 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `MQTTObserverRecord.h` — the `/mqtt_prefs` record framing (magic `MQO1`,
   CRC-16 over the payload) and its header/version/checksum checks.
 - `MQTTObserverPolicy.h` — pure host-tested policies: command/slot parsing, JWT
-  renewal, the queue/retry rules, the connect-admission heap gate, and the raw
-  frame stager.
+  renewal, the queue/retry rules, the connect gates (heap admission, attempt
+  outcome), the liveness probe, and the raw frame stager.
+- `MQTTObserverCli.h/.cpp` — the `mqtt*`/`wifi*` command handling, separated
+  from the radio, the Wi-Fi stack and the MQTT client: the observer fills in
+  the device facts (Wi-Fi, clock, heap, queue, slot states) and the unit owns
+  the config and the replies. Host-tested, like the filter's and the fleet's
+  CLIs.
 - `MQTTObserverFormat.h/.cpp` — pure host-tested JSON builders for the status,
   packet and raw messages (the reference observer schema).
 `observer_targets.ini` (repo root) defines the optional `*_repeater_observer`
-PlatformIO environments and is the allowlist `build.sh` / the release builder use.
+PlatformIO environments. It is pulled in through `platformio.ini`'s
+`extra_configs`, so the environments it adds are part of the resolved config
+(`build.sh list` enumerates them); what marks an environment as an observer is
+the `_repeater_observer` name suffix, not membership in that file.
 
-**Tests:** `test/test_packet_filter/` (301 behavior-level cases: matching,
-content rules, limiter, persistence upgrades, CLI surface, TinyRegex,
-PatternMatch), `test/test_fleet/` (112 cases: runner grammar, tag targeting,
-acknowledgements, scheduling, persistence, CLI surface, the battery
-exemption contract), `test/test_battery_gate/`, `test/test_mesh_clock/` (24
-behavior-level cases), and `test/test_mqtt_observer/` (30 cases: config codec +
+**Tests:** the behavior-level (native googletest) suites, one per feature, each
+reached through the same entry points a user or the firmware would:
+`test/test_packet_filter/` (matching, content rules, limiter, persistence
+upgrades, CLI surface, TinyRegex, PatternMatch), `test/test_fleet/` (runner
+grammar, tag targeting, acknowledgements, scheduling, persistence, CLI surface,
+the battery exemption contract), `test/test_battery_gate/` (suspension
+behavior, persistence, CLI), `test/test_mesh_clock/` (sample collection, quorum
+decision, persistence, CLI) and `test/test_mqtt_observer/` (config codec +
 record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
-connect heap gate, queue/retry policy, and the status/packet/raw JSON schema).
-Test-only shims:
+connect gates, queue/retry policy, the liveness probe, and the
+status/packet/raw JSON schema). Test-only shims:
 `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
-`FilterTestHelpers.h`.
+`FilterTestHelpers.h`, `CliReplyHelper.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` / `-e native_fleet` / `-e native_mesh_clock` / `-e
-native_mqtt_observer` (host-native, no hardware), plus `-e
+native_battery_gate` / `-e native_fleet` / `-e native_fleet_noack` (the fleet
+suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
+other env compiles) / `-e native_mesh_clock` / `-e native_mqtt_observer`
+(host-native, no hardware), plus `-e
 native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_fleet_san` /
 `-e native_mesh_clock_san` / `-e native_mqtt_observer_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
@@ -141,13 +156,16 @@ only; the firmware assets are built locally with
 `scripts/local-release-build.sh` (the default target set includes the observer
 targets, so they ship in the same release — no separate observer channel) and
 uploaded to the release with `gh`
-(CI no longer builds firmware — the 155-target runner fan-out got Actions
+(CI no longer builds firmware — the wide runner fan-out got Actions
 shut down). `sync-upstream.yml` merges upstream into the chosen channel branch
 and `promote-stable.yml` cherry-picks the filter commits from `repeater-filter`
 onto `repeater-filter-stable`; both are manual-dispatch only (never on a
-schedule) and neither cuts a release — use Filter Release for that. Upstream's
-own docs live in `docs/` (MeshCore protocol/CLI generally) — not fork-filter
-documentation.
+schedule) and neither cuts a release — use Filter Release for that. A conflict
+in either one opens (or updates) an issue through
+`.github/actions/open-conflict-issue/` and fails the run. The promotion runs a
+quality gate (the native suites plus the build-tooling tests in
+`scripts/tests/`) before it publishes. Upstream's own docs live in `docs/`
+(MeshCore protocol/CLI generally) — not fork-filter documentation.
 
 ## Branch model
 
@@ -171,16 +189,24 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
-- `test/test_packet_filter/`, `test/test_battery_gate/`,
+- `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
   `test/test_mesh_clock/`, `test/test_mqtt_observer/`
 - `examples/mqtt_observer/`, `observer_targets.ini`
-- `FILTER.md`, `FLEET.md`, `MESHCLOCK.md`, `MQTT_OBSERVER.md`,
-  `.github/workflows/filter-release.yml`,
+- `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `MQTT_OBSERVER.md`
+- `scripts/local-release-build.sh`, `scripts/tests/`
+- `.github/workflows/filter-release.yml`,
   `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
+- `.github/actions/open-conflict-issue/` (the conflict issue the two sync
+  workflows open; `setup-build-environment/` next to it is upstream's)
 
-Hook lines in upstream files (`MyMesh.h/.cpp`, `main.cpp`) must stay **minimal**
-— a reviewer should see a handful of lines, not a fork interleaved into
-upstream code. Everything else is upstream: apply the change discipline below
+Fork lines inside upstream files stay **minimal** — a reviewer should see a
+handful of lines, not a fork interleaved into upstream code. Those files are
+`examples/simple_repeater/MyMesh.h/.cpp` (the hooks the features call),
+`build.sh` (the observer commands and `build_observer_firmwares`),
+`platformio.ini` (the fork's native and sanitizer environments, and the
+`observer_targets.ini` include), plus small patches in
+`examples/companion_radio/` and `test/mocks/SHA256.h`; `README.md` is the
+fork's own. Everything else is upstream: apply the change discipline below
 *even more strictly* there, and match the existing style (`.clang-format`:
 2-space indent, `camelCase` functions, `UpperCamelCase` classes, lines < ~100
 chars).
@@ -210,8 +236,9 @@ CLI and filter semantics must work the way a user would guess without reading
 FILTER.md:
 
 - `filter get <idx>` is an **inspection** command: its reply shows the rule's
-  predicates plus counters, is truncated to the 160-byte transport, and is *not*
-  re-addable input (`add` rejects the `hits=`/`air=`/`pass=` metadata it prints).
+  predicates plus counters, is truncated to the CLI reply bound (see hard
+  invariant 3), and is *not* re-addable input (`add` rejects the
+  `hits=`/`air=`/`pass=` metadata it prints).
 - `filter chan list [<start-idx>]` exists because a full store does not fit one
   reply and `chan del` takes a name; a truncated listing ends with `next=N`.
 - Errors say what's wrong and what's accepted (e.g. `Err - chanhash must be 2
@@ -287,10 +314,18 @@ FILTER.md:
    check in the wrapper, and propose the trade-off (diff size, hot-path cost,
    what else it would pin down) rather than deciding unilaterally. Features,
    syntax and tuning are never a reason.
-3. **CLI reply buffer is 160 bytes.** All writes bounded: one-liners via
-   `snprintf(reply, CLI_REPLY_MAX, ...)`, staged output via `radd()`; never
-   unbounded `sprintf` into `reply`. Shared CLI helpers (`nextToken`, `radd`)
-   live in `CliUtil.h` — don't duplicate them.
+3. **CLI reply bound: 157 bytes, in a 160-byte buffer.** All writes bounded:
+   one-liners via `snprintf(reply, CLI_REPLY_MAX, ...)`, staged output via
+   `CliBuf`; never unbounded `sprintf` into `reply`. `CLI_REPLY_MAX` is 3 bytes
+   under the upstream buffers (`main.cpp`'s serial/ethernet `char reply[160]`,
+   the mesh remote-CLI's `&temp[5]` of `temp[166]`) because the core's
+   companion-radio `xx|command` form puts that 3-byte prefix in front of the
+   reply the handler writes *into the same buffer* — those buffers are
+   upstream's, the fork only keeps its replies short enough not to overrun them
+   (`static_assert` in `CliUtil.h`). A fork-owned buffer the prefix is written
+   into is `CLI_REPLY_BUFFER_MAX` (the fleet's script runner). Shared CLI
+   helpers (`nextToken`, `CliBuf`, `cliPrepare`) live in `CliUtil.h` — don't
+   duplicate them.
 4. **First match wins.** Rule evaluation order (listed order, packet-level in
    `checkPacket()`, whole-list single pass in `checkContent()`, stash
    consumption) is load-bearing; the prob roll runs before the throttle gate.
@@ -318,15 +353,15 @@ FILTER.md:
   fails any release target whose `src/`/`examples/` code holds a frame
   >= 2 KB (formerly a filter-release.yml CI check) — keep new frames well
   under it.
-- Pure refactors keep the suites green **unchanged** — the suites (301 filter,
-  112 fleet, 50 battery, 24 mesh-clock, 31 observer) are the safety net that
-  proves no behavior slipped.
+- Pure refactors keep the suites green **unchanged** — the suites are the safety
+  net that proves no behavior slipped.
 - Run the feature suites, then re-read the diff:
 
 ```
 pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + persistence
 pio test -e native_battery_gate     # battery gate
 pio test -e native_fleet            # fleet manager + runner + CLI + persistence
+pio test -e native_fleet_noack      # the same, with FLEET_ACK_RETRY=0 (the off switch)
 pio test -e native_mesh_clock       # mesh clock sync
 pio test -e native_mqtt_observer    # observer config/format/policy
 ```
@@ -335,7 +370,7 @@ All green, and every touched line required — together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_mesh_clock -e native_mqtt_observer
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_mqtt_observer
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks

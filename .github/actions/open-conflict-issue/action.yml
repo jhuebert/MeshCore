@@ -40,7 +40,15 @@ runs:
       with:
         script: |
           const fs = require('fs');
-          const files = fs.readFileSync(process.env.CONFLICT_FILES_FILE, 'utf8').trim() || '(none listed)';
+          // the conflicted step writes the file; if it is missing there is
+          // nothing to list, and a raw ENOENT stack trace would replace the
+          // message the operator needs
+          let files = '(none listed)';
+          try {
+            files = fs.readFileSync(process.env.CONFLICT_FILES_FILE, 'utf8').trim() || '(none listed)';
+          } catch (err) {
+            core.warning('conflict file ' + process.env.CONFLICT_FILES_FILE + ' is missing: ' + err.message);
+          }
           const body = [
             process.env.CONFLICT_MARKER,
             process.env.CONFLICT_INTRO,

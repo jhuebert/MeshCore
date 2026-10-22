@@ -164,6 +164,30 @@ inline bool validTopic(const char* topic) {
   return true;
 }
 
+// The placeholders the topic publisher knows: {iata}, {device}, {token} and
+// {type}. Anything else in braces is published verbatim, so a typo would send
+// the whole feed to a topic nobody reads.
+inline bool knownTopicPlaceholder(const char* name, size_t len) {
+  return (len == 4 && memcmp(name, "iata", 4) == 0) ||
+         (len == 6 && memcmp(name, "device", 6) == 0) ||
+         (len == 5 && memcmp(name, "token", 5) == 0) ||
+         (len == 4 && memcmp(name, "type", 4) == 0);
+}
+
+// A topic template: a valid topic whose placeholders are all known. An
+// unclosed brace is not a placeholder and is refused too.
+inline bool validTopicTemplate(const char* topic) {
+  if (!validTopic(topic)) return false;
+  for (const char* p = topic; *p; p++) {
+    if (*p != '{') continue;
+    const char* end = strchr(p + 1, '}');
+    if (end == NULL) return false;
+    if (!knownTopicPlaceholder(p + 1, (size_t)(end - p - 1))) return false;
+    p = end;
+  }
+  return true;
+}
+
 inline bool validOwner(const char* owner) {
   if (!owner || !*owner) return true;
   if (strlen(owner) != 64) return false;

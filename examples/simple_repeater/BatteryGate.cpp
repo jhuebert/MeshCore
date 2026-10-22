@@ -204,27 +204,25 @@ static void badMilliVolts(const char* tok, char* reply) {
 }
 
 static void cliStatus(BatteryGate& gate, mesh::MainBoard& board, char* reply) {
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  radd(&out, &remain, "batt %umV; gate %s", board.getBattMilliVolts(),
-       gate.isEnabled() ? "on" : "off");
+  CliBuf buf(reply, CLI_REPLY_MAX);
+  buf.add("batt %umV; gate %s", board.getBattMilliVolts(),
+          gate.isEnabled() ? "on" : "off");
   if (gate.isEnabled()) {
-    radd(&out, &remain, "; %s", gate.isSuspended() ? "SUSPENDED" : "forwarding");
+    buf.add("; %s", gate.isSuspended() ? "SUSPENDED" : "forwarding");
   }
   if (gate.getSuspendMilliVolts() != 0) {
-    radd(&out, &remain, "; suspend <%umV; resume >=%umV",
-         gate.getSuspendMilliVolts(), gate.getResumeMilliVolts());
+    buf.add("; suspend <%umV; resume >=%umV",
+            gate.getSuspendMilliVolts(), gate.getResumeMilliVolts());
   }
-  radd(&out, &remain, "; drops %lu", (unsigned long)gate.getDropCount());
+  buf.add("; drops %lu", (unsigned long)gate.getDropCount());
 }
 
 void batteryCLI(BatteryGate& gate, mesh::MainBoard& board, const char* command, char* reply) {
   // Refused whole rather than acted on as a prefix, and unbalanced quotes are an
   // error rather than a silent misparse — both checked before anything changes.
-  char buf[MAX_PACKET_PAYLOAD + 1];
-  if (!cliQuotesBalanced(command)) { strcpy(reply, "Err - unbalanced quotes"); return; }
-  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
-  char* p = buf;
+  char scratch[MAX_PACKET_PAYLOAD + 1];
+  if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
+  char* p = scratch;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {

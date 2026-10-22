@@ -28,18 +28,6 @@ namespace {
 const char kConfigPath[] = "/mqtt_prefs";
 const uint32_t kBackoffMs[] = {10000, 30000, 60000, 120000, 300000};
 
-bool startsWith(const char* text, const char* prefix) {
-  return text && strncmp(text, prefix, strlen(prefix)) == 0;
-}
-
-const char* commandValue(const char* command, const char* prefix) {
-  size_t len = strlen(prefix);
-  if (strncmp(command, prefix, len) != 0 || (command[len] && command[len] != ' ')) return nullptr;
-  const char* value = command + len;
-  while (*value == ' ') value++;
-  return value;
-}
-
 bool parseToggle(const char* value, uint8_t& enabled) {
   if (strcmp(value, "on") == 0) { enabled = 1; return true; }
   if (strcmp(value, "off") == 0) { enabled = 0; return true; }
@@ -99,24 +87,7 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       next_connect_ms(0), attempt_started(0), connected_at(0), last_status_ms(0),
       status_retry_ms(0), backoff_index(0), status_retry_pending(false),
       client_started(false), configured(false), connected(false), status_pending(false),
-      state(STATE_OFF), probe_msg_id(0), probe_sent_ms(0), last_probe_ms(0) {}
-
-void MQTTObserver::BrokerRuntime::noteProbe(int msg_id) {
-  if (msg_id <= 0) return;
-  int expected = 0;
-  if (!probe_msg_id.compare_exchange_strong(expected, msg_id, std::memory_order_relaxed))
-    return;
-  uint32_t now = millis();
-  probe_sent_ms.store(now, std::memory_order_relaxed);
-  last_probe_ms = now;
-}
-
-void MQTTObserver::BrokerRuntime::notePuback(int msg_id) {
-  if (msg_id <= 0) return;
-  int expected = msg_id;
-  if (probe_msg_id.compare_exchange_strong(expected, 0, std::memory_order_relaxed))
-    probe_sent_ms.store(0, std::memory_order_relaxed);
-}
+      connect_failed(false), state(STATE_OFF) {}
 
 MQTTObserver::MQTTObserver()
     : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _model{},
@@ -473,6 +444,7 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
       _brokers[slot].connected_at.store(millis(), std::memory_order_relaxed);
       _brokers[slot].connected.store(true, std::memory_order_relaxed);
       _brokers[slot].status_pending.store(true, std::memory_order_relaxed);
+      _brokers[slot].connect_failed.store(false, std::memory_order_relaxed);
       _brokers[slot].state.store(STATE_CONNECTED, std::memory_order_relaxed);
     });
     runtime.client->onDisconnect([this, slot](bool) {
@@ -483,7 +455,7 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
       _brokers[slot].state.store(STATE_ERROR, std::memory_order_relaxed);
     });
     runtime.client->onPublish([this, slot](int msg_id) {
-      _brokers[slot].notePuback(msg_id);
+      _brokers[slot].probe.notePuback(msg_id);
     });
   }
   if (!MQTTObserverConfigCodec::buildServerUri(broker, runtime.server_uri,
@@ -550,9 +522,7 @@ void MQTTObserver::disconnectBroker(size_t slot) {
   runtime.client_started = false;
   runtime.connected.store(false, std::memory_order_relaxed);
   runtime.status_pending.store(false, std::memory_order_relaxed);
-  runtime.probe_msg_id.store(0, std::memory_order_relaxed);
-  runtime.probe_sent_ms.store(0, std::memory_order_relaxed);
-  runtime.last_probe_ms = 0;
+  runtime.probe.reset();   // a new connection restarts the packet ids
 }
 
 void MQTTObserver::deferReconnect(size_t slot, uint32_t now) {
@@ -612,8 +582,8 @@ void MQTTObserver::worker() {
       WiFi.mode(WIFI_STA);
       WiFi.setAutoReconnect(true);
       WiFi.begin(_work_config.wifi_ssid, _work_config.wifi_password);
-      strcpy(active_ssid, _work_config.wifi_ssid);
-      strcpy(active_password, _work_config.wifi_password);
+      memcpy(active_ssid, _work_config.wifi_ssid, sizeof(active_ssid));
+      memcpy(active_password, _work_config.wifi_password, sizeof(active_password));
       _wifi_started = true;
       active_wifi_power_save = 0xff;
       active_ntp_server[0] = 0;
@@ -679,6 +649,9 @@ void MQTTObserver::worker() {
         runtime.configured = false;
         runtime.status_retry_pending = false;
         runtime.last_status_ms = 0;
+        // a reconfigured slot gets a fresh attempt: the previous failure says
+        // nothing about the new credentials
+        runtime.connect_failed.store(false, std::memory_order_relaxed);
         if (!configureClient(i, _work_config)) {
           runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
           continue;
@@ -698,8 +671,7 @@ void MQTTObserver::worker() {
           runtime.backoff_index = 0;
 
         if (MQTTObserverConnectionPolicy::livenessProbeTimedOut(
-                runtime.probe_msg_id.load(std::memory_order_relaxed), now,
-                runtime.probe_sent_ms.load(std::memory_order_relaxed))) {
+                runtime.probe.outstanding(), now, runtime.probe.sentMs())) {
           // An unacknowledged QoS 1 probe is the one failure the local connected
           // flag cannot see; reuse the reconnect ladder instead of looping.
           deferReconnect(i, now);
@@ -727,9 +699,16 @@ void MQTTObserver::worker() {
       }
 
       runtime.connected.store(false, std::memory_order_relaxed);
-      if (runtime.client_started &&
-          static_cast<uint32_t>(now - runtime.attempt_started) >= 30000) {
+      if (MQTTObserverConnectionPolicy::connectAttemptTimedOut(
+              runtime.client_started, now, runtime.attempt_started)) {
+        // The attempt never came up: the broker refused it (bad credentials,
+        // wrong protocol) or was unreachable. The library only reports
+        // transport errors to the application, so the outcome is decided here
+        // — and the slot says so instead of cycling "connecting" -> "retry"
+        // forever. The ladder keeps retrying in the background.
+        runtime.connect_failed.store(true, std::memory_order_relaxed);
         deferReconnect(i, now);
+        runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
       }
       if (!runtime.client_started && static_cast<int32_t>(now - runtime.next_connect_ms) >= 0) {
         if (hasConnectHeadroom(secureUri(runtime.server_uri))) {
@@ -744,6 +723,9 @@ void MQTTObserver::worker() {
           runtime.next_connect_ms = now + 30000;
           runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
         }
+      } else if (!runtime.client_started && runtime.connect_failed.load(std::memory_order_relaxed)) {
+        // waiting for the next attempt: the failed one is still the news
+        runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
       }
       State state = runtime.state.load(std::memory_order_relaxed);
       any_connecting = any_connecting || state == STATE_CONNECTING || state == STATE_RETRY;
@@ -821,12 +803,15 @@ bool MQTTObserver::publishStatus(size_t slot, const MQTTObserverConfig& config) 
   size_t written = 0;
   if (!buildStatusMessage(_json, sizeof(_json), written)) return false;
   int msg_id = runtime.client->publish(topic, 1, false, _json, written, true);
-  if (msg_id >= 0) runtime.noteProbe(msg_id);
+  if (msg_id >= 0) runtime.probe.noteProbe(msg_id, millis());
   return msg_id >= 0;
 }
 
 bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& config) {
   bool any_published = false;
+  // A drop is counted per event, not per broker: one event that no broker
+  // accepted is one skipped event, whatever the number of brokers.
+  bool dropped = false;
   char origin[sizeof(_origin)];
   portENTER_CRITICAL(&_config_mux);
   memcpy(origin, _origin, sizeof(origin));
@@ -840,8 +825,8 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
     // With status off, a packet (else raw) publish doubles as the liveness
     // probe; at most one QoS 1 message per broker is in flight at a time.
     bool probe_due = MQTTObserverConnectionPolicy::livenessProbeDue(
-        config.status_enabled != 0, runtime.probe_msg_id.load(std::memory_order_relaxed),
-        now, runtime.last_probe_ms,
+        config.status_enabled != 0, runtime.probe.outstanding(),
+        now, runtime.probe.lastProbeMs(),
         static_cast<uint32_t>(config.status_interval_minutes) * 60000UL);
     int packet_qos = probe_due ? 1 : 0;
     int raw_qos = probe_due && !config.packets_enabled ? 1 : 0;
@@ -855,12 +840,12 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
         int expected = event.packet.getRawLength();
         if (expected <= 0 || expected > MAX_TRANS_UNIT ||
             event.packet.payload_len > MAX_PACKET_PAYLOAD) {
-          _publish_drops.fetch_add(1, std::memory_order_relaxed);
+          dropped = true;
           continue;
         }
         wire_len = event.packet.writeTo(serialized);
         if (!wire_len || wire_len > sizeof(serialized)) {
-          _publish_drops.fetch_add(1, std::memory_order_relaxed);
+          dropped = true;
           continue;
         }
         wire = serialized;
@@ -881,14 +866,14 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
         int msg_id = runtime.client->publish(topic, packet_qos, false, _json,
                                              written, false);
         if (msg_id >= 0) {
-          if (packet_qos) runtime.noteProbe(msg_id);
+          if (packet_qos) runtime.probe.noteProbe(msg_id, millis());
           _published.fetch_add(1, std::memory_order_relaxed);
           any_published = true;
         } else {
-          _publish_drops.fetch_add(1, std::memory_order_relaxed);
+          dropped = true;
         }
       } else {
-        _publish_drops.fetch_add(1, std::memory_order_relaxed);
+        dropped = true;
       }
     }
 
@@ -903,17 +888,18 @@ bool MQTTObserver::publishEvent(const Event& event, const MQTTObserverConfig& co
         int msg_id = runtime.client->publish(topic, raw_qos, false, _json,
                                              written, false);
         if (msg_id >= 0) {
-          if (raw_qos) runtime.noteProbe(msg_id);
+          if (raw_qos) runtime.probe.noteProbe(msg_id, millis());
           _published.fetch_add(1, std::memory_order_relaxed);
           any_published = true;
         } else {
-          _publish_drops.fetch_add(1, std::memory_order_relaxed);
+          dropped = true;
         }
       } else {
-        _publish_drops.fetch_add(1, std::memory_order_relaxed);
+        dropped = true;
       }
     }
   }
+  if (dropped && !any_published) _publish_drops.fetch_add(1, std::memory_order_relaxed);
   return any_published;
 }
 
@@ -921,406 +907,42 @@ void MQTTObserver::markDirty() {
   _save_state.markDirty();
 }
 
-bool MQTTObserver::setString(char* destination, size_t capacity, const char* value) {
-  if (!destination || !value || strlen(value) >= capacity) return false;
-  memset(destination, 0, capacity);
-  memcpy(destination, value, strlen(value));
-  return true;
-}
-
-bool MQTTObserver::commandSlot(const char* command, const char* operation, size_t& slot,
-                               const char*& property) const {
-  return MQTTObserverCommandPolicy::parseSlot(command, operation,
-                                                MQTT_OBSERVER_MAX_BROKERS,
-                                                slot, property);
+// The device facts the CLI reports: the observer fills them in, the command
+// handling itself lives in MQTTObserverCli (host-tested).
+void MQTTObserver::cliFacts(MQTTObserverCliFacts& facts) {
+  facts.wifi_up = WiFi.status() == WL_CONNECTED;
+  facts.wifi_rssi = facts.wifi_up ? WiFi.RSSI() : 0;
+  IPAddress ip = WiFi.localIP();
+  for (int i = 0; i < 4; i++) facts.wifi_ip[i] = ip[i];
+  facts.clock_valid = time(nullptr) >= static_cast<time_t>(kMinimumValidTime);
+  facts.free_heap = ESP.getFreeHeap();
+  facts.max_heap = ESP.getMaxAllocHeap();
+  facts.queue_size = (uint32_t)queueSize();
+  facts.queue_capacity = MQTT_OBSERVER_QUEUE_CAPACITY;
+  facts.received = _received.load(std::memory_order_relaxed);
+  facts.published = _published.load(std::memory_order_relaxed);
+  facts.disconnected_drops = _disconnected_drops.load(std::memory_order_relaxed);
+  facts.queue_drops = _queue_drops.load(std::memory_order_relaxed);
+  facts.publish_drops = _publish_drops.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
+    facts.slot_state[i] = _brokers[i].state.load(std::memory_order_relaxed);
+    facts.slot_connected[i] = _brokers[i].connected.load(std::memory_order_relaxed);
+  }
 }
 
 bool MQTTObserver::handleCommand(char* command, char* reply) {
   if (!command || !reply) return false;
-  if (handleGetCommand(command, reply)) return true;
-  if (startsWith(command, "set mqtt") || startsWith(command, "set wifi"))
-    return handleSetCommand(command, reply);
-  return false;
-}
-
-bool MQTTObserver::handleSetCommand(char* command, char* reply) {
+  MQTTObserverCliFacts facts;
+  cliFacts(facts);
   bool changed = false;
-  uint8_t toggle = 0;
-  const char* common_property = nullptr;
-  const char* common_value = commandValue(command, "set mqtt.iata");
-  if (common_value) common_property = "iata";
-  else if ((common_value = commandValue(command, "set mqtt.origin"))) common_property = "origin";
-  else if ((common_value = commandValue(command, "set mqtt.ntp"))) common_property = "ntp";
-  else if ((common_value = commandValue(command, "set mqtt.rx"))) common_property = "rx";
-  else if ((common_value = commandValue(command, "set mqtt.status"))) common_property = "status";
-  else if ((common_value = commandValue(command, "set mqtt.packets"))) common_property = "packets";
-  else if ((common_value = commandValue(command, "set mqtt.raw"))) common_property = "raw";
-  else if ((common_value = commandValue(command, "set mqtt.tx"))) common_property = "tx";
-  else if ((common_value = commandValue(command, "set mqtt.interval"))) common_property = "interval";
-  if (common_property) {
-    if (strcmp(common_property, "iata") == 0) {
-      char iata[sizeof(_config.iata)];
-      if (strlen(common_value) >= sizeof(iata)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - IATA must be 3 letters/digits; XXX is reserved");
-        return true;
-      }
-      for (size_t i = 0; i <= strlen(common_value); i++)
-        iata[i] = common_value[i] >= 'a' && common_value[i] <= 'z' ?
-                  common_value[i] - 'a' + 'A' : common_value[i];
-      if (!MQTTObserverConfigCodec::validIata(iata)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - IATA must be 3 letters/digits; XXX is reserved");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      changed = strcmp(_config.iata, iata) != 0 &&
-                setString(_config.iata, sizeof(_config.iata), iata);
-      portEXIT_CRITICAL(&_config_mux);
-    } else if (strcmp(common_property, "origin") == 0) {
-      if (strlen(common_value) >= sizeof(_config.origin)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - origin too long");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      changed = strcmp(_config.origin, common_value) != 0 &&
-                setString(_config.origin, sizeof(_config.origin), common_value);
-      portEXIT_CRITICAL(&_config_mux);
-    } else if (strcmp(common_property, "ntp") == 0) {
-      const char* ntp = strcmp(common_value, "none") == 0 ? "" : common_value;
-      if (!MQTTObserverConfigCodec::validNtpServer(ntp) ||
-          strlen(ntp) >= sizeof(_config.ntp_server)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - invalid NTP server");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      changed = strcmp(_config.ntp_server, ntp) != 0 &&
-                setString(_config.ntp_server, sizeof(_config.ntp_server), ntp);
-      portEXIT_CRITICAL(&_config_mux);
-    } else if (strcmp(common_property, "interval") == 0) {
-      unsigned minutes;
-      if (!MQTTObserverCommandPolicy::parseUnsigned(common_value, 1, 60, minutes)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - interval must be 1-60 minutes");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      changed = _config.status_interval_minutes != minutes;
-      _config.status_interval_minutes = static_cast<uint8_t>(minutes);
-      portEXIT_CRITICAL(&_config_mux);
-    } else if (strcmp(common_property, "tx") == 0) {
-      uint8_t mode;
-      if (strcmp(common_value, "off") == 0) mode = 0;
-      else if (strcmp(common_value, "on") == 0) mode = 1;
-      else if (strcmp(common_value, "advert") == 0) mode = 2;
-      else {
-        snprintf(reply, CLI_REPLY_MAX, "Err - tx must be off, on, or advert");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      changed = _config.tx_enabled != mode;
-      _config.tx_enabled = mode;
-      portEXIT_CRITICAL(&_config_mux);
-    } else {
-      if (!parseToggle(common_value, toggle)) {
-        snprintf(reply, CLI_REPLY_MAX, "Err - expected on or off");
-        return true;
-      }
-      portENTER_CRITICAL(&_config_mux);
-      uint8_t* field = strcmp(common_property, "rx") == 0 ? &_config.rx_enabled :
-                       strcmp(common_property, "status") == 0 ? &_config.status_enabled :
-                       strcmp(common_property, "packets") == 0 ? &_config.packets_enabled :
-                       &_config.raw_enabled;
-      changed = *field != toggle;
-      *field = toggle;
-      portEXIT_CRITICAL(&_config_mux);
-    }
-    if (changed) markDirty();
-    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT setting saved");
-    return true;
-  }
-
-  size_t slot = 0;
-  const char* property = nullptr;
-  const char* value = nullptr;
-  bool has_slot = commandSlot(command, "set ", slot, property);
-  const char* space = has_slot ? strchr(property, ' ') : nullptr;
-  size_t property_len = space ? static_cast<size_t>(space - property) : strlen(property ? property : "");
-  if (has_slot && space) {
-    value = space + 1;
-    while (*value == ' ') value++;
-  }
-#define MQTT_PROP_IS(name) (has_slot && property_len == sizeof(name) - 1 && strncmp(property, name, sizeof(name) - 1) == 0)
-
-  if (MQTT_PROP_IS("enabled")) {
-    uint8_t enabled;
-    if (!parseToggle(value ? value : "", enabled)) {
-      snprintf(reply, CLI_REPLY_MAX, "Err - expected on or off");
-      return true;
-    }
-    portENTER_CRITICAL(&_config_mux);
-    changed = _config.brokers[slot].enabled != enabled;
-    _config.brokers[slot].enabled = enabled;
-    portEXIT_CRITICAL(&_config_mux);
-    if (changed) markDirty();
-    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u %s", static_cast<unsigned>(slot + 1),
-             enabled ? "enabled" : "disabled");
-    return true;
-  }
-
-  if (MQTT_PROP_IS("port")) {
-    unsigned port;
-    if (!MQTTObserverCommandPolicy::parseUnsigned(value, 1, 65535, port)) {
-      snprintf(reply, CLI_REPLY_MAX, "Err - port must be 1-65535");
-      return true;
-    }
-    portENTER_CRITICAL(&_config_mux);
-    changed = _config.brokers[slot].port != port;
-    _config.brokers[slot].port = static_cast<uint16_t>(port);
-    portEXIT_CRITICAL(&_config_mux);
-    if (changed) markDirty();
-    snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u port saved", static_cast<unsigned>(slot + 1));
-    return true;
-  }
-
-  if (MQTT_PROP_IS("server") || MQTT_PROP_IS("username") ||
-      MQTT_PROP_IS("password") || MQTT_PROP_IS("audience") ||
-      MQTT_PROP_IS("topic") || MQTT_PROP_IS("token") ||
-      MQTT_PROP_IS("owner") || MQTT_PROP_IS("email")) {
-    if (!value) value = "";
-    size_t capacity = 0;
-    enum Validation { NONE, SERVER, AUDIENCE, TOPIC, OWNER, EMAIL } validation = NONE;
-    if (MQTT_PROP_IS("server")) { capacity = sizeof(_config.brokers[slot].server); validation = SERVER; }
-    else if (MQTT_PROP_IS("username")) capacity = sizeof(_config.brokers[slot].username);
-    else if (MQTT_PROP_IS("password")) capacity = sizeof(_config.brokers[slot].password);
-    else if (MQTT_PROP_IS("audience")) { capacity = sizeof(_config.brokers[slot].audience); validation = AUDIENCE; }
-    else if (MQTT_PROP_IS("topic")) { capacity = sizeof(_config.brokers[slot].topic); validation = TOPIC; }
-    else if (MQTT_PROP_IS("token")) { capacity = sizeof(_config.brokers[slot].token); validation = TOPIC; }
-    else if (MQTT_PROP_IS("owner")) { capacity = sizeof(_config.brokers[slot].owner); validation = OWNER; }
-    else { capacity = sizeof(_config.brokers[slot].email); validation = EMAIL; }
-    const char* setting = value;   // empty value clears the setting
-    if (strlen(setting) >= capacity ||
-        (validation == SERVER && *setting && !MQTTObserverConfigCodec::validServer(setting)) ||
-        (validation == AUDIENCE && !MQTTObserverConfigCodec::validAudience(setting)) ||
-        (validation == TOPIC && !MQTTObserverConfigCodec::validTopic(setting)) ||
-        (validation == OWNER && !MQTTObserverConfigCodec::validOwner(setting)) ||
-        (validation == EMAIL && !MQTTObserverConfigCodec::validEmail(setting))) {
-      snprintf(reply, CLI_REPLY_MAX, "Err - invalid or oversized MQTT setting");
-      return true;
-    }
-    portENTER_CRITICAL(&_config_mux);
-    MQTTObserverBrokerConfig& broker = _config.brokers[slot];
-    char* field = MQTT_PROP_IS("server") ? broker.server :
-                  MQTT_PROP_IS("username") ? broker.username :
-                  MQTT_PROP_IS("password") ? broker.password :
-                  MQTT_PROP_IS("audience") ? broker.audience :
-                  MQTT_PROP_IS("topic") ? broker.topic :
-                  MQTT_PROP_IS("token") ? broker.token :
-                  MQTT_PROP_IS("owner") ? broker.owner : broker.email;
-    changed = strcmp(field, setting) != 0;
-    if (changed) setString(field, capacity, setting);
-    portEXIT_CRITICAL(&_config_mux);
-    if (changed) markDirty();
-    if (MQTT_PROP_IS("password") || MQTT_PROP_IS("token"))
-      snprintf(reply, CLI_REPLY_MAX, "OK - credential saved");
-    else
-      snprintf(reply, CLI_REPLY_MAX, "OK - MQTT%u setting saved", static_cast<unsigned>(slot + 1));
-    return true;
-  }
-#undef MQTT_PROP_IS
-
-  if (startsWith(command, "set wifi.powersave ")) {
-    const char* ps = command + strlen("set wifi.powersave ");
-    uint8_t power_save;
-    if (strcmp(ps, "min") == 0) power_save = 0;
-    else if (strcmp(ps, "none") == 0) power_save = 1;
-    else if (strcmp(ps, "max") == 0) power_save = 2;
-    else {
-      snprintf(reply, CLI_REPLY_MAX, "Err - expected none, min, or max");
-      return true;
-    }
-    portENTER_CRITICAL(&_config_mux);
-    changed = _config.wifi_power_save != power_save;
-    _config.wifi_power_save = power_save;
-    portEXIT_CRITICAL(&_config_mux);
-    if (changed) markDirty();
-    snprintf(reply, CLI_REPLY_MAX, "OK - WiFi power save saved");
-    return true;
-  }
-
-  const char* wifi_value = commandValue(command, "set wifi.ssid");
-  bool wifi_secret = false;
-  char* wifi_field = _config.wifi_ssid;
-  size_t wifi_capacity = sizeof(_config.wifi_ssid);
-  if (!wifi_value) {
-    wifi_value = commandValue(command, "set wifi.pwd");
-    if (wifi_value) {
-      wifi_field = _config.wifi_password;
-      wifi_capacity = sizeof(_config.wifi_password);
-      wifi_secret = true;
-    }
-  }
-  if (wifi_value) {
-    if (strlen(wifi_value) >= wifi_capacity) {
-      snprintf(reply, CLI_REPLY_MAX, "Err - setting too long");
-      return true;
-    }
-    portENTER_CRITICAL(&_config_mux);
-    changed = strcmp(wifi_field, wifi_value) != 0;
-    if (changed) setString(wifi_field, wifi_capacity, wifi_value);
-    portEXIT_CRITICAL(&_config_mux);
-    if (changed) markDirty();
-    snprintf(reply, CLI_REPLY_MAX, "%s", wifi_secret ? "OK - credential saved" : "OK - WiFi SSID saved");
-    return true;
-  }
-
-  snprintf(reply, CLI_REPLY_MAX, "Err - unsupported MQTT/WiFi setting");
-  return true;
-}
-
-bool MQTTObserver::handleGetCommand(const char* command, char* reply) {
-  if (strcmp(command, "get mqtt.status") == 0) {
-    formatStatus(reply, CLI_REPLY_MAX);
-    return true;
-  }
-  if (strcmp(command, "get wifi.powersave") == 0 || strcmp(command, "get wifi.ssid") == 0 ||
-      strcmp(command, "get wifi.pwd") == 0) {
-    const char* value;
-    portENTER_CRITICAL(&_config_mux);
-    if (strcmp(command, "get wifi.powersave") == 0)
-      value = _config.wifi_power_save == 1 ? "none" :
-              _config.wifi_power_save == 2 ? "max" : "min";
-    else if (strcmp(command, "get wifi.ssid") == 0)
-      value = _config.wifi_ssid[0] ? _config.wifi_ssid : "not set";
-    else value = _config.wifi_password[0] ? _config.wifi_password : "not set";
-    snprintf(reply, CLI_REPLY_MAX, "%s", value);
-    portEXIT_CRITICAL(&_config_mux);
-    return true;
-  }
-  if (strcmp(command, "get wifi.status") == 0) {
-    IPAddress ip = WiFi.localIP();
-    snprintf(reply, CLI_REPLY_MAX, "wifi %s ip:%u.%u.%u.%u rssi:%d",
-             WiFi.status() == WL_CONNECTED ? "connected" : "disconnected",
-             static_cast<unsigned>(ip[0]), static_cast<unsigned>(ip[1]),
-             static_cast<unsigned>(ip[2]), static_cast<unsigned>(ip[3]),
-             WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
-    return true;
-  }
-
-  enum CommonGet { COMMON_NONE, COMMON_IATA, COMMON_ORIGIN, COMMON_NTP, COMMON_RX,
-                   COMMON_STATUS, COMMON_PACKETS, COMMON_RAW, COMMON_TX,
-                   COMMON_INTERVAL } common = COMMON_NONE;
-  if (strcmp(command, "get mqtt.iata") == 0) common = COMMON_IATA;
-  else if (strcmp(command, "get mqtt.origin") == 0) common = COMMON_ORIGIN;
-  else if (strcmp(command, "get mqtt.ntp") == 0) common = COMMON_NTP;
-  else if (strcmp(command, "get mqtt.rx") == 0) common = COMMON_RX;
-  else if (strcmp(command, "get mqtt.status.enabled") == 0) common = COMMON_STATUS;
-  else if (strcmp(command, "get mqtt.packets") == 0) common = COMMON_PACKETS;
-  else if (strcmp(command, "get mqtt.raw") == 0) common = COMMON_RAW;
-  else if (strcmp(command, "get mqtt.tx") == 0) common = COMMON_TX;
-  else if (strcmp(command, "get mqtt.interval") == 0) common = COMMON_INTERVAL;
-  if (common != COMMON_NONE) {
-    char common_value[160];
-    portENTER_CRITICAL(&_config_mux);
-    switch (common) {
-      case COMMON_IATA:
-        snprintf(common_value, sizeof(common_value), "%s", _config.iata[0] ? _config.iata : "not configured");
-        break;
-      case COMMON_ORIGIN:
-        snprintf(common_value, sizeof(common_value), "%s", _config.origin[0] ? _config.origin :
-                 (_origin_source && *_origin_source ? _origin_source : "not configured"));
-        break;
-      case COMMON_NTP:
-        snprintf(common_value, sizeof(common_value), "%s", _config.ntp_server[0] ? _config.ntp_server : "pool.ntp.org");
-        break;
-      case COMMON_RX: snprintf(common_value, sizeof(common_value), "%s", _config.rx_enabled ? "on" : "off"); break;
-      case COMMON_STATUS: snprintf(common_value, sizeof(common_value), "%s", _config.status_enabled ? "on" : "off"); break;
-      case COMMON_PACKETS: snprintf(common_value, sizeof(common_value), "%s", _config.packets_enabled ? "on" : "off"); break;
-      case COMMON_RAW: snprintf(common_value, sizeof(common_value), "%s", _config.raw_enabled ? "on" : "off"); break;
-      case COMMON_TX: snprintf(common_value, sizeof(common_value), "%s",
-                               _config.tx_enabled == 2 ? "advert" : _config.tx_enabled == 1 ? "on" : "off"); break;
-      case COMMON_INTERVAL: snprintf(common_value, sizeof(common_value), "%u", static_cast<unsigned>(_config.status_interval_minutes)); break;
-      default: common_value[0] = 0; break;
-    }
-    portEXIT_CRITICAL(&_config_mux);
-    snprintf(reply, CLI_REPLY_MAX, "%s", common_value);
-    return true;
-  }
-
-  size_t slot = 0;
-  const char* property = nullptr;
-  if (!commandSlot(command, "get ", slot, property)) return false;
-  size_t property_len = strcspn(property, " ");
-#define MQTT_GET_IS(name) (property_len == sizeof(name) - 1 && strncmp(property, name, sizeof(name) - 1) == 0)
-  char value[160] = {};
+  // the CLI reads and writes the config the worker copies from: keep the whole
+  // command under the same lock
   portENTER_CRITICAL(&_config_mux);
-  const MQTTObserverBrokerConfig& broker = _config.brokers[slot];
-  const char* result = nullptr;
-  if (MQTT_GET_IS("server")) {
-    MQTTObserverConfigCodec::hostLabel(broker.server, value, sizeof(value));
-    result = value[0] ? value : "not configured";
-  } else if (MQTT_GET_IS("port")) {
-    snprintf(value, sizeof(value), "%u", static_cast<unsigned>(MQTTObserverConfigCodec::configuredPort(broker)));
-    result = value;
-  } else if (MQTT_GET_IS("audience")) result = broker.audience[0] ? broker.audience : "not configured";
-  else if (MQTT_GET_IS("topic")) result = broker.topic[0] ? broker.topic : "meshcore/{iata}/{device}/{type}";
-  else if (MQTT_GET_IS("owner")) result = broker.owner[0] ? broker.owner : "not configured";
-  else if (MQTT_GET_IS("email")) result = broker.email[0] ? broker.email : "not configured";
-  else if (MQTT_GET_IS("enabled")) result = broker.enabled ? "on" : "off";
-  else if (MQTT_GET_IS("password")) result = broker.password[0] ? broker.password : "not set";
-  else if (MQTT_GET_IS("username")) result = broker.username[0] ? broker.username : "not set";
-  else if (MQTT_GET_IS("token")) result = broker.token[0] ? broker.token : "not set";
-  if (result && result != value) {
-    snprintf(value, sizeof(value), "%s", result);
-    result = value;
-  }
+  bool handled =
+      mqttObserverCliCommand(_config, _origin_source, facts, command, reply, &changed);
   portEXIT_CRITICAL(&_config_mux);
-
-  if (result) {
-    snprintf(reply, CLI_REPLY_MAX, "%s", result);
-    return true;
-  }
-  if (MQTT_GET_IS("status")) {
-    BrokerRuntime& runtime = _brokers[slot];
-    snprintf(reply, CLI_REPLY_MAX, "mqtt%u %s wifi:%s q:%u",
-             static_cast<unsigned>(slot + 1), stateName(runtime.state.load(std::memory_order_relaxed)),
-             WiFi.status() == WL_CONNECTED ? "up" : "down", static_cast<unsigned>(queueSize()));
-    return true;
-  }
-#undef MQTT_GET_IS
-  return false;
-}
-
-const char* MQTTObserver::stateName(State state) const {
-  switch (state) {
-    case STATE_OFF: return "off";
-    case STATE_CONFIG: return "config";
-    case STATE_WIFI: return "wifi";
-    case STATE_TIME: return "time";
-    case STATE_CONNECTING: return "connecting";
-    case STATE_CONNECTED: return "connected";
-    case STATE_RETRY: return "retry";
-    default: return "error";
-  }
-}
-
-void MQTTObserver::formatStatus(char* reply, size_t capacity) {
-  if (!reply || capacity == 0) return;
-  size_t connected = 0;
-  for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++)
-    if (_brokers[i].connected.load(std::memory_order_relaxed)) connected++;
-  const char* wifi = WiFi.status() == WL_CONNECTED ? "up" : "down";
-  time_t epoch = time(nullptr);
-  const char* time_state = epoch >= static_cast<time_t>(kMinimumValidTime) ? "ok" : "wait";
-  uint32_t drops = _disconnected_drops.load(std::memory_order_relaxed) +
-                   _queue_drops.load(std::memory_order_relaxed) +
-                   _publish_drops.load(std::memory_order_relaxed);
-  snprintf(reply, capacity,
-      "mqtt wifi:%s time:%s slots:%u/%u rx:%lu pub:%lu drop:%lu q:%u/%u heap:%u/%u",
-      wifi, time_state, static_cast<unsigned>(connected),
-      static_cast<unsigned>(MQTT_OBSERVER_MAX_BROKERS),
-      static_cast<unsigned long>(_received.load(std::memory_order_relaxed)),
-      static_cast<unsigned long>(_published.load(std::memory_order_relaxed)),
-      static_cast<unsigned long>(drops), static_cast<unsigned>(queueSize()),
-      static_cast<unsigned>(MQTT_OBSERVER_QUEUE_CAPACITY),
-      static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+  if (changed) markDirty();
+  return handled;
 }
 
 #endif  // WITH_MQTT_OBSERVER

@@ -46,8 +46,9 @@
 
 // Execute one script line, in the style of the serial console. `key` is the
 // job's !id key string (for logging only — never the stored hash). `reply` is
-// a CLI_REPLY_MAX buffer the callee fills; `line` is mutable scratch the
-// callee may tokenise in place, as the CLI handlers do.
+// a CLI_REPLY_BUFFER_MAX buffer the callee fills with at most CLI_REPLY_MAX
+// bytes; `line` is mutable scratch the callee may tokenise in place, as the
+// CLI handlers do.
 typedef void (*CliExecFn)(void* ctx, const char* key, char* line, char* reply);
 
 // what a script's !ack directive asked for
@@ -91,6 +92,8 @@ struct CliRunResult {
   char summary[FLEET_REPLY_SUMMARY_LEN];  // single command: its actual reply;
                                           // several: "ran N ok" or
                                           // "ran N; err: <first failing reply>"
+                                          // Kept whole: the fleet cuts it to
+                                          // the packet's room when it is sent
   uint8_t ack;                            // CliAckMode of the finished script
   bool error;                             // at least one command line replied "Err ..."
   uint8_t chan_secret[PUB_KEY_SIZE];      // the captured channel, echoed back
@@ -118,6 +121,7 @@ struct CliPendingScript {
   uint16_t ran_count;                  // command lines executed so far
   char last_reply[FLEET_REPLY_SUMMARY_LEN];   // reply of the most recent line
   char first_err[FLEET_REPLY_SUMMARY_LEN];    // first "Err ..." reply, or empty
+                                               // (kept whole, like the summary)
 };
 
 class CliScriptRunner {

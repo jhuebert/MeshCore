@@ -16,6 +16,8 @@
 #ifndef _FLEET_CONFIG_H
 #define _FLEET_CONFIG_H
 
+#include "CliUtil.h"   // CLI_REPLY_MAX: the reply the fleet keeps is a CLI reply
+
 // tag store capacities (persisted in /fleet_cfg — see note above)
 #ifndef FLEET_MAX_TAGS
   #define FLEET_MAX_TAGS 8            // tag slots on this repeater
@@ -117,16 +119,63 @@
                                               // no attempt)
 #endif
 
-// Summary budget for one acknowledgement: the repeater name (max 31, CommonCLI
-// prefs) + ": " + the job key (FLEET_CLI_KEY_LEN) + " " must share the
-// createGroupDatagram data limit (184 B payload - 1 B hash - 15 B cipher pad =
-// 168 B) with it, so 31 + 2 + 32 + 1 + summary <= 168 gives this 100-char cap;
-// a longer summary is truncated at build time, never split across packets.
-#define FLEET_REPLY_SUMMARY_LEN 100
+// How many attempts a refused acknowledgement send gets before the reply is
+// dropped and counted as refused. The packet pool refuses a send when the mesh
+// is saturated, and a reply that never leaves must not hold its store slot
+// forever: two of them would block every later acknowledgement until a reboot.
+#ifndef FLEET_ACK_SEND_MAX_ATTEMPTS
+  #define FLEET_ACK_SEND_MAX_ATTEMPTS 3
+#endif
 
 // The data limit one group datagram can carry (createGroupDatagram refuses
 // more): MAX_PACKET_PAYLOAD (184) - 1 B channel hash - 15 B cipher padding.
 // Acknowledgement messages are composed inside this bound.
-#define FLEET_REPLY_DATA_MAX 168
+#ifndef FLEET_REPLY_DATA_MAX
+  #define FLEET_REPLY_DATA_MAX 168
+#endif
+
+// The longest node name a reply can carry: CommonCLI keeps the name in
+// node_name[32], so 31 characters plus the NUL.
+#ifndef FLEET_MAX_NODE_NAME
+  #define FLEET_MAX_NODE_NAME 31
+#endif
+
+// What a reply carries besides its own text: the group-text header (the
+// 4-byte timestamp plus the 1-byte text type) and the "<name>: " prefix the
+// sender puts in front of it. Both come out of the same datagram budget, so
+// the room the reply text gets is the data limit less these two.
+#ifndef FLEET_REPLY_HEADER_LEN
+  #define FLEET_REPLY_HEADER_LEN 5
+#endif
+#ifndef FLEET_REPLY_NAME_PREFIX_LEN
+  #define FLEET_REPLY_NAME_PREFIX_LEN 2
+#endif
+
+// "ran 65535; err: " — the longest prefix a multi-command summary carries.
+#ifndef FLEET_REPLY_PREFIX_MAX
+  #define FLEET_REPLY_PREFIX_MAX 16
+#endif
+
+// The reply the fleet keeps for one acknowledgement: the command's actual
+// reply (a CLI reply buffer's worth) or "ran N; err: " + the first failing
+// reply. It is kept whole and cut to the room the node name leaves when the
+// acknowledgement is sent, so a short name buys a longer reply (see FLEET.md).
+#ifndef FLEET_REPLY_SUMMARY_LEN
+  #define FLEET_REPLY_SUMMARY_LEN (CLI_REPLY_BUFFER_MAX + FLEET_REPLY_PREFIX_MAX)
+#endif
+
+// The reply must always fit one datagram. The summary is cut to what the node
+// name leaves of the packet, so the composed text never exceeds the data
+// limit: 31 + 2 + 32 + 1 leaves 97 characters for the summary in the worst
+// case, and more whenever the name or the job key is shorter.
+static_assert(FLEET_REPLY_DATA_MAX - FLEET_REPLY_HEADER_LEN - FLEET_MAX_NODE_NAME
+                - FLEET_REPLY_NAME_PREFIX_LEN - FLEET_CLI_KEY_LEN - 1 > 0,
+              "the fleet reply must fit one group datagram");
+
+// The summary must hold a whole CLI reply plus the "ran N; err: " prefix: a
+// shorter buffer would drop the reply's tail before it is sent, and the tail
+// is where the marker that says the reply was cut lives.
+static_assert(FLEET_REPLY_SUMMARY_LEN >= CLI_REPLY_MAX + FLEET_REPLY_PREFIX_MAX,
+              "the fleet summary must hold a whole reply");
 
 #endif // _FLEET_CONFIG_H

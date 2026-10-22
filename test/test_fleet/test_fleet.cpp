@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@
 #include <helpers/TxtDataHelpers.h>   // TXT_TYPE_PLAIN
 #include "FleetManager.h"
 #include "CliUtil.h"
+#include "../test_packet_filter/CliReplyHelper.h"   // the shared canaried reply buffer
 
 // a 32-byte PSK whose bytes are 0x00..0x1F, as hex (shared by all fixtures)
 static std::string psk32hex() {
@@ -347,10 +349,19 @@ TEST_F(FleetTest, BackupRecoveredAndRepaired) {
 struct ExecRecorder {
   std::vector<std::string> lines;
   bool fail_next = false;
+  std::string forced_reply;   // when set, this exact reply is returned (cut to
+                              // the CLI reply buffer, as a real handler would)
 
   static void fn(void* ctx, const char* key, char* line, char* reply) {
     auto* r = (ExecRecorder*)ctx;
     r->lines.push_back(line);
+    if (!r->forced_reply.empty()) {
+      size_t n = r->forced_reply.size();
+      if (n > (size_t)CLI_REPLY_MAX - 1) n = CLI_REPLY_MAX - 1;
+      memcpy(reply, r->forced_reply.data(), n);
+      reply[n] = 0;
+      return;
+    }
     if (r->fail_next) {
       strcpy(reply, "Err - injected failure");
       r->fail_next = false;
@@ -463,6 +474,14 @@ TEST_F(RunnerTest, ParseTagsListValidation) {
             CLI_ENQUEUE_BAD_DIRECTIVE);
   EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags 0123456789abcdefg\nset", &meta),
             CLI_ENQUEUE_BAD_DIRECTIVE);   // 17 chars
+  // the other side of the length boundary, and the empty items a leading or
+  // trailing comma makes (the list is split in place, one tag at a time)
+  EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags 0123456789abcdef\nset", &meta),
+            CLI_ENQUEUE_OK);
+  EXPECT_EQ(meta.tag_count, 1);
+  EXPECT_STREQ(meta.tags[0], "0123456789abcdef");
+  EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags a,\nset", &meta), CLI_ENQUEUE_BAD_DIRECTIVE);
+  EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags ,a\nset", &meta), CLI_ENQUEUE_BAD_DIRECTIVE);
   EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags no*wild\nset", &meta),
             CLI_ENQUEUE_BAD_DIRECTIVE);
   EXPECT_EQ(CliScriptRunner::parse("!id k1\n!tags\nset", &meta), CLI_ENQUEUE_BAD_DIRECTIVE);
@@ -582,12 +601,79 @@ TEST_F(RunnerTest, SummaryMultiOk) {
   EXPECT_FALSE(out.error);
 }
 
+// The core's companion-radio CLI form ("xx|command") reflects the 3-byte
+// prefix back in front of the reply and then writes a whole CLI reply after
+// it. The runner hands its buffer to that handler, so the buffer must hold the
+// prefix and the reply — this writes exactly what the core's handler writes,
+// so a buffer that is one reply too small trips the sanitizer build.
+static void prefixExecFn(void* ctx, const char* key, char* line, char* reply) {
+  memcpy(reply, "ab|", 3);
+  memset(reply + 3, 'x', CLI_REPLY_MAX - 1);
+  reply[CLI_REPLY_MAX + 2] = 0;
+}
+
+TEST_F(RunnerTest, ReplyBufferHoldsTheCompanionPrefixAndAFullReply) {
+  ASSERT_EQ(runner.enqueue("!id k1\nset a"), CLI_ENQUEUE_OK);
+  CliRunResult out;
+  memset(&out, 0, sizeof(out));
+  ASSERT_TRUE(runner.run(prefixExecFn, nullptr, &out));
+  // the whole reply (prefix included) reached the summary
+  EXPECT_EQ(strlen(out.summary), (size_t)(CLI_REPLY_MAX + 2));
+}
+
 TEST_F(RunnerTest, SummaryFirstError) {
   ASSERT_EQ(runner.enqueue("!id k1\nset a\nset b\nset c"), CLI_ENQUEUE_OK);
   rec.fail_next = true;   // "set a" fails
   CliRunResult out = finish();
   EXPECT_STREQ(out.summary, "ran 3; err: Err - injected failure");
   EXPECT_TRUE(out.error);
+}
+
+// The core's CommonCLI has its own failure vocabulary, and a fleet script
+// runs core commands too: a typo'd command replies "Unknown command", and
+// `!ack err` must not read that as a success.
+TEST_F(RunnerTest, UpstreamErrorVocabularyCountsAsFailure) {
+  const char* upstream_errors[] = {
+      "Unknown command",
+      "Error",
+      "Error, invalid params",
+      "Error: unsupported",
+      "ERROR: af must be 0-9",
+      "ERR: clock cannot go backwards",
+      "error",
+      "unknown config: foo",
+  };
+  int i = 0;
+  for (const char* reply : upstream_errors) {
+    char script[32];
+    snprintf(script, sizeof(script), "!id k%d\nset a", ++i);   // a fresh key: a seen key is a dup
+    ASSERT_EQ(runner.enqueue(script), CLI_ENQUEUE_OK);
+    rec.forced_reply = reply;
+    CliRunResult out = finish();
+    EXPECT_TRUE(out.error) << "reply: " << reply;
+    EXPECT_NE(std::string(out.summary).find(reply), std::string::npos) << "reply: " << reply;
+  }
+}
+
+TEST_F(RunnerTest, SuccessRepliesAreNotErrors) {
+  const char* successes[] = {
+      "OK - done: set a",
+      "OK",
+      "on",
+      "off",
+      "filter stats",
+      "tags: (none) - broadcast scripts only",
+      "seen 0/32",
+  };
+  int i = 0;
+  for (const char* reply : successes) {
+    char script[32];
+    snprintf(script, sizeof(script), "!id k%d\nset a", ++i);
+    ASSERT_EQ(runner.enqueue(script), CLI_ENQUEUE_OK);
+    rec.forced_reply = reply;
+    CliRunResult out = finish();
+    EXPECT_FALSE(out.error) << "reply: " << reply;
+  }
 }
 
 TEST_F(RunnerTest, AckModeCarriedToResult) {
@@ -631,6 +717,27 @@ TEST_F(RunnerTest, DelayResumesAfterDeadline) {
   EXPECT_EQ(rec.lines[1], "set b");
   EXPECT_STREQ(out.summary, "ran 2 ok");
   EXPECT_EQ(runner.getRan(), (uint32_t)1);
+}
+
+// The pause deadline crosses the millis() rollover: the script stays asleep
+// until the delay has really elapsed, then resumes.
+TEST_F(RunnerTest, DelayResumesAcrossMillisWrap) {
+  g_mock_millis = 0xFFFFFF00u;
+  ASSERT_EQ(runner.enqueue("!id k1\nset a\n!delay 5000\nset b"), CLI_ENQUEUE_OK);
+
+  CliRunResult out;
+  memset(&out, 0, sizeof(out));
+  ASSERT_TRUE(runner.run(ExecRecorder::fn, &rec, &out));   // "set a", delay armed
+  ASSERT_EQ(rec.lines.size(), (size_t)1);
+
+  g_mock_millis += 5000 - 1;   // past the rollover, one tick early
+  EXPECT_FALSE(runner.run(ExecRecorder::fn, &rec));
+
+  g_mock_millis += 1;
+  out = finish();
+  ASSERT_EQ(rec.lines.size(), (size_t)2);
+  EXPECT_EQ(rec.lines[1], "set b");
+  EXPECT_STREQ(out.summary, "ran 2 ok");
 }
 
 TEST_F(RunnerTest, DirectivesNeverExecute) {
@@ -724,19 +831,251 @@ TEST_F(RunnerTest, MarkKeySeenAndEnqueueValidated) {
   ASSERT_EQ(rec.lines.size(), (size_t)1);
 }
 
+// ---------------------------------------------------------------- reply cuts
+//
+// A reply that does not fit one packet is cut, and the cut is never silent:
+// the text before the cut is kept as it was, and the reply ends with "...".
+// The cut used to be a plain byte cut, which silently ate the "..."
+// continuation marker of a paginated `filter list` — over the fleet the
+// operator could not tell that the listing continued (issue #8).
+//
+// The runner keeps the reply whole; the cut happens when the reply is sent,
+// because only then is it known how much of the packet the node name leaves.
+
+// split on '\n': the reply body is line-structured
+static std::vector<std::string> splitLines(const std::string& s) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t nl = s.find('\n', pos);
+    if (nl == std::string::npos) {
+      out.push_back(s.substr(pos));
+      break;
+    }
+    out.push_back(s.substr(pos, nl - pos));
+    pos = nl + 1;
+  }
+  return out;
+}
+
+// a `filter list`-shaped reply: `rules` rules and the filter's own "..."
+// marker, the shape the filter's own paginated listing produces
+static std::string filterListReply(size_t rules) {
+  static const char* bodies[] = {
+    "drop txt text=^Alert",
+    "forward advert sender=node-01",
+    "drop txt chan=ops text=^Help",
+    "forward txt text=^Status sender=ops-01",
+    "drop txt chan=ops text=^Panic sender=node-02",
+    "forward grp data chan=ops sender=node-03",
+  };
+  std::string s;
+  for (size_t i = 0; i < rules && i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+    s += std::to_string(i) + ": " + bodies[i] + "\n";
+  }
+  s += "...";
+  return s;
+}
+
+// what the command actually answered: the CLI's reply buffer bounds it, and a
+// handler that overflows it is cut there (the filter marks its own cuts)
+static std::string cliReply(const std::string& s) {
+  return s.size() > (size_t)(CLI_REPLY_MAX - 1) ? s.substr(0, CLI_REPLY_MAX - 1) : s;
+}
+
+// ------------------------------------------------------------------ helpers
+//
+// The shared CLI helpers (CliUtil.h): the bounded reply writer, the command
+// entry point and the marked cut. Every CLI's suite exercises them, but their
+// edges — a full buffer, a room too small to mark — are only reachable here.
+
+TEST(CliUtilTest, BufAppendsAndTracksTheRoom) {
+  char buf[16];
+  memset(buf, 0xA5, sizeof(buf));
+  CliBuf b(buf, sizeof(buf));
+  EXPECT_EQ(b.remain(), 16);
+  EXPECT_EQ(b.len(), (size_t)0);
+
+  b.add("abc");
+  EXPECT_STREQ(buf, "abc");
+  EXPECT_EQ(b.len(), (size_t)3);
+  EXPECT_EQ(b.remain(), 13);
+
+  b.addStr("de");
+  EXPECT_STREQ(buf, "abcde");
+  EXPECT_EQ(b.len(), (size_t)5);
+}
+
+TEST(CliUtilTest, BufNeverOverrunsTheBuffer) {
+  char buf[8];
+  memset(buf, 0xA5, sizeof(buf));
+  CliBuf b(buf, sizeof(buf));
+  b.add("%s", "0123456789");   // longer than the buffer
+  EXPECT_EQ(strlen(buf), (size_t)7);   // 7 characters and the NUL fill it
+  EXPECT_EQ(b.remain(), 0);
+}
+
+TEST(CliUtilTest, BufDropsAWriteIntoAFullBuffer) {
+  char buf[4];
+  CliBuf b(buf, sizeof(buf));
+  b.add("abcd");   // does not fit: the buffer keeps what it had
+  EXPECT_STREQ(buf, "abc");
+  EXPECT_EQ(b.remain(), 0);
+
+  b.add("more");   // and the next write goes nowhere
+  EXPECT_STREQ(buf, "abc");
+}
+
+TEST(CliUtilTest, BufWithNoRoomWritesNothingAndKeepsWhatItHad) {
+  char buf[8];
+  memset(buf, 0xA5, sizeof(buf));
+  buf[0] = 0;
+  CliBuf b(buf, 0);   // a buffer with no room at all
+  b.add("hello");
+  b.addCut("hello", 4);
+  EXPECT_EQ(buf[0], (char)0);   // nothing was written
+  EXPECT_EQ((int)(unsigned char)buf[1], 0xA5);
+  EXPECT_EQ(b.remain(), 0);
+}
+
+TEST(CliUtilTest, BufCutWithNoRoomLeftKeepsTheText) {
+  char buf[4];
+  CliBuf b(buf, sizeof(buf));
+  b.add("abc");              // 3 characters: only the NUL slot is left
+  EXPECT_EQ(b.remain(), 1);
+  b.addCut("cdefgh", 8);      // nowhere to go: the text written so far stands
+  EXPECT_STREQ(buf, "abc");
+  EXPECT_EQ(b.len(), (size_t)3);
+}
+
+TEST(CliUtilTest, CutWithNoRoomWritesNothing) {
+  char dst[8];
+  memset(dst, 0xA5, sizeof(dst));
+  cliCutReply(dst, 0, "0123456789");
+  EXPECT_EQ((int)(unsigned char)dst[0], 0xA5);   // no room, no write
+}
+
+TEST(CliUtilTest, ParseIntRangeRejectsRangeAndOverflow) {
+  long value = 99;
+  EXPECT_FALSE(parseIntRange("9", 0, 2, &value));
+  EXPECT_FALSE(parseIntRange("42949672960", 1, 65535, &value));
+  EXPECT_FALSE(parseIntRange("0", 1, 60, &value));
+  EXPECT_FALSE(parseIntRange(nullptr, 1, 60, &value));
+  EXPECT_FALSE(parseIntRange("1x", 1, 60, &value));
+  EXPECT_FALSE(parseIntRange("", 1, 60, &value));
+  EXPECT_EQ(value, 99L);   // a rejected value leaves the old one alone
+  ASSERT_TRUE(parseIntRange("60", 1, 60, &value));
+  EXPECT_EQ(value, 60L);
+}
+
+TEST(CliUtilTest, CommandValueReadsTheValueAfterThePrefix) {
+  EXPECT_STREQ(cliCommandValue("get mqtt.interval 30", "get mqtt.interval"), "30");
+  EXPECT_STREQ(cliCommandValue("get mqtt.interval   30", "get mqtt.interval"), "30");
+  // the prefix with nothing after it: the value is empty, not absent
+  EXPECT_STREQ(cliCommandValue("get mqtt.interval", "get mqtt.interval"), "");
+  EXPECT_EQ(cliCommandValue("get mqtt.intervalx 30", "get mqtt.interval"), nullptr);
+  EXPECT_EQ(cliCommandValue("get mqtt.inter", "get mqtt.interval"), nullptr);
+  EXPECT_TRUE(cliStartsWith("set wifi.powersave on", "set wifi"));
+  EXPECT_FALSE(cliStartsWith("get wifi", "set wifi"));
+  EXPECT_FALSE(cliStartsWith(nullptr, "set wifi"));
+}
+
+TEST(CliUtilTest, PrepareRefusesUnbalancedQuotes) {
+  char scratch[32];
+  char reply[CLI_REPLY_MAX];
+  memset(reply, 0xA5, sizeof(reply));
+  EXPECT_FALSE(cliPrepare("filter add txt text=\"abc", scratch, sizeof(scratch), reply));
+  EXPECT_STREQ(reply, "Err - unbalanced quotes");
+}
+
+TEST(CliUtilTest, PrepareRefusesAnOverlongCommand) {
+  char scratch[8];
+  char reply[CLI_REPLY_MAX];
+  EXPECT_FALSE(cliPrepare("0123456789", scratch, sizeof(scratch), reply));
+  EXPECT_STREQ(reply, "Err - command too long");
+}
+
+TEST(CliUtilTest, PrepareCopiesTheCommandForTheTokeniser) {
+  char scratch[32];
+  char reply[CLI_REPLY_MAX];
+  memset(reply, 0xA5, sizeof(reply));
+  EXPECT_TRUE(cliPrepare("filter list", scratch, sizeof(scratch), reply));
+  EXPECT_STREQ(scratch, "filter list");
+  EXPECT_EQ(reply[0], (char)0xA5);   // nothing written on success
+}
+
+TEST(CliUtilTest, CutKeepsAWholeReplyByteForByte) {
+  char dst[32];
+  cliCutReply(dst, sizeof(dst), "OK - done");
+  EXPECT_STREQ(dst, "OK - done");
+}
+
+TEST(CliUtilTest, CutWithNoRoomToMarkIsAPlainCut) {
+  char dst[8];
+  memset(dst, 0xA5, sizeof(dst));
+  cliCutReply(dst, 4, "0123456789");
+  EXPECT_EQ(strlen(dst), (size_t)3);
+}
+
+TEST(CliUtilTest, BufAddCutAppendsAMarkedCut) {
+  char buf[32];
+  CliBuf b(buf, sizeof(buf));
+  b.add("k1\n");
+  b.addCut("0123456789ABCDEF", 16);
+  // the cut costs exactly the marker and the NUL: 13 of the 16 bytes are text
+  EXPECT_EQ(std::string(buf), "k1\n0123456789AB...");
+}
+
+// The shape every cut summary must have: one trailing "..." that says it was
+// cut, and the text before it is the source's own text — a prefix of it, with
+// nothing inserted (a line the cut landed inside stays as it was).
+static void expectMarkedCut(const std::string& summary, const std::string& src) {
+  ASSERT_GE(summary.size(), (size_t)4) << summary;
+  ASSERT_EQ(summary.compare(summary.size() - 3, 3, "..."), 0) << summary;
+  std::string head = summary.substr(0, summary.size() - 3);   // drop the marker
+  EXPECT_EQ(src.compare(0, head.size(), head), 0) << summary;
+  // nothing in the kept text is a marker of its own
+  EXPECT_EQ(head.find("\n..."), std::string::npos) << summary;
+}
+
+TEST_F(RunnerTest, LongReplyIsKeptWholeUntilItIsSent) {
+  const std::string reply = filterListReply(4);
+  rec.forced_reply = reply;
+
+  ASSERT_EQ(runner.enqueue("!id k1\nfilter list"), CLI_ENQUEUE_OK);
+  CliRunResult out = finish();
+
+  // nothing is cut here: only the packet's room can say what fits, and that
+  // is known when the reply is sent. The reply is whole, so the filter's own
+  // "..." continuation marker survives untouched.
+  EXPECT_STREQ(out.summary, reply.c_str());
+}
+
+TEST_F(RunnerTest, ShortReplyIsPassedThroughUnchanged) {
+  rec.forced_reply = "OK - list: 3 rules";
+  ASSERT_EQ(runner.enqueue("!id k1\nfilter stats"), CLI_ENQUEUE_OK);
+  CliRunResult out = finish();
+  EXPECT_STREQ(out.summary, "OK - list: 3 rules");
+  EXPECT_EQ(strstr(out.summary, "..."), nullptr);   // no marker on a whole reply
+}
+
+TEST_F(RunnerTest, MultiCommandSummaryCarriesTheFirstFailure) {
+  rec.forced_reply = "Err - " + std::string(150, 'z');
+  ASSERT_EQ(runner.enqueue("!id k1\nset a\nset b"), CLI_ENQUEUE_OK);
+  CliRunResult out = finish();
+  EXPECT_TRUE(out.error);
+  EXPECT_EQ(strncmp(out.summary, "ran 2; err: ", 12), 0);
+  // the whole failure is kept: it is cut to the packet's room when it is sent
+  EXPECT_EQ(strlen(out.summary), (size_t)12 + 6 + 150);
+}
+
 // Run a fleet CLI command and return the reply (canary-checked, like the
 // filter suite's helper).
 static std::string cli(FleetManager& fleet, const char* command) {
-  static const uint8_t CANARY = 0xA5;
-  uint8_t raw[CLI_REPLY_MAX + 1];
-  memset(raw, CANARY, sizeof(raw));
-  char* reply = (char*)raw;
-  reply[0] = 0;
-  fleetCLI(fleet, command, reply);
-  EXPECT_EQ(raw[CLI_REPLY_MAX], CANARY) << "reply overran " << CLI_REPLY_MAX << " bytes: " << command;
-  EXPECT_NE(memchr(reply, 0, CLI_REPLY_MAX), nullptr)
-      << "reply not NUL-terminated in " << CLI_REPLY_MAX << " bytes: " << command;
-  return std::string(reply);
+  CliReplyBuf buf;
+  fleetCLI(fleet, command, buf.reply());
+  buf.check(command);
+  return std::string(buf.reply());
 }
 
 // ------------------------------------------------------------------ hooks
@@ -807,6 +1146,7 @@ struct SentReply {
   uint8_t secret[PUB_KEY_SIZE];
   uint8_t hash;                        // channel hash
   uint32_t ts = 0;                     // group-text timestamp
+  std::string name;                    // the sender name the reply carried
   std::string body;
   mesh::Packet pkt;                    // the packet the callback claimed to send
 };
@@ -818,6 +1158,8 @@ struct HookEnv {
   uint32_t jitter = 12345;
   uint32_t last_window = 0;
   bool next_send_fails = false;        // make the sender refuse the next packet
+  int send_failures = 0;               // refuse this many sends in a row
+  std::string name = "xiao";           // the node name, as MyMesh would send it
   ExecRecorder rec;
 
   static uint32_t timeFn(void* ctx) { return ((HookEnv*)ctx)->clock_now; }
@@ -826,18 +1168,21 @@ struct HookEnv {
     e->last_window = window;
     return e->jitter;
   }
+  static const char* nameFn(void* ctx) { return ((HookEnv*)ctx)->name.c_str(); }
   static bool sendFn(void* ctx, const uint8_t* secret, uint8_t hash, uint32_t ts,
-                     const char* body, uint8_t* out_pkt_hash) {
+                     const char* sender_name, const char* body, uint8_t* out_pkt_hash) {
     auto* e = (HookEnv*)ctx;
     if (e->next_send_fails) { e->next_send_fails = false; return false; }
+    if (e->send_failures > 0) { e->send_failures--; return false; }
     SentReply r;
     r.hash = hash;
     r.ts = ts;
+    r.name = sender_name;
     r.body = body;
     memcpy(r.secret, secret, PUB_KEY_SIZE);
     // compose the same packet MyMesh would, so a replayed rebroadcast of it has
     // an identical calculatePacketHash()
-    GroupTextPayload p = makeGroupTextTs("xiao", body, ts);
+    GroupTextPayload p = makeGroupTextTs(sender_name, body, ts);
     r.pkt = makeGroupPacket(PAYLOAD_TYPE_GRP_TXT, hash, p);
     if (out_pkt_hash) r.pkt.calculatePacketHash(out_pkt_hash);
     e->sent.push_back(r);
@@ -863,6 +1208,7 @@ struct FleetHooksTest : public ::testing::Test {
     chan.hash[0] = fleet.getChanHash();
     fleet.setClock(HookEnv::timeFn, &env);
     fleet.setJitter(HookEnv::jitterFn, &env);
+    fleet.setNameProvider(HookEnv::nameFn, &env);
     fleet.setSender(HookEnv::sendFn, &env);
   }
   void TearDown() override { g_mock_millis = 0; }
@@ -963,6 +1309,196 @@ TEST_F(FleetHooksTest, AckAlwaysRepliesJitteredInChannel) {
   EXPECT_EQ(env.last_window, (uint32_t)FLEET_REPLY_WINDOW_MS);
 }
 
+// The jitter deadline crosses the millis() rollover: the reply is still due
+// exactly when it should be (signed-difference comparison), not held for 49
+// days.
+TEST_F(FleetHooksTest, ReplyJitterDeadlineSurvivesMillisWrap) {
+  g_mock_millis = 0xFFFFFF00u;   // the jitter deadline lands past the wrap
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  ASSERT_EQ(fleet.getReplyCount(), 1);
+
+  g_mock_millis += env.jitter - 1;   // one tick early
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+
+  g_mock_millis += 1;                // the deadline, after the rollover
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].body, "k1\nOK - done: set a");
+}
+
+// A send the packet pool refuses keeps its slot and retries after the backoff;
+// that deadline crossing the rollover must still come due.
+TEST_F(FleetHooksTest, RefusedSendBackoffSurvivesMillisWrap) {
+  env.send_failures = 1;             // the first attempt is refused
+  g_mock_millis = 0xFFFFFF00u;
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+
+  g_mock_millis += env.jitter;       // jitter deadline (past the wrap)
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)0);   // refused, reply retained
+  EXPECT_EQ(fleet.getReplyCount(), 1);
+
+  g_mock_millis += FLEET_ACK_RETRY_BACKOFF_MS - 1;   // backoff not elapsed
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+
+  g_mock_millis += 1;                // backoff elapsed, across the rollover
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+}
+
+// The end-to-end shape of issue #8: a `filter list` reply that did not fit the
+// packet still tells the operator, over the air, that there is more.
+TEST_F(FleetHooksTest, LongReplyKeepsItsCutMarkerOnAir) {
+  const std::string reply = cliReply(filterListReply(6));
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter list");
+  ASSERT_TRUE(pass());   // runs, schedules the ack
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);   // due: sends the reply
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  const std::string& body = env.sent[0].body;
+  ASSERT_EQ(body.compare(0, 3, "k1\n"), 0);   // the job key line
+  std::string summary = body.substr(3);
+  // the cut is marked
+  EXPECT_NE(summary.find("..."), std::string::npos) << summary;
+  expectMarkedCut(summary, reply);
+  // the body fits the room the node name left
+  EXPECT_LE(body.size(), FLEET_REPLY_DATA_MAX - 5 - env.name.size() - 2);
+}
+
+// A cut must not cost a whole rule: the lines that fit are there in full, and
+// the rule the cut landed in is kept as its own prefix.
+TEST_F(FleetHooksTest, CutReplyKeepsTheRulesItShows) {
+  const std::string reply = cliReply(filterListReply(6));
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter list");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  std::string summary = env.sent[0].body.substr(3);
+  EXPECT_NE(summary.find("0: drop txt text=^Alert\n"), std::string::npos) << summary;
+  EXPECT_NE(summary.find("1: forward advert sender=node-01\n"), std::string::npos) << summary;
+  expectMarkedCut(summary, reply);
+}
+
+// A cut that lands on a line boundary shows no half line at all: the marker
+// starts a line of its own. A reply of blank lines makes the boundary the only
+// possible outcome, whatever the exact cut point is.
+TEST_F(FleetHooksTest, CutOnALineBoundaryShowsNoHalfLine) {
+  const std::string reply(200, '\n');   // blank lines only
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter list");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  std::vector<std::string> got = splitLines(env.sent[0].body);
+  ASSERT_FALSE(got.empty());
+  EXPECT_EQ(got.back(), "...");
+  EXPECT_EQ(got[0], "k1");   // the job key line
+  // every line between it and the marker is a complete (empty) line, and none
+  // of them carries the inline marker: the cut was on a boundary
+  for (size_t i = 1; i + 1 < got.size(); i++) EXPECT_EQ(got[i], "") << env.sent[0].body;
+}
+
+// One long line has no line to cut at: the text is cut, the line is marked,
+// and the "..." line says the reply continues.
+TEST_F(FleetHooksTest, SingleLineReplyIsCutAndMarked) {
+  const std::string reply = "0: drop txt text=^" + std::string(150, 'y');
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter get 0");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  std::string summary = env.sent[0].body.substr(3);
+  EXPECT_NE(summary.find("..."), std::string::npos) << summary;
+  // the text before the marker is the start of the original reply, marked as
+  // cut where it was cut
+  EXPECT_EQ(summary.compare(0, 18, "0: drop txt text=^"), 0);
+  expectMarkedCut(summary, reply);
+}
+
+// The "ran N; err: " prefix must never swallow the marker that says the
+// reply was cut.
+TEST_F(FleetHooksTest, MultiCommandErrorKeepsTheCutMarker) {
+  env.rec.forced_reply = "Err - " + std::string(150, 'z');
+
+  deliver("!id k1\n!ack\nset a\nset b");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  std::string summary = env.sent[0].body.substr(3);
+  EXPECT_EQ(summary.compare(0, 12, "ran 2; err: "), 0) << summary;
+  EXPECT_NE(summary.find("..."), std::string::npos) << summary;
+}
+
+// A long node name eats into the packet: the reply does not fit the room and
+// is cut, and the cut says so.
+TEST_F(FleetHooksTest, LongNameCutsTheReply) {
+  const std::string reply = filterListReply(4);
+  env.name = std::string(FLEET_MAX_NODE_NAME, 'n');
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter list");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  const std::string& body = env.sent[0].body;
+  EXPECT_NE(body.find("..."), std::string::npos) << body;
+  EXPECT_LT(body.size(), reply.size() + 3);
+}
+
+// A short node name leaves more of the packet for the reply: the same reply
+// fits whole, marker included.
+TEST_F(FleetHooksTest, ShortNameFitsTheWholeReply) {
+  const std::string reply = filterListReply(4);
+  env.name = "R1";
+  env.rec.forced_reply = reply;
+
+  deliver("!id k1\n!ack\nfilter list");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  EXPECT_EQ(env.sent[0].body, "k1\n" + reply);
+}
+
+// The reply must fit one group datagram in the worst case: the longest node
+// name, the longest job key and the longest reply share one packet's budget.
+TEST_F(FleetHooksTest, ReplyFitsOneDatagramInTheWorstCase) {
+  const std::string key(FLEET_CLI_KEY_LEN, 'k');    // the longest job key
+  env.name = std::string(FLEET_MAX_NODE_NAME, 'n');  // the longest node name
+  env.rec.forced_reply = std::string(200, 'r');
+
+  deliver(("!id " + key + "\n!ack\nfilter list").c_str());
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  std::string text = env.name + ": " + env.sent[0].body;
+  EXPECT_LE(text.size(), (size_t)(FLEET_REPLY_DATA_MAX - 5));
+}
+
 // --- ack repeat confirmation ---------------------------------------------
 
 #if FLEET_ACK_RETRY
@@ -1028,6 +1564,79 @@ TEST_F(FleetHooksTest, AckRetryIsByteIdentical) {
   env.sent[0].pkt.calculatePacketHash(h0);
   env.sent[1].pkt.calculatePacketHash(h1);
   EXPECT_EQ(memcmp(h0, h1, MAX_HASH_SIZE), 0);
+}
+
+// The repeat-confirmation window crosses the millis() rollover: the resend
+// still fires once when the window elapses.
+TEST_F(FleetHooksTest, AckRetryWindowSurvivesMillisWrap) {
+  g_mock_millis = 0xFFFFFF00u;
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;   // first send, past the wrap
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  ASSERT_EQ(fleet.getAwaitingCount(), 1);
+
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS - 1;   // window not up yet
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);
+
+  g_mock_millis += 1;            // window elapsed, across the wrap
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)2);
+  EXPECT_EQ(fleet.getReplyRetries(), (uint32_t)1);
+}
+
+// The retry must be byte-identical even when the node was renamed after the
+// first attempt: a different name (or a different room for the body) would be
+// a different packet, so every node that already relayed attempt 1 would
+// relay the copy too and the operator would see the reply twice.
+TEST_F(FleetHooksTest, AckRetryStaysByteIdenticalAcrossANameChange) {
+  env.rec.forced_reply = "OK - " + std::string(150, 'x');   // long enough to be cut
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+
+  env.name = "a-much-longer-node-name";   // renamed: a longer name, less room
+  g_mock_millis += FLEET_ACK_REPEAT_WINDOW_MS;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)2);
+
+  EXPECT_EQ(env.sent[0].name, "xiao");
+  EXPECT_EQ(env.sent[1].name, env.sent[0].name);   // the name is frozen
+  EXPECT_EQ(env.sent[0].ts, env.sent[1].ts);
+  EXPECT_EQ(env.sent[0].body, env.sent[1].body);     // cut with the frozen room
+  ASSERT_EQ(env.sent[0].pkt.payload_len, env.sent[1].pkt.payload_len);
+  EXPECT_EQ(memcmp(env.sent[0].pkt.payload, env.sent[1].pkt.payload,
+                   env.sent[0].pkt.payload_len), 0);
+}
+
+// A send the packet pool refuses forever must not hold its reply slot: the
+// attempts are capped, the reply is dropped and counted as refused, so a later
+// acknowledgement can still be scheduled.
+TEST_F(FleetHooksTest, RefusedSendIsCappedAndFreesTheSlot) {
+  env.send_failures = 100;   // the pool refuses every send
+  deliver("!id k1\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  for (int i = 0; i < FLEET_ACK_SEND_MAX_ATTEMPTS; i++) {
+    fleet.runScripts(ExecRecorder::fn, &env.rec);
+    g_mock_millis += FLEET_ACK_RETRY_BACKOFF_MS;
+  }
+  EXPECT_EQ(env.sent.size(), (size_t)0);
+  EXPECT_EQ(fleet.getReplyCount(), 0);        // the store slot is free again
+  EXPECT_EQ(fleet.getAwaitingCount(), 0);
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)1);   // the ack was dropped
+
+  // a later acknowledgement is scheduled and sent
+  env.send_failures = 0;
+  deliver("!id k2\n!ack\nset a");
+  ASSERT_TRUE(pass());
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  EXPECT_EQ(env.sent.size(), (size_t)1);
 }
 
 // A zero-hop echo (bridge/mirror of the raw bytes) is not a relay: it must not
@@ -1309,6 +1918,25 @@ TEST_F(FleetHooksTest, AtScheduledAckRepliesAfterExecution) {
   EXPECT_EQ(env.sent[0].body, "k1\nOK - done: filter stats");
 }
 
+// A re-sent !at job is a duplicate whatever the clock says: the key was already
+// seen, so it is counted as a dup — not as a stale refusal.
+TEST_F(FleetHooksTest, AtDuplicateIsDupEvenWhenTheTimestampWentStale) {
+  char script[64];
+  snprintf(script, sizeof(script), "!id k1\n!at %u\nreset",
+           (unsigned)(env.clock_now + 600));
+  deliver(script);
+  ASSERT_EQ(fleet.getSchedCount(), 1);
+  EXPECT_EQ(fleet.getScripts().getDup(), (uint32_t)0);
+
+  // the same key again, with a timestamp that is now stale
+  snprintf(script, sizeof(script), "!id k1\n!at %u\nreset",
+           (unsigned)(env.clock_now - FLEET_AT_STALE_SECS - 10));
+  deliver(script);
+  EXPECT_EQ(fleet.getSchedCount(), 1);       // not armed twice
+  EXPECT_EQ(fleet.getScripts().getDup(), (uint32_t)1);
+  EXPECT_EQ(fleet.getScripts().getRefused(), (uint32_t)0);
+}
+
 TEST_F(FleetHooksTest, AtDupAndStoreFull) {
   deliver("!id k1\n!at 1800000600\nreset");
   deliver("!id k2\n!at 1800000601\nreset");
@@ -1473,8 +2101,26 @@ TEST_F(FleetHooksTest, StatusLine) {
   EXPECT_NE(r.find("seen 0/32"), std::string::npos);
   EXPECT_NE(r.find("ackq 0/2 await 0 rtx 0"), std::string::npos);
   EXPECT_NE(r.find("badline 0"), std::string::npos);
+  EXPECT_NE(r.find("crowded 0"), std::string::npos);
   // the psk is never echoed
   EXPECT_EQ(r.find("00010203"), std::string::npos);
+}
+
+// Core offers at most four candidate keys per on-air hash, and the filter's
+// channel store is offered first. When it filled them all, the fleet channel
+// is never tried: its traffic is not decrypted and no script can arrive. The
+// count is what turns that silent failure into something the operator sees.
+TEST_F(FleetHooksTest, CrowdedOutIsCountedAndShown) {
+  uint8_t hash = fleet.getChanHash();
+  mesh::GroupChannel dest[4];
+  memset(dest, 0, sizeof(dest));
+  // room for the fleet channel: it is offered
+  EXPECT_EQ(fleet.appendChannelByHash(&hash, dest, 4, 0), 1);
+  EXPECT_EQ(fleet.getCrowdedOut(), (uint32_t)0);
+  // no room left: the fleet channel is crowded out, and that is counted
+  EXPECT_EQ(fleet.appendChannelByHash(&hash, dest, 4, 4), 0);
+  EXPECT_EQ(fleet.getCrowdedOut(), (uint32_t)1);
+  EXPECT_NE(cli(fleet, "").find("crowded 1"), std::string::npos);
 }
 
 // onHeardPacket is inert while the fleet is off.

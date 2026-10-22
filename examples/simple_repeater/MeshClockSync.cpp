@@ -129,16 +129,24 @@ void MeshClockSync::evaluate(uint32_t local_now) {
     return;
   }
 
-  // deadband vs the node's own clock
+  // deadband vs the node's own clock: a difference of MESHCLOCK_MIN_DIFF_SECS
+  // or less is in sync (the knob is the minimum difference that counts as out
+  // of sync, and MESHCLOCK.md says "within 60 s")
   const uint32_t d = median > local_now ? median - local_now : local_now - median;
   last_delta = (int32_t)(median - local_now);   // exact within ±68 years
-  if (d < MESHCLOCK_MIN_DIFF_SECS) {
+  if (d <= MESHCLOCK_MIN_DIFF_SECS) {
     last_result = IN_SYNC;
     clear();
     return;
   }
 
-  if (set_fn) set_fn(set_ctx, median);
+  if (set_fn == NULL) {
+    // no clock service wired: the decision cannot be carried out, and nothing
+    // is claimed either way
+    clear();
+    return;
+  }
+  set_fn(set_ctx, median);
   last_result = SET_CLOCK;
   clear();
 }
@@ -213,33 +221,33 @@ static void clockStatus(MeshClockSync& c, char* reply) {
     strcpy(reply, "off");
     return;
   }
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  radd(&out, &remain, "on samples=%d/%d last=", c.getSampleCount(), MESHCLOCK_SLOTS);
+  CliBuf buf(reply, CLI_REPLY_MAX);
+  buf.add("on samples=%d/%d last=", c.getSampleCount(), MESHCLOCK_SLOTS);
   switch (c.getLastResult()) {
     case MeshClockSync::SET_CLOCK:
-      radd(&out, &remain, "set(%+lds)", (long)c.getLastDeltaSecs());
+      buf.add("set(%+lds)", (long)c.getLastDeltaSecs());
       break;
     case MeshClockSync::IN_SYNC: {
       long d = (long)c.getLastDeltaSecs();
       if (d < 0) d = -d;
-      radd(&out, &remain, "in-sync(%lds)", d);
+      buf.add("in-sync(%lds)", d);
       break;
     }
     case MeshClockSync::NO_CONSENSUS:
-      radd(&out, &remain, "no-consensus");
+      buf.add("no-consensus");
       break;
     default:
-      radd(&out, &remain, "idle");
+      buf.add("idle");
       break;
   }
 }
 
 void meshClockCLI(MeshClockSync& clock, const char* command, char* reply) {
-  // An oversized command is refused whole rather than acted on as a prefix.
-  char buf[MAX_PACKET_PAYLOAD + 1];
-  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
-  char* p = buf;
+  // An oversized command is refused whole rather than acted on as a prefix, and
+  // unbalanced quotes are an error rather than a silent misparse.
+  char scratch[MAX_PACKET_PAYLOAD + 1];
+  if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
+  char* p = scratch;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {

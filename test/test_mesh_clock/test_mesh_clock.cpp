@@ -280,6 +280,26 @@ TEST_F(ClockTest, CloseEnoughIsInSync) {
   EXPECT_EQ(clock.getSampleCount(), 0);
 }
 
+// The deadband is "within 60 s", so a difference of exactly
+// MESHCLOCK_MIN_DIFF_SECS is still in sync (the knob is the minimum
+// difference that counts as out of sync).
+TEST_F(ClockTest, TheDeadbandBoundaryIsInclusive) {
+  clock.setEnabled(true);
+  const uint32_t local = TRUE_NOW;
+  for (int i = 0; i < MESHCLOCK_SLOTS; i++) {
+    feed(clock, i, local + MESHCLOCK_MIN_DIFF_SECS, local);
+  }
+  EXPECT_EQ(set_calls, 0u);
+  EXPECT_EQ(clock.getLastResult(), MeshClockSync::IN_SYNC);
+
+  // one second more is out of sync: the clock is stepped
+  for (int i = 0; i < MESHCLOCK_SLOTS; i++) {
+    feed(clock, i, local + MESHCLOCK_MIN_DIFF_SECS + 1, local);
+  }
+  EXPECT_EQ(set_calls, 1u);
+  EXPECT_EQ(clock.getLastResult(), MeshClockSync::SET_CLOCK);
+}
+
 TEST_F(ClockTest, NegativeOffsetReconstructsAcrossWrap) {
   clock.setEnabled(true);
   // within 2^31 of the build floor, so it survives the signed floor check, but

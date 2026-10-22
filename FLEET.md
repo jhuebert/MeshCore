@@ -209,15 +209,48 @@ message.
   This is the airtime-polite choice for large fleets.
 - No `!ack` — no reply.
 
+"Error" means the command's reply is a failure — the fork's own `Err - ...`
+and the core's `Error`, `Error, ...`, `ERROR: ...`, `ERR: ...`, `error` and
+`Unknown command`. A typo'd core command (`set txdelayy 2`) replies
+`Unknown command`, and that is an error: the job did not do what it said.
+
 Reply content, always prefixed with the job key so replies are correlatable
 when several jobs are in flight. On air the body is `<key>`, then a newline,
 then the response — companions show the id and the response on separate lines:
 
 - Single-command script → the command's **actual reply** (e.g.
-  `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), truncated to fit one packet.
+  `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), cut to fit one packet.
 - Multi-command script → `<key> ran 5 ok`, or
   `<key> ran 5; err: <first failing line's reply>` — the first error is the
   only useful detail in one packet. Replies are never split across packets.
+
+**A cut reply says so.** An acknowledgement carries as much reply as the
+packet has room for: the node name and the job key take their share of the
+datagram, and what is left is the reply — 97 bytes in the worst case (a
+31-character name and a 32-character key), more whenever either is shorter.
+A reply that does not fit is cut, and the cut is never silent, and never costs
+a whole rule: the reply is cut where it stops fitting, the text before the cut
+is **kept** exactly as it was (the line the cut landed in stays visible), and a
+single `...` marks where the reply stopped. A reply that fits is copied byte
+for byte, so the filter's own `...` marker survives untouched. The marker takes
+3 bytes of that room, so about 93 bytes of reply text are shown in the worst
+case.
+
+**What the markers mean.** A `...` at the end of the reply means *the reply was
+cut here*; a `...` on a line of its own in a `filter list` reply is the
+filter's own page marker (see FILTER.md) and means the same thing — more
+follows. A `..` at the end of a line means *that line is incomplete*: the
+repeater's own listing abbreviated a rule too large for one line (FILTER.md
+marks those with `..`). The two say different things: `...` is the end of what
+you got, `..` is that rule **not shown whole**.
+
+The way on from a cut reply is therefore the same in both cases:
+
+- `filter get <idx>` shows that rule whole (it is the rule's own index — the
+  number before the `:` in the listing).
+- `filter list <idx+1>` shows the rules after it — send it as a new job; a
+  listing that stopped at an abbreviated rule shows the same `..` again, so
+  page on by index rather than by re-reading the same line.
 
 Protocol guarantees, by construction:
 
@@ -247,21 +280,30 @@ reply cooldown in v1 — per-key dedupe already bounds each script to one reply.
 
 **Repeat confirmation and retry:** after a reply floods, the repeater listens
 for a neighbour repeating it. If none is heard within ~5 s, the reply is
-re-sent **once, byte-identically** — same frozen timestamp, so the same on-air
-packet — and then the repeater stops. Because the copy is byte-identical, every
-node that already relayed the first attempt has it in its seen table and
-suppresses the copy at the mesh layer *before* any app or companion sees it: a
-retry can never appear as a duplicate message, and a healthy fleet still shows
-exactly one reply per node. "Heard a repeat" proves a repeater relayed the
-reply; it does **not** prove the operator's companion received it — there is no
-end-to-end ack for flood group text. Each such miss is counted as `rtx` on the
-status line; a climbing `rtx` means replies are not being repeated — likely no
-neighbouring repeater in range, or heavy loss. If the packet pool refuses an
-initial send or retry, it is tried again after the configured backoff; `rtx`
-increments only when the retry is queued. The retry is build-time tunable
-(`FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`, and
-`FLEET_ACK_RETRY_BACKOFF_MS`), never persisted; build with `FLEET_ACK_RETRY=0`
-to restore the single fire-and-forget send.
+re-sent **once, byte-identically** — same frozen timestamp, same node name,
+same cut body, so the same on-air packet — and then the repeater stops.
+Because the copy is byte-identical, every node that already relayed the first
+attempt has it in its seen table and suppresses the copy at the mesh layer
+*before* any app or companion sees it: a retry can never appear as a duplicate
+message, and a healthy fleet still shows exactly one reply per node. (The
+node name and the room the reply body is cut to are frozen with the first
+attempt, so a `set name` job running in between cannot turn the copy into a
+different packet — that would show the reply twice.) "Heard a repeat" proves a
+repeater relayed the reply; it does **not** prove the operator's companion
+received it — there is no end-to-end ack for flood group text. Each such miss
+is counted as `rtx` on the status line; a climbing `rtx` means replies are not
+being repeated — likely no neighbouring repeater in range, or heavy loss. If
+the packet pool refuses an initial send or retry, it is tried again after the
+configured backoff; `rtx` increments only when the retry is queued. A send the
+pool keeps refusing is given up on after a few attempts (build-time tunable,
+`FLEET_ACK_SEND_MAX_ATTEMPTS`): an acknowledgement that can never be sent
+must not hold its reply slot forever, or two of them would block every later
+acknowledgement until a reboot. An acknowledgement that never went out is
+counted as `refused` when it is dropped. The retry is build-time tunable
+(`FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`,
+`FLEET_ACK_RETRY_BACKOFF_MS`, and `FLEET_ACK_SEND_MAX_ATTEMPTS`), never
+persisted; build with `FLEET_ACK_RETRY=0` to restore the single
+fire-and-forget send.
 
 ## Inline pauses (`!delay <ms>`)
 
@@ -309,7 +351,9 @@ enables off-hours maintenance windows.
   (counted, key not marked) — a typo'd stale date must never run immediately,
   since the damage it can do (a surprise `reset`) is exactly what scheduling is
   meant to control. Within the 300 s grace (clock skew, mesh transit delay) it
-  executes immediately.
+  executes immediately. A job whose key was already seen is a **duplicate**
+  (counted as `dup`), whatever its timestamp says — the job ran or was armed
+  once, and a re-sent copy is a duplicate, not a stale refusal.
 - **Clock unset → refuse.** While the node's RTC is before 2025-01-01, `!at`
   scripts are refused and counted: executing at an unknown time is worse than
   not executing. The sync recipe below fixes this first.
@@ -370,12 +414,24 @@ Counter meanings:
 | `ran` | Scripts executed since boot |
 | `dup` | Messages refused because their key was already seen (the normal "re-send" case) |
 | `noid` | Messages ignored because line 1 was not `!id …` (ordinary chat on the channel) |
-| `refused` | Scripts refused: queue full, a bad `!id` key, a malformed or unknown `!` directive, a stale/unset-clock/full-store `!at` admission, or a dropped acknowledgement |
+| `refused` | Scripts refused: queue full, a bad `!id` key, a malformed or unknown `!` directive, a stale/unset-clock/full-store `!at` admission, or an acknowledgement the packet pool kept refusing |
 | `badline` | Command lines skipped at run time for being over-long |
 | `sched` | Armed `!at` scripts (`0/2`) |
-| `ackq` | Pending acknowledgements (`0/2`) |
+| `ackq` | Acknowledgements queued but not sent yet (`0/2`) |
 | `await` | Sent acknowledgements still awaiting a heard repeat (`0/2`) |
 | `rtx` | Replies re-sent because the first attempt was not heard repeated |
+| `crowded` | Packets on the fleet channel that core never offered the fleet key for (the filter's channel store filled core's four candidate slots for that hash) |
+
+`ackq` and `await` share one two-slot store: a queued reply and a sent one
+waiting for its repeat both hold a slot, so the store is full when the two
+counts add up to 2 (`ackq 1/2 await 1` = full, no room for another
+acknowledgement).
+
+The status line is one line, and it is cut to the CLI's reply bound like every
+other reply (a few bytes under 160). The counters are 32-bit, so a node that
+has run for a very long time can push the line past that; the cut is
+**marked**, never silent — the line ends with `...` and the operator knows the
+status is incomplete.
 
 ## Two-phase fleet changes (radio presets and other cutovers)
 
@@ -555,9 +611,12 @@ cli[2026-06-12-preset2-cfg] set radio 869.650,62.5,9,5
 | `dup` climbing, nothing changed | — | Normal: re-sends and duplicate flood deliveries |
 | Job ran twice | seen-ring wrap | 33+ distinct jobs this boot evicted the key; re-send deliberately via `forget` semantics |
 | Lines missing from a run | `badline` counter | Lines over the CLI's length limit were skipped — split the job |
+| Reply ends with `...` | — | The reply did not fit one packet and was cut there; the text before the marker is everything that fitted. Page on with `filter list <idx+1>` (the first rule after the last complete one) |
+| Reply line ends in `..` | — | That rule is not shown whole: the repeater's listing abbreviated a rule too large for one line (see FILTER.md). `filter get <idx>` shows the rule whole |
 | Whole script refused, `refused` up | — | Unknown `!` directive, bad key characters, or a malformed `!tags`/`!ack`/`!at`/`!delay`; check the exact text |
 | `!at` job never fired | `sched` count; `clock` reply per node | Clock not synced (below the 2025 floor → refused), or the RTC is past it and it fired already; or a reboot wiped the armed job — re-send |
 | `!at` refused, `refused` up | — | Timestamp > 300 s in the past (stale), RTC unset, or the scheduled store was full |
+| Nothing on the fleet channel is ever decrypted | `crowded` counter on the node | Core tries at most **4** candidate keys per on-air channel hash, and the packet filter's channel store is offered first. If the filter's store holds 4 *different* keys on the fleet channel's hash, the fleet key is never tried: the fleet channel goes deaf. The `crowded` counter counts the packets that were never offered to it. Fix it by removing a filter channel (`filter chan del <name>`) that shares the hash, or by using a different fleet PSK |
 
 ### Kill switches
 
@@ -630,6 +689,7 @@ so it can't be orphaned from a fleet cutover by its own battery state.
 | Tags | up to 8 on a repeater; up to 8 per `!tags` list; 1–16 chars each |
 | `!delay` | 1–300000 ms per pause; a sleeping script holds its queue slot |
 | Command lines | up to the serial CLI's buffer (~160 bytes); longer lines are skipped |
+| Reply content | up to 97 bytes of room per acknowledgement in the worst case (a 31-character node name and a 32-character job key); a shorter name or key buys more. About 93 bytes of that are reply text — the cut marker takes 3. A reply that does not fit is cut where it stops fitting and ends with `...`; the text before it is kept as it was |
 
 - Execution is **deferred**: a queued script runs in the main loop, outside the
   packet handling that queued it, so scripts may safely contain `filter …` and

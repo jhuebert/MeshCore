@@ -1,16 +1,19 @@
 // CliUtil.h — small helpers shared by the simple_repeater fork's CLI command
-// handlers (filter, battery, and future ones). Fork-owned code; keeping the
+// handlers (filter, battery, fleet, clock). Fork-owned code; keeping the
 // tokenizer and the reply writer in one place guarantees every CLI parses
-// input and builds replies identically.
+// input and builds replies identically. New CLI helpers belong here, not in a
+// handler.
 //
-// nextToken() and radd() were previously duplicated (and had diverged) in
-// PacketFilter.cpp and BatteryGate.cpp — new CLI helpers belong here instead.
-// Same for parseIntRange(), which both CLIs spelled out per parameter.
+// The reply side lives here for the same reason: CliBuf is the one bounded
+// writer every CLI builds its reply with, cliPrepare() is the one command
+// entry point, and cliCutReply() is the one place that knows how a reply says
+// it was cut.
 
 #ifndef _CLI_UTIL_H
 #define _CLI_UTIL_H
 
 #include <errno.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,10 +67,24 @@ inline bool cliCopyCommand(char* buf, size_t sz, const char* command) {
   return true;
 }
 
-// all CLI reply buffers are 160 B: main.cpp uses char reply[160] (serial and
-// ethernet), and the mesh remote-CLI hands out &temp[5] of a uint8_t temp[166].
-// Reply writers must bound to this, never MAX_PACKET_PAYLOAD.
-#define CLI_REPLY_MAX 160
+// A fork reply writer never fills more than CLI_REPLY_MAX bytes (one-liners via
+// snprintf(reply, CLI_REPLY_MAX, ...), staged output via CliBuf), never
+// MAX_PACKET_PAYLOAD.
+//
+// CLI_REPLY_MAX is 157, three short of the 160-byte buffers those replies are
+// written into (main.cpp's serial and ethernet `char reply[160]`; the mesh
+// remote CLI's `&temp[5]` of a `uint8_t temp[166]` leaves 161). The missing
+// three bytes are the core's companion-radio CLI form ("xx|command"): it
+// copies that prefix back in front of the reply and then moves the pointer, so
+// the handler writes a whole reply after it, into a buffer the fork does not
+// own. Keeping the prefix's room here means no fork reply can overrun the
+// smallest of them.
+#define CLI_REPLY_MAX 157
+#define CLI_REPLY_PREFIX_LEN 3
+#define CLI_REPLY_BUFFER_MAX (CLI_REPLY_MAX + CLI_REPLY_PREFIX_LEN)
+// the smallest upstream reply buffer: a prefixed fork reply must fit it
+static_assert(CLI_REPLY_BUFFER_MAX <= 160,
+              "a prefixed fork reply must fit the upstream CLI reply buffer");
 
 // An odd number of double quotes means the tokenizer would swallow the rest of
 // the line into one value. Cheap to check up front, and it turns a silent
@@ -91,17 +108,156 @@ inline bool cliNoExtra(char* p, char* reply, const char* usage) {
   return true;
 }
 
-// bounded reply append (CLI reply buffer is 160 bytes)
-inline void radd(char** out, int* remain, const char* fmt, ...) {
-  if (*remain <= 0) return;
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(*out, *remain, fmt, ap);
-  va_end(ap);
-  if (n < 0) { *remain = 0; return; }
-  if (n >= *remain) { *out += *remain - 1; *remain = 0; return; }
-  *out += n;
-  *remain -= n;
+// Cut a reply to at most `room` bytes (NUL included) and mark the cut, so a
+// reply that does not fit says so instead of ending in silence. The text before
+// the cut is kept exactly as it was — a line the cut landed inside stays
+// visible, with nothing inserted into it — and the reply ends with "...".
+//
+// One marker, at the very end, and nothing else: nothing follows it, so "..."
+// needs no second form to say where the cut landed. The tightest budget the
+// fork has is the fleet's packet room (what a node name and a job key leave).
+//
+// `dst` must have room for `room` bytes; with no room nothing is written.
+inline void cliCutReply(char* dst, size_t room, const char* src) {
+  const char* marker = "...";     // the one end-of-reply marker
+  const size_t marker_len = 3;
+  if (room == 0) return;          // no room: write nothing, keep the caller's NUL
+  size_t n = strlen(src);
+  if (n + 1 <= room) {   // fits: unchanged, byte for byte
+    memcpy(dst, src, n + 1);
+    return;
+  }
+  if (room <= marker_len + 1) {   // no room to mark: a plain cut, silently
+    memcpy(dst, src, room - 1);
+    dst[room - 1] = 0;
+    return;
+  }
+  // reserve the marker's room first: a cut reply has to say so
+  size_t keep = room - 1 - marker_len;
+  memcpy(dst, src, keep);
+  memcpy(dst + keep, marker, marker_len + 1);
+}
+
+// A bounded, allocation-free builder for a fixed buffer — the one reply writer
+// the fork's CLIs share. The caller asks the builder how much room is left
+// instead of tracking a write pointer and a count, and a write that does not
+// fit is dropped instead of overrunning the buffer.
+//
+// The buffer is the caller's: no heap, no copy-in. `cap` includes the NUL.
+class CliBuf {
+public:
+  CliBuf(char* buf, size_t cap)
+      : _start(buf), _out(buf), _remain(cap > (size_t)INT_MAX ? INT_MAX : (int)cap) {}
+
+  // Append a formatted string. Never writes past the buffer.
+  void add(const char* fmt, ...) {
+    if (_remain <= 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(_out, (size_t)_remain, fmt, ap);
+    va_end(ap);
+    if (n < 0) { _remain = 0; return; }
+    if (n >= _remain) { _out += _remain - 1; _remain = 0; return; }
+    _out += n;
+    _remain -= n;
+  }
+  void addStr(const char* s) { add("%s", s); }
+
+  // Append `src`, cut to at most `limit` bytes (NUL included) and marked: a
+  // reply that does not fit ends with "..." instead of ending in silence.
+  // `limit` is further clamped to the room the buffer has left.
+  void addCut(const char* src, size_t limit) {
+    if (_remain <= 0) return;   // no room: nothing is written and nothing is skipped
+    if (limit > (size_t)_remain) limit = (size_t)_remain;
+    cliCutReply(_out, limit, src);
+    size_t wrote = strlen(_out);
+    _out += wrote;
+    _remain -= (int)wrote;
+    if (_remain <= 0) _remain = 0;
+  }
+
+  // The room left, NUL included: 0 when nothing more fits.
+  int remain() const { return _remain; }
+  size_t len() const { return (size_t)(_out - _start); }
+  const char* c_str() const { return _start; }
+
+private:
+  char* _start;
+  char* _out;
+  int _remain;
+};
+
+// The shared first step of every CLI command: the quotes must balance (or the
+// tokeniser would swallow the rest of the line into one value), and the
+// command must fit the scratch buffer the tokeniser works in — the tokeniser
+// edits its copy in place. Both refusals answer the operator in one place, so
+// the CLIs cannot drift apart.
+//
+// `scratch` is the caller's buffer; on success it holds the copy to tokenise.
+inline bool cliPrepare(const char* command, char* scratch, size_t scratch_sz, char* reply) {
+  if (!cliQuotesBalanced(command)) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - unbalanced quotes");
+    return false;
+  }
+  if (!cliCopyCommand(scratch, scratch_sz, command)) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - command too long");
+    return false;
+  }
+  return true;
+}
+
+// True when `text` starts with `prefix`. Both are NUL-terminated.
+inline bool cliStartsWith(const char* text, const char* prefix) {
+  return text && strncmp(text, prefix, strlen(prefix)) == 0;
+}
+
+// True when a CLI reply reports a failure.
+//
+// The fork's own CLIs answer "Err - ...", but the core's CommonCLI has its own
+// vocabulary: "Error", "Error, ...", "Error: ...", "ERROR: ...", "ERR: ...",
+// "error", "Unknown command", "unknown config: ...". A fleet script runs core
+// commands as well as fork ones, and `!ack err` promises "reply only on
+// error" — so a typo'd command that answers "Unknown command" must not pass
+// for a success, or the operator is told the job worked.
+//
+// The list is a prefix table: a reply is a failure when it starts with one of
+// these. Nothing the core answers on success ("OK - ...", a value, a listing)
+// starts with one of them.
+inline bool cliIsErrorReply(const char* reply) {
+  static const char* const kErrorPrefixes[] = {
+      "Err",   // the fork's "Err - ...", and the core's "Error", "Error, ..."
+      "ERR",   // the core's "ERR: ...", "ERROR: ..."
+      "err",   // the core's "error"
+      "Unknown command",
+      "unknown config: ",
+      "Board not supported",
+      "Bridge not supported",
+      "can't find custom var",
+      "Can't find GPS",
+      "gps provider not found",
+      "gps toggle not found",
+      "no custom var",
+      "No extra SF configured",
+      "Invalid extra SF config",
+  };
+  if (reply == NULL || reply[0] == 0) return false;
+  for (size_t i = 0; i < sizeof(kErrorPrefixes) / sizeof(kErrorPrefixes[0]); i++) {
+    if (strncmp(reply, kErrorPrefixes[i], strlen(kErrorPrefixes[i])) == 0) return true;
+  }
+  return false;
+}
+
+// The value after `prefix` in a command, or NULL when the command is not that
+// one: the prefix must be followed by a space or the end of the command, so
+// "get mqtt.interval" is not a match for the prefix "get mqtt.inter" and
+// "get mqtt.intervalx" is not a match for "get mqtt.interval" either.
+inline const char* cliCommandValue(const char* command, const char* prefix) {
+  size_t len = strlen(prefix);
+  if (command == NULL || strncmp(command, prefix, len) != 0 ||
+      (command[len] && command[len] != ' ')) return nullptr;
+  const char* value = command + len;
+  while (*value == ' ') value++;
+  return value;
 }
 
 // A "token" charset shared by !id job keys (CliScript) and fleet tags
@@ -130,6 +286,19 @@ inline int cliDecodeHex(const char* in, size_t in_len, uint8_t* out, size_t capa
     out[i / 2] = (uint8_t)((hi << 4) | lo);
   }
   return (int)(in_len / 2);
+}
+
+// The PSK rule every channel key follows: exactly 16 or 32 bytes of hex (32 or
+// 64 digits), decoded into the caller's buffer. The filter's channel store and
+// the fleet channel both take their key this way, so the rule lives here once;
+// each caller keeps its own error wording.
+inline bool cliDecodePskHex(const char* hex, uint8_t* out, size_t capacity, int* out_len) {
+  size_t hex_len = strlen(hex);
+  if (hex_len != 32 && hex_len != 64) return false;
+  int len = cliDecodeHex(hex, hex_len, out, capacity);
+  if (len != 16 && len != 32) return false;
+  *out_len = len;
+  return true;
 }
 
 // Split a decrypted group-text body into "<sender>: <text>". Content is

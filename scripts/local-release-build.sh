@@ -9,7 +9,7 @@
 # A release URL works from any clone; a bare tag additionally assumes the
 # clone has a remote named "fork" pointing at the release's repo (falling
 # back to the URL works everywhere). Requires gh (authenticated), git,
-# python3, and bash 4+.
+# python3, and bash 4.4+.
 #
 #     -j, --jobs N        parallel build workers (default: 4)
 #     --targets LIST      comma/space/newline-separated target list
@@ -54,13 +54,13 @@
 # framework embeds via __FILE__, and the SHA256 trailers derived from those —
 # all benign, and all shared by every asset in one release (CI's own reruns
 # vary the same way; to match CI's exact bytes, export
-# PLATFORMIO_HOME_DIR=/home/runner/.platformio after creating that path).
+# PLATFORMIO_CORE_DIR=/home/runner/.platformio after creating that path —
+# PlatformIO 6 reads PLATFORMIO_CORE_DIR, not the older PLATFORMIO_HOME_DIR).
 #
 set -euo pipefail
 
 die() { echo "local-release-build: $*" >&2; exit 1; }
 info() { echo "local-release-build: $*"; }
-trap 'exit 130' INT
 
 # Ctrl-C must take the whole tree down: the build workers and the uploader run
 # as asynchronous commands, which bash makes ignore SIGINT when job control is
@@ -271,7 +271,8 @@ done
 [[ -n $RELEASE_ARG ]] || { usage; exit 1; }
 command -v gh >/dev/null || die "gh is required"
 command -v git >/dev/null || die "git is required"
-((BASH_VERSINFO[0] >= 4)) || die "bash 4+ is required (macOS ships 3.2; try 'brew install bash')"
+((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) \
+  || die "bash 4.4+ is required (macOS ships 3.2; try 'brew install bash')"
 
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 REPO_ROOT=$(git -C "$(dirname "$SCRIPT_PATH")" rev-parse --show-toplevel)
@@ -395,6 +396,13 @@ fi
 # artifacts upload like any other.
 info "resolving platforms"
 mapfile -t platform_lines < <(run_tool __platforms "${targets[@]}")
+# The resolution must cover every target. A failed or partial resolution would
+# otherwise build nothing (or a subset) and still report success — the exit
+# status is the only thing a caller can trust, so it must not say "built"
+# when a target was never built.
+if [[ ${#platform_lines[@]} -ne ${#targets[@]} ]]; then
+  die "platform resolution returned ${#platform_lines[@]} of ${#targets[@]} targets"
+fi
 declare -A target_platform=()
 declare -A platform_seen=()
 warmup=()
@@ -456,8 +464,12 @@ upload_one() {  # upload_one <target> — runs in the release's build dir
   local t=$1
   local log="$state_dir/logs/upload-$t.log"
   cd "$build_dir"
+  # the file list is one path per line: read it into an array so a path with
+  # spaces cannot split into two arguments
+  local -a files=()
+  mapfile -t files <"$state_dir/files/$t"
   for attempt in 1 2; do
-    if gh release upload "$tag" --repo "$release_repo" --clobber $(cat "$state_dir/files/$t") >>"$log" 2>&1; then
+    if gh release upload "$tag" --repo "$release_repo" --clobber ${files[@]+"${files[@]}"} >>"$log" 2>&1; then
       : >"$state_dir/uploaded/$t"
       return 0
     fi
@@ -541,6 +553,17 @@ fi
 if [[ $n_fail -gt 0 ]]; then
   info "build failures:"
   ls "$state_dir/failed" | sed 's/^/  /'
+  exit 1
+fi
+if [[ $n_ok -ne $total ]]; then
+  # a target that is neither done nor failed never completed: the run must not
+  # report success over it
+  info "built $n_ok of $total targets — the rest never completed"
+  exit 1
+fi
+if [[ $UPLOAD == 1 && $n_upfail -gt 0 ]]; then
+  info "upload failures:"
+  ls "$state_dir/upfail" | sed 's/^/  /'
   exit 1
 fi
 info "all targets built"

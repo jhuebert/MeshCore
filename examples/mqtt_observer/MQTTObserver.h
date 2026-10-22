@@ -11,6 +11,7 @@
 #include <freertos/FreeRTOS.h>
 
 #include "../simple_repeater/PersistUtil.h"
+#include "MQTTObserverCli.h"
 #include "MQTTObserverConfig.h"
 #include "MQTTObserverFormat.h"
 #include "MQTTObserverPolicy.h"
@@ -31,10 +32,7 @@ class MQTTObserver {
 
   using EventQueue = MQTTObserverEventQueue<Event, MQTT_OBSERVER_QUEUE_CAPACITY>;
 
-  enum State : uint8_t {
-    STATE_OFF, STATE_CONFIG, STATE_WIFI, STATE_TIME, STATE_CONNECTING,
-    STATE_CONNECTED, STATE_RETRY, STATE_ERROR
-  };
+  using State = MQTTObserverSlotState;   // the CLI reports these names
 
   struct BrokerRuntime {
     PsychicMqttClient* client;
@@ -56,18 +54,13 @@ class MQTTObserver {
     bool configured;
     std::atomic<bool> connected;
     std::atomic<bool> status_pending;
+    std::atomic<bool> connect_failed;   // the last connect attempt never came up
     std::atomic<State> state;
-    std::atomic<int> probe_msg_id;
-    std::atomic<uint32_t> probe_sent_ms;
-    uint32_t last_probe_ms;
+    // The outstanding liveness probe (one QoS 1 publish in flight) and its
+    // bookkeeping; see MQTTObserverProbeTracker.
+    MQTTObserverProbeTracker probe;
 
     BrokerRuntime();
-
-    // One outstanding QoS 1 liveness probe per broker; a PUBACK for it clears
-    // the outstanding marker, and starting a new one only happens when none is
-    // in flight.
-    void noteProbe(int msg_id);
-    void notePuback(int msg_id);
   };
 
   static const uint32_t kMinimumValidTime = 1735689600UL;
@@ -137,12 +130,8 @@ class MQTTObserver {
   static bool writeRecord(File& file, void* context);
   static bool validateRecord(File& file, void* context);
   bool readRecord(File& file, MQTTObserverConfig& config);
-  bool handleSetCommand(char* command, char* reply);
-  bool handleGetCommand(const char* command, char* reply);
-  bool setString(char* destination, size_t capacity, const char* value);
-  const char* stateName(State state) const;
-  bool commandSlot(const char* command, const char* operation, size_t& slot,
-                   const char*& property) const;
+  // the device facts the CLI reports
+  void cliFacts(MQTTObserverCliFacts& facts);
 
 public:
   MQTTObserver();
@@ -157,7 +146,6 @@ public:
   void capture(mesh::Packet* packet, float score);
   void captureTx(mesh::Packet* packet);
   bool handleCommand(char* command, char* reply);
-  void formatStatus(char* reply, size_t capacity);
 };
 
 #endif  // WITH_MQTT_OBSERVER

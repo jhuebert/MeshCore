@@ -27,6 +27,7 @@ void FleetManager::resetToDefaults() {
   reply_count = 0;
   offered = 0;
   matched = 0;
+  crowded_out = 0;
   reply_retries = 0;
   // device services are deliberately NOT reset here: they are wiring (set by
   // MyMesh::begin() before load()), not config state — they have in-class
@@ -55,16 +56,12 @@ void FleetManager::setEnabled(bool on) {
 // ---------------------------------------------------------------- channel
 
 bool FleetManager::setChannel(const char* psk_hex) {
-  // exactly 16 or 32 bytes of hex; anything else is refused before decoding
-  size_t hex_len = strlen(psk_hex);
-  if (hex_len != 32 && hex_len != 64) return false;
-
   // build the whole candidate off to the side: a rejected key must leave the
   // live channel byte-for-byte unchanged
   uint8_t candidate[32];
   memset(candidate, 0, sizeof(candidate));
-  int len = cliDecodeHex(psk_hex, hex_len, candidate, sizeof(candidate));
-  if (len != 16 && len != 32) return false;
+  int len = 0;
+  if (!cliDecodePskHex(psk_hex, candidate, sizeof(candidate), &len)) return false;
 
   memcpy(psk, candidate, sizeof(psk));   // zero-padded, like the filter's store
   psk_len = (uint8_t)len;
@@ -152,8 +149,10 @@ void FleetManager::onGroupData(const mesh::Packet* packet, uint8_t type,
   if (len < 5 || (data[4] >> 2) != TXT_TYPE_PLAIN) return;
 
   // split the message body (sender prefix skipped; the fleet intake never
-  // uses it — targeting is tags)
-  char sender[MAX_PACKET_PAYLOAD + 1];
+  // uses it — targeting is tags). The sender field is not read here, so it
+  // gets a one-byte buffer: the receive path runs on a 4 KB task and 185
+  // unused bytes of stack are 185 bytes the core does not get.
+  char sender[1];
   char text[MAX_PACKET_PAYLOAD + 1];
   bool has_text = false, has_sender = false;
   parseGroupText(data, len, sender, sizeof(sender), text, sizeof(text), &has_text, &has_sender);
@@ -199,13 +198,15 @@ void FleetManager::admitScheduled(const char* text, const CliScriptMeta& meta,
                                   const mesh::GroupChannel& chan) {
   // the runner stays clock-free: staleness and clock-floor refusals are
   // manager decisions, made with the node RTC
+  // A key already seen is a duplicate whatever the clock says: the job ran (or
+  // was armed) once, and a re-sent copy is a dup, not a stale refusal.
+  if (runner.keySeen(meta.key)) { runner.noteDup(); return; }
   uint32_t now = time_fn ? time_fn(time_ctx) : 0;
   if (now < FLEET_AT_CLOCK_FLOOR) { runner.noteRefused(); return; }   // RTC unset
   if ((int32_t)(now - meta.due_epoch) > FLEET_AT_STALE_SECS) {
     runner.noteRefused();   // a typo'd stale date must never run immediately
     return;
   }
-  if (runner.keySeen(meta.key)) { runner.noteDup(); return; }
   if (sched_count >= FLEET_SCHED_STORE) { runner.noteRefused(); return; }
 
   // commit only once everything validated: store + mark-at-admission
@@ -295,6 +296,13 @@ void FleetManager::removeReply(int idx) {
   reply_count--;
 }
 
+// The room the reply body may use: the datagram's data limit less the
+// group-text header and the "<name>: " prefix the sender puts in front of it.
+size_t FleetManager::replyRoom(const char* name) const {
+  size_t overhead = FLEET_REPLY_HEADER_LEN + FLEET_REPLY_NAME_PREFIX_LEN + strlen(name);
+  return overhead < FLEET_REPLY_DATA_MAX ? FLEET_REPLY_DATA_MAX - overhead : 0;
+}
+
 void FleetManager::serviceReplies() {
   for (int i = 0; i < reply_count;) {
     FleetReply& r = replies[i];
@@ -302,21 +310,44 @@ void FleetManager::serviceReplies() {
     // window/backoff) away, so it only wraps when millis() itself does
     if ((int32_t)(millis() - r.deadline_ms) < 0) { i++; continue; }
 
-    char body[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key>\n<summary>"
-    snprintf(body, sizeof(body), "%s\n%s", r.key, r.summary);
+    if (!r.awaiting) {
+      // First attempt: freeze the node name, and with it the room the body is
+      // cut to. The byte-identical resend must compose the same packet, and
+      // the live name would otherwise cut the body differently — a different
+      // packet, and the retry would show up twice.
+      const char* name = name_fn ? name_fn(name_ctx) : "";
+      strncpy(r.sender_name, name, sizeof(r.sender_name) - 1);
+      r.sender_name[sizeof(r.sender_name) - 1] = 0;
+    }
+
+    // The reply is cut to the room the frozen name leaves of the packet, so
+    // the acknowledgement always fits one datagram and the cut is marked,
+    // never silent. The job key line comes first and is never the part that
+    // is cut: it identifies the reply.
+    char body_buf[FLEET_CLI_KEY_LEN + 1 + FLEET_REPLY_SUMMARY_LEN];   // "<key>\n<summary>"
+    CliBuf body(body_buf, sizeof(body_buf));
+    body.add("%s\n", r.key);
+    size_t room = replyRoom(r.sender_name);
+    body.addCut(r.summary, room > body.len() ? room - body.len() : 0);
 
     if (r.awaiting) {
       // window elapsed with no repeater heard repeating the reply: one
-      // byte-identical resend. Same ts => same packet hash, so every node that
-      // already relayed attempt 1 suppresses this copy — no duplicate on air.
+      // byte-identical resend. Same ts, same name, same body => same packet
+      // hash, so every node that already relayed attempt 1 suppresses this
+      // copy — no duplicate on air.
       if (send_fn == NULL) {
         removeReply(i);
         continue;
       }
-      bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, body, NULL);
+      bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, r.sender_name,
+                           body.c_str(), NULL);
       if (!sent) {
         // packet pool refused the retry: it was not sent, so retain the slot and
-        // try again after the same bounded backoff as an initial-send refusal.
+        // try again after the same bounded backoff as an initial-send refusal
+        if (++r.send_attempts >= FLEET_ACK_SEND_MAX_ATTEMPTS) {
+          removeReply(i);   // the first copy already went out: drop the pending entry
+          continue;
+        }
         r.deadline_ms = millis() + FLEET_ACK_RETRY_BACKOFF_MS;
         i++;
         continue;
@@ -333,9 +364,17 @@ void FleetManager::serviceReplies() {
     }
     uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
     uint8_t hash[MAX_HASH_SIZE];
-    bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, body, hash);
+    bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, r.sender_name,
+                         body.c_str(), hash);
     if (!sent) {
-      // packet pool refused the send: no attempt used, try again shortly
+      // packet pool refused the send: no attempt used, try again shortly. The
+      // attempts are capped: a reply that can never be sent must not hold its
+      // store slot forever (two of them would block every later ack).
+      if (++r.send_attempts >= FLEET_ACK_SEND_MAX_ATTEMPTS) {
+        removeReply(i);
+        runner.noteRefused();   // the acknowledgement was dropped
+        continue;
+      }
       r.deadline_ms = millis() + FLEET_ACK_RETRY_BACKOFF_MS;
       i++;
       continue;
@@ -375,7 +414,8 @@ void FleetManager::onHeardPacket(const mesh::Packet* packet) {
 bool FleetManager::sendAlert(const char* body) {
   if (!enabled || psk_len == 0 || send_fn == NULL) return false;
   uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
-  return send_fn(send_ctx, psk, chan_hash, ts, body, NULL);   // one-shot: no retry
+  const char* name = name_fn ? name_fn(name_ctx) : "";
+  return send_fn(send_ctx, psk, chan_hash, ts, name, body, NULL);   // one-shot: no retry
 }
 
 // ---------------------------------------------------------------- relay side
@@ -402,8 +442,16 @@ bool FleetManager::checkForward(const mesh::Packet* packet) {
 int FleetManager::appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[],
                                       int max_matches, int filled) {
   if (!enabled || psk_len == 0) return 0;
-  if (filled >= max_matches) return 0;
   if (chan_hash != hash[0]) return 0;
+  if (filled >= max_matches) {
+    // core offers at most max_matches candidate keys per on-air hash, and the
+    // filter's channel store is offered first. When it filled them all, the
+    // fleet channel is never tried: its traffic is not decrypted, so no script
+    // can arrive. Counted, so the operator sees it instead of a fleet that
+    // silently stopped working.
+    crowded_out++;
+    return 0;
+  }
   // the filter store may hold the same PSK: handing core the same secret twice
   // would burn one of its few candidate slots. Only the filled prefix of dest
   // is initialised (core's caller passes raw stack), so only it is compared.
@@ -462,7 +510,11 @@ static bool fleetValidateFile(File& f, void* ctx) {
   memcpy(&stored, &buf[FLEET_CFG_PAYLOAD_BYTES], 2);
   computed = crc16_ccitt(buf, FLEET_CFG_PAYLOAD_BYTES);
   if (stored != computed) return false;
-  return fleetValidateRecord(*(const FleetCfgRecord*)buf);
+  // copy into a record before reading its fields: the file buffer has no
+  // alignment guarantee, and a misaligned struct reference is undefined
+  FleetCfgRecord rec;
+  memcpy(&rec, buf, sizeof(rec));
+  return fleetValidateRecord(rec);
 }
 
 void FleetManager::save(FILESYSTEM* fs) {
@@ -497,7 +549,10 @@ void FleetManager::load(FILESYSTEM* fs) {
   computed = crc16_ccitt(buf, FLEET_CFG_PAYLOAD_BYTES);
   if (stored != computed) return;   // chooseConfigToLoad validated it; re-verify anyway
 
-  const FleetCfgRecord& rec = *(const FleetCfgRecord*)buf;
+  // copy into a record before reading its fields: the file buffer has no
+  // alignment guarantee, and a misaligned struct reference is undefined
+  FleetCfgRecord rec;
+  memcpy(&rec, buf, sizeof(rec));
   if (!fleetValidateRecord(rec)) return;
 
   enabled = (rec.enabled == 1);
@@ -536,23 +591,32 @@ void FleetManager::load(FILESYSTEM* fs) {
 #define FLEET_CHAN_USAGE "Err - usage: chan set <psk-hex>|clear"
 
 static void fleetStatus(FleetManager& fleet, char* reply) {
-  char* out = reply;
-  int remain = CLI_REPLY_MAX;
-  radd(&out, &remain, "%s, chan ", fleet.isEnabled() ? "on" : "off");
-  if (fleet.hasChannel()) radd(&out, &remain, "h=%02X", fleet.getChanHash());
-  else radd(&out, &remain, "-");
-  radd(&out, &remain, ", tags %d/%d", fleet.getTagCount(), FLEET_MAX_TAGS);
+  // The line is built in full and then cut with the marked cut: the counters
+  // are 32-bit, so a long-lived node can push the line past the CLI reply
+  // bound. A silent cut would drop a counter without saying so; the marked cut
+  // ends the line with "...", so the operator knows the status is incomplete.
+  char line[256];
+  CliBuf buf(line, sizeof(line));
+  buf.add("%s, chan ", fleet.isEnabled() ? "on" : "off");
+  if (fleet.hasChannel()) buf.add("h=%02X", fleet.getChanHash());
+  else buf.add("-");
+  buf.add(", tags %d/%d", fleet.getTagCount(), FLEET_MAX_TAGS);
   auto& s = fleet.getScripts();
-  radd(&out, &remain, "; scripts ran:%lu dup:%lu noid:%lu refused:%lu",
-       (unsigned long)s.getRan(), (unsigned long)s.getDup(),
-       (unsigned long)s.getNoId(), (unsigned long)s.getRefused());
-  radd(&out, &remain, "; pending %d/%d", s.getPendingCount(), FLEET_CLI_QUEUE_DEPTH);
-  radd(&out, &remain, "; sched %d/%d", fleet.getSchedCount(), FLEET_SCHED_STORE);
-  radd(&out, &remain, "; seen %d/%d", s.getSeenCount(), FLEET_CLI_SEEN_SIZE);
-  radd(&out, &remain, "; ackq %d/%d await %d rtx %lu",
-       fleet.getReplyCount(), FLEET_REPLY_STORE, fleet.getAwaitingCount(),
-       (unsigned long)fleet.getReplyRetries());
-  radd(&out, &remain, "; badline %lu", (unsigned long)s.getBadLines());
+  buf.add("; scripts ran:%lu dup:%lu noid:%lu refused:%lu",
+          (unsigned long)s.getRan(), (unsigned long)s.getDup(),
+          (unsigned long)s.getNoId(), (unsigned long)s.getRefused());
+  buf.add("; pending %d/%d", s.getPendingCount(), FLEET_CLI_QUEUE_DEPTH);
+  buf.add("; sched %d/%d", fleet.getSchedCount(), FLEET_SCHED_STORE);
+  buf.add("; seen %d/%d", s.getSeenCount(), FLEET_CLI_SEEN_SIZE);
+  buf.add("; ackq %d/%d await %d rtx %lu",
+          fleet.getReplyCount(), FLEET_REPLY_STORE, fleet.getAwaitingCount(),
+          (unsigned long)fleet.getReplyRetries());
+  buf.add("; badline %lu", (unsigned long)s.getBadLines());
+  // packets core never offered the fleet key for: a non-zero count means the
+  // fleet channel is not being decrypted and no script can arrive
+  buf.add("; crowded %lu", (unsigned long)fleet.getCrowdedOut());
+
+  cliCutReply(reply, CLI_REPLY_MAX, line);
 }
 
 static void fleetTagCLI(FleetManager& fleet, char* params, char* reply) {
@@ -564,11 +628,10 @@ static void fleetTagCLI(FleetManager& fleet, char* params, char* reply) {
       strcpy(reply, "tags: (none) - broadcast scripts only");
       return;
     }
-    char* out = reply;
-    int remain = CLI_REPLY_MAX;
-    radd(&out, &remain, "tags:");
+    CliBuf buf(reply, CLI_REPLY_MAX);
+    buf.addStr("tags:");
     for (int i = 0; i < fleet.getTagCount(); i++) {
-      radd(&out, &remain, " %s", fleet.getTag(i));
+      buf.add(" %s", fleet.getTag(i));
     }
   } else if (strcmp(sub, "add") == 0) {
     char* tag = nextToken(&p);
@@ -696,10 +759,9 @@ void fleetCLI(FleetManager& fleet, const char* command, char* reply) {
   // An oversized command is refused whole rather than acted on as a prefix, and
   // unbalanced quotes are an error rather than a silent misparse. Both are
   // checked before anything is touched.
-  char buf[MAX_PACKET_PAYLOAD + 1];
-  if (!cliQuotesBalanced(command)) { strcpy(reply, "Err - unbalanced quotes"); return; }
-  if (!cliCopyCommand(buf, sizeof(buf), command)) { strcpy(reply, "Err - command too long"); return; }
-  char* p = buf;
+  char scratch[MAX_PACKET_PAYLOAD + 1];
+  if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
+  char* p = scratch;
   char* cmd = nextToken(&p);
 
   if (cmd == NULL) {

@@ -195,6 +195,11 @@ Content rules match against the repeater's store of named channels:
   when you don't have (or want) the channel's key.
 - The store holds at most 32 channels. If it fills up, `filter chan list`
   shows what's stored and `filter chan del <name>` frees a slot.
+- A `chan=` list can name every channel in the store. Its length is bounded by
+  the CLI command length (about 180 characters), not by a limit of its own: a
+  list of 32 short names fits, a list of long names may not. A command that
+  does not fit is refused whole (`Err - command too long`) — it is never acted
+  on as a truncated prefix.
 
 ### Sender and text
 
@@ -780,6 +785,13 @@ evaluated airtime it shows `0%`. It measures the filter's estimated savings,
 not actual transmitted airtime or channel utilization: packets allowed by the
 filter may still be blocked by other forwarding checks.
 
+The figure is also an **upper bound on the real saving**: a packet the filter
+drops is billed whether or not this repeater would have relayed it anyway (the
+flood hop limit, forwarding disabled, loop detection). The filter is asked
+first, so it cannot know what the repeater's own forwarding checks would have
+decided; the billed airtime is what the filter's decisions *avoided*, not what
+the repeater demonstrably did not spend.
+
 All airtime counters are RAM-only and reset on reboot or a statistics reset,
 like every counter.
 
@@ -813,7 +825,7 @@ is only needed for initial flashing and emergencies.
 | Text pattern length | 63 characters |
 | Alternatives per pattern | 8 (`\|`-separated) |
 | Advert rate-limit window | 0–720 hours (0 = off) |
-| CLI reply length | short (~160 bytes) — use `filter get <idx>` for detail |
+| CLI reply length | one short line — use `filter get <idx>` for detail |
 
 - Overly long or complex patterns are **rejected with an error**, not silently
   shortened. Keep patterns short and specific.
@@ -1124,7 +1136,7 @@ filter stats
 |---|---|
 | Typo in a command did nothing | Nothing is ignored any more: a command with an unexpected extra word, unbalanced quotes, or an over-long line is refused with a usage line and changes nothing |
 | A channel is missing from `filter chan list` | The store holds more than fits one reply — the listing ends with `next=N`; run `filter chan list N` for the rest |
-| `filter list` stops at a `...` line, or a rule ends with `..` | The listing did not fit one reply: run `filter list <last-index + 1>` (the number after the last line shown) for the rest. A rule ending in `..` was too large for its line — `filter get <idx>` shows more of it |
+| `filter list` stops at a `...` line, or a rule ends with `..` | The listing did not fit one reply: run `filter list <last-index + 1>` (the number after the last line shown) for the rest. A rule ending in `..` was too large for its line — `filter get <idx>` shows more of it. A reply the fleet cut to fit one packet ends with `...` too — see [FLEET.md](./FLEET.md) |
 | Rule gets no hits | Is the filter on (`filter on`)? Is the rule enabled? Did an earlier rule match first? |
 | Sender/text never matches | Can the repeater decrypt the channel? Is it group text? Are you matching the right field (sender without colon, text without name)? |
 | Matches too broadly | Add `^`/`$` anchors; escape literal dots; remember `sender=Bot` matches `MyBot2` |

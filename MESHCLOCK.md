@@ -65,6 +65,12 @@ collected over hours and its samples still cluster within seconds.
 | `clock mesh on` | Enable |
 | `clock mesh off` | Disable |
 
+Like the other fork CLIs (`filter`, `battery`, `fleet`), the command is refused
+whole — nothing is enabled or disabled — when it is too long for the CLI's
+buffer (`Err - command too long`) or carries an odd number of double quotes
+(`Err - unbalanced quotes`); an unexpected extra word answers
+`Err - clock mesh takes on|off`.
+
 The status `last=` field is one of:
 
 | Value | Meaning |

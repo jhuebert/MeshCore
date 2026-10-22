@@ -45,16 +45,6 @@ static bool validKey(const char* key) {
   return cliValidToken(key, FLEET_CLI_KEY_LEN);
 }
 
-// Bounded copy of a line's reply into a summary slot: the first error and the
-// last reply are both kept to FLEET_REPLY_SUMMARY_LEN so a finished script's
-// acknowledgement always fits one packet.
-static void copySummary(char* dst, const char* src) {
-  size_t n = strlen(src);
-  if (n >= FLEET_REPLY_SUMMARY_LEN) n = FLEET_REPLY_SUMMARY_LEN - 1;
-  memcpy(dst, src, n);
-  dst[n] = 0;
-}
-
 // ---------------------------------------------------------------- directives
 
 // "!delay <ms>": 1..FLEET_DELAY_MAX_MS milliseconds. The pause bounds how long
@@ -74,15 +64,24 @@ static bool parseDelayValue(const char* rest, uint32_t* out_ms) {
 // FLEET.md): no contains, no prefix, no wildcards.
 static bool parseTagsList(const char* rest, CliScriptMeta* meta) {
   if (rest[0] == 0) return false;
-  char vals[MAX_PACKET_PAYLOAD];
-  if (!cliCopyCommand(vals, sizeof(vals), rest)) return false;
-  char* p = vals;
-  char* t;
-  while ((t = strsep(&p, ",")) != NULL) {
-    if (!cliValidToken(t, FLEET_TAG_LEN)) return false;
+  // Walked in place: a tag is at most FLEET_TAG_LEN chars, so one tag's worth
+  // of scratch is all the split needs. The old copy of the whole list was
+  // MAX_PACKET_PAYLOAD bytes of the receive path's stack for a list that can
+  // never exceed 8*16+7 chars.
+  const char* p = rest;
+  while (true) {
+    const char* comma = strchr(p, ',');
+    size_t n = comma ? (size_t)(comma - p) : strlen(p);
+    if (n == 0 || n > FLEET_TAG_LEN) return false;   // empty item, or too long
+    char tag[FLEET_TAG_LEN + 1];
+    memcpy(tag, p, n);
+    tag[n] = 0;
+    if (!cliValidToken(tag, FLEET_TAG_LEN)) return false;
     if (meta->tag_count >= FLEET_MAX_SCRIPT_TAGS) return false;
-    strcpy(meta->tags[meta->tag_count], t);   // validated by cliValidToken()
+    strcpy(meta->tags[meta->tag_count], tag);   // validated by cliValidToken()
     meta->tag_count++;
+    if (comma == NULL) break;
+    p = comma + 1;
   }
   return meta->tag_count > 0;
 }
@@ -279,7 +278,9 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
   }
 
   LineWalker lines(slot->text + slot->body_off);
-  char reply[CLI_REPLY_MAX];
+  // The buffer holds the companion-radio prefix and a whole CLI reply: the
+  // core's "xx|" form reflects the prefix back and writes the reply after it.
+  char reply[CLI_REPLY_BUFFER_MAX];
   char* line;
   bool slept = false;
   while ((line = lines.next()) != NULL) {
@@ -311,9 +312,9 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
     reply[0] = 0;
     fn(ctx, slot->key, line, reply);
     slot->ran_count++;
-    copySummary(slot->last_reply, reply);
-    if (strncmp(reply, "Err", 3) == 0 && slot->first_err[0] == 0) {
-      copySummary(slot->first_err, reply);
+    snprintf(slot->last_reply, sizeof(slot->last_reply), "%s", reply);
+    if (cliIsErrorReply(reply) && slot->first_err[0] == 0) {
+      snprintf(slot->first_err, sizeof(slot->first_err), "%s", reply);
     }
   }
 
@@ -321,22 +322,20 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
 
   // the script finished: free the slot and report, so the caller can schedule
   // the acknowledgement without re-running anything
-  char summary[FLEET_REPLY_SUMMARY_LEN];
-  bool error = slot->first_err[0] != 0;
-  if (slot->ran_count == 1) {
-    copySummary(summary, slot->last_reply);   // the command's actual reply
-  } else if (error) {
-    snprintf(summary, sizeof(summary), "ran %u; err: %s",
-             (unsigned)slot->ran_count, slot->first_err);
-  } else {
-    snprintf(summary, sizeof(summary), "ran %u ok", (unsigned)slot->ran_count);
-  }
-
   if (out != NULL) {
     strcpy(out->key, slot->key);
-    copySummary(out->summary, summary);
+    // the summary is the command's actual reply, or the first failure; it is
+    // cut to the room the node name leaves when the reply is sent
+    CliBuf buf(out->summary, sizeof(out->summary));
+    if (slot->ran_count == 1) {
+      buf.addStr(slot->last_reply);
+    } else if (slot->first_err[0] != 0) {
+      buf.add("ran %u; err: %s", (unsigned)slot->ran_count, slot->first_err);
+    } else {
+      buf.add("ran %u ok", (unsigned)slot->ran_count);
+    }
     out->ack = slot->ack;
-    out->error = error;
+    out->error = slot->first_err[0] != 0;
     memcpy(out->chan_secret, slot->chan_secret, sizeof(out->chan_secret));
     out->chan_hash = slot->chan_hash;
   }

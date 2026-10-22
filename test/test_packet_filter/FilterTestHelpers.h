@@ -14,6 +14,7 @@
 #include <helpers/TxtDataHelpers.h>   // TXT_TYPE_PLAIN
 #include "PacketFilter.h"
 #include "CliUtil.h"        // CLI_REPLY_MAX
+#include "CliReplyHelper.h"   // the shared canaried reply buffer
 
 // payload offsets the advert rate limiter samples its 4-byte origin key from
 // (mirrors the fixed KEY_OFFSETS in AdvertRateLimiter.cpp)
@@ -97,19 +98,13 @@ inline mesh::GroupChannel channelFromStore(FilterRules& filter, int idx) {
 // silently passing. `regions` is a real RegionMap: the CLI calls members on it,
 // and calling through a null pointer is undefined behaviour.
 inline std::string cli(FilterRules& filter, const char* command) {
-  static const uint8_t CANARY = 0xA5;
   static TransportKeyStore store;
   static RegionMap regions(store);
 
-  uint8_t raw[CLI_REPLY_MAX + 1];
-  memset(raw, CANARY, sizeof(raw));
-  char* reply = (char*)raw;
-  reply[0] = 0;
-  filterCLI(filter, command, reply, &regions);
-  EXPECT_EQ(raw[CLI_REPLY_MAX], CANARY) << "reply overran " << CLI_REPLY_MAX << " bytes: " << command;
-  EXPECT_NE(memchr(reply, 0, CLI_REPLY_MAX), nullptr)
-      << "reply not NUL-terminated in " << CLI_REPLY_MAX << " bytes: " << command;
-  return std::string(reply);
+  CliReplyBuf buf;
+  filterCLI(filter, command, buf.reply(), &regions);
+  buf.check(command);
+  return std::string(buf.reply());
 }
 
 // Run a CLI command expected to succeed (reply begins "OK ").

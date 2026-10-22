@@ -140,10 +140,21 @@ jobs:
                 return;
               }
               const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
-                '-e', 'native_packet_filter', '-e', 'native_battery_gate', '-e', 'native_fleet'],
+                '-e', 'native_packet_filter', '-e', 'native_battery_gate', '-e', 'native_fleet',
+                '-e', 'native_fleet_noack', '-e', 'native_mesh_clock',
+                '-e', 'native_mqtt_observer'],
                 { stdio: 'inherit' });
               if (gate.status !== 0) {
                 core.setFailed('native test gate failed; stable is unchanged');
+                return;
+              }
+              // the fork's own build-tooling tests (the target catalog and the
+              // build.sh environment list): nothing else runs them
+              const tooling = spawnSync('python3',
+                ['-m', 'unittest', 'discover', '-s', 'scripts/tests'],
+                { stdio: 'inherit' });
+              if (tooling.status !== 0) {
+                core.setFailed('build tooling test gate failed; stable is unchanged');
                 return;
               }
             } else {

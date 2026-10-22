@@ -1,11 +1,236 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include "MQTTObserverCli.h"
 #include "MQTTObserverConfig.h"
 #include "MQTTObserverFormat.h"
 #include "MQTTObserverPolicy.h"
 #include "MQTTObserverRecord.h"
 #include "PersistUtil.h"
+
+// The CLI surface: the observer's commands and their replies, driven the way
+// the firmware drives them (MQTT_OBSERVER.md is the spec for these strings).
+struct ObserverCliTest : public ::testing::Test {
+  MQTTObserverConfig config;
+  MQTTObserverCliFacts facts;
+  std::string reply;
+  bool changed = false;
+
+  void SetUp() override {
+    MQTTObserverConfigCodec::setDefaults(config);
+    facts.wifi_up = true;
+    facts.clock_valid = true;
+    facts.wifi_ip[0] = 192; facts.wifi_ip[1] = 168; facts.wifi_ip[2] = 1; facts.wifi_ip[3] = 42;
+    facts.wifi_rssi = -55;
+    facts.free_heap = 118032;
+    facts.max_heap = 98304;
+    facts.queue_capacity = 8;
+    facts.slot_state[0] = STATE_CONNECTED;
+    facts.slot_connected[0] = true;
+  }
+
+  // run one command; returns true when the command was the observer's
+  bool run(const std::string& command) {
+    reply.assign(200, '\0');
+    changed = false;
+    return mqttObserverCliCommand(config, "Roof Repeater", facts, command.c_str(),
+                                  &reply[0], &changed);
+  }
+  std::string said() const { return std::string(reply.c_str()); }
+};
+
+TEST_F(ObserverCliTest, SharedSettersAnswerAndStore) {
+  EXPECT_TRUE(run("set mqtt.iata sea"));
+  EXPECT_EQ(said(), "OK - MQTT setting saved");
+  EXPECT_STREQ(config.iata, "SEA");   // auto-uppercased
+  EXPECT_TRUE(changed);
+
+  EXPECT_TRUE(run("set mqtt.origin Shed"));
+  EXPECT_STREQ(config.origin, "Shed");
+  EXPECT_TRUE(run("set mqtt.interval 12"));
+  EXPECT_EQ(config.status_interval_minutes, 12);
+  EXPECT_TRUE(run("set mqtt.rx on"));
+  EXPECT_EQ(config.rx_enabled, 1);
+  EXPECT_TRUE(run("set mqtt.tx advert"));
+  EXPECT_EQ(config.tx_enabled, 2);
+  EXPECT_TRUE(run("set mqtt.ntp none"));
+  EXPECT_STREQ(config.ntp_server, "");   // none restores the default
+}
+
+TEST_F(ObserverCliTest, SharedSettersRefuseBadValues) {
+  EXPECT_TRUE(run("set mqtt.iata x"));
+  EXPECT_EQ(said(), "Err - IATA must be 3 letters/digits; XXX is reserved");
+  EXPECT_TRUE(run("set mqtt.iata XXXX"));
+  EXPECT_EQ(said(), "Err - IATA must be 3 letters/digits; XXX is reserved");
+  EXPECT_TRUE(run("set mqtt.interval 0"));
+  EXPECT_EQ(said(), "Err - interval must be 1-60 minutes");
+  EXPECT_TRUE(run("set mqtt.interval 61"));
+  EXPECT_EQ(said(), "Err - interval must be 1-60 minutes");
+  EXPECT_TRUE(run("set mqtt.tx sometimes"));
+  EXPECT_EQ(said(), "Err - tx must be off, on, or advert");
+  EXPECT_TRUE(run("set mqtt.rx maybe"));
+  EXPECT_EQ(said(), "Err - expected on or off");
+  EXPECT_TRUE(run("set mqtt.ntp not a host"));
+  EXPECT_EQ(said(), "Err - invalid NTP server");
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(ObserverCliTest, PerBrokerSettersAnswerAndStore) {
+  EXPECT_TRUE(run("set mqtt1.enabled on"));
+  EXPECT_EQ(said(), "OK - MQTT1 enabled");
+  EXPECT_EQ(config.brokers[0].enabled, 1);
+
+  EXPECT_TRUE(run("set mqtt1.server wss://broker.example:443/mqtt"));
+  EXPECT_EQ(said(), "OK - MQTT1 setting saved");
+  EXPECT_STREQ(config.brokers[0].server, "wss://broker.example:443/mqtt");
+
+  EXPECT_TRUE(run("set mqtt1.port 8883"));
+  EXPECT_EQ(said(), "OK - MQTT1 port saved");
+  EXPECT_EQ(config.brokers[0].port, 8883);
+
+  EXPECT_TRUE(run("set mqtt1.password hunter2"));
+  EXPECT_EQ(said(), "OK - credential saved");
+  EXPECT_STREQ(config.brokers[0].password, "hunter2");
+
+  EXPECT_TRUE(run("set mqtt1.audience mqtt.example"));
+  EXPECT_STREQ(config.brokers[0].audience, "mqtt.example");
+}
+
+TEST_F(ObserverCliTest, PerBrokerSettersRefuseBadValues) {
+  EXPECT_TRUE(run("set mqtt1.port 0"));
+  EXPECT_EQ(said(), "Err - port must be 1-65535");
+  EXPECT_TRUE(run("set mqtt1.port 70000"));
+  EXPECT_EQ(said(), "Err - port must be 1-65535");
+  EXPECT_TRUE(run("set mqtt1.server not a url"));
+  EXPECT_EQ(said(), "Err - invalid or oversized MQTT setting");
+  EXPECT_TRUE(run("set mqtt1.enabled maybe"));
+  EXPECT_EQ(said(), "Err - expected on or off");
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(ObserverCliTest, TopicTemplateRefusesUnknownPlaceholders) {
+  EXPECT_TRUE(run("set mqtt1.topic meshcore/{iata}/{device}/{type}"));
+  EXPECT_EQ(said(), "OK - MQTT1 setting saved");
+  EXPECT_STREQ(config.brokers[0].topic, "meshcore/{iata}/{device}/{type}");
+
+  // a typo would publish the whole feed to a topic nobody reads
+  EXPECT_TRUE(run("set mqtt1.topic meshcore/{iataa}/{device}"));
+  EXPECT_EQ(said(), "Err - topic placeholder must be {iata}, {device}, {token} or {type}");
+  EXPECT_STREQ(config.brokers[0].topic, "meshcore/{iata}/{device}/{type}");   // unchanged
+  EXPECT_FALSE(changed);
+}
+
+TEST_F(ObserverCliTest, WifiSettersAndGetters) {
+  EXPECT_TRUE(run("set wifi.ssid mesh-net"));
+  EXPECT_EQ(said(), "OK - WiFi SSID saved");
+  EXPECT_STREQ(config.wifi_ssid, "mesh-net");
+  EXPECT_TRUE(run("set wifi.pwd secret"));
+  EXPECT_EQ(said(), "OK - credential saved");
+  EXPECT_STREQ(config.wifi_password, "secret");
+  EXPECT_TRUE(run("set wifi.powersave max"));
+  EXPECT_EQ(said(), "OK - WiFi power save saved");
+  EXPECT_EQ(config.wifi_power_save, 2);
+  EXPECT_TRUE(run("set wifi.powersave sometimes"));
+  EXPECT_EQ(said(), "Err - expected none, min, or max");
+
+  EXPECT_TRUE(run("get wifi.ssid"));
+  EXPECT_EQ(said(), "mesh-net");
+  EXPECT_TRUE(run("get wifi.pwd"));
+  EXPECT_EQ(said(), "secret");
+  EXPECT_TRUE(run("get wifi.powersave"));
+  EXPECT_EQ(said(), "max");
+  EXPECT_TRUE(run("get wifi.status"));
+  EXPECT_EQ(said(), "wifi connected ip:192.168.1.42 rssi:-55");
+}
+
+TEST_F(ObserverCliTest, SharedGettersReportTheConfig) {
+  EXPECT_TRUE(run("set mqtt.iata SEA"));
+  EXPECT_TRUE(run("set mqtt.origin Shed"));
+  EXPECT_TRUE(run("set mqtt.interval 7"));
+  EXPECT_TRUE(run("set mqtt.rx on"));
+  EXPECT_TRUE(run("set mqtt.tx advert"));
+
+  EXPECT_TRUE(run("get mqtt.iata"));
+  EXPECT_EQ(said(), "SEA");
+  EXPECT_TRUE(run("get mqtt.origin"));
+  EXPECT_EQ(said(), "Shed");
+  EXPECT_TRUE(run("get mqtt.ntp"));
+  EXPECT_EQ(said(), "pool.ntp.org");
+  EXPECT_TRUE(run("get mqtt.interval"));
+  EXPECT_EQ(said(), "7");
+  EXPECT_TRUE(run("get mqtt.rx"));
+  EXPECT_EQ(said(), "on");
+  EXPECT_TRUE(run("get mqtt.status.enabled"));
+  EXPECT_EQ(said(), "on");
+  EXPECT_TRUE(run("get mqtt.tx"));
+  EXPECT_EQ(said(), "advert");
+  // the origin falls back to the node name
+  EXPECT_TRUE(run("set mqtt.origin "));
+  EXPECT_TRUE(run("get mqtt.origin"));
+  EXPECT_EQ(said(), "Roof Repeater");
+}
+
+TEST_F(ObserverCliTest, PerBrokerGettersReportTheConfig) {
+  EXPECT_TRUE(run("set mqtt1.server wss://broker.example:443/mqtt"));
+  EXPECT_TRUE(run("set mqtt1.port 8883"));
+  EXPECT_TRUE(run("set mqtt1.username user"));
+  EXPECT_TRUE(run("set mqtt1.enabled on"));
+
+  EXPECT_TRUE(run("get mqtt1.server"));
+  EXPECT_EQ(said(), "broker.example:443");
+  EXPECT_TRUE(run("get mqtt1.port"));
+  EXPECT_EQ(said(), "443");   // the effective port: the server URL carries it
+  EXPECT_TRUE(run("get mqtt1.username"));
+  EXPECT_EQ(said(), "user");
+  EXPECT_TRUE(run("get mqtt1.password"));
+  EXPECT_EQ(said(), "not set");
+  EXPECT_TRUE(run("get mqtt1.audience"));
+  EXPECT_EQ(said(), "not configured");
+  EXPECT_TRUE(run("get mqtt1.topic"));
+  EXPECT_EQ(said(), "meshcore/{iata}/{device}/{type}");
+  EXPECT_TRUE(run("get mqtt1.enabled"));
+  EXPECT_EQ(said(), "on");
+}
+
+TEST_F(ObserverCliTest, SlotStatusAndDashboard) {
+  EXPECT_TRUE(run("get mqtt1.status"));
+  EXPECT_EQ(said(), "mqtt1 connected wifi:up q:0");
+
+  facts.slot_state[1] = STATE_ERROR;
+  facts.queue_size = 3;
+  EXPECT_TRUE(run("get mqtt2.status"));
+  EXPECT_EQ(said(), "mqtt2 error wifi:up q:3");
+
+  // the dashboard counts the configured slots, not the build-time maximum
+  EXPECT_TRUE(run("set mqtt1.enabled on"));
+  facts.published = 12;
+  facts.received = 34;
+  facts.publish_drops = 2;
+  facts.queue_size = 0;
+  EXPECT_TRUE(run("get mqtt.status"));
+  EXPECT_EQ(said(), "mqtt wifi:up time:ok slots:1/1 rx:34 pub:12 drop:2 q:0/8 heap:118032/98304");
+}
+
+TEST_F(ObserverCliTest, ForeignCommandsAreNotOurs) {
+  EXPECT_FALSE(run("filter stats"));
+  EXPECT_FALSE(run("battery"));
+  EXPECT_FALSE(run("get mqtt9.status"));   // there is no mqtt3
+  EXPECT_FALSE(run("get mqtt1.nosuchthing"));
+  // an unsupported set is still the observer's to answer
+  EXPECT_TRUE(run("set mqtt1.nosuchthing x"));
+  EXPECT_EQ(said(), "Err - unsupported MQTT/WiFi setting");
+}
+
+TEST_F(ObserverCliTest, StateNames) {
+  EXPECT_STREQ(mqttObserverStateName(STATE_OFF), "off");
+  EXPECT_STREQ(mqttObserverStateName(STATE_CONFIG), "config");
+  EXPECT_STREQ(mqttObserverStateName(STATE_WIFI), "wifi");
+  EXPECT_STREQ(mqttObserverStateName(STATE_TIME), "time");
+  EXPECT_STREQ(mqttObserverStateName(STATE_CONNECTING), "connecting");
+  EXPECT_STREQ(mqttObserverStateName(STATE_CONNECTED), "connected");
+  EXPECT_STREQ(mqttObserverStateName(STATE_RETRY), "retry");
+  EXPECT_STREQ(mqttObserverStateName(STATE_ERROR), "error");
+}
 
 TEST(MQTTObserverConfig, RoundTripsTwoBrokerSettings) {
   MQTTObserverConfig config;
@@ -198,18 +423,6 @@ TEST(MQTTObserverConfig, BrokerSlotsHaveDistinctClientIds) {
   EXPECT_FALSE(MQTTObserverConfigCodec::buildClientId(device, 0, first, sizeof(first) - 1));
 }
 
-TEST(MQTTObserverCommandPolicy, UnsignedParsingRejectsRangeAndOverflow) {
-  unsigned value = 99;
-  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("9", 0, 2, value));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("42949672960", 1, 65535, value));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("0", 1, 60, value));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned(nullptr, 1, 60, value));
-  EXPECT_FALSE(MQTTObserverCommandPolicy::parseUnsigned("1x", 1, 60, value));
-  EXPECT_EQ(value, 99u);
-  ASSERT_TRUE(MQTTObserverCommandPolicy::parseUnsigned("60", 1, 60, value));
-  EXPECT_EQ(value, 60u);
-}
-
 TEST(MQTTObserverConnectionPolicy, RenewsBeforeReconnectAsWellAsWhileConnected) {
   EXPECT_FALSE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(1000, 0));
   EXPECT_FALSE(MQTTObserverConnectionPolicy::jwtNeedsRenewal(1000, 1301));
@@ -269,6 +482,69 @@ TEST(MQTTObserverConnectionPolicy, TimesOutAnUnacknowledgedPacketProbe) {
   EXPECT_FALSE(livenessProbeTimedOut(42, 1000 + kTimeoutMs - 1, 1000));
   EXPECT_TRUE(livenessProbeTimedOut(42, 1000 + kTimeoutMs, 1000));
   EXPECT_TRUE(livenessProbeTimedOut(42, 100, 200));
+}
+
+TEST(MQTTObserverConnectionPolicy, AConnectAttemptThatNeverCameUpIsAFailure) {
+  using namespace MQTTObserverConnectionPolicy;
+  // no attempt in flight: nothing to time out
+  EXPECT_FALSE(connectAttemptTimedOut(false, 1000 + kConnectAttemptTimeoutMs, 1000));
+  // the attempt is still young
+  EXPECT_FALSE(connectAttemptTimedOut(true, 1000 + kConnectAttemptTimeoutMs - 1, 1000));
+  // it never came up
+  EXPECT_TRUE(connectAttemptTimedOut(true, 1000 + kConnectAttemptTimeoutMs, 1000));
+  // wrap-safe: the attempt started just before the rollover
+  EXPECT_TRUE(connectAttemptTimedOut(true, 100, 200));
+}
+
+TEST(MQTTObserverProbeTracker, ClearsTheProbeOnItsPuback) {
+  MQTTObserverProbeTracker tracker;
+  tracker.noteProbe(42, 1000);
+  EXPECT_EQ(tracker.outstanding(), 42);
+  EXPECT_EQ(tracker.sentMs(), 1000u);
+  EXPECT_EQ(tracker.lastProbeMs(), 1000u);
+  tracker.notePuback(42);
+  EXPECT_EQ(tracker.outstanding(), 0);
+  EXPECT_EQ(tracker.sentMs(), 0u);
+}
+
+TEST(MQTTObserverProbeTracker, AProbeAcknowledgedBeforeItWasRecordedIsNotOutstanding) {
+  // The broker can answer while publish() is still returning: the PUBACK
+  // arrives before the id is recorded. Recording it anyway would leave a probe
+  // outstanding that nothing clears, and the liveness timeout would force a
+  // reconnect every 60 s.
+  MQTTObserverProbeTracker tracker;
+  tracker.notePuback(7);        // the ack landed first
+  tracker.noteProbe(7, 1000);
+  EXPECT_EQ(tracker.outstanding(), 0);
+  EXPECT_EQ(tracker.sentMs(), 0u);
+  EXPECT_FALSE(MQTTObserverConnectionPolicy::livenessProbeTimedOut(
+      tracker.outstanding(), 1000 + MQTTObserverConnectionPolicy::kLivenessProbeTimeoutMs,
+      tracker.sentMs()));
+}
+
+TEST(MQTTObserverProbeTracker, OnlyOneProbeIsOutstandingAtATime) {
+  MQTTObserverProbeTracker tracker;
+  tracker.noteProbe(1, 1000);
+  tracker.noteProbe(2, 1100);   // a second probe while one is in flight
+  EXPECT_EQ(tracker.outstanding(), 1);
+  EXPECT_EQ(tracker.sentMs(), 1000u);
+  // a PUBACK for another id does not clear the outstanding probe
+  tracker.notePuback(99);
+  EXPECT_EQ(tracker.outstanding(), 1);
+  EXPECT_EQ(tracker.sentMs(), 1000u);
+}
+
+TEST(MQTTObserverProbeTracker, ANewConnectionForgetsTheOldPacketIds) {
+  MQTTObserverProbeTracker tracker;
+  tracker.noteProbe(5, 1000);
+  tracker.reset();
+  EXPECT_EQ(tracker.outstanding(), 0);
+  EXPECT_EQ(tracker.sentMs(), 0u);
+  // the ids restart on a new connection: an id from the old session must not
+  // be mistaken for an acknowledgement
+  tracker.noteProbe(5, 2000);
+  EXPECT_EQ(tracker.outstanding(), 5);
+  EXPECT_EQ(tracker.sentMs(), 2000u);
 }
 
 TEST(MQTTObserverQueuePolicy, RestartsStaleWindowAfterFlushAndHandlesWrap) {
@@ -522,6 +798,20 @@ TEST(MQTTObserverConfig, DefaultsAreEnabledAndSafeForAFreshInstall) {
     EXPECT_EQ(config.brokers[i].server[0], 0);
   }
   EXPECT_TRUE(MQTTObserverConfigCodec::valid(config));
+}
+
+TEST(MQTTObserverConfig, TopicTemplateTakesOnlyKnownPlaceholders) {
+  // An unknown placeholder would be published verbatim, so the whole feed
+  // would go to a topic nobody reads.
+  EXPECT_TRUE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{iata}/{device}/{type}"));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{token}"));
+  EXPECT_TRUE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/plain"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{iataa}/{device}"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{IATA}"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{}"));
+  EXPECT_FALSE(MQTTObserverConfigCodec::validTopicTemplate("meshcore/{iata"));
+  // the plain topic validator is unchanged: a token is a value, not a template
+  EXPECT_TRUE(MQTTObserverConfigCodec::validTopic("token-with-{braces}"));
 }
 
 TEST(MQTTObserverConfig, ValidatorsRejectHostileStrings) {

@@ -125,8 +125,15 @@ and survives reboots.
 set wifi.ssid <ssid>            # not quoted; the rest of the line is the value
 set wifi.pwd <password>
 set wifi.powersave none|min|max
+get wifi.ssid                   # the stored SSID, or "not set"
+get wifi.pwd                    # the stored password, or "not set" — echoes it
+get wifi.powersave              # none, min or max
 get wifi.status                 # wifi connected ip:192.0.2.10 rssi:-58
 ```
+
+`get wifi.pwd` prints the Wi-Fi password in cleartext, the same way
+`get mqttN.password` prints the broker password — read it over a trusted link
+and do not paste the output anywhere.
 
 `none` keeps the radio fully awake (best for an observer that streams); `min`
 and `max` trade latency for power. The observer manages Wi-Fi and reconnects
@@ -290,7 +297,7 @@ There is no `mqtt3`.
 | `set mqttN.username <user>` / `password <pass>` | Password auth (audience must be empty) |
 | `set mqttN.audience <aud>` | JWT audience; empty clears JWT mode and reverts to password auth |
 | `set mqttN.owner <hex>` / `email <addr>` | Optional JWT claims |
-| `set mqttN.topic <template>` | Topic layout; empty restores the MeshCore default |
+| `set mqttN.topic <template>` | Topic layout; empty restores the MeshCore default. The template may only use the known placeholders — `{iata}`, `{device}`, `{token}`, `{type}` — anything else is refused (`Err - topic placeholder must be {iata}, {device}, {token} or {type}`), because an unknown one would be published verbatim and the whole feed would go to a topic nobody reads |
 | `set mqttN.token <token>` | Value for `{token}` in the template |
 | `get mqttN.status` | One slot's state — `mqtt1 <state> wifi:up q:0` |
 | `get mqttN.enabled` | `on`/`off` |
@@ -302,6 +309,17 @@ There is no `mqtt3`.
 
 Slot states are `off`, `config` (incomplete), `wifi`, `time` (waiting for a
 valid clock), `connecting`, `connected`, `retry`, and `error`.
+
+`error` means the last **connect attempt never came up**: the broker refused
+it (wrong credentials, wrong protocol) or was unreachable. The MQTT library
+only hands transport errors to the application, so the observer decides this
+from the attempt's own clock — a connect attempt that has not come up within
+30 s is a failure, and the slot says so instead of cycling `connecting` →
+`retry` forever. The reconnect ladder keeps trying in the background, so a
+broker that comes back is picked up without a restart: each retry attempt shows
+`connecting` again, the state returns to `error` between attempts, and it stays
+`error` only until an attempt succeeds or the configuration changes (a
+reconfigured slot starts with a clean slate).
 
 ---
 
@@ -475,7 +493,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 |---|---|
 | `wifi:` | Station link: `up` / `down` |
 | `time:` | Clock valid enough for TLS/JWT: `ok` / `wait` |
-| `slots:` | Connected slots / configured slots |
+| `slots:` | Connected slots / configured slots (the brokers that are enabled, not the build-time maximum) |
 | `rx:` | Frames heard since boot (counted before the receive gate) |
 | `pub:` | Publish successes since boot |
 | `drop:` | Skipped events (queue overflow, disconnect flush, failed publishes) |
@@ -491,6 +509,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | `get mqtt.status` shows `slots:0/2` | `get wifi.status`, `time:` field | Wi-Fi not connected, or clock still `wait` |
 | Slot stuck at `config` | `get mqttN.server`, `get mqtt.iata` | No server, or the default topic needs an `IATA` and none is set |
 | Slot cycles `connecting` → `retry` | `get mqttN.server`, broker reachability | Wrong host/port, wrong scheme, or the broker is down |
+| Slot shows `error` | `get mqttN.server`, `get mqttN.username` / `password` / `audience` | The last connect attempt never came up: the broker refused it (wrong credentials, wrong protocol) or was unreachable. The slot keeps retrying; a configuration change starts a fresh attempt |
 | Auth rejected | audience vs username/password | Audience set when you meant password (JWT wins); or the audience/token is wrong |
 | No TLS, immediately after boot | `time:` | Clock not yet synced; secure brokers need valid time |
 | `drop:` climbing steadily | `q:` | Broker disconnected too long, or an overloaded node — check the broker |

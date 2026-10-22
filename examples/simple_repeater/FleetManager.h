@@ -42,8 +42,14 @@
 //           caller-supplied so a retry can reproduce the exact same packet.
 typedef uint32_t (*FleetTimeFn)(void* ctx);
 typedef uint32_t (*FleetJitterFn)(void* ctx, uint32_t window);
+// The node name a reply is sent under. It is frozen into the reply at its
+// first send, so the byte-identical resend carries the same name even if the
+// node was renamed in between (a different name would be a different packet,
+// and the retry would show up twice on the air).
+typedef const char* (*FleetNameFn)(void* ctx);
 typedef bool (*FleetSendFn)(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
-                            uint32_t ts, const char* body, uint8_t* out_pkt_hash);
+                            uint32_t ts, const char* sender_name, const char* body,
+                            uint8_t* out_pkt_hash);
 
 // ---------------------------------------------------------------- /fleet_cfg
 
@@ -128,6 +134,11 @@ class FleetManager {
                                          // retry is byte-identical
     uint8_t pkt_hash[MAX_HASH_SIZE];     // hash of the sent packet (repeat identity)
     uint8_t awaiting;                    // 0 = queued (pre-jitter); 1 = sent
+    uint8_t send_attempts;               // refused sends so far (the pool was
+                                         // full); the cap drops the reply
+    char sender_name[FLEET_MAX_NODE_NAME + 1];   // frozen at the first send: the
+                                         // retry must carry the same name (and
+                                         // with it the same body room)
   };
   FleetReply replies[FLEET_REPLY_STORE];
   int reply_count;
@@ -135,6 +146,10 @@ class FleetManager {
   // RAM-only telemetry: scripts offered/matched on the fleet channel
   uint32_t offered;
   uint32_t matched;
+  // packets on the fleet channel that core never offered the fleet key for:
+  // the filter's channel store filled core's candidate slots for that hash,
+  // so the fleet channel was never tried and its traffic was never decrypted
+  uint32_t crowded_out;
   // byte-identical resends issued: a reply whose first attempt was not heard
   // repeated in time (the "not propagating" signal)
   uint32_t reply_retries;
@@ -147,6 +162,7 @@ class FleetManager {
   // in-class initializers and resetToDefaults() must never touch them.
   FleetTimeFn time_fn = NULL;       void* time_ctx = NULL;
   FleetJitterFn jitter_fn = NULL;   void* jitter_ctx = NULL;
+  FleetNameFn name_fn = NULL;       void* name_ctx = NULL;
   FleetSendFn send_fn = NULL;       void* send_ctx = NULL;
 
 public:
@@ -195,6 +211,10 @@ public:
   CliScriptRunner& getScripts() { return runner; }
   uint32_t getOffered() const { return offered; }
   uint32_t getMatched() const { return matched; }
+  // packets that core never offered the fleet key for (the candidate slots
+  // were full): a non-zero count means the fleet channel is not being
+  // decrypted and no script can arrive
+  uint32_t getCrowdedOut() const { return crowded_out; }
   int getSchedCount() const { return sched_count; }
   // replies queued, waiting to be sent (unsent); sent ones awaiting a repeat
   // occupy a store slot but are counted by getAwaitingCount()
@@ -205,6 +225,7 @@ public:
   // device service wiring (MyMesh::begin); see the typedefs above
   void setClock(FleetTimeFn fn, void* ctx) { time_fn = fn; time_ctx = ctx; }
   void setJitter(FleetJitterFn fn, void* ctx) { jitter_fn = fn; jitter_ctx = ctx; }
+  void setNameProvider(FleetNameFn fn, void* ctx) { name_fn = fn; name_ctx = ctx; }
   void setSender(FleetSendFn fn, void* ctx) { send_fn = fn; send_ctx = ctx; }
 
   // Receive-side hook: called from MyMesh::onGroupDataRecv() BEFORE the
@@ -264,6 +285,9 @@ private:
   // send every due acknowledgement, and issue a repeat-confirmation retry when
   // a sent reply's window elapses without its repeat being heard
   void serviceReplies();
+  // the room the reply body may use: one datagram less the group-text header
+  // and the "<name>: " prefix that `name` takes
+  size_t replyRoom(const char* name) const;
   // shared detach: drop replies[idx], shifting the tail down
   void removeReply(int idx);
 };

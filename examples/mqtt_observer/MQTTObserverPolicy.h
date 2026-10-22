@@ -1,24 +1,15 @@
 #pragma once
 
+#include <atomic>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-namespace MQTTObserverCommandPolicy {
+// The fork's shared CLI helpers: dependency-free (standard headers only), so
+// including them keeps this header host-testable without an Arduino.
+#include "../simple_repeater/CliUtil.h"
 
-inline bool parseUnsigned(const char* value, unsigned min, unsigned max, unsigned& parsed) {
-  if (!value || !*value) return false;
-  unsigned result = 0;
-  for (const char* p = value; *p; p++) {
-    if (*p < '0' || *p > '9') return false;
-    unsigned digit = static_cast<unsigned>(*p - '0');
-    if (digit > max || result > (max - digit) / 10) return false;
-    result = result * 10 + digit;
-  }
-  if (result < min) return false;
-  parsed = result;
-  return true;
-}
+namespace MQTTObserverCommandPolicy {
 
 inline bool parseSlot(const char* command, const char* operation, size_t max_slots,
                       size_t& slot, const char*& property) {
@@ -97,7 +88,73 @@ inline bool livenessProbeTimedOut(int outstanding_msg_id, uint32_t now,
   return now - probe_sent_ms >= kLivenessProbeTimeoutMs;
 }
 
+// A connect attempt that has not come up within the timeout failed: the broker
+// refused it (bad credentials, wrong protocol) or was unreachable. The client
+// library only reports transport errors to the application, so the outcome of
+// a connect attempt is decided here, from the attempt's own clock.
+static const uint32_t kConnectAttemptTimeoutMs = 30000UL;
+
+inline bool connectAttemptTimedOut(bool client_started, uint32_t now,
+                                   uint32_t attempt_started) {
+  if (!client_started) return false;
+  return (uint32_t)(now - attempt_started) >= kConnectAttemptTimeoutMs;
+}
+
 }  // namespace MQTTObserverConnectionPolicy
+
+// The outstanding liveness probe of one broker.
+//
+// The probe is a QoS 1 publish: its packet id is recorded when it goes out and
+// cleared when its PUBACK arrives. The two do not happen in that order: the
+// broker can answer while publish() is still returning, so the PUBACK can be
+// delivered before the id is recorded. Recording it anyway would leave a probe
+// outstanding that nothing will ever clear, and the liveness timeout would
+// force a reconnect every 60 s — a permanent churn, not a one-off.
+//
+// So the last acknowledged id is remembered: a probe whose id was already
+// acknowledged is not outstanding, and the liveness timeout stays quiet. The
+// tracker is reset with the connection (the packet ids restart there, so a
+// stale id from the previous session must not be able to match).
+class MQTTObserverProbeTracker {
+public:
+  // A QoS 1 publish went out with this packet id.
+  void noteProbe(int msg_id, uint32_t now) {
+    if (msg_id <= 0) return;
+    if (_last_puback_id.load(std::memory_order_relaxed) == msg_id) return;   // already acked
+    int expected = 0;
+    if (!_outstanding.compare_exchange_strong(expected, msg_id, std::memory_order_relaxed)) return;
+    _sent_ms.store(now, std::memory_order_relaxed);
+    _last_probe_ms = now;
+  }
+
+  // The broker acknowledged this packet id.
+  void notePuback(int msg_id) {
+    if (msg_id <= 0) return;
+    _last_puback_id.store(msg_id, std::memory_order_relaxed);
+    int expected = msg_id;
+    if (_outstanding.compare_exchange_strong(expected, 0, std::memory_order_relaxed))
+      _sent_ms.store(0, std::memory_order_relaxed);
+  }
+
+  // A new connection: the packet ids start over, so no id from the previous
+  // session may be remembered.
+  void reset() {
+    _outstanding.store(0, std::memory_order_relaxed);
+    _sent_ms.store(0, std::memory_order_relaxed);
+    _last_puback_id.store(-1, std::memory_order_relaxed);
+    _last_probe_ms = 0;
+  }
+
+  int outstanding() const { return _outstanding.load(std::memory_order_relaxed); }
+  uint32_t sentMs() const { return _sent_ms.load(std::memory_order_relaxed); }
+  uint32_t lastProbeMs() const { return _last_probe_ms; }
+
+private:
+  std::atomic<int> _outstanding{0};
+  std::atomic<uint32_t> _sent_ms{0};
+  std::atomic<int> _last_puback_id{-1};   // -1 = no acknowledgement seen yet
+  uint32_t _last_probe_ms = 0;
+};
 
 namespace MQTTObserverQueuePolicy {
 

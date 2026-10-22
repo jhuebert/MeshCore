@@ -1047,6 +1047,44 @@ TEST_F(FilterTest, ChanPredicateMatchesDeliveredChannelSecret) {
             FILTER_ACT_ALLOW);
 }
 
+TEST_F(FilterTest, ChanListNamesEveryStoredChannel) {
+  // A rule can name every channel the store holds: the list's length is the
+  // command's length, not a cap of its own (the old 80-char buffer could only
+  // fit a handful of names).
+  std::string names;
+  std::vector<std::string> added;
+  for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
+    char name[16];
+    snprintf(name, sizeof(name), "#c%02d", i);
+    ASSERT_EQ(cli(filter, (std::string("chan add ") + name).c_str()).substr(0, 3), "OK ");
+    if (!names.empty()) names += ",";
+    names += name;
+    added.push_back(name);
+  }
+  ASSERT_GT(names.size(), (size_t)80);
+  EXPECT_EQ(cli(filter, ("add chan=" + names).c_str()), "OK - rule 0 added");
+  // the rule references all of them
+  uint32_t expected = 0;
+  for (int i = 0; i < filter.getNumChannels(); i++) {
+    for (const std::string& name : added) {
+      if (name == filter.getChannel(i)->name) expected |= (1u << i);
+    }
+  }
+  EXPECT_EQ(filter.getRule(0)->chan_mask, expected);
+  EXPECT_EQ(__builtin_popcount(expected), (int)added.size());
+}
+
+TEST_F(FilterTest, ChanListRejectsEmptyAndUnknownNames) {
+  EXPECT_EQ(cli(filter, "add chan=#a,,#b"), "Err - empty chan name");
+  EXPECT_EQ(cli(filter, "add chan=#a,"), "Err - empty chan name");
+  EXPECT_EQ(cli(filter, "add chan=#"), "Err - empty chan name");
+  EXPECT_EQ(cli(filter, "add chan=nosuchchan"), "Err - unknown chan 'nosuchchan'");
+  // a name longer than the store's name storage cannot be in the store
+  std::string longname = "#" + std::string(20, 'y');
+  EXPECT_EQ(cli(filter, ("add chan=" + longname).c_str()),
+            "Err - unknown chan '" + longname + "'");
+}
+
 TEST_F(FilterTest, ChanPredicateMultiChannel) {
   addChanRule(filter, "#a,#b");
   int a_idx = -1, b_idx = -1;
@@ -3963,18 +4001,17 @@ TEST_F(FilterTest, ThrottleCliRejects) {
 }
 
 TEST_F(FilterTest, ThrottleGetFullyLoadedRuleTruncatesAtReplyBuffer) {
-  // every predicate set, throttle= at max width: the get line overflows the
-  // reply buffer and truncates per radd's order — the counters are echoed
-  // last, so the tail (air=) is cut first
+  // every predicate set, throttle= at max width: the rule body alone fills the
+  // reply bound, so the last predicate is abbreviated ("..") and the stats
+  // tail after it is cut
   ASSERT_EQ(cli(filter, "add type=txt route=flood hops=1 len=1 snr=0 path=^10$ "
                         "hsize=1 chan=#t chanhash=AA region=TestNorth sender=\"^X\" "
                         "text=\"^y\" prob=50 throttle=65535"),
             "OK - rule 0 added");
   std::string reply = cli(filter, "get 0");
-  EXPECT_EQ(reply.size(), (size_t)160 - 1);   // pinned truncation (CLI_REPLY_MAX - 1)
-  EXPECT_NE(reply.find("prob=50"), std::string::npos);
-  EXPECT_NE(reply.find("throttle=65535"), std::string::npos);   // predicates now all fit
-  EXPECT_EQ(reply.find("air="), std::string::npos);             // the stats tail truncates
+  EXPECT_EQ(reply.size(), (size_t)CLI_REPLY_MAX - 1);   // pinned truncation
+  EXPECT_NE(reply.find("prob=50"), std::string::npos);  // the last field that fits whole
+  EXPECT_EQ(reply.find("air="), std::string::npos);     // the stats tail truncates
 }
 
 TEST_F(FilterTest, AddRejectsOverlongRegexWithoutTruncating) {
@@ -4050,11 +4087,11 @@ TEST_F(FilterTest, LongTokenErrorsStayWithinReplyBuffer) {
   // (mesh path reply is &temp[5] of temp[166])
   std::string long_tok(150, 'a');
   std::string reply = cli(filter, ("add " + long_tok).c_str());
-  EXPECT_LE(reply.size(), (size_t)160 - 1);
+  EXPECT_LE(reply.size(), (size_t)CLI_REPLY_MAX - 1);
   EXPECT_EQ(reply.find("Err - expected key=value"), 0);
 
   reply = cli(filter, ("add " + long_tok + "=x").c_str());
-  EXPECT_LE(reply.size(), (size_t)160 - 1);
+  EXPECT_LE(reply.size(), (size_t)CLI_REPLY_MAX - 1);
   EXPECT_EQ(reply.find("Err - unknown param"), 0);
   EXPECT_EQ(filter.getNumRules(), 0);
 }
@@ -4159,9 +4196,12 @@ TEST_F(FilterTest, ListAbbreviatesOversizedRuleAtFieldBoundary) {
   ASSERT_GE(page.size(), 2u);
   EXPECT_EQ(page.compare(page.size() - 2, 2, ".."), 0);        // the in-rule abbreviation marker
 
-  // get still shows the whole rule (only the stats tail truncates)
+  // get renders the same abbreviated body, then the stats tail — which is what
+  // the reply bound cuts
   std::string full = cli(filter, "get 0");
-  EXPECT_NE(full.find("throttle=65535"), std::string::npos);
+  EXPECT_EQ(full.size(), (size_t)CLI_REPLY_MAX - 1);
+  EXPECT_NE(full.find("prob=50.."), std::string::npos);   // the same field boundary
+  EXPECT_EQ(full.find("air="), std::string::npos);
 }
 
 TEST_F(FilterTest, ListPaginatesAndTerminates) {
@@ -4462,13 +4502,13 @@ TEST_F(FilterTest, ChanDelRemapsMasksAtTheWidenedStoreEdge) {
 
 TEST_F(FilterTest, ChanListStaysWithinReplyBuffer) {
   // real CLI reply buffers are 160 B (serial/ethernet reply[160]; mesh path is
-  // &temp[5] of temp[166] — CliUtil.h caps radd() at CLI_REPLY_MAX for this);
+  // &temp[5] of temp[166] — CliUtil.h caps the reply writer at CLI_REPLY_MAX for this);
   // a full chan list must never exceed that
   for (int i = 0; i < FILTER_MAX_CHANNELS - 1; i++) {
     ASSERT_EQ(cli(filter, ("chan add #c" + std::to_string(i)).c_str()).substr(0, 3), "OK ");
   }
   std::string reply = cli(filter, "chan list");
-  EXPECT_LE(reply.size(), (size_t)160 - 1);   // radd leaves room for the NUL
+  EXPECT_LE(reply.size(), (size_t)CLI_REPLY_MAX - 1);   // radd leaves room for the NUL
   EXPECT_NE(reply.find("0:Public"), std::string::npos);   // clean, not garbage
 }
 

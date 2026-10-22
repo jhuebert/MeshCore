@@ -1017,16 +1017,24 @@ static uint32_t fleetJitter(void* ctx, uint32_t window) {
   return ((MyMesh*)ctx)->getRNG()->nextInt(0, window);
 }
 
+// The node name a reply is sent under. The fleet freezes it into the reply at
+// its first send, so a byte-identical resend carries the same name even if the
+// node was renamed in between.
+static const char* fleetNodeName(void* ctx) {
+  return ((MyMesh*)ctx)->getNodeName();
+}
+
 // Send one acknowledgement as a plain group text (txt_type 0x00) on the
 // captured channel, with the repeater's own name as the sender — companions
 // and other fleet members see an ordinary "<name>: <text>" message. The body
 // starts with the job key (charset [A-Za-z0-9._-], never '!'), so no fleet
 // member can ever parse a reply as a script. Returns true iff a packet was
 // created and queued, and reports its hash so FleetManager can recognise a
-// neighbour's relay of it. `ts` is caller-supplied so a retry reproduces the
-// exact same packet (hash).
+// neighbour's relay of it. `ts` and `sender_name` are caller-supplied so a
+// retry reproduces the exact same packet (hash).
 static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
-                           uint32_t ts, const char* body, uint8_t* out_pkt_hash) {
+                           uint32_t ts, const char* sender_name, const char* body,
+                           uint8_t* out_pkt_hash) {
   MyMesh* m = (MyMesh*)ctx;
   mesh::GroupChannel chan;
   memset(&chan, 0, sizeof(chan));
@@ -1035,12 +1043,13 @@ static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   // on-air group text payload is [ts(4)][txt_type(1)]"<name>: <body>"; receivers
   // read the header before the text (BaseChatMesh::onGroupDataRecv), so an ack
   // composed without it parses as an unsupported txt_type and is dropped
-  // "<name>: " + body must fit one packet's data limit (168 B): bound the
-  // composition so a long name truncates the tail rather than refusing the send
+  // "<name>: " + body must fit one packet's data limit (168 B): the fleet cuts
+  // the body to the room this node's name leaves (fleetReplyRoom), so the
+  // composition fits by construction; the bound below is the safety net
   uint8_t msg[FLEET_REPLY_DATA_MAX + 1];
   memcpy(msg, &ts, 4);
   msg[4] = 0;   // TXT_TYPE_PLAIN
-  snprintf((char*)&msg[5], sizeof(msg) - 5, "%s: %s", m->getNodeName(), body);
+  snprintf((char*)&msg[5], sizeof(msg) - 5, "%s: %s", sender_name, body);
   mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg,
                                              5 + strlen((char*)&msg[5]));
   if (!pkt) return false;   // pool empty: FleetManager retries later
@@ -1089,6 +1098,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   battGate.begin(fs);
   fleet.setClock(fleetClock, this);
   fleet.setJitter(fleetJitter, this);
+  fleet.setNameProvider(fleetNodeName, this);
   fleet.setSender(fleetReplySend, this);
   fleet.begin(fs);
   meshClock.setClockFn(meshClockSet, this);
