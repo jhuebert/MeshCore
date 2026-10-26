@@ -439,60 +439,82 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
   if (slot >= MQTT_OBSERVER_MAX_BROKERS) return false;
   const MQTTObserverBrokerConfig& broker = config.brokers[slot];
   BrokerRuntime& runtime = _brokers[slot];
-  if (!runtime.client) {
-    runtime.client = new (std::nothrow) PsychicMqttClient();
-    if (!runtime.client) return false;
-    runtime.client->setAutoReconnect(false);
-    runtime.client->onConnect([this, slot](bool) {
-      BrokerRuntime& rt = _brokers[slot];
-      rt.connected_at.store(millis(), std::memory_order_relaxed);
-      rt.connected.store(true, std::memory_order_relaxed);
-      rt.status_pending.store(true, std::memory_order_relaxed);
-      rt.connect_failed.store(false, std::memory_order_relaxed);
-      rt.diag_failures.store(0, std::memory_order_relaxed);
-      rt.diag_disconnect_ms.store(0, std::memory_order_relaxed);
-      rt.diag_connected_ms.store(millis(), std::memory_order_relaxed);
-      rt.state.store(STATE_CONNECTED, std::memory_order_relaxed);
-    });
-    runtime.client->onDisconnect([this, slot](bool) {
-      BrokerRuntime& rt = _brokers[slot];
-      rt.connected.store(false, std::memory_order_relaxed);
-      // A DISCONNECTED with no transport error is how a CONNACK refusal
-      // reaches us: the pinned client forwards only transport errors. Record
-      // it now so `diag` shows the refusal during the worker's 30 s wait; a
-      // transport error immediately before the disconnect keeps its detail.
-      uint32_t now = millis();
-      uint32_t error_ms = rt.diag_error_ms.load(std::memory_order_relaxed);
-      if (!MQTTObserverConnectionPolicy::disconnectBelongsToError(now, error_ms))
-        noteDiagError(rt, DIAG_ERR_CLOSED, now);
-      rt.diag_disconnect_ms.store(now, std::memory_order_relaxed);
-      rt.state.store(STATE_RETRY, std::memory_order_relaxed);
-    });
-    runtime.client->onError([this, slot](esp_mqtt_error_codes_t error) {
-      BrokerRuntime& rt = _brokers[slot];
-      uint8_t type = static_cast<uint8_t>(error.error_type);
-      // An MQTT event with no category is still an error worth reporting.
-      if (type == DIAG_ERR_NONE) type = DIAG_ERR_MQTT;
-      rt.diag_error_type.store(type, std::memory_order_relaxed);
-      rt.diag_tls_err.store(static_cast<int32_t>(error.esp_tls_last_esp_err),
-                            std::memory_order_relaxed);
-      rt.diag_tls_stack.store(static_cast<int32_t>(error.esp_tls_stack_err),
-                              std::memory_order_relaxed);
-      rt.diag_tls_flags.store(static_cast<int32_t>(error.esp_tls_cert_verify_flags),
-                              std::memory_order_relaxed);
-      rt.diag_sock_errno.store(static_cast<int32_t>(error.esp_transport_sock_errno),
-                               std::memory_order_relaxed);
-      rt.diag_error_ms.store(millis(), std::memory_order_relaxed);
-      rt.state.store(STATE_ERROR, std::memory_order_relaxed);
-    });
-    runtime.client->onPublish([this, slot](int msg_id) {
-      _brokers[slot].probe.notePuback(msg_id);
-    });
-  }
+
+  // Prepare everything that can fail before touching the client: a bad URI or
+  // a failed token leaves the stopped client in place for the next retry.
   if (!MQTTObserverConfigCodec::buildServerUri(broker, runtime.server_uri,
-                                                 sizeof(runtime.server_uri)) ||
+                                                sizeof(runtime.server_uri)) ||
       !MQTTObserverConfigCodec::buildClientId(_device_id, slot, runtime.client_id,
                                               sizeof(runtime.client_id))) return false;
+  if (broker.audience[0]) {
+    runtime.username[0] = 0;
+    runtime.password[0] = 0;
+    if (!createJwt(slot, broker, runtime.jwt_expiry)) return false;
+  } else {
+    runtime.jwt_expiry = 0;
+    strncpy(runtime.username, broker.username, sizeof(runtime.username) - 1);
+    runtime.username[sizeof(runtime.username) - 1] = 0;
+    strncpy(runtime.password, broker.password, sizeof(runtime.password) - 1);
+    runtime.password[sizeof(runtime.password) - 1] = 0;
+  }
+
+  // The clean-session flag and credentials only take effect when the client is
+  // initialized. A started client keeps its previous state when connect()
+  // reuses it via esp_mqtt_set_config(), so rebuild the client for every
+  // configuration change, including a JWT renewal.
+  if (runtime.client) {
+    delete runtime.client;
+    runtime.client = nullptr;
+  }
+  runtime.client = new (std::nothrow) PsychicMqttClient();
+  if (!runtime.client) return false;
+  runtime.client->setAutoReconnect(false);
+  runtime.client->onConnect([this, slot](bool) {
+    BrokerRuntime& rt = _brokers[slot];
+    rt.connected_at.store(millis(), std::memory_order_relaxed);
+    rt.connected.store(true, std::memory_order_relaxed);
+    rt.status_pending.store(true, std::memory_order_relaxed);
+    rt.connect_failed.store(false, std::memory_order_relaxed);
+    rt.diag_failures.store(0, std::memory_order_relaxed);
+    rt.diag_disconnect_ms.store(0, std::memory_order_relaxed);
+    rt.diag_connected_ms.store(millis(), std::memory_order_relaxed);
+    rt.state.store(STATE_CONNECTED, std::memory_order_relaxed);
+  });
+  runtime.client->onDisconnect([this, slot](bool) {
+    BrokerRuntime& rt = _brokers[slot];
+    rt.connected.store(false, std::memory_order_relaxed);
+    // A DISCONNECTED with no transport error is how a CONNACK refusal
+    // reaches us: the pinned client forwards only transport errors. Record
+    // it now so `diag` shows the refusal during the worker's 30 s wait; a
+    // transport error immediately before the disconnect keeps its detail.
+    uint32_t now = millis();
+    uint32_t error_ms = rt.diag_error_ms.load(std::memory_order_relaxed);
+    if (!MQTTObserverConnectionPolicy::disconnectBelongsToError(now, error_ms))
+      noteDiagError(rt, DIAG_ERR_CLOSED, now);
+    rt.diag_disconnect_ms.store(now, std::memory_order_relaxed);
+    rt.state.store(STATE_RETRY, std::memory_order_relaxed);
+  });
+  runtime.client->onError([this, slot](esp_mqtt_error_codes_t error) {
+    BrokerRuntime& rt = _brokers[slot];
+    uint8_t type = static_cast<uint8_t>(error.error_type);
+    // An MQTT event with no category is still an error worth reporting.
+    if (type == DIAG_ERR_NONE) type = DIAG_ERR_MQTT;
+    rt.diag_error_type.store(type, std::memory_order_relaxed);
+    rt.diag_tls_err.store(static_cast<int32_t>(error.esp_tls_last_esp_err),
+                          std::memory_order_relaxed);
+    rt.diag_tls_stack.store(static_cast<int32_t>(error.esp_tls_stack_err),
+                            std::memory_order_relaxed);
+    rt.diag_tls_flags.store(static_cast<int32_t>(error.esp_tls_cert_verify_flags),
+                            std::memory_order_relaxed);
+    rt.diag_sock_errno.store(static_cast<int32_t>(error.esp_transport_sock_errno),
+                             std::memory_order_relaxed);
+    rt.diag_error_ms.store(millis(), std::memory_order_relaxed);
+    rt.state.store(STATE_ERROR, std::memory_order_relaxed);
+  });
+  runtime.client->onPublish([this, slot](int msg_id) {
+    _brokers[slot].probe.notePuback(msg_id);
+  });
+
   runtime.client->setServer(runtime.server_uri);
   runtime.client->setClientId(runtime.client_id);
   runtime.client->setKeepAlive(60);
@@ -508,7 +530,10 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
 #if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
   if (mqtt_config) mqtt_config->buffer.out_size = 1280;
 #endif
-  runtime.client->setCleanSession(true);
+  // Resume the broker session on reconnect rather than asking the broker to
+  // discard it. A clean reconnect can be closed while the previous session is
+  // still settling for the stable client id; a resume/takeover is accepted.
+  runtime.client->setCleanSession(false);
 #if ESP_IDF_VERSION_MAJOR == 5
   runtime.client->attachArduinoCACertBundle(secureUri(runtime.server_uri));
 #else
@@ -517,26 +542,9 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
         secureUri(runtime.server_uri) ? esp_crt_bundle_attach : nullptr;
   }
 #endif
-  if (mqtt_config) {
-#if ESP_IDF_VERSION_MAJOR == 5
-    mqtt_config->credentials.username = nullptr;
-    mqtt_config->credentials.authentication.password = nullptr;
-#else
-    mqtt_config->username = nullptr;
-    mqtt_config->password = nullptr;
-#endif
-  }
   if (broker.audience[0]) {
-    runtime.username[0] = 0;
-    runtime.password[0] = 0;
-    if (!createJwt(slot, broker, runtime.jwt_expiry)) return false;
     runtime.client->setCredentials(runtime.jwt_username, runtime.jwt_token);
   } else {
-    runtime.jwt_expiry = 0;
-    strncpy(runtime.username, broker.username, sizeof(runtime.username) - 1);
-    runtime.username[sizeof(runtime.username) - 1] = 0;
-    strncpy(runtime.password, broker.password, sizeof(runtime.password) - 1);
-    runtime.password[sizeof(runtime.password) - 1] = 0;
     runtime.client->setCredentials(runtime.username[0] ? runtime.username : nullptr,
                                    runtime.password[0] ? runtime.password : nullptr);
   }

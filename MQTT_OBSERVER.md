@@ -209,6 +209,13 @@ reconnect, so a long outage never leaves you with a dead token. The token
 carries `publicKey`, `aud`, `iat`, `exp`, and `client` (this fork's version
 string) claims plus any `owner`/`email` you set. Clearing the audience
 (`set mqtt1.audience` with no value) switches the slot back to username/password.
+Renewing the token, or changing the slot's configuration, rebuilds the MQTT
+client before reconnecting: the broker then sees the new credentials and
+session settings instead of a reused client's previous ones.
+The observer also keeps its MQTT session (`clean_session=false`) with a stable
+client ID, so a reconnect resumes/takes over the previous session instead of
+asking the broker to discard it. Brokers that close a clean reconnect while the
+old session is still settling accept this path.
 
 **Username/password.** For a private broker:
 
@@ -584,6 +591,7 @@ point at the path or the TLS session; `config` never opened a socket at all.
 | Connect attempt timeout | 30 s |
 | Status interval | 1–60 minutes (default 5) |
 | JWT lifetime | 24 hours, renewed before expiry and before reconnect |
+| MQTT session | retained across reconnects (`clean_session=false`), stable client ID |
 | Packet/raw network timeout | 2.5 s |
 | Liveness probe | status message (or one packet/raw per interval when status is off); 60 s PUBACK timeout |
 | TLS heap gate | ~64 KB free and ~18 KB largest block in the TLS pool (PSRAM when present, otherwise internal), plus ~24 KB free and ~8 KB largest internal for a secure connect |
