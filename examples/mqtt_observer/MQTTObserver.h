@@ -59,6 +59,20 @@ class MQTTObserver {
     // The outstanding liveness probe (one QoS 1 publish in flight) and its
     // bookkeeping; see MQTTObserverProbeTracker.
     MQTTObserverProbeTracker probe;
+    // The last broker error for get mqttN.diag. The MQTT callbacks run on the
+    // client task and the CLI reads from the main task, so these are atomics;
+    // the worker owns the attempt counters.
+    std::atomic<uint8_t> diag_error_type;
+    std::atomic<int32_t> diag_tls_err;
+    std::atomic<int32_t> diag_tls_stack;
+    std::atomic<int32_t> diag_tls_flags;
+    std::atomic<int32_t> diag_sock_errno;
+    std::atomic<uint32_t> diag_error_ms;
+    std::atomic<uint32_t> diag_disconnect_ms;
+    std::atomic<uint32_t> diag_connected_ms;
+    std::atomic<uint32_t> diag_next_retry_ms;
+    std::atomic<uint16_t> diag_attempts;
+    std::atomic<uint8_t> diag_failures;
 
     BrokerRuntime();
   };
@@ -119,7 +133,8 @@ class MQTTObserver {
   bool publishStatus(size_t slot, const MQTTObserverConfig& config);
   bool buildStatusMessage(char* out, size_t capacity, size_t& written);
   void disconnectBroker(size_t slot);
-  void deferReconnect(size_t slot, uint32_t now);
+  void deferReconnect(size_t slot, uint32_t now, uint8_t reason);
+  void noteDiagError(BrokerRuntime& runtime, uint8_t type, uint32_t now);
   void trackDisconnectedQueue(uint32_t now);
   void flushQueue();
   size_t queueSize();

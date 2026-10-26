@@ -391,6 +391,36 @@ bool handleGetCommand(const MQTTObserverConfig& config, const char* origin_sourc
     snprintf(reply, CLI_REPLY_MAX, "%s", result);
     return true;
   }
+  if (MQTT_GET_IS("diag")) {
+    const MQTTObserverSlotDiag& diag = facts.slot_diag[slot];
+    char error[24];
+    switch (diag.error_type) {
+      case DIAG_ERR_TRANSPORT: snprintf(error, sizeof(error), "transport"); break;
+      case DIAG_ERR_MQTT: snprintf(error, sizeof(error), "mqtt"); break;
+      case DIAG_ERR_TIMEOUT: snprintf(error, sizeof(error), "timeout"); break;
+      case DIAG_ERR_CONFIG: snprintf(error, sizeof(error), "config"); break;
+      case DIAG_ERR_LIVENESS: snprintf(error, sizeof(error), "liveness"); break;
+      case DIAG_ERR_CLOSED: snprintf(error, sizeof(error), "closed"); break;
+      case DIAG_ERR_NONE: snprintf(error, sizeof(error), "none"); break;
+      default:
+        snprintf(error, sizeof(error), "other/%u",
+                 static_cast<unsigned>(diag.error_type));
+        break;
+    }
+    snprintf(reply, CLI_REPLY_MAX,
+             "mqtt%u diag %s err:%s tls:0x%X stk:0x%X cert:0x%X sock:%d "
+             "att:%u fail:%u age:%lus up:%lus retry:%lus",
+             static_cast<unsigned>(slot + 1), mqttObserverStateName(facts.slot_state[slot]),
+             error, static_cast<unsigned>(diag.tls_err),
+             static_cast<unsigned>(diag.tls_stack),
+             static_cast<unsigned>(diag.tls_flags), static_cast<int>(diag.sock_errno),
+             static_cast<unsigned>(diag.attempts),
+             static_cast<unsigned>(diag.failures),
+             static_cast<unsigned long>(diag.error_age_s),
+             static_cast<unsigned long>(diag.connected_age_s),
+             static_cast<unsigned long>(diag.retry_in_s));
+    return true;
+  }
   if (MQTT_GET_IS("status")) {
     snprintf(reply, CLI_REPLY_MAX, "mqtt%u %s wifi:%s q:%u",
              static_cast<unsigned>(slot + 1), mqttObserverStateName(facts.slot_state[slot]),

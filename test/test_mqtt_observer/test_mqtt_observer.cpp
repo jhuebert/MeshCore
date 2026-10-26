@@ -211,6 +211,60 @@ TEST_F(ObserverCliTest, SlotStatusAndDashboard) {
   EXPECT_EQ(said(), "mqtt wifi:up time:ok slots:1/1 rx:34 pub:12 drop:2 q:0/8 heap:118032/98304");
 }
 
+TEST_F(ObserverCliTest, SlotDiagReportsTheLastBrokerError) {
+  // A healthy slot that has never had an error still answers with a stable
+  // field layout (parsers should not have to special-case the first run).
+  EXPECT_TRUE(run("get mqtt1.diag"));
+  EXPECT_EQ(said(),
+            "mqtt1 diag connected err:none tls:0x0 stk:0x0 cert:0x0 sock:0 "
+            "att:0 fail:0 age:0s up:0s retry:0s");
+
+  facts.slot_state[1] = STATE_ERROR;
+  facts.slot_connected[1] = false;
+  MQTTObserverSlotDiag& diag = facts.slot_diag[1];
+  diag.error_type = DIAG_ERR_TRANSPORT;
+  diag.tls_stack = -29184;
+  diag.tls_flags = 0x8000;
+  diag.sock_errno = 111;
+  diag.attempts = 7;
+  diag.failures = 3;
+  diag.error_age_s = 42;
+  diag.retry_in_s = 18;
+  EXPECT_TRUE(run("get mqtt2.diag"));
+  EXPECT_EQ(said(),
+            "mqtt2 diag error err:transport tls:0x0 stk:0xFFFF8E00 cert:0x8000 "
+            "sock:111 att:7 fail:3 age:42s up:0s retry:18s");
+  EXPECT_LT(said().size(), static_cast<size_t>(CLI_REPLY_MAX));
+
+  // The observer's own outcomes have no transport detail of their own.
+  diag.error_type = DIAG_ERR_TIMEOUT;
+  diag.tls_stack = 0;
+  diag.tls_flags = 0;
+  diag.sock_errno = 0;
+  EXPECT_TRUE(run("get mqtt2.diag"));
+  EXPECT_EQ(said(),
+            "mqtt2 diag error err:timeout tls:0x0 stk:0x0 cert:0x0 sock:0 "
+            "att:7 fail:3 age:42s up:0s retry:18s");
+
+  diag.error_type = DIAG_ERR_CONFIG;
+  EXPECT_TRUE(run("get mqtt2.diag"));
+  EXPECT_EQ(said(),
+            "mqtt2 diag error err:config tls:0x0 stk:0x0 cert:0x0 sock:0 "
+            "att:7 fail:3 age:42s up:0s retry:18s");
+
+  diag.error_type = DIAG_ERR_LIVENESS;
+  EXPECT_TRUE(run("get mqtt2.diag"));
+  EXPECT_EQ(said(),
+            "mqtt2 diag error err:liveness tls:0x0 stk:0x0 cert:0x0 sock:0 "
+            "att:7 fail:3 age:42s up:0s retry:18s");
+
+  diag.error_type = DIAG_ERR_CLOSED;
+  EXPECT_TRUE(run("get mqtt2.diag"));
+  EXPECT_EQ(said(),
+            "mqtt2 diag error err:closed tls:0x0 stk:0x0 cert:0x0 sock:0 "
+            "att:7 fail:3 age:42s up:0s retry:18s");
+}
+
 TEST_F(ObserverCliTest, ForeignCommandsAreNotOurs) {
   EXPECT_FALSE(run("filter stats"));
   EXPECT_FALSE(run("battery"));
@@ -494,6 +548,30 @@ TEST(MQTTObserverConnectionPolicy, AConnectAttemptThatNeverCameUpIsAFailure) {
   EXPECT_TRUE(connectAttemptTimedOut(true, 1000 + kConnectAttemptTimeoutMs, 1000));
   // wrap-safe: the attempt started just before the rollover
   EXPECT_TRUE(connectAttemptTimedOut(true, 100, 200));
+}
+
+TEST(MQTTObserverConnectionPolicy, ClassifiesConnectFailureSources) {
+  using namespace MQTTObserverConnectionPolicy;
+  EXPECT_EQ(attemptFailureSource(1000, 0, 0), AttemptFailureSource::Timeout);
+  EXPECT_EQ(attemptFailureSource(1000, 1500, 0), AttemptFailureSource::Reported);
+  EXPECT_EQ(attemptFailureSource(1000, 0, 1500), AttemptFailureSource::Closed);
+  // a transport error outranks the disconnect it caused
+  EXPECT_EQ(attemptFailureSource(1000, 1500, 1600), AttemptFailureSource::Reported);
+  // timestamps older than the attempt belong to its predecessor
+  EXPECT_EQ(attemptFailureSource(1000, 900, 0), AttemptFailureSource::Timeout);
+  EXPECT_EQ(attemptFailureSource(1000, 0, 900), AttemptFailureSource::Timeout);
+  // wrap-safe: both stamps are after the attempt in millis() terms
+  EXPECT_EQ(attemptFailureSource(0xFFFFFF00u, 0x00000100u, 0),
+            AttemptFailureSource::Reported);
+}
+
+TEST(MQTTObserverConnectionPolicy, DisconnectBelongsToARecentTransportError) {
+  using namespace MQTTObserverConnectionPolicy;
+  EXPECT_FALSE(disconnectBelongsToError(10000, 0));
+  EXPECT_TRUE(disconnectBelongsToError(10000, 10000));
+  EXPECT_TRUE(disconnectBelongsToError(10000, 10000 - kDisconnectAfterErrorMs));
+  EXPECT_FALSE(disconnectBelongsToError(10000,
+                                        10000 - kDisconnectAfterErrorMs - 1));
 }
 
 TEST(MQTTObserverProbeTracker, ClearsTheProbeOnItsPuback) {

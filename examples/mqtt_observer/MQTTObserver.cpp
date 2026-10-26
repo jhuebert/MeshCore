@@ -87,7 +87,10 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       next_connect_ms(0), attempt_started(0), connected_at(0), last_status_ms(0),
       status_retry_ms(0), backoff_index(0), status_retry_pending(false),
       client_started(false), configured(false), connected(false), status_pending(false),
-      connect_failed(false), state(STATE_OFF) {}
+      connect_failed(false), state(STATE_OFF),
+      diag_error_type(DIAG_ERR_NONE), diag_tls_err(0), diag_tls_stack(0),
+      diag_tls_flags(0), diag_sock_errno(0), diag_error_ms(0), diag_disconnect_ms(0),
+      diag_connected_ms(0), diag_next_retry_ms(0), diag_attempts(0), diag_failures(0) {}
 
 MQTTObserver::MQTTObserver()
     : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _model{},
@@ -441,18 +444,46 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
     if (!runtime.client) return false;
     runtime.client->setAutoReconnect(false);
     runtime.client->onConnect([this, slot](bool) {
-      _brokers[slot].connected_at.store(millis(), std::memory_order_relaxed);
-      _brokers[slot].connected.store(true, std::memory_order_relaxed);
-      _brokers[slot].status_pending.store(true, std::memory_order_relaxed);
-      _brokers[slot].connect_failed.store(false, std::memory_order_relaxed);
-      _brokers[slot].state.store(STATE_CONNECTED, std::memory_order_relaxed);
+      BrokerRuntime& rt = _brokers[slot];
+      rt.connected_at.store(millis(), std::memory_order_relaxed);
+      rt.connected.store(true, std::memory_order_relaxed);
+      rt.status_pending.store(true, std::memory_order_relaxed);
+      rt.connect_failed.store(false, std::memory_order_relaxed);
+      rt.diag_failures.store(0, std::memory_order_relaxed);
+      rt.diag_disconnect_ms.store(0, std::memory_order_relaxed);
+      rt.diag_connected_ms.store(millis(), std::memory_order_relaxed);
+      rt.state.store(STATE_CONNECTED, std::memory_order_relaxed);
     });
     runtime.client->onDisconnect([this, slot](bool) {
-      _brokers[slot].connected.store(false, std::memory_order_relaxed);
-      _brokers[slot].state.store(STATE_RETRY, std::memory_order_relaxed);
+      BrokerRuntime& rt = _brokers[slot];
+      rt.connected.store(false, std::memory_order_relaxed);
+      // A DISCONNECTED with no transport error is how a CONNACK refusal
+      // reaches us: the pinned client forwards only transport errors. Record
+      // it now so `diag` shows the refusal during the worker's 30 s wait; a
+      // transport error immediately before the disconnect keeps its detail.
+      uint32_t now = millis();
+      uint32_t error_ms = rt.diag_error_ms.load(std::memory_order_relaxed);
+      if (!MQTTObserverConnectionPolicy::disconnectBelongsToError(now, error_ms))
+        noteDiagError(rt, DIAG_ERR_CLOSED, now);
+      rt.diag_disconnect_ms.store(now, std::memory_order_relaxed);
+      rt.state.store(STATE_RETRY, std::memory_order_relaxed);
     });
-    runtime.client->onError([this, slot](esp_mqtt_error_codes_t) {
-      _brokers[slot].state.store(STATE_ERROR, std::memory_order_relaxed);
+    runtime.client->onError([this, slot](esp_mqtt_error_codes_t error) {
+      BrokerRuntime& rt = _brokers[slot];
+      uint8_t type = static_cast<uint8_t>(error.error_type);
+      // An MQTT event with no category is still an error worth reporting.
+      if (type == DIAG_ERR_NONE) type = DIAG_ERR_MQTT;
+      rt.diag_error_type.store(type, std::memory_order_relaxed);
+      rt.diag_tls_err.store(static_cast<int32_t>(error.esp_tls_last_esp_err),
+                            std::memory_order_relaxed);
+      rt.diag_tls_stack.store(static_cast<int32_t>(error.esp_tls_stack_err),
+                              std::memory_order_relaxed);
+      rt.diag_tls_flags.store(static_cast<int32_t>(error.esp_tls_cert_verify_flags),
+                              std::memory_order_relaxed);
+      rt.diag_sock_errno.store(static_cast<int32_t>(error.esp_transport_sock_errno),
+                               std::memory_order_relaxed);
+      rt.diag_error_ms.store(millis(), std::memory_order_relaxed);
+      rt.state.store(STATE_ERROR, std::memory_order_relaxed);
     });
     runtime.client->onPublish([this, slot](int msg_id) {
       _brokers[slot].probe.notePuback(msg_id);
@@ -522,16 +553,33 @@ void MQTTObserver::disconnectBroker(size_t slot) {
   runtime.client_started = false;
   runtime.connected.store(false, std::memory_order_relaxed);
   runtime.status_pending.store(false, std::memory_order_relaxed);
+  runtime.diag_next_retry_ms.store(0, std::memory_order_relaxed);
   runtime.probe.reset();   // a new connection restarts the packet ids
 }
 
-void MQTTObserver::deferReconnect(size_t slot, uint32_t now) {
+void MQTTObserver::noteDiagError(BrokerRuntime& runtime, uint8_t type, uint32_t now) {
+  runtime.diag_error_type.store(type, std::memory_order_relaxed);
+  runtime.diag_error_ms.store(now ? now : 1, std::memory_order_relaxed);
+  // The transport details belong to the last MQTT event; an observer-decided
+  // failure has none of its own.
+  runtime.diag_tls_err.store(0, std::memory_order_relaxed);
+  runtime.diag_tls_stack.store(0, std::memory_order_relaxed);
+  runtime.diag_tls_flags.store(0, std::memory_order_relaxed);
+  runtime.diag_sock_errno.store(0, std::memory_order_relaxed);
+}
+
+void MQTTObserver::deferReconnect(size_t slot, uint32_t now, uint8_t reason) {
   if (slot >= MQTT_OBSERVER_MAX_BROKERS) return;
   BrokerRuntime& runtime = _brokers[slot];
+  if (reason != DIAG_ERR_NONE) noteDiagError(runtime, reason, now);
+  uint8_t failures = runtime.diag_failures.load(std::memory_order_relaxed);
+  if (failures < 0xFF)
+    runtime.diag_failures.store(failures + 1, std::memory_order_relaxed);
   disconnectBroker(slot);
   uint8_t index = runtime.backoff_index < 5 ? runtime.backoff_index : 4;
   runtime.next_connect_ms = now + kBackoffMs[index];
   if (runtime.backoff_index < 4) runtime.backoff_index++;
+  runtime.diag_next_retry_ms.store(runtime.next_connect_ms, std::memory_order_relaxed);
   runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
 }
 
@@ -652,7 +700,12 @@ void MQTTObserver::worker() {
         // a reconfigured slot gets a fresh attempt: the previous failure says
         // nothing about the new credentials
         runtime.connect_failed.store(false, std::memory_order_relaxed);
+        runtime.diag_failures.store(0, std::memory_order_relaxed);
         if (!configureClient(i, _work_config)) {
+          noteDiagError(runtime, DIAG_ERR_CONFIG, now);
+          uint8_t failures = runtime.diag_failures.load(std::memory_order_relaxed);
+          if (failures < 0xFF)
+            runtime.diag_failures.store(failures + 1, std::memory_order_relaxed);
           runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
           continue;
         }
@@ -674,7 +727,7 @@ void MQTTObserver::worker() {
                 runtime.probe.outstanding(), now, runtime.probe.sentMs())) {
           // An unacknowledged QoS 1 probe is the one failure the local connected
           // flag cannot see; reuse the reconnect ladder instead of looping.
-          deferReconnect(i, now);
+          deferReconnect(i, now, DIAG_ERR_LIVENESS);
           continue;
         }
 
@@ -707,20 +760,42 @@ void MQTTObserver::worker() {
         // — and the slot says so instead of cycling "connecting" -> "retry"
         // forever. The ladder keeps retrying in the background.
         runtime.connect_failed.store(true, std::memory_order_relaxed);
-        deferReconnect(i, now);
+        // onError may already have recorded the real reason (a TLS/socket
+        // error) during this attempt; keep it instead of replacing it with
+        // the generic timeout.
+        uint32_t started = runtime.attempt_started;
+        uint32_t error_ms = runtime.diag_error_ms.load(std::memory_order_relaxed);
+        uint32_t disconnect_ms = runtime.diag_disconnect_ms.load(std::memory_order_relaxed);
+        auto source = MQTTObserverConnectionPolicy::attemptFailureSource(
+            started, error_ms, disconnect_ms);
+        uint8_t reason = DIAG_ERR_TIMEOUT;
+        if (source == MQTTObserverConnectionPolicy::AttemptFailureSource::Reported)
+          reason = DIAG_ERR_NONE;   // onError already recorded the detail
+        else if (source == MQTTObserverConnectionPolicy::AttemptFailureSource::Closed)
+          reason = DIAG_ERR_CLOSED;
+        deferReconnect(i, now, reason);
         runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
       }
       if (!runtime.client_started && static_cast<int32_t>(now - runtime.next_connect_ms) >= 0) {
         if (hasConnectHeadroom(secureUri(runtime.server_uri))) {
+          // Stamp the attempt before starting the client: its task can
+          // dispatch an error or disconnect before connect() returns, and
+          // the callbacks use this stamp to tell this attempt's failure from
+          // the previous one.
+          runtime.attempt_started = now;
           runtime.client->connect();
           runtime.client_started = true;
-          runtime.attempt_started = now;
+          runtime.diag_attempts.fetch_add(1, std::memory_order_relaxed);
+          runtime.diag_disconnect_ms.store(0, std::memory_order_relaxed);
+          runtime.diag_next_retry_ms.store(0, std::memory_order_relaxed);
           runtime.state.store(STATE_CONNECTING, std::memory_order_relaxed);
         } else {
           // A second TLS client started without a contiguous internal-heap
           // allocation can abort the device. Defer and retry indefinitely
           // (never a terminal state) until the heap recovers.
           runtime.next_connect_ms = now + 30000;
+          runtime.diag_next_retry_ms.store(runtime.next_connect_ms,
+                                           std::memory_order_relaxed);
           runtime.state.store(STATE_RETRY, std::memory_order_relaxed);
         }
       } else if (!runtime.client_started && runtime.connect_failed.load(std::memory_order_relaxed)) {
@@ -924,9 +999,33 @@ void MQTTObserver::cliFacts(MQTTObserverCliFacts& facts) {
   facts.disconnected_drops = _disconnected_drops.load(std::memory_order_relaxed);
   facts.queue_drops = _queue_drops.load(std::memory_order_relaxed);
   facts.publish_drops = _publish_drops.load(std::memory_order_relaxed);
+  uint32_t now = millis();
   for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
-    facts.slot_state[i] = _brokers[i].state.load(std::memory_order_relaxed);
-    facts.slot_connected[i] = _brokers[i].connected.load(std::memory_order_relaxed);
+    const BrokerRuntime& broker = _brokers[i];
+    MQTTObserverSlotState state = broker.state.load(std::memory_order_relaxed);
+    bool connected = broker.connected.load(std::memory_order_relaxed);
+    facts.slot_state[i] = state;
+    facts.slot_connected[i] = connected;
+
+    MQTTObserverSlotDiag& diag = facts.slot_diag[i];
+    diag.error_type = broker.diag_error_type.load(std::memory_order_relaxed);
+    diag.tls_err = broker.diag_tls_err.load(std::memory_order_relaxed);
+    diag.tls_stack = broker.diag_tls_stack.load(std::memory_order_relaxed);
+    diag.tls_flags = broker.diag_tls_flags.load(std::memory_order_relaxed);
+    diag.sock_errno = broker.diag_sock_errno.load(std::memory_order_relaxed);
+    diag.attempts = broker.diag_attempts.load(std::memory_order_relaxed);
+    diag.failures = broker.diag_failures.load(std::memory_order_relaxed);
+    uint32_t error_ms = broker.diag_error_ms.load(std::memory_order_relaxed);
+    diag.error_age_s = error_ms ? (now - error_ms) / 1000 : 0;
+    uint32_t connected_ms = broker.diag_connected_ms.load(std::memory_order_relaxed);
+    diag.connected_age_s = connected && connected_ms ? (now - connected_ms) / 1000 : 0;
+    uint32_t retry_ms = broker.diag_next_retry_ms.load(std::memory_order_relaxed);
+    if ((state == STATE_RETRY || state == STATE_ERROR) && retry_ms) {
+      int32_t remaining = static_cast<int32_t>(retry_ms - now);
+      diag.retry_in_s = remaining > 0
+                            ? (static_cast<uint32_t>(remaining) + 999) / 1000
+                            : 0;
+    }
   }
 }
 

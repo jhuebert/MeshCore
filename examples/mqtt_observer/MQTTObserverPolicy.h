@@ -100,6 +100,31 @@ inline bool connectAttemptTimedOut(bool client_started, uint32_t now,
   return (uint32_t)(now - attempt_started) >= kConnectAttemptTimeoutMs;
 }
 
+// The observer's attempt clock separates the ways a connect attempt can fail:
+// a transport error arrives through onError during the attempt, a broker that
+// closes the session (a CONNACK refusal, which the pinned client does not
+// forward) only leaves a disconnect behind, and a silently stuck attempt
+// reaches neither. Timestamps older than the attempt belong to its
+// predecessor, so they are ignored.
+enum class AttemptFailureSource : uint8_t { Reported, Closed, Timeout };
+
+static const uint32_t kDisconnectAfterErrorMs = 5000;
+
+inline AttemptFailureSource attemptFailureSource(uint32_t started, uint32_t error_ms,
+                                                 uint32_t disconnect_ms) {
+  if (error_ms != 0 && static_cast<int32_t>(error_ms - started) >= 0)
+    return AttemptFailureSource::Reported;
+  if (disconnect_ms != 0 && static_cast<int32_t>(disconnect_ms - started) >= 0)
+    return AttemptFailureSource::Closed;
+  return AttemptFailureSource::Timeout;
+}
+
+// A disconnect this soon after a transport error is that error's disconnect;
+// an older error belongs to a previous attempt.
+inline bool disconnectBelongsToError(uint32_t now, uint32_t error_ms) {
+  return error_ms != 0 && static_cast<uint32_t>(now - error_ms) <= kDisconnectAfterErrorMs;
+}
+
 }  // namespace MQTTObserverConnectionPolicy
 
 // The outstanding liveness probe of one broker.

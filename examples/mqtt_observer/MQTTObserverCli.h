@@ -28,6 +28,37 @@ enum MQTTObserverSlotState : uint8_t {
 // The name a slot state is reported under ("off", "config", ...).
 const char* mqttObserverStateName(MQTTObserverSlotState state);
 
+// The last failure a slot recorded, reported by `get mqttN.diag`. Value 1
+// mirrors esp_mqtt_error_type_t (transport); DIAG_ERR_MQTT covers an MQTT
+// error event with no more specific observer category; the high values are
+// the observer's own outcomes.
+enum MQTTObserverDiagError : uint8_t {
+  DIAG_ERR_NONE = 0,
+  DIAG_ERR_TRANSPORT = 1,
+  DIAG_ERR_MQTT = 2,          // an MQTT error event with no more specific type
+  DIAG_ERR_TIMEOUT = 0xF0,    // the connect attempt never came up in 30 s
+  DIAG_ERR_CONFIG = 0xF1,     // configureClient()/createJwt() failed
+  DIAG_ERR_LIVENESS = 0xF2,   // the broker stopped acknowledging the probe
+  DIAG_ERR_CLOSED = 0xF3      // broker closed the session, no transport error
+};
+
+// One slot's last-error report. The observer fills this from the MQTT client
+// callbacks and its own attempt bookkeeping; the CLI only formats it. The
+// last error is kept after a reconnect so a recovered slot still explains
+// what happened.
+struct MQTTObserverSlotDiag {
+  uint8_t error_type = DIAG_ERR_NONE;
+  int32_t tls_err = 0;           // esp_tls_last_esp_err
+  int32_t tls_stack = 0;         // esp_tls_stack_err
+  int32_t tls_flags = 0;         // esp_tls_cert_verify_flags
+  int32_t sock_errno = 0;        // esp_transport_sock_errno
+  uint32_t error_age_s = 0;      // seconds since the last error; 0 = none
+  uint32_t connected_age_s = 0;  // seconds since this connection began; 0 = not connected
+  uint32_t retry_in_s = 0;       // seconds until the next attempt; 0 = due/attempting/connected
+  uint16_t attempts = 0;         // connect() calls since boot
+  uint8_t failures = 0;          // consecutive failed attempts
+};
+
 // What the device reports to the commands: the Wi-Fi link, the clock, the
 // heap, the queue and the per-slot state. The observer fills this in; the
 // command handling itself is pure.
@@ -47,6 +78,7 @@ struct MQTTObserverCliFacts {
   uint32_t publish_drops = 0;
   MQTTObserverSlotState slot_state[MQTT_OBSERVER_MAX_BROKERS] = {STATE_OFF};
   bool slot_connected[MQTT_OBSERVER_MAX_BROKERS] = {false};
+  MQTTObserverSlotDiag slot_diag[MQTT_OBSERVER_MAX_BROKERS];
 };
 
 // Handle one CLI command.

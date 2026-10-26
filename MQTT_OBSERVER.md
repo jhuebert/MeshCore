@@ -307,6 +307,7 @@ There is no `mqtt3`.
 | `set mqttN.topic <template>` | Topic layout; empty restores the MeshCore default. The template may only use the known placeholders — `{iata}`, `{device}`, `{token}`, `{type}` — anything else is refused (`Err - topic placeholder must be {iata}, {device}, {token} or {type}`), because an unknown one would be published verbatim and the whole feed would go to a topic nobody reads |
 | `set mqttN.token <token>` | Value for `{token}` in the template |
 | `get mqttN.status` | One slot's state — `mqtt1 <state> wifi:up q:0` |
+| `get mqttN.diag` | Last broker error and attempt history (see [Diagnostics](#reading-get-mqttndiag)) |
 | `get mqttN.enabled` | `on`/`off` |
 | `get mqttN.server` | Host label (or `not configured`) |
 | `get mqttN.port` | Effective port |
@@ -509,6 +510,35 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 
 `get mqttN.status` narrows this to one slot's state and queue depth.
 
+### Reading `get mqttN.diag`
+
+`status` says *what* the slot is doing; `diag` says *why the last attempt
+failed*. The last error is kept after a reconnect, so a slot that has come
+back still explains what happened.
+
+```text
+mqtt1 diag error err:closed tls:0x0 stk:0x0 cert:0x0 sock:0 att:7 fail:3 age:42s up:0s retry:18s
+```
+
+| Field | Meaning |
+|---|---|
+| `diag <state>` | The slot state (the same names as `status`) |
+| `err:` | Last failure: `none`, `transport` (TLS/socket), `closed` (the broker closed the session with no transport error — typically a CONNACK refusal, e.g. auth/identity), `mqtt` (an uncategorised client error), `timeout` (the connect attempt never came up in 30 s), `config` (URI/JWT/config failure), `liveness` (the broker stopped acknowledging the QoS 1 probe), or `other/<n>` |
+| `tls:` | `esp_tls_last_esp_err`, the ESP-IDF TLS error (hex; `0x0` = none) |
+| `stk:` | The TLS stack's own error (mbedTLS; hex) |
+| `cert:` | Certificate verification flags (hex bitmask; `0x0` = none) |
+| `sock:` | Socket errno from the transport (`0` = none; e.g. `111` = `ECONNREFUSED`, `113` = `EHOSTUNREACH`, `118` = `ETIMEDOUT`) |
+| `att:` | Connect attempts since boot |
+| `fail:` | Consecutive failed attempts; reset by a successful connection or a configuration change |
+| `age:` | Seconds since the last error (`0s` = none since boot) |
+| `up:` | Seconds the current connection has been up (`0s` = disconnected) |
+| `retry:` | Seconds until the next attempt; `0s` when connected, attempting, or due now |
+
+The pinned MQTT client forwards only transport errors to the firmware, so a
+refused session appears as `closed` here; the broker's exact CONNACK code is
+not available to the observer. `transport`, `timeout`, `tls`, `cert` and `sock`
+point at the path or the TLS session; `config` never opened a socket at all.
+
 ### Common problems
 
 | Symptom | Check | Usual cause |
@@ -516,7 +546,7 @@ mqtt wifi:up time:ok slots:1/2 rx:4231 pub:4200 drop:31 q:0/8 heap:118032/98304
 | `get mqtt.status` shows `slots:0/2` | `get wifi.status`, `time:` field | Wi-Fi not connected, or clock still `wait` |
 | Slot stuck at `config` | `get mqttN.server`, `get mqtt.iata` | No server, or the default topic needs an `IATA` and none is set |
 | Slot cycles `connecting` → `retry` | `get mqttN.server`, broker reachability | Wrong host/port, wrong scheme, or the broker is down |
-| Slot shows `error` | `get mqttN.server`, `get mqttN.username` / `password` / `audience` | The last connect attempt never came up: the broker refused it (wrong credentials, wrong protocol) or was unreachable. The slot keeps retrying; a configuration change starts a fresh attempt |
+| Slot shows `error` | `get mqttN.diag`, then `get mqttN.server` / `username` / `password` / `audience` | The last connect attempt never came up. `diag` separates a broker refusal (`closed`) from a network/TLS failure (`transport`, `timeout`, `tls`, `sock`). The slot keeps retrying; a configuration change starts a fresh attempt |
 | Auth rejected | audience vs username/password | Audience set when you meant password (JWT wins); or the audience/token is wrong |
 | No TLS, immediately after boot | `time:` | Clock not yet synced; secure brokers need valid time |
 | `drop:` climbing steadily | `q:` | Broker disconnected too long, or an overloaded node — check the broker |
