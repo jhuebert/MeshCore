@@ -73,6 +73,7 @@ class MQTTObserver {
     std::atomic<uint32_t> diag_next_retry_ms;
     std::atomic<uint16_t> diag_attempts;
     std::atomic<uint8_t> diag_failures;
+    std::atomic<uint8_t> closed_failures;   // consecutive broker-closed refusals
 
     BrokerRuntime();
   };
@@ -109,6 +110,7 @@ class MQTTObserver {
   MQTTObserverRawStager _raw_stager;
   BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
+  std::atomic<bool> _recover_requested;   // reset the Wi-Fi station and reconnect
   uint32_t _queue_disconnected_since;
   uint32_t _last_ntp_request;
   char _device_id[2 * PUB_KEY_SIZE + 1];

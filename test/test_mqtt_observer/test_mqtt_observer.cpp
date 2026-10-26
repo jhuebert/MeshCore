@@ -574,6 +574,14 @@ TEST(MQTTObserverConnectionPolicy, DisconnectBelongsToARecentTransportError) {
                                         10000 - kDisconnectAfterErrorMs - 1));
 }
 
+TEST(MQTTObserverConnectionPolicy,
+     ResetsTheNetworkOnlyAfterConsecutiveClosedFailures) {
+  using namespace MQTTObserverConnectionPolicy;
+  EXPECT_FALSE(closedRecoveryDue(0));
+  EXPECT_FALSE(closedRecoveryDue(kClosedRecoveryCount - 1));
+  EXPECT_TRUE(closedRecoveryDue(kClosedRecoveryCount));
+}
+
 TEST(MQTTObserverProbeTracker, ClearsTheProbeOnItsPuback) {
   MQTTObserverProbeTracker tracker;
   tracker.noteProbe(42, 1000);

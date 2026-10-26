@@ -90,7 +90,8 @@ MQTTObserver::BrokerRuntime::BrokerRuntime()
       connect_failed(false), state(STATE_OFF),
       diag_error_type(DIAG_ERR_NONE), diag_tls_err(0), diag_tls_stack(0),
       diag_tls_flags(0), diag_sock_errno(0), diag_error_ms(0), diag_disconnect_ms(0),
-      diag_connected_ms(0), diag_next_retry_ms(0), diag_attempts(0), diag_failures(0) {}
+      diag_connected_ms(0), diag_next_retry_ms(0), diag_attempts(0), diag_failures(0),
+      closed_failures(0) {}
 
 MQTTObserver::MQTTObserver()
     : _fs(nullptr), _identity(nullptr), _origin_source(nullptr), _origin{}, _model{},
@@ -99,7 +100,8 @@ MQTTObserver::MQTTObserver()
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
       _queue(), _raw_stager(), _brokers{}, _wifi_started(false),
-      _queue_disconnected_since(0), _last_ntp_request(0), _device_id{}, _json{},
+      _recover_requested(false), _queue_disconnected_since(0), _last_ntp_request(0),
+      _device_id{}, _json{},
       _state(STATE_OFF), _save_state(), _received(0), _published(0),
       _disconnected_drops(0), _queue_drops(0), _publish_drops(0) {
   MQTTObserverConfigCodec::setDefaults(_config);
@@ -476,6 +478,7 @@ bool MQTTObserver::configureClient(size_t slot, const MQTTObserverConfig& config
     rt.status_pending.store(true, std::memory_order_relaxed);
     rt.connect_failed.store(false, std::memory_order_relaxed);
     rt.diag_failures.store(0, std::memory_order_relaxed);
+    rt.closed_failures.store(0, std::memory_order_relaxed);
     rt.diag_disconnect_ms.store(0, std::memory_order_relaxed);
     rt.diag_connected_ms.store(millis(), std::memory_order_relaxed);
     rt.state.store(STATE_CONNECTED, std::memory_order_relaxed);
@@ -601,6 +604,20 @@ void MQTTObserver::worker() {
   while (true) {
     copyConfig(_work_config);
     uint32_t now = millis();
+    if (_recover_requested.exchange(false, std::memory_order_relaxed)) {
+      // Force the Wi-Fi station to rejoin. A broker that keeps the old
+      // connection/session can refuse the in-process reconnect; the new
+      // station/TCP/TLS state is what a reboot provides, without rebooting.
+      active_ssid[0] = 1;   // never equal to the configured SSID
+      active_ssid[1] = 0;
+      active_password[0] = 1;
+      active_password[1] = 0;
+      active_ntp_server[0] = 0;
+      for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
+        _brokers[i].configured = false;
+        _brokers[i].closed_failures.store(0, std::memory_order_relaxed);
+      }
+    }
     bool have_ready_broker = false;
     for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++)
       have_ready_broker = have_ready_broker || ready(_work_config, i);
@@ -627,7 +644,11 @@ void MQTTObserver::worker() {
         (strcmp(active_ssid, _work_config.wifi_ssid) != 0 ||
          strcmp(active_password, _work_config.wifi_password) != 0);
     if (wifi_changed) {
-      for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) disconnectBroker(i);
+      for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
+        disconnectBroker(i);
+        _brokers[i].configured = false;
+        _brokers[i].closed_failures.store(0, std::memory_order_relaxed);
+      }
       WiFi.disconnect(true, false);
       WiFi.mode(WIFI_OFF);
       _wifi_started = false;
@@ -709,6 +730,7 @@ void MQTTObserver::worker() {
         // nothing about the new credentials
         runtime.connect_failed.store(false, std::memory_order_relaxed);
         runtime.diag_failures.store(0, std::memory_order_relaxed);
+        runtime.closed_failures.store(0, std::memory_order_relaxed);
         if (!configureClient(i, _work_config)) {
           noteDiagError(runtime, DIAG_ERR_CONFIG, now);
           uint8_t failures = runtime.diag_failures.load(std::memory_order_relaxed);
@@ -735,6 +757,7 @@ void MQTTObserver::worker() {
                 runtime.probe.outstanding(), now, runtime.probe.sentMs())) {
           // An unacknowledged QoS 1 probe is the one failure the local connected
           // flag cannot see; reuse the reconnect ladder instead of looping.
+          runtime.closed_failures.store(0, std::memory_order_relaxed);
           deferReconnect(i, now, DIAG_ERR_LIVENESS);
           continue;
         }
@@ -782,6 +805,19 @@ void MQTTObserver::worker() {
         else if (source == MQTTObserverConnectionPolicy::AttemptFailureSource::Closed)
           reason = DIAG_ERR_CLOSED;
         deferReconnect(i, now, reason);
+        uint8_t failure_type = runtime.diag_error_type.load(std::memory_order_relaxed);
+        uint32_t failure_ms = runtime.diag_error_ms.load(std::memory_order_relaxed);
+        bool current_closed = failure_type == DIAG_ERR_CLOSED && failure_ms != 0 &&
+            static_cast<int32_t>(failure_ms - started) >= 0;
+        if (current_closed) {
+          uint8_t count = runtime.closed_failures.load(std::memory_order_relaxed);
+          if (count < 0xFF) count++;
+          runtime.closed_failures.store(count, std::memory_order_relaxed);
+          if (MQTTObserverConnectionPolicy::closedRecoveryDue(count))
+            _recover_requested.store(true, std::memory_order_relaxed);
+        } else {
+          runtime.closed_failures.store(0, std::memory_order_relaxed);
+        }
         runtime.state.store(STATE_ERROR, std::memory_order_relaxed);
       }
       if (!runtime.client_started && static_cast<int32_t>(now - runtime.next_connect_ms) >= 0) {
@@ -1039,6 +1075,13 @@ void MQTTObserver::cliFacts(MQTTObserverCliFacts& facts) {
 
 bool MQTTObserver::handleCommand(char* command, char* reply) {
   if (!command || !reply) return false;
+  if (strcmp(command, "mqtt recover") == 0) {
+    // Diagnostic/manual recovery: rejoin the Wi-Fi station so both slots get
+    // fresh TCP/TLS state without rebooting the repeater.
+    _recover_requested.store(true, std::memory_order_relaxed);
+    snprintf(reply, CLI_REPLY_MAX, "OK - Wi-Fi reset requested");
+    return true;
+  }
   MQTTObserverCliFacts facts;
   cliFacts(facts);
   bool changed = false;

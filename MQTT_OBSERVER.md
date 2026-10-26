@@ -297,6 +297,7 @@ There is no `mqtt3`.
 | `set mqtt.raw on\|off` | Raw-frame publish switch |
 | `set mqtt.tx off\|on\|advert` | Own-transmission uplink — `Err - tx must be off, on, or advert` otherwise |
 | `get mqtt.status` | Combined dashboard (see [Status](#reading-get-mqttstatus)) |
+| `mqtt recover` | Drop and rejoin the Wi-Fi station, then reconnect both slots — `OK - Wi-Fi reset requested` |
 | `get mqtt.iata` / `mqtt.origin` / `mqtt.ntp` | Current shared values |
 | `get mqtt.interval` | Minutes |
 | `get mqtt.rx` / `mqtt.status.enabled` / `mqtt.packets` / `mqtt.raw` / `mqtt.tx` | `on`/`off`, or `off`/`on`/`advert` for tx |
@@ -597,6 +598,14 @@ point at the path or the TLS session; `config` never opened a socket at all.
 | TLS heap gate | ~64 KB free and ~18 KB largest block in the TLS pool (PSRAM when present, otherwise internal), plus ~24 KB free and ~8 KB largest internal for a secure connect |
 | Config file | `/mqtt_prefs`, version 5, CRC-checked |
 
+- **Stale-session recovery.** Some brokers keep the previous session or
+  authentication state bound to the identity and silently close an in-process
+  reconnect (`err:closed`) even with a fresh token and client. After **5
+  consecutive `closed` failures**, the observer drops and rejoins the Wi-Fi
+  station, which gives both slots new TCP/TLS state (the same thing a reboot
+  provides) without rebooting the repeater. The station IP may change; the
+  status gap is the Wi-Fi rejoin plus one connect attempt. `mqtt recover` forces
+  the same reset immediately.
 - **ESP32 only.** nRF52, STM32, and RP2040 boards have no observer build.
 - **Not included:** broker presets, per-slot packet-type allowlists, neighbour
   queries, a WebConfig portal, SNMP, and alerting. Every packet type is captured

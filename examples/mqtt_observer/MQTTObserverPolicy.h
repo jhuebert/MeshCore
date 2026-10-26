@@ -125,6 +125,16 @@ inline bool disconnectBelongsToError(uint32_t now, uint32_t error_ms) {
   return error_ms != 0 && static_cast<uint32_t>(now - error_ms) <= kDisconnectAfterErrorMs;
 }
 
+// A persistent `closed` streak is a broker that keeps refusing the session
+// (often a stale identity/session at the broker). Reset the station only after
+// several attempts on the backoff ladder, so a transient broker restart or a
+// single refusal does not drop the whole observer.
+static const uint8_t kClosedRecoveryCount = 5;
+
+inline bool closedRecoveryDue(uint8_t consecutive_closed) {
+  return consecutive_closed >= kClosedRecoveryCount;
+}
+
 }  // namespace MQTTObserverConnectionPolicy
 
 // The outstanding liveness probe of one broker.
