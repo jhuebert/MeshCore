@@ -104,6 +104,12 @@ jobs:
               .map((line) => line.split(/\s+/)[1])
               .filter(Boolean);
             let pickCount = 0;
+            // A source-side squash or rewrite gives a commit a fresh patch-id,
+            // so git cherry keeps listing a commit whose content is already on
+            // stable under another hash; cherry-picking it then conflicts with
+            // stable's own copy. Skipping it is only safe if the end state
+            // proves the content is there, which the tree check below does.
+            const skipped = [];
             for (const pick of toPick) {
               // skip fork-owned-README-only commits; the README is synced below
               const touched = run('show', '--pretty=format:', '--name-only', pick)
@@ -111,14 +117,11 @@ jobs:
               if (touched.length === 0) continue;
               const pickResult = git('cherry-pick', pick);
               if (pickResult.status !== 0) {
-                fs.writeFileSync('stable-conflicted-files.txt',
-                  git('diff', '--name-only', '--diff-filter=U').stdout);
                 run('cherry-pick', '--abort');
-                core.setOutput('conflict', 'true');
-                // A stable conflict is a failure, not a warning. The previous
-                // stable is still intact on the remote; nothing was pushed.
-                // The failure is raised by the issue step below.
-                return;
+                skipped.push(pick);
+                core.warning(`skipped ${pick} ${run('log', '-1', '--format=%s', pick).trim()}: `
+                  + 'cherry-pick conflicted (already on stable in another form?)');
+                continue;
               }
               pickCount += 1;
             }
@@ -128,6 +131,35 @@ jobs:
             run('add', '-A');
             if (git('diff', '--cached', '--quiet').status !== 0) {
               run('commit', '-m', 'docs: sync fork README');
+            }
+
+            // A skipped pick is harmless only when the source branch already
+            // delivered its content some other way. Prove it: every path the
+            // source changed since its upstream merge base must match the
+            // source revision here, so a skip that really lost a commit fails
+            // the promotion instead of publishing a partial one. (Paths that
+            // upstream also touched after the merge base rightly land here
+            // too: that is a conflict a human has to resolve.)
+            if (skipped.length > 0) {
+              const base = run('merge-base', 'upstream/dev', sourceSha).trim();
+              const forkOwned = run('diff', '--name-only', base, sourceSha)
+                .split('\n').filter(Boolean);
+              const missing = forkOwned.length > 0
+                ? run('diff', '--name-only', sourceSha, 'HEAD', '--', ...forkOwned)
+                  .split('\n').filter(Boolean)
+                : [`${source} changed nothing since its merge base`];
+              if (missing.length > 0) {
+                const skipLines = skipped.map((s) =>
+                  `[skipped] ${s} ${run('log', '-1', '--format=%s', s).trim()}`);
+                fs.writeFileSync('stable-conflicted-files.txt',
+                  [...skipLines, ...missing].join('\n') + '\n');
+                core.setOutput('conflict', 'true');
+                // A lost commit is a failure, not a warning. The previous
+                // stable is still intact on the remote; nothing was pushed.
+                // The failure is raised by the issue step below.
+                return;
+              }
+              core.info(`skipped ${skipped.length} already-applied commit(s); tree matches the source`);
             }
             core.setOutput('picked', String(pickCount));
 
