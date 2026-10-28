@@ -1,0 +1,110 @@
+name: Filter Release Build
+
+# Builds one filter release's firmware assets on a single runner by invoking
+# scripts/local-release-build.sh — the same script, flags and code path used
+# locally. No matrix: the script drives its own build pool, and keeping a
+# release in one job is the point (the old per-target fan-out is what got
+# Actions shut down).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release URL or tag (e.g. filter-v1.19.0-dev.3)
+        required: true
+        type: string
+      jobs:
+        # the runner has 4 vCPUs and each `pio run -e` build is single-threaded,
+        # so more workers would only contend
+        description: Parallel build workers
+        required: false
+        type: number
+        default: 4
+      filter:
+        description: Build only targets matching this regex (empty = every repeater target, observers included)
+        required: false
+        type: string
+        default: ""
+      no_upload:
+        description: Build and collect the artifacts only — do not upload them to the release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # gh release upload --clobber
+
+# two runs on one release would clobber each other's uploads
+concurrency:
+  group: filter-release-build-${{ inputs.release }}
+  cancel-in-progress: false
+
+jobs:
+
+  build:
+    name: Build release assets
+    runs-on: ubuntu-latest
+    # a full release takes ~90 min on a workstation and this runner has 4 cores;
+    # a job dies at 360 min. Reruns rebuild everything (per-target uploads
+    # clobber), so a partial run is recoverable but never cheaper.
+    timeout-minutes: 350
+    steps:
+
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          # the script fetches the release's tag itself and builds in a worktree
+          # at the release's pinned commit, so this checkout only has to carry
+          # the script
+          fetch-depth: 1
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      # the script puts PlatformIO in its own venv, but every compiler and
+      # toolchain comes from the shared PlatformIO home: caching that saves the
+      # multi-GB downloads. PlatformIO installs whatever the release's
+      # platformio.ini asks for that a restored cache lacks.
+      - name: Init Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini', 'observer_targets.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      # a bare tag is resolved against the "fork" remote; here that is the repo
+      # this workflow runs in (a release URL names its own repo instead)
+      - name: Add the repo as a fork remote
+        shell: bash
+        run: |
+          git remote get-url fork >/dev/null 2>&1 \
+            || git remote add fork "https://github.com/${GITHUB_REPOSITORY}.git"
+
+      # --prune: a full release needs ~50 GB of per-target build trees, which
+      # this runner does not have; each target's tree goes as soon as its
+      # artifacts are collected
+      - name: Build and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ inputs.release }}
+          JOBS: ${{ inputs.jobs }}
+          FILTER: ${{ inputs.filter }}
+          NO_UPLOAD: ${{ inputs.no_upload }}
+        run: |
+          args=(--prune --jobs "$JOBS")
+          [[ -n $FILTER ]] && args+=(--filter "$FILTER")
+          [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
+          bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
+
+      # without the upload the runner's artifacts vanish with it
+      - name: Upload built artifacts
+        if: inputs.no_upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: ~/.cache/meshcore-release-build/*/out
