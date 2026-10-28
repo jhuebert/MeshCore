@@ -19,6 +19,10 @@
 #     --no-warmup         skip the serial first-build-per-platform phase (faster
 #                         start, but concurrent first-time toolchain installs
 #                         into the PlatformIO home can race)
+#     --prune             delete a target's .pio/build and .pio/libdeps dirs as
+#                         soon as its artifacts are collected: a full release
+#                         needs ~50 GB of per-target trees otherwise, which no
+#                         hosted runner has (reruns stop being incremental)
 #     --build-dir DIR     persistent work dir
 #                         (default: ~/.cache/meshcore-release-build/<tag>)
 #     --dry-run           resolve the release, list targets, exit
@@ -239,6 +243,12 @@ EOF
     echo "ERROR: no artifacts produced for $target" >&2
     exit 1
   fi
+  # one-shot mode (hosted CI): nothing here has a rerun to be incremental for,
+  # and the runner cannot hold a full release's build trees. The artifacts are
+  # already in out/, so this env's build and library dirs are dead weight.
+  if [[ ${WORKER_PRUNE:-0} == 1 ]]; then
+    rm -rf ".pio/build/$target" ".pio/libdeps/$target"
+  fi
   printf '%s\n' "${artifacts[@]}"
   exit 0
 fi
@@ -247,6 +257,7 @@ fi
 JOBS=4
 UPLOAD=1
 WARMUP=1
+PRUNE=0
 DRY_RUN=0
 BUILD_ATTEMPTS=3   # total tries for a target whose failure looks transient
 TARGETS_INPUT=""
@@ -259,6 +270,7 @@ while [[ $# -gt 0 ]]; do
     -j|--jobs) JOBS=$2; shift 2;;
     --no-upload) UPLOAD=0; shift;;
     --no-warmup) WARMUP=0; shift;;
+    --prune) PRUNE=1; shift;;
     --targets) TARGETS_INPUT=$2; shift 2;;
     --filter) FILTER_ARG=$2; shift 2;;
     --build-dir) BUILD_DIR_BASE=$2; shift 2;;
@@ -366,6 +378,7 @@ run_tool() {
   (
     cd "$build_dir"
     export FIRMWARE_VERSION="$firmware_version" RELEASE_SHA="$release_sha" WORKER_DIR="$build_dir"
+    export WORKER_PRUNE="$PRUNE"
     PATH="$venv_dir/bin:$PATH" bash "$SCRIPT_PATH" "$@"
   )
 }
