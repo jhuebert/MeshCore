@@ -135,6 +135,28 @@ void halt() {
   bool wifi_enabled = false;   // set at boot from prefs; false also when the effective SSID is blank
 #endif
 
+#ifdef ESP32_PLATFORM
+// Light sleep keeps its hands off an active session unless the level says
+// otherwise: whatever breaks the link also breaks the CLI needed to turn it
+// back off.
+static bool lightSleepAllowed() {
+  switch (the_mesh.getNodePrefs()->light_sleep_level) {
+    case 1:  return !interface_manager.isConnected();
+    case 2:  return true;
+    default: return false;
+  }
+}
+
+static PowerSaving::CompanionConfig companionPowerConfig() {
+  NodePrefs* prefs = the_mesh.getNodePrefs();
+  return {
+    prefs->powersaving_enabled != 0,
+    lightSleepAllowed(),
+    (int) board.getIRQGpio()
+  };
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
   board.begin();
@@ -209,6 +231,11 @@ void setup() {
 
 // add bluetooth interface
 #if defined(BLE_PIN_CODE)
+#if defined(ESP32_PLATFORM)
+  NodePrefs* ble_prefs = the_mesh.getNodePrefs();
+  bluetooth_interface.setPowerPrefs(ble_prefs->ble_adv_ms, ble_prefs->ble_tx_dbm,
+                                    ble_prefs->ble_conn_ms, ble_prefs->ble_conn_latency);
+#endif
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);
 #endif
@@ -290,10 +317,6 @@ void setup() {
 #endif
 
   board.onBootComplete();
-
-#if defined(ESP32_PLATFORM)
-  PowerSaving::applyCompanionPowerSaving(the_mesh.getNodePrefs()->powersaving_enabled);
-#endif
 }
 
 void loop() {
@@ -309,27 +332,39 @@ void loop() {
   external_watchdog.loop();
 #endif
 
-  if (the_mesh.getNodePrefs()->powersaving_enabled && !the_mesh.hasPendingWork()) {
+#if defined(ESP32_PLATFORM)
+  // Light sleep only happens while every task is blocked, so an idle loop has
+  // to give the idle task a slot - with either power knob on.
+  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled ||
+                     the_mesh.getNodePrefs()->light_sleep_level;
+#else
+  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled;
+#endif
+  if (idle_yields && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
     board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #elif defined(ESP32_PLATFORM)
   #if defined(BLE_PIN_CODE)
       if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) { // BLE is not busy
-        vTaskDelay(pdMS_TO_TICKS(10));                                               // attempt to sleep
+        vTaskDelay(pdMS_TO_TICKS(10));                                    // let the idle task run
       }
   #elif defined(ENABLE_USB_INTERFACE)
       if(!usb_serial_interface.isReadBusy() && !usb_serial_interface.isWriteBusy()){
-        vTaskDelay(pdMS_TO_TICKS(10)); // attempt to sleep
+        vTaskDelay(pdMS_TO_TICKS(10)); // let the idle task run
       }
   #endif
 #endif
   }
 
 #if defined(ESP32_PLATFORM)
-  static uint8_t applied_powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
-  if (the_mesh.getNodePrefs()->powersaving_enabled != applied_powersaving) { // changed via CLI
-    applied_powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
-    PowerSaving::applyCompanionPowerSaving(applied_powersaving);
+  // Re-apply whenever the profile would be different: on the first loop, when a
+  // prefs knob moves, or when the `idle` level sees a client connect/disconnect.
+  static uint8_t applied_power = 0xFF;
+  uint8_t power = (the_mesh.getNodePrefs()->powersaving_enabled ? 1 : 0) |
+                  (lightSleepAllowed() ? 2 : 0);
+  if (power != applied_power) {
+    applied_power = power;
+    PowerSaving::applyCompanionPowerSaving(companionPowerConfig());
   }
 #endif
 

@@ -2,38 +2,48 @@
 
 #if defined(ESP32_PLATFORM)
 // PowerSaving for companions
-void PowerSaving::applyCompanionPowerSaving(bool powersaving_enabled) {
-  if (powersaving_enabled) {
-    enableCompanionPowerSaving();
+void PowerSaving::applyCompanionPowerSaving(const CompanionConfig& cfg) {
+#if defined(BLE_PIN_CODE) && !CONFIG_IDF_TARGET_ESP32C6
+  // The BT controller has to be asleep-capable before the PM block may put the
+  // CPU to sleep while a connection is open, so a light sleep request implies
+  // modem sleep even when `powersaving` itself is off.
+  if (cfg.powersaving || cfg.light_sleep) {
+    esp_bt_sleep_enable();
   } else {
-    disableCompanionPowerSaving();
+    esp_bt_sleep_disable();
   }
+#endif
+
+  int max_freq_mhz = 80;
+#ifdef ESP32_CPU_FREQ
+  max_freq_mhz = ESP32_CPU_FREQ;
+#endif
+  int min_freq_mhz = cfg.powersaving ? 10 : max_freq_mhz;
+
+  esp_err_t errPM = configurePowerManagement(max_freq_mhz, min_freq_mhz, cfg.light_sleep);
+  if (errPM != ESP_OK && cfg.light_sleep) {
+    // Automatic light sleep is unavailable in this build/config (e.g. a BT
+    // controller that is not sleep-capable). Keep the CPU awake rather than
+    // ending up with a partly applied profile.
+    POWERSAVING_DEBUG_PRINTLN("Light sleep unavailable, staying awake: %d", errPM);
+    configurePowerManagement(max_freq_mhz, min_freq_mhz, false);
+    applyRadioWakeup(cfg.radio_irq_gpio, false);
+    return;
+  }
+
+  applyRadioWakeup(cfg.radio_irq_gpio, cfg.light_sleep);
 }
 
-void PowerSaving::enableCompanionPowerSaving() {
-#if defined(BLE_PIN_CODE) && !CONFIG_IDF_TARGET_ESP32C6
-  // Enable BLE sleep
-  esp_bt_sleep_enable();
-#endif
+void PowerSaving::applyRadioWakeup(int gpio, bool enable) {
+  if (gpio < 0) return;
 
-  // Configure Power Management
-#if defined(BLE_PIN_CODE)
-  configurePowerManagement(80, 10, false);
-#endif
-}
-
-void PowerSaving::disableCompanionPowerSaving() {
-#if defined(BLE_PIN_CODE) && !CONFIG_IDF_TARGET_ESP32C6
-  // Disable BLE sleep
-  esp_bt_sleep_disable();
-#endif
-
-  // Configure Power Management
-#if defined(ESP32_CPU_FREQ)
-  configurePowerManagement(ESP32_CPU_FREQ, ESP32_CPU_FREQ, false);
-#else
-  configurePowerManagement(80, 80, false);
-#endif
+  gpio_num_t pin = (gpio_num_t) gpio;
+  if (enable) {
+    gpio_wakeup_enable(pin, GPIO_INTR_HIGH_LEVEL);   // DIO1 goes high on a packet
+    esp_sleep_enable_gpio_wakeup();
+  } else {
+    gpio_wakeup_disable(pin);
+  }
 }
 
 esp_err_t PowerSaving::configurePowerManagement(int max_freq_mhz, int min_freq_mhz, bool light_sleep_enable) {

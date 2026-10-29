@@ -2,9 +2,9 @@
 
 Fork-only, unpublished notes for the `custom-companion-easysky` branch. That
 branch is `IoTThinks/MeshCore`'s `PowerSaving-v18` — the source behind the
-EasySkyMesh PowerSaving18 release — plus a deliberately tiny diff (five
-commits, eight files) so it stays easy to rebase: it adds four commands to the
-companion (client) firmware's CLI.
+EasySkyMesh PowerSaving18 release — plus a deliberately small diff so it stays
+easy to rebase: it adds a handful of commands to the companion (client)
+firmware's CLI, LED/buzzer muting and a set of power-tuning switches.
 
 This is not a release channel — no CI, no release workflow. Build and flash
 locally.
@@ -109,6 +109,91 @@ colour sweeps. `off` silences all of it — the same effect as the
 `led_q` and re-read by the UI every loop, so it takes effect immediately
 (no reboot).
 
+## Power tuning
+
+The ESP32 companions are ~20 mA above a repeater because the repeater puts its
+MCU into light sleep between packets (`board.sleep()`) while a companion never
+does: it has to stay awake for the BLE connection events. Everything below is
+persisted and off-by-default (except where noted), so each knob can be tried on
+its own with a meter.
+
+### `set lightsleep off|idle|always` / `get lightsleep`
+
+```
+get lightsleep       # > off
+set lightsleep idle  # OK - light sleep is now idle
+```
+
+Turns on ESP32 **automatic light sleep** (PM/tickless): the idle task stops the
+CPU between events and wakes for each connection event or for a LoRa packet
+(the radio's DIO1 pin is armed as a wake source). This is the only knob that
+removes the ~20 mA an awake CPU costs; the rest are a few mA each. Applied
+immediately, no reboot.
+
+| Level | Behaviour |
+|---|---|
+| `off` (default) | never sleeps |
+| `idle` | sleeps only while nothing is connected (no BLE link, no TCP client) |
+| `always` | also sleeps between the connection events of a live link |
+
+`idle` is the safe one to start with: the big win is while the app is away, and
+an active session can never be harmed. `always` goes further but leans on the
+BT controller's modem sleep keeping the link alive through every connection
+event — worth measuring, not worth trusting blind, because a dropped link also
+takes away the CLI you would use to turn it back off (USB flashing or a
+configured WiFi console remain).
+
+- Enabling it implies the BT controller's modem sleep even when `powersaving` is
+  off. If the platform refuses the PM configuration the firmware logs why and
+  stays awake rather than half-applying the profile.
+- **USB/Serial companions:** light sleep powers down the USB PHY, so the console
+  drops and re-enumerates. Don't use it on the USB/Serial builds — BLE and WiFi
+  companions only. (The `usb`/`serial` presets are the reason this is opt-in.)
+- With the build's `LPCLK = MAIN_XTAL` (no 32 kHz crystal on these boards) BT
+  sleep keeps the main crystal running, so expect ~1-2 mA sleeping rather than a
+  µA state. Still an order of magnitude below running.
+- The idle loop still ticks every 10 ms, so button presses and queued traffic
+  stay responsive.
+
+### BLE: `set ble.adv` / `set ble.tx` / `set ble.conn` / `set ble.lat`
+
+```
+get ble            # > adv=0 tx=3 conn=0 lat=0
+set ble.adv 500    # OK - reboot to apply
+set ble.tx -9      # OK - reboot to apply
+set ble.conn 200   # OK - applies on next connection
+set ble.lat 4      # OK - applies on next connection
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `adv` | advertising interval, ms; `0` = stack default (20-40 ms) | `0` |
+| `tx` | TX power, dBm (-24..21); ESP32 default is `+3` | `3` |
+| `conn` | preferred connection interval, ms; `0` = the phone decides | `0` |
+| `lat` | connection events the peripheral may skip | `0` |
+
+`adv` and `tx` are read once in `SerialBLEInterface::begin()` (reboot to apply);
+`conn`/`lat` are re-requested after the link is encrypted, so they land on the
+next connection. `conn`/`lat` are a *request* — iOS in particular may keep its
+own interval, Android usually honours it.
+
+Slower advertising is the biggest BLE win when no app is connected (roughly a
+few mA at 20-40 ms down to well under 1 mA at 300-600 ms); the trade-off is that
+the phone takes longer to discover the device. `tx` mostly affects connection
+events — -9 dBm is still enough for a room, -12 dBm for a pocket. `conn`/`lat`
+cut the radio's on-time per connection event, at the cost of message latency.
+
+Keep the set internally consistent: a slow `conn` with a large `lat` needs a
+longer supervision timeout (the firmware sizes it from the two, capped at the
+BLE maximum of 6 s), and `lat` above ~4 can make the app feel laggy.
+
+### Measuring
+
+Change one knob at a time, let the display time out (15 s) and the radio settle,
+then read a USB power meter or an inline meter for a minute. The order that
+usually shows the biggest steps is `lightsleep`, then `adv`, then WiFi off, then
+`tx`/`conn`/`lat`.
+
 ## `start ota`
 
 Start an over-the-air firmware update, like the repeater/room-server command:
@@ -143,10 +228,17 @@ Only these commands and prefs are ours; everything else is IoTThinks'
 PowerSaving firmware. The diff against `PowerSaving-v18` is:
 
 - `examples/companion_radio/MyMesh.cpp` — the CLI commands.
-- `examples/companion_radio/NodePrefs.h` — the `led_q` pref (`buzzer_quiet`
-  already exists upstream; `set buzzer` only reaches it from the CLI).
+- `examples/companion_radio/NodePrefs.h` — the `led_q`, `lsleep` and
+  `ble.{adv,tx,conn,lat}` prefs (`buzzer_quiet` already exists upstream; `set
+  buzzer` only reaches it from the CLI).
+- `examples/companion_radio/main.cpp` — apply the power profile and pass the BLE
+  prefs to the interface.
 - `examples/companion_radio/ui-{orig,new,tiny}/UITask.cpp` — honour `led_q` in
   the status LED handler and apply `buzzer_quiet` to the buzzer each loop.
+- `src/helpers/PowerSaving.{h,cpp}` — companion light sleep (PM config plus the
+  radio wake source) next to the existing modem-sleep/DFS profile.
+- `src/helpers/esp32/SerialBLEInterface.{h,cpp}` — advertising interval, TX
+  power and preferred connection parameters.
 - `src/helpers/ESP32Board.cpp` — serve the ESP32 OTA page on the current Wi-Fi
   network when connected, otherwise the usual `MeshCore-OTA` hotspot.
 - `variants/xiao_s3_wio/platformio.ini` — enable OTA on the Xiao S3 WIO

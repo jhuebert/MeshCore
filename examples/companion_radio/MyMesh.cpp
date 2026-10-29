@@ -2104,6 +2104,9 @@ void MyMesh::enterCLIRescue() {
   Serial.println("========= CLI Rescue =========");
 }
 
+// `set lightsleep` / `get lightsleep` levels, indexed by the pref value.
+static const char* const LIGHT_SLEEP_NAMES[] = {"off", "idle", "always"};
+
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
   while (*command == ' ') command++; // skip leading spaces
 
@@ -2288,6 +2291,82 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
   }
   if (strcmp(command, "get led") == 0) {
     sprintf(reply, "> %s", _prefs.led_quiet ? "off" : "on");
+    return true;
+  }
+
+  // Power tuning. The BLE values are read once in SerialBLEInterface::begin(),
+  // so they need a reboot; the connection ones are re-requested by the next
+  // connection. Light sleep is re-applied by the loop as soon as the pref moves.
+  if (memcmp(command, "set ble.adv ", 12) == 0) {
+    int ms = atoi(&command[12]);
+    if (ms < 0 || ms > 10240) {
+      strcpy(reply, "Error, adv must be 0-10240 ms (0 = default)");
+    } else {
+      _prefs.ble_adv_ms = ms;
+      savePrefs();
+      strcpy(reply, "OK - reboot to apply");
+    }
+    return true;
+  }
+  if (memcmp(command, "set ble.tx ", 11) == 0) {
+    int dbm = atoi(&command[11]);
+    if (dbm < -24 || dbm > 21) {
+      strcpy(reply, "Error, tx must be -24..21 dBm");
+    } else {
+      _prefs.ble_tx_dbm = dbm;
+      savePrefs();
+      strcpy(reply, "OK - reboot to apply");
+    }
+    return true;
+  }
+  if (memcmp(command, "set ble.conn ", 13) == 0) {
+    int ms = atoi(&command[13]);
+    if (ms != 0 && (ms < 20 || ms > 2000)) {
+      strcpy(reply, "Error, conn must be 0 or 20-2000 ms");
+    } else {
+      _prefs.ble_conn_ms = ms;
+      savePrefs();
+      strcpy(reply, "OK - applies on next connection");
+    }
+    return true;
+  }
+  if (memcmp(command, "set ble.lat ", 12) == 0) {
+    int latency = atoi(&command[12]);
+    if (latency < 0 || latency > 9) {
+      strcpy(reply, "Error, lat must be 0-9");
+    } else {
+      _prefs.ble_conn_latency = latency;
+      savePrefs();
+      strcpy(reply, "OK - applies on next connection");
+    }
+    return true;
+  }
+  if (strcmp(command, "get ble") == 0) {
+    sprintf(reply, "> adv=%u tx=%d conn=%u lat=%u",
+            (unsigned)_prefs.ble_adv_ms, (int)_prefs.ble_tx_dbm,
+            (unsigned)_prefs.ble_conn_ms, (unsigned)_prefs.ble_conn_latency);
+    return true;
+  }
+
+  if (memcmp(command, "set lightsleep ", 15) == 0) {
+    const char* arg = &command[15];
+    int value = -1;
+    for (size_t i = 0; i < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]); i++) {
+      if (strcmp(arg, LIGHT_SLEEP_NAMES[i]) == 0) { value = i; break; }
+    }
+    if (value < 0) {
+      strcpy(reply, "Error, must be off, idle or always");
+    } else {
+      _prefs.light_sleep_level = value;
+      savePrefs();
+      sprintf(reply, "OK - light sleep is now %s", LIGHT_SLEEP_NAMES[value]);
+    }
+    return true;
+  }
+  if (strcmp(command, "get lightsleep") == 0) {
+    uint8_t level = _prefs.light_sleep_level < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0])
+                    ? _prefs.light_sleep_level : 0;   // tolerate a value written by a newer build
+    sprintf(reply, "> %s", LIGHT_SLEEP_NAMES[level]);
     return true;
   }
 

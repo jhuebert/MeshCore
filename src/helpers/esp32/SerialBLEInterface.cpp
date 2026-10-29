@@ -10,6 +10,32 @@
 
 #define ADVERT_RESTART_DELAY  1000   // millis
 
+// BLE intervals are in 1.25 ms / 0.625 ms units; the CLI works in millis.
+#define BLE_INTERVAL_UNIT_MS    1.25f
+#define BLE_ADV_UNIT_MS         0.625f
+
+// Advertised TX power steps are 3 dBm apart on every ESP32 variant; only the
+// base differs (S3/C3 start at -24 dBm, the original ESP32 at -12 dBm).
+#if CONFIG_IDF_TARGET_ESP32
+  #define BLE_TX_MIN_DBM    (-12)
+  #define BLE_TX_LEVELS     8
+#else
+  #define BLE_TX_MIN_DBM    (-24)
+  #define BLE_TX_LEVELS     16
+#endif
+
+static esp_power_level_t bleTxPowerLevel(int8_t dbm) {
+  int level = (dbm - BLE_TX_MIN_DBM) / 3;
+  if (level < 0) level = 0;
+  if (level >= BLE_TX_LEVELS) level = BLE_TX_LEVELS - 1;
+  return (esp_power_level_t) level;
+}
+
+static uint16_t bleIntervalUnits(uint16_t ms, float unit_ms) {
+  uint16_t units = (uint16_t)(ms / unit_ms + 0.5f);
+  return units < 6 ? 6 : units;   // BLE minimum is 7.5 ms
+}
+
 void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code) {
   _pin_code = pin_code;
 
@@ -25,14 +51,13 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
 
   // Create the BLE Device
   BLEDevice::init(dev_name);
+  BLEDevice::setPower(bleTxPowerLevel(_tx_dbm));
   BLEDevice::setSecurityCallbacks(this);
   BLEDevice::setMTU(MAX_FRAME_SIZE);
 
   BLESecurity  sec;
   sec.setStaticPIN(pin_code);
   sec.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-
-  //BLEDevice::setPower(ESP_PWR_LVL_N8);
 
   // Create the BLE Server
   pServer = BLEDevice::createServer();
@@ -51,6 +76,28 @@ void SerialBLEInterface::begin(const char* prefix, char* name, uint32_t pin_code
   pRxCharacteristic->setCallbacks(this);
 
   pServer->getAdvertising()->addServiceUUID(SERVICE_UUID);
+  if (_adv_ms) {
+    uint16_t units = bleIntervalUnits(_adv_ms, BLE_ADV_UNIT_MS);
+    pServer->getAdvertising()->setMinInterval(units);
+    pServer->getAdvertising()->setMaxInterval(units);
+  }
+}
+
+// Ask the phone for slacker connection timing. It is a request (the central may
+// decline), sent once the link is encrypted so it cannot be dropped mid-pairing.
+void SerialBLEInterface::applyConnParams() {
+  if (!_conn_ms) return;
+
+  uint16_t interval = bleIntervalUnits(_conn_ms, BLE_INTERVAL_UNIT_MS);
+  // Spec: supervision timeout > (1 + latency) * interval * 2. Keep 25% margin,
+  // never below 4 s, never above the 6 s BLE maximum.
+  uint32_t period_ms = (uint32_t) interval * 5 / 4;
+  uint32_t timeout = period_ms * 2 * (1 + _conn_latency) / 10;   // units of 10 ms
+  timeout += timeout / 4;
+  if (timeout < 400) timeout = 400;
+  if (timeout > 600) timeout = 600;
+
+  pServer->updateConnParams(_peer_bda, interval, interval, _conn_latency, timeout);
 }
 
 // -------- BLESecurityCallbacks methods
@@ -78,6 +125,7 @@ void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
   if (cmpl.success) {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Success");
     deviceConnected = true;
+    applyConnParams();
   } else {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Failure*");
 
@@ -95,6 +143,7 @@ void SerialBLEInterface::onConnect(BLEServer* pServer) {
 void SerialBLEInterface::onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t *param) {
   BLE_DEBUG_PRINTLN("onConnect(), conn_id=%d, mtu=%d", param->connect.conn_id, pServer->getPeerMTU(param->connect.conn_id));
   last_conn_id = param->connect.conn_id;
+  memcpy(_peer_bda, param->connect.remote_bda, sizeof(_peer_bda));
 }
 
 void SerialBLEInterface::onMtuChanged(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) {
