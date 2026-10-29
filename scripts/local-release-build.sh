@@ -25,6 +25,11 @@
 #                         hosted runner has (reruns stop being incremental)
 #     --build-dir DIR     persistent work dir
 #                         (default: ~/.cache/meshcore-release-build/<tag>)
+#     --allow-build-failures
+#                         report targets that failed to build but exit 0: the
+#                         release keeps the targets that did build (a rerun with
+#                         --filter rebuilds the rest). An incomplete run or a
+#                         failed upload still exits non-zero.
 #     --dry-run           resolve the release, list targets, exit
 #     -h, --help          this help
 #
@@ -151,11 +156,12 @@ if [[ ${1:-} == __worker ]]; then
   # (codegen unchanged, consumed by the stack gate below) + version string
   export PLATFORMIO_BUILD_FLAGS="-fstack-usage -DFIRMWARE_BUILD_DATE='\"${firmware_build_date}\"' -DFIRMWARE_VERSION='\"${firmware_version_string}\"'"
 
-  # wio-e5-mini_repeater is ~4.5 KB over its 224 KB flash region. LTO on the
+  # wio-e5-mini_repeater is ~4.5 KB over its 224 KB flash region and
+  # wio-e5-repeater_bridge_rs232 is 152 B over it. LTO on the
   # framework/libraries recovers the space; project sources stay non-LTO so
   # the stack gate below still gets their .su files. Fork-owned override: the
   # upstream variant does not carry it.
-  if [[ $target == wio-e5-mini_repeater ]]; then
+  if [[ $target == wio-e5-mini_repeater || $target == wio-e5-repeater_bridge_rs232 ]]; then
     export PLATFORMIO_BUILD_FLAGS="$PLATFORMIO_BUILD_FLAGS -flto"
     export PLATFORMIO_BUILD_SRC_FLAGS="${PLATFORMIO_BUILD_SRC_FLAGS:-} -fno-lto"
   fi
@@ -259,6 +265,7 @@ UPLOAD=1
 WARMUP=1
 PRUNE=0
 DRY_RUN=0
+ALLOW_BUILD_FAILURES=0
 BUILD_ATTEMPTS=3   # total tries for a target whose failure looks transient
 TARGETS_INPUT=""
 FILTER_ARG=""
@@ -274,6 +281,7 @@ while [[ $# -gt 0 ]]; do
     --targets) TARGETS_INPUT=$2; shift 2;;
     --filter) FILTER_ARG=$2; shift 2;;
     --build-dir) BUILD_DIR_BASE=$2; shift 2;;
+    --allow-build-failures) ALLOW_BUILD_FAILURES=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
     -h|--help) usage; exit 0;;
     -*) die "unknown option: $1 (see --help)";;
@@ -566,9 +574,8 @@ fi
 if [[ $n_fail -gt 0 ]]; then
   info "build failures:"
   ls "$state_dir/failed" | sed 's/^/  /'
-  exit 1
 fi
-if [[ $n_ok -ne $total ]]; then
+if [[ $((n_ok + n_fail)) -ne $total ]]; then
   # a target that is neither done nor failed never completed: the run must not
   # report success over it
   info "built $n_ok of $total targets — the rest never completed"
@@ -579,4 +586,11 @@ if [[ $UPLOAD == 1 && $n_upfail -gt 0 ]]; then
   ls "$state_dir/upfail" | sed 's/^/  /'
   exit 1
 fi
-info "all targets built"
+if [[ $n_fail -gt 0 ]]; then
+  # the failures are listed above; the caller decides whether they are fatal.
+  # The release workflow tolerates them: a release ships the targets that
+  # built, and a rerun with --filter rebuilds the rest.
+  [[ $ALLOW_BUILD_FAILURES == 1 ]] || exit 1
+else
+  info "all targets built"
+fi

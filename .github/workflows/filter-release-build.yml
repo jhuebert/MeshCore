@@ -96,7 +96,11 @@ jobs:
           FILTER: ${{ inputs.filter }}
           NO_UPLOAD: ${{ inputs.no_upload }}
         run: |
-          args=(--prune --jobs "$JOBS")
+          # a target that does not build is reported by the script and is
+          # visible as a missing asset on the release, but it must not fail the
+          # job: a release ships what built, and a rerun with `filter` rebuilds
+          # just the targets that failed.
+          args=(--prune --jobs "$JOBS" --allow-build-failures)
           [[ -n $FILTER ]] && args+=(--filter "$FILTER")
           [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
           bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
