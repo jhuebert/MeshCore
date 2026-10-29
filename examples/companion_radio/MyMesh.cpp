@@ -2267,6 +2267,30 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
 
+  // Same flags the UI button combo flips, reachable without the buttons. The
+  // ui-*/UITask.cpp loops apply both to the live hardware within one tick.
+  if (memcmp(command, "set buzzer ", 11) == 0) {
+    _prefs.buzzer_quiet = memcmp(&command[11], "off", 3) == 0 ? 1 : 0;
+    savePrefs();
+    strcpy(reply, _prefs.buzzer_quiet ? "OK - buzzer is now OFF" : "OK - buzzer is now ON");
+    return true;
+  }
+  if (strcmp(command, "get buzzer") == 0) {
+    sprintf(reply, "> %s", _prefs.buzzer_quiet ? "off" : "on");
+    return true;
+  }
+
+  if (memcmp(command, "set led ", 8) == 0) {
+    _prefs.led_quiet = memcmp(&command[8], "off", 3) == 0 ? 1 : 0;
+    savePrefs();
+    strcpy(reply, _prefs.led_quiet ? "OK - status LED is now OFF" : "OK - status LED is now ON");
+    return true;
+  }
+  if (strcmp(command, "get led") == 0) {
+    sprintf(reply, "> %s", _prefs.led_quiet ? "off" : "on");
+    return true;
+  }
+
   return false;  // not handled
 }
 

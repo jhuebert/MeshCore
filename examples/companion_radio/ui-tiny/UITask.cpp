@@ -551,6 +551,10 @@ void UITask::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
 
 void UITask::userLedHandler() {
 #ifdef PIN_STATUS_LED
+  if (_node_prefs->led_quiet) {   // `set led off`
+    digitalWrite(PIN_STATUS_LED, !LED_STATE_ON);
+    return;
+  }
   int cur_time = millis();
   if (cur_time > next_led_change) {
     if (led_state == 0) {
@@ -691,6 +695,9 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
+  if (buzzer.isQuiet() != (_node_prefs->buzzer_quiet != 0)) {
+    buzzer.quiet(_node_prefs->buzzer_quiet);   // pref can also change via CLI
+  }
   if (buzzer.isPlaying())  buzzer.loop();
 #endif
 

@@ -336,6 +336,10 @@ static void statusLedWheel(uint8_t pos) {   // smooth hue sweep, 0..255
 
 void UITask::userLedHandler() {
 #ifdef STATUS_LED_RGB
+  if (_node_prefs->led_quiet) {   // `set led off`
+    statusLedWrite(0, 0, 0);
+    return;
+  }
   static bool booted = false;
   static bool flourish_active = false;
   static unsigned long flourish_until = 0;
@@ -422,6 +426,10 @@ void UITask::userLedHandler() {
     }
   }
 #elif defined(PIN_STATUS_LED)
+  if (_node_prefs->led_quiet) {   // `set led off`
+    digitalWrite(PIN_STATUS_LED, !LED_STATE_ON);
+    return;
+  }
   static int state = 0;
   static int next_change = 0;
   static int last_increment = 0;
@@ -485,6 +493,9 @@ void UITask::loop() {
   userLedHandler();
 
 #ifdef PIN_BUZZER
+  if (buzzer.isQuiet() != (_node_prefs->buzzer_quiet != 0)) {
+    buzzer.quiet(_node_prefs->buzzer_quiet);   // pref can also change via CLI
+  }
   if (buzzer.isPlaying())  buzzer.loop();
 #endif
 

@@ -33,6 +33,7 @@ public:
   uint8_t  advert_loc_policy = 0;
   uint8_t  buzzer_quiet = 0;
   uint8_t  vibe_quiet = 0;
+  uint8_t  led_quiet = 0;        // 1 = status LED heartbeat disabled
   uint8_t  gps_enabled = 0;      // GPS enabled flag (0=disabled, 1=enabled)
   uint32_t gps_interval = 0;     // GPS read interval in seconds
   uint8_t autoadd_config = 0;    // bitmask for auto-add contacts config
@@ -177,6 +178,7 @@ private:
       def("pin", _parent->ble_pin);
       def("buzz_q", _parent->buzzer_quiet);
       def("vibe_q", _parent->vibe_quiet);
+      def("led_q", _parent->led_quiet);
       def("auto_add", _parent->autoadd_config);    // bitmask for auto-add contacts config
       def("man_add", _parent->manual_add_contacts);
       def("tel_base", _parent->telemetry_mode_base);

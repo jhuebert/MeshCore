@@ -2,8 +2,8 @@
 
 Fork-only, unpublished notes for the `custom-companion-easysky` branch. That
 branch is `IoTThinks/MeshCore`'s `PowerSaving-v18` — the source behind the
-EasySkyMesh PowerSaving18 release — plus a deliberately tiny diff (four
-commits, four files) so it stays easy to rebase: it adds two commands to the
+EasySkyMesh PowerSaving18 release — plus a deliberately tiny diff (five
+commits, eight files) so it stays easy to rebase: it adds four commands to the
 companion (client) firmware's CLI.
 
 This is not a release channel — no CI, no release workflow. Build and flash
@@ -47,7 +47,7 @@ export FIRMWARE_VERSION=v1.18.0-custom
 bash build.sh build-firmware Xiao_S3_WIO_companion_radio_ble
 ```
 
-Both commands below are reached the same way on every companion build: the
+The commands below are reached the same way on every companion build: the
 serial "CLI rescue" prompt (display long-press) and the app's remote CLI
 console (`CMD_RUN_CLI_COMMAND`).
 
@@ -75,6 +75,39 @@ flag alone, so repeat can be enabled on the frequency you are already using.
 parameters: it re-sends repeat-enabled with the current frequency, which the
 firmware rejects. Run `set repeat off` before editing radio settings in the
 app.
+
+## `set buzzer on|off` / `get buzzer`
+
+Mute or unmute the received-message buzzer — the same flag the triple-press
+button combo flips on boards that have a button, but reachable from the CLI:
+
+```
+get buzzer         # > on     /  > off
+set buzzer off     # OK - buzzer is now OFF
+set buzzer on      # OK - buzzer is now ON
+```
+
+Only `off` turns it off; anything else is treated as `on`, as with
+`set repeat`. Persisted as `buzz_q` and applied to the buzzer by the UI loop on
+its next tick, so no reboot — and no button — is needed.
+
+## `set led on|off` / `get led`
+
+Stop the status LED from blinking:
+
+```
+get led            # > on     /  > off
+set led off        # OK - status LED is now OFF
+set led on         # OK - status LED is now ON
+```
+
+`on` (the default) is the normal heartbeat: a short flash every 4 s, green when
+idle, amber while messages are unread, blue while the app is connected, red on
+low battery; boards with an RGB status LED also run their boot/new-message
+colour sweeps. `off` silences all of it — the same effect as the
+`-D PIN_STATUS_LED`-less builds, but per device and reversible. Persisted as
+`led_q` and re-read by the UI every loop, so it takes effect immediately
+(no reboot).
 
 ## `start ota`
 
@@ -106,11 +139,14 @@ attempts may briefly disturb the hotspot.
 
 ## Scope
 
-Only these two commands are ours; everything else is IoTThinks' PowerSaving
-firmware. The diff against `PowerSaving-v18` is three code files plus this
-document:
+Only these commands and prefs are ours; everything else is IoTThinks'
+PowerSaving firmware. The diff against `PowerSaving-v18` is:
 
-- `examples/companion_radio/MyMesh.cpp` — the two CLI commands.
+- `examples/companion_radio/MyMesh.cpp` — the CLI commands.
+- `examples/companion_radio/NodePrefs.h` — the `led_q` pref (`buzzer_quiet`
+  already exists upstream; `set buzzer` only reaches it from the CLI).
+- `examples/companion_radio/ui-{orig,new,tiny}/UITask.cpp` — honour `led_q` in
+  the status LED handler and apply `buzzer_quiet` to the buzzer each loop.
 - `src/helpers/ESP32Board.cpp` — serve the ESP32 OTA page on the current Wi-Fi
   network when connected, otherwise the usual `MeshCore-OTA` hotspot.
 - `variants/xiao_s3_wio/platformio.ini` — enable OTA on the Xiao S3 WIO
