@@ -126,9 +126,10 @@ set lightsleep idle  # OK - light sleep is now idle
 
 Turns on ESP32 **automatic light sleep** (PM/tickless): the idle task stops the
 CPU between events and wakes for each connection event or for a LoRa packet
-(the radio's DIO1 pin is armed as a wake source). This is the only knob that
-removes the ~20 mA an awake CPU costs; the rest are a few mA each. Applied
-immediately, no reboot.
+(the radio's DIO1 pin is armed as a wake source for the duration of the idle wait
+only — it is level-triggered, so leaving it armed would turn every TX into an
+interrupt storm). This is the only knob that removes the ~20 mA an awake CPU
+costs; the rest are a few mA each. Applied immediately, no reboot.
 
 | Level | Behaviour |
 |---|---|

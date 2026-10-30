@@ -2,7 +2,7 @@
 
 #if defined(ESP32_PLATFORM)
 // PowerSaving for companions
-void PowerSaving::applyCompanionPowerSaving(const CompanionConfig& cfg) {
+bool PowerSaving::applyCompanionPowerSaving(const CompanionConfig& cfg) {
 #if defined(BLE_PIN_CODE) && !CONFIG_IDF_TARGET_ESP32C6
   // The BT controller has to be asleep-capable before the PM block may put the
   // CPU to sleep while a connection is open, so a light sleep request implies
@@ -21,29 +21,36 @@ void PowerSaving::applyCompanionPowerSaving(const CompanionConfig& cfg) {
   int min_freq_mhz = cfg.powersaving ? 10 : max_freq_mhz;
 
   esp_err_t errPM = configurePowerManagement(max_freq_mhz, min_freq_mhz, cfg.light_sleep);
-  if (errPM != ESP_OK && cfg.light_sleep) {
+  if (errPM == ESP_OK) return true;
+
+  if (cfg.light_sleep) {
     // Automatic light sleep is unavailable in this build/config (e.g. a BT
     // controller that is not sleep-capable). Keep the CPU awake rather than
     // ending up with a partly applied profile.
     POWERSAVING_DEBUG_PRINTLN("Light sleep unavailable, staying awake: %d", errPM);
     configurePowerManagement(max_freq_mhz, min_freq_mhz, false);
-    applyRadioWakeup(cfg.radio_irq_gpio, false);
-    return;
   }
-
-  applyRadioWakeup(cfg.radio_irq_gpio, cfg.light_sleep);
+  return false;
 }
 
-void PowerSaving::applyRadioWakeup(int gpio, bool enable) {
+// The pin is level-triggered only while it is a wake source; see the note in
+// PowerSaving.h. Restore the pin's own (disabled) interrupt type afterwards -
+// gpio_wakeup_disable() does not, and the repeater's sleep() restores it for the
+// same reason.
+void PowerSaving::armRadioWakeup(int gpio) {
   if (gpio < 0) return;
 
   gpio_num_t pin = (gpio_num_t) gpio;
-  if (enable) {
-    gpio_wakeup_enable(pin, GPIO_INTR_HIGH_LEVEL);   // DIO1 goes high on a packet
-    esp_sleep_enable_gpio_wakeup();
-  } else {
-    gpio_wakeup_disable(pin);
-  }
+  gpio_wakeup_enable(pin, GPIO_INTR_HIGH_LEVEL);   // DIO1 goes high on a packet
+  esp_sleep_enable_gpio_wakeup();
+}
+
+void PowerSaving::disarmRadioWakeup(int gpio) {
+  if (gpio < 0) return;
+
+  gpio_num_t pin = (gpio_num_t) gpio;
+  gpio_wakeup_disable(pin);
+  gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
 }
 
 esp_err_t PowerSaving::configurePowerManagement(int max_freq_mhz, int min_freq_mhz, bool light_sleep_enable) {

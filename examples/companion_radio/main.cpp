@@ -147,13 +147,22 @@ static bool lightSleepAllowed() {
   }
 }
 
-static PowerSaving::CompanionConfig companionPowerConfig() {
-  NodePrefs* prefs = the_mesh.getNodePrefs();
-  return {
-    prefs->powersaving_enabled != 0,
-    lightSleepAllowed(),
-    (int) board.getIRQGpio()
-  };
+// Hand the idle task a slot so the PM block can light-sleep. With light sleep
+// on, the radio's IRQ pin is armed for the wait and disarmed right after: the
+// wake needs a level trigger, and leaving the pin level-triggered floods the CPU
+// with interrupts as soon as the radio asserts it (every TX does).
+static void idleDelay(bool light_sleep) {
+  int irq_gpio = (int) board.getIRQGpio();
+  // An already-asserted IRQ would keep the level wake firing; let the mesh drain
+  // it first (the repeater's sleep() skips the same case).
+  if (!light_sleep || irq_gpio < 0 || digitalRead(irq_gpio) == HIGH) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return;
+  }
+
+  PowerSaving::armRadioWakeup(irq_gpio);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  PowerSaving::disarmRadioWakeup(irq_gpio);
 }
 #endif
 
@@ -335,8 +344,8 @@ void loop() {
 #if defined(ESP32_PLATFORM)
   // Light sleep only happens while every task is blocked, so an idle loop has
   // to give the idle task a slot - with either power knob on.
-  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled ||
-                     the_mesh.getNodePrefs()->light_sleep_level;
+  bool light_sleep = lightSleepAllowed();
+  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled || light_sleep;
 #else
   bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled;
 #endif
@@ -346,11 +355,11 @@ void loop() {
 #elif defined(ESP32_PLATFORM)
   #if defined(BLE_PIN_CODE)
       if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) { // BLE is not busy
-        vTaskDelay(pdMS_TO_TICKS(10));                                    // let the idle task run
+        idleDelay(light_sleep);
       }
   #elif defined(ENABLE_USB_INTERFACE)
       if(!usb_serial_interface.isReadBusy() && !usb_serial_interface.isWriteBusy()){
-        vTaskDelay(pdMS_TO_TICKS(10)); // let the idle task run
+        idleDelay(light_sleep);
       }
   #endif
 #endif
@@ -360,11 +369,16 @@ void loop() {
   // Re-apply whenever the profile would be different: on the first loop, when a
   // prefs knob moves, or when the `idle` level sees a client connect/disconnect.
   static uint8_t applied_power = 0xFF;
+  static uint32_t power_retry_at = 0;
   uint8_t power = (the_mesh.getNodePrefs()->powersaving_enabled ? 1 : 0) |
-                  (lightSleepAllowed() ? 2 : 0);
-  if (power != applied_power) {
-    applied_power = power;
-    PowerSaving::applyCompanionPowerSaving(companionPowerConfig());
+                  (light_sleep ? 2 : 0);
+  if (power != applied_power && (int32_t)(millis() - power_retry_at) >= 0) {
+    PowerSaving::CompanionConfig cfg = { the_mesh.getNodePrefs()->powersaving_enabled != 0, light_sleep };
+    if (PowerSaving::applyCompanionPowerSaving(cfg)) {
+      applied_power = power;
+    } else {
+      power_retry_at = millis() + 2000;   // PM refused; don't latch, try again
+    }
   }
 #endif
 
