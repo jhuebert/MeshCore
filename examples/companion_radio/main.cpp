@@ -140,6 +140,10 @@ void halt() {
 // otherwise: whatever breaks the link also breaks the CLI needed to turn it
 // back off.
 static bool lightSleepAllowed() {
+  // The board inhibits sleep during OTA: the web server needs the CPU to stay
+  // scheduled, and with light sleep on the page silently fails to bind.
+  if (board.isSleepInhibited()) return false;
+
   switch (the_mesh.getNodePrefs()->light_sleep_level) {
     case 1:  return !interface_manager.isConnected();
     case 2:  return true;

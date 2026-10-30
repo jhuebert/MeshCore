@@ -35,7 +35,14 @@ bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
   static char home_buf[90];
   sprintf(home_buf, "<H2>Hi! I am a MeshCore %s. ID: %s</H2>", OTA_DEVICE_TYPE, id);
 
-  AsyncWebServer* server = new AsyncWebServer(80);
+  // One server per boot: a second AsyncWebServer cannot bind port 80 again, so
+  // repeated `start ota` would leak a server and leave the page dead.
+  static AsyncWebServer* server = nullptr;
+  if (server != nullptr) {
+    return true;
+  }
+
+  server = new AsyncWebServer(80);
 
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", home_buf);
