@@ -2377,12 +2377,24 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 
   if (memcmp(command, "set lightsleep ", 15) == 0) {
     const char* arg = &command[15];
+    if (memcmp(arg, "tick ", 5) == 0) {   // how often the idle loop wakes
+      int ms = atoi(&arg[5]);
+      if (ms < 10 || ms > 1000) {
+        strcpy(reply, "Error, tick must be 10-1000 ms");
+      } else {
+        _prefs.sleep_tick_ms = ms;
+        savePrefs();
+        sprintf(reply, "OK - idle tick is now %d ms", ms);
+      }
+      return true;
+    }
+
     int value = -1;
     for (size_t i = 0; i < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]); i++) {
       if (strcmp(arg, LIGHT_SLEEP_NAMES[i]) == 0) { value = i; break; }
     }
     if (value < 0) {
-      strcpy(reply, "Error, must be off, idle or always");
+      strcpy(reply, "Error, must be off, idle, always or tick <ms>");
     } else {
       _prefs.light_sleep_level = value;
       savePrefs();
@@ -2393,7 +2405,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
   if (strcmp(command, "get lightsleep") == 0) {
     uint8_t level = _prefs.light_sleep_level < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0])
                     ? _prefs.light_sleep_level : 0;   // tolerate a value written by a newer build
-    sprintf(reply, "> %s", LIGHT_SLEEP_NAMES[level]);
+    sprintf(reply, "> %s tick=%u", LIGHT_SLEEP_NAMES[level], (unsigned)_prefs.sleep_tick_ms);
     return true;
   }
 

@@ -114,6 +114,10 @@ public:
     _quiet_s = quiet_s;
   }
 
+  // True while the app is talking (the fast profile is up), which the main loop
+  // uses to stay on the responsive cadence instead of the long idle tick.
+  bool isLinkActive() const { return deviceConnected && _fast; }
+
   /**
    * init the BLE interface.
    * @param prefix   a prefix for the device name

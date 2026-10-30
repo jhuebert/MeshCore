@@ -57,6 +57,7 @@ public:
   // PowerSaving variant
   uint8_t powersaving_enabled = 0; // boolean
   uint8_t light_sleep_level = 0;   // ESP32: 0 = off, 1 = idle only, 2 = always
+  uint16_t sleep_tick_ms = 10;     // ESP32: loop poll interval while idle (10 = responsive)
 
   // BLE power tuning (ESP32 only, see SerialBLEInterface)
   uint16_t ble_adv_ms = 0;        // advertising interval; 0 = stack default (20-40 ms)
@@ -207,6 +208,7 @@ private:
     void structure() override {
       def("pwr_sav_en", _parent->powersaving_enabled);
       def("lsleep", _parent->light_sleep_level);
+      def("tick", _parent->sleep_tick_ms);
     }
   public:
     PowerPrefs(NodePrefs* parent) : _parent(parent) { }
