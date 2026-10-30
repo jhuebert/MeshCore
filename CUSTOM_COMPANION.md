@@ -172,14 +172,13 @@ configured WiFi console remain).
 ### BLE: `set ble.adv` / `set ble.tx` / `set ble.conn` / `set ble.lat`
 
 ```
-get ble            # > adv=0 tx=3 conn=0 lat=0
+get ble            # > adv=0 tx=3 conn=0 lat=0 sync=30 quiet=10
 set ble.adv 500    # OK - reboot to apply
 set ble.tx -9      # OK - reboot to apply
 set ble.conn 200   # OK - applies on next connection
 set ble.lat 4      # OK - applies on next connection
 set ble.sync 30    # OK - applies on next connection
 set ble.quiet 10   # OK - applies immediately
-get ble.sync       # > sync=30 quiet=10
 ```
 
 | Key | Meaning | Default |
@@ -223,6 +222,18 @@ cut the radio's on-time per connection event, at the cost of message latency.
 Keep the set internally consistent: a slow `conn` with a large `lat` needs a
 longer supervision timeout (the firmware sizes it from the two, capped at the
 BLE maximum of 6 s), and `lat` above ~4 can make the app feel laggy.
+
+### `get reset`
+
+Not a power knob, but the reason the last boot happened - worth knowing before
+blaming the mesh for missing packets:
+
+```
+get reset          # > Software reset | Brownout (low voltage) | Interrupt watchdog reset | ...
+```
+
+`Interrupt watchdog reset` is how the light-sleep wake bug in this branch was
+found: a reset on every received packet looked like deafness, not a crash.
 
 ### Measuring
 

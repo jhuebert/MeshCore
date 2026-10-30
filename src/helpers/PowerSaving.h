@@ -12,19 +12,16 @@
 class PowerSaving {
 public:
     #if defined(ESP32_PLATFORM)
-    // Companion power profile. `powersaving` is the original switch: BLE modem
-    // sleep plus DVFS. `light_sleep` adds automatic light sleep (the idle task
-    // stops the CPU between events), which is the only way an ESP32 companion
-    // drops below the ~20 mA an awake CPU costs - the repeater gets there by
-    // calling board.sleep() itself, a companion cannot (BLE has to keep its
-    // connection events, so only the PM/tickless path is safe).
-    struct CompanionConfig {
-        bool powersaving;
-        bool light_sleep;
-    };
-    // Returns false when the PM block refused the profile, so the caller can
-    // retry instead of latching a state that never took effect.
-    static bool applyCompanionPowerSaving(const CompanionConfig& cfg);
+    // Companion profile. `powersaving` is the original switch: BLE modem sleep
+    // plus DVFS. `light_sleep` adds automatic light sleep, the only way an ESP32
+    // companion gets below the ~20 mA an awake CPU costs - the repeater reaches
+    // that with board.sleep(), which a companion cannot use because BLE has to
+    // keep its connection events.
+    // Returns false when the PM block refused the profile, so the caller retries
+    // instead of latching something that never took effect.
+    static bool applyCompanionPowerSaving(bool powersaving, bool light_sleep);
+
+  private:
     static esp_err_t configurePowerManagement(int max_freq_mhz, int min_freq_mhz, bool light_sleep_enable);
     #endif
 };

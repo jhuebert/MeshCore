@@ -4,9 +4,6 @@
 #ifdef ENABLE_WIFI_INTERFACE
 #include <WiFi.h>
 #endif
-#if defined(ESP32)
-#include <esp_system.h>
-#endif
 #include <Mesh.h>
 
 #define CMD_APP_START                 1
@@ -2110,25 +2107,25 @@ void MyMesh::enterCLIRescue() {
 // `set lightsleep` / `get lightsleep` levels, indexed by the pref value.
 static const char* const LIGHT_SLEEP_NAMES[] = {"off", "idle", "always"};
 
-#if defined(ESP32)
-// Why the last boot happened - brownout and a code panic look the same from the
-// outside (both "it restarted"), and they need opposite fixes.
-static const char* resetReasonName(esp_reset_reason_t reason) {
-  switch (reason) {
-    case ESP_RST_POWERON:   return "power-on";
-    case ESP_RST_EXT:       return "external pin";
-    case ESP_RST_SW:        return "software";
-    case ESP_RST_PANIC:     return "panic/exception";
-    case ESP_RST_INT_WDT:   return "interrupt watchdog";
-    case ESP_RST_TASK_WDT:  return "task watchdog";
-    case ESP_RST_WDT:       return "other watchdog";
-    case ESP_RST_DEEPSLEEP: return "deep sleep";
-    case ESP_RST_BROWNOUT:  return "brownout";
-    case ESP_RST_SDIO:      return "sdio";
-    default:                return "unknown";
+// Shared shape of the numeric knobs: `set <name> <int>`, range-checked, persisted.
+// Returns false when the command belongs to a different knob.
+template <typename T>
+static bool setIntKnob(MyMesh& mesh, const char* command, const char* name, T& target,
+                       int min_value, int max_value, const char* range_msg,
+                       const char* done_msg, char* reply) {
+  size_t name_len = strlen(name);
+  if (memcmp(command, name, name_len) != 0) return false;
+
+  int value = atoi(&command[name_len]);
+  if (value < min_value || value > max_value) {
+    strcpy(reply, range_msg);
+    return true;
   }
+  target = (T) value;
+  mesh.savePrefs();
+  strcpy(reply, done_msg);
+  return true;
 }
-#endif
 
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
   while (*command == ' ') command++; // skip leading spaces
@@ -2317,32 +2314,15 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
 
-  // Power tuning. The BLE values are read once in SerialBLEInterface::begin(),
-  // so they need a reboot; the connection ones are re-requested by the next
-  // connection. Light sleep is re-applied by the loop as soon as the pref moves.
-  if (memcmp(command, "set ble.adv ", 12) == 0) {
-    int ms = atoi(&command[12]);
-    if (ms < 0 || ms > 10240) {
-      strcpy(reply, "Error, adv must be 0-10240 ms (0 = default)");
-    } else {
-      _prefs.ble_adv_ms = ms;
-      savePrefs();
-      strcpy(reply, "OK - reboot to apply");
-    }
-    return true;
-  }
-  if (memcmp(command, "set ble.tx ", 11) == 0) {
-    int dbm = atoi(&command[11]);
-    if (dbm < -24 || dbm > 21) {
-      strcpy(reply, "Error, tx must be -24..21 dBm");
-    } else {
-      _prefs.ble_tx_dbm = dbm;
-      savePrefs();
-      strcpy(reply, "OK - reboot to apply");
-    }
-    return true;
-  }
-  if (memcmp(command, "set ble.conn ", 13) == 0) {
+  // Power tuning. adv/tx are read once at boot; conn/lat/sync are re-requested
+  // on the next connection; the rest apply immediately.
+  if (setIntKnob(*this, command, "set ble.adv ", _prefs.ble_adv_ms, 0, 10240,
+                 "Error, adv must be 0-10240 ms (0 = default)",
+                 "OK - reboot to apply", reply)) return true;
+  if (setIntKnob(*this, command, "set ble.tx ", _prefs.ble_tx_dbm, -24, 21,
+                 "Error, tx must be -24..21 dBm",
+                 "OK - reboot to apply", reply)) return true;
+  if (memcmp(command, "set ble.conn ", 13) == 0) {   // 0 or a usable interval
     int ms = atoi(&command[13]);
     if (ms != 0 && (ms < 20 || ms > 2000)) {
       strcpy(reply, "Error, conn must be 0 or 20-2000 ms");
@@ -2353,65 +2333,29 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     }
     return true;
   }
-  if (memcmp(command, "set ble.lat ", 12) == 0) {
-    int latency = atoi(&command[12]);
-    if (latency < 0 || latency > 9) {
-      strcpy(reply, "Error, lat must be 0-9");
-    } else {
-      _prefs.ble_conn_latency = latency;
-      savePrefs();
-      strcpy(reply, "OK - applies on next connection");
-    }
-    return true;
-  }
-  if (memcmp(command, "set ble.sync ", 13) == 0) {
-    int ms = atoi(&command[13]);
-    if (ms < 0 || ms > 1000) {
-      strcpy(reply, "Error, sync must be 0-1000 ms (0 = never switch)");
-    } else {
-      _prefs.ble_sync_ms = ms;
-      savePrefs();
-      strcpy(reply, "OK - applies on next connection");
-    }
-    return true;
-  }
-  if (memcmp(command, "set ble.quiet ", 14) == 0) {
-    int secs = atoi(&command[14]);
-    if (secs < 1 || secs > 3600) {
-      strcpy(reply, "Error, quiet must be 1-3600 s");
-    } else {
-      _prefs.ble_quiet_s = secs;
-      savePrefs();
-      strcpy(reply, "OK - applies immediately");
-    }
-    return true;
-  }
+  if (setIntKnob(*this, command, "set ble.lat ", _prefs.ble_conn_latency, 0, 9,
+                 "Error, lat must be 0-9",
+                 "OK - applies on next connection", reply)) return true;
+  if (setIntKnob(*this, command, "set ble.sync ", _prefs.ble_sync_ms, 0, 1000,
+                 "Error, sync must be 0-1000 ms (0 = never switch)",
+                 "OK - applies on next connection", reply)) return true;
+  if (setIntKnob(*this, command, "set ble.quiet ", _prefs.ble_quiet_s, 1, 3600,
+                 "Error, quiet must be 1-3600 s",
+                 "OK - applies immediately", reply)) return true;
   if (strcmp(command, "get ble") == 0) {
-    sprintf(reply, "> adv=%u tx=%d conn=%u lat=%u",
-            (unsigned)_prefs.ble_adv_ms, (int)_prefs.ble_tx_dbm,
-            (unsigned)_prefs.ble_conn_ms, (unsigned)_prefs.ble_conn_latency);
+    sprintf(reply, "> adv=%u tx=%d conn=%u lat=%u sync=%u quiet=%u",
+            (unsigned)_prefs.ble_adv_ms, (int)_prefs.ble_tx_dbm, (unsigned)_prefs.ble_conn_ms,
+            (unsigned)_prefs.ble_conn_latency, (unsigned)_prefs.ble_sync_ms,
+            (unsigned)_prefs.ble_quiet_s);
     return true;
   }
-  if (strcmp(command, "get ble.sync") == 0) {
-    sprintf(reply, "> sync=%u quiet=%u",
-            (unsigned)_prefs.ble_sync_ms, (unsigned)_prefs.ble_quiet_s);
-    return true;
-  }
+
+  if (setIntKnob(*this, command, "set lightsleep tick ", _prefs.sleep_tick_ms, 10, 1000,
+                 "Error, tick must be 10-1000 ms",
+                 "OK - applies immediately", reply)) return true;
 
   if (memcmp(command, "set lightsleep ", 15) == 0) {
     const char* arg = &command[15];
-    if (memcmp(arg, "tick ", 5) == 0) {   // how often the idle loop wakes
-      int ms = atoi(&arg[5]);
-      if (ms < 10 || ms > 1000) {
-        strcpy(reply, "Error, tick must be 10-1000 ms");
-      } else {
-        _prefs.sleep_tick_ms = ms;
-        savePrefs();
-        sprintf(reply, "OK - idle tick is now %d ms", ms);
-      }
-      return true;
-    }
-
     int value = -1;
     for (size_t i = 0; i < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]); i++) {
       if (strcmp(arg, LIGHT_SLEEP_NAMES[i]) == 0) { value = i; break; }
@@ -2426,26 +2370,14 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
   if (strcmp(command, "get lightsleep") == 0) {
-    uint8_t level = _prefs.light_sleep_level < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0])
-                    ? _prefs.light_sleep_level : 0;   // tolerate a value written by a newer build
+    size_t levels = sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]);
+    uint8_t level = _prefs.light_sleep_level < levels ? _prefs.light_sleep_level : 0;  // tolerate junk
     sprintf(reply, "> %s tick=%u", LIGHT_SLEEP_NAMES[level], (unsigned)_prefs.sleep_tick_ms);
     return true;
   }
 
-#if defined(ESP32)
   if (strcmp(command, "get reset") == 0) {
-    sprintf(reply, "> %s", resetReasonName(esp_reset_reason()));
-    return true;
-  }
-  if (strcmp(command, "get heap") == 0) {
-    sprintf(reply, "> heap=%u min=%u stack=%u",
-            (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
-            (unsigned)uxTaskGetStackHighWaterMark(NULL));
-    return true;
-  }
-#endif
-  if (strcmp(command, "get radio.state") == 0) {
-    sprintf(reply, "> %s", radio_driver.isInRecvMode() ? "rx" : "not-rx");
+    sprintf(reply, "> %s", board.getResetReasonString(board.getResetReason()));
     return true;
   }
 
