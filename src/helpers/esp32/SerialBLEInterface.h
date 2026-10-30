@@ -25,9 +25,16 @@ class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLE
   int8_t   _tx_dbm;
   uint16_t _conn_ms;
   uint8_t  _conn_latency;
+  uint16_t _sync_ms;          // interval while the app is talking; 0 = never switch
+  uint16_t _quiet_s;          // silence before dropping to the idle interval
+  bool     _fast;             // currently on the sync profile
+  uint8_t  _burst;            // frames counted towards the next fast switch
+  unsigned long _last_activity;
   esp_bd_addr_t _peer_bda;
 
   void applyConnParams();
+  void noteActivity();
+  void pollConnParams();
 
   struct Frame {
     uint8_t len;
@@ -74,6 +81,11 @@ public:
     _tx_dbm = 3;
     _conn_ms = 0;
     _conn_latency = 0;
+    _sync_ms = 0;
+    _quiet_s = 10;
+    _fast = false;
+    _burst = 0;
+    _last_activity = 0;
     memset(_peer_bda, 0, sizeof(_peer_bda));
     recv_queue = xQueueCreateStatic(
       FRAME_QUEUE_SIZE, sizeof(Frame), recv_queue_storage, &recv_queue_state
@@ -86,14 +98,20 @@ public:
    * stack's own settings (20-40 ms advertising, +3 dBm, phone-chosen interval).
    * @param adv_ms        advertising interval, 0 = stack default
    * @param tx_dbm        TX power in dBm
-   * @param conn_ms       preferred connection interval, 0 = leave it to the phone
-   * @param conn_latency  connection events the peripheral may skip
+   * @param conn_ms       idle connection interval, 0 = leave it to the phone
+   * @param conn_latency  connection events the peripheral may skip while idle
+   * @param sync_ms       connection interval while the app is talking, 0 = never
+   *                      switch (keep the idle interval all the time)
+   * @param quiet_s       seconds of silence before dropping back to idle timing
    */
-  void setPowerPrefs(uint16_t adv_ms, int8_t tx_dbm, uint16_t conn_ms, uint8_t conn_latency) {
+  void setPowerPrefs(uint16_t adv_ms, int8_t tx_dbm, uint16_t conn_ms, uint8_t conn_latency,
+                     uint16_t sync_ms, uint16_t quiet_s) {
     _adv_ms = adv_ms;
     _tx_dbm = tx_dbm;
     _conn_ms = conn_ms;
     _conn_latency = conn_latency;
+    _sync_ms = sync_ms;
+    _quiet_s = quiet_s;
   }
 
   /**

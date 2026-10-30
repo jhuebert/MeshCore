@@ -164,19 +164,34 @@ set ble.adv 500    # OK - reboot to apply
 set ble.tx -9      # OK - reboot to apply
 set ble.conn 200   # OK - applies on next connection
 set ble.lat 4      # OK - applies on next connection
+set ble.sync 30    # OK - applies on next connection
+set ble.quiet 10   # OK - applies immediately
+get ble.sync       # > sync=30 quiet=10
 ```
 
 | Key | Meaning | Default |
 |---|---|---|
 | `adv` | advertising interval, ms; `0` = stack default (20-40 ms) | `0` |
 | `tx` | TX power, dBm (-24..21); ESP32 default is `+3` | `3` |
-| `conn` | preferred connection interval, ms; `0` = the phone decides | `0` |
-| `lat` | connection events the peripheral may skip | `0` |
+| `conn` | idle connection interval, ms; `0` = the phone decides | `0` |
+| `lat` | connection events the peripheral may skip while idle | `0` |
+| `sync` | connection interval while the app is talking, ms; `0` = never switch | `30` |
+| `quiet` | seconds of app silence before dropping back to `conn`/`lat` | `10` |
 
 `adv` and `tx` are read once in `SerialBLEInterface::begin()` (reboot to apply);
-`conn`/`lat` are re-requested after the link is encrypted, so they land on the
-next connection. `conn`/`lat` are a *request* — iOS in particular may keep its
-own interval, Android usually honours it.
+`conn`/`lat`/`sync` are re-requested after the link is encrypted, so they land on
+the next connection. `conn`/`lat`/`sync` are a *request* — iOS in particular may
+keep its own interval, Android usually honours it.
+
+**Adaptive timing.** A slow connection interval is what makes light sleep pay
+off, but it also makes the app's first sync crawl (every round trip waits for a
+connection event). So the link runs on two profiles: it starts on `sync` (fast,
+latency 0) when the app connects and whenever the app sends a burst of frames, and
+drops to `conn`/`lat` (slow, high latency) once the app has been quiet for `quiet`
+seconds. Contacts/channels/message sync therefore run at full speed, and the idle
+link costs almost nothing. `set ble.sync 0` turns the switching off and keeps the
+idle timing all the time (what you want if you'd rather keep the link slow and
+accept a slow first sync).
 
 Slower advertising is the biggest BLE win when no app is connected (roughly a
 few mA at 20-40 ms down to well under 1 mA at 300-600 ms); the trade-off is that

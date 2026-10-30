@@ -61,8 +61,10 @@ public:
   // BLE power tuning (ESP32 only, see SerialBLEInterface)
   uint16_t ble_adv_ms = 0;        // advertising interval; 0 = stack default (20-40 ms)
   int8_t   ble_tx_dbm = 3;        // ESP32 default is +3 dBm
-  uint16_t ble_conn_ms = 0;       // connection interval; 0 = leave it to the phone
-  uint8_t  ble_conn_latency = 0;  // connection events the peripheral may skip
+  uint16_t ble_conn_ms = 0;       // idle connection interval; 0 = leave it to the phone
+  uint8_t  ble_conn_latency = 0;  // connection events the peripheral may skip while idle
+  uint16_t ble_sync_ms = 30;      // connection interval while the app talks; 0 = never switch
+  uint16_t ble_quiet_s = 10;      // silence before dropping back to the idle interval
 
 #ifdef ENABLE_WIFI_INTERFACE
   #ifndef WIFI_SSID
@@ -219,6 +221,8 @@ private:
       def("tx", _parent->ble_tx_dbm);
       def("conn", _parent->ble_conn_ms);
       def("lat", _parent->ble_conn_latency);
+      def("sync", _parent->ble_sync_ms);
+      def("quiet", _parent->ble_quiet_s);
     }
   public:
     BlePrefs(NodePrefs* parent) : _parent(parent) { }

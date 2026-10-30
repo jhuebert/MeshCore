@@ -243,7 +243,8 @@ void setup() {
 #if defined(ESP32_PLATFORM)
   NodePrefs* ble_prefs = the_mesh.getNodePrefs();
   bluetooth_interface.setPowerPrefs(ble_prefs->ble_adv_ms, ble_prefs->ble_tx_dbm,
-                                    ble_prefs->ble_conn_ms, ble_prefs->ble_conn_latency);
+                                    ble_prefs->ble_conn_ms, ble_prefs->ble_conn_latency,
+                                    ble_prefs->ble_sync_ms, ble_prefs->ble_quiet_s);
 #endif
   bluetooth_interface.begin(BLE_NAME_PREFIX, the_mesh.getNodePrefs()->node_name, the_mesh.getBLEPin());
   interface_manager.addInterface(InterfaceType::Bluetooth, &bluetooth_interface);

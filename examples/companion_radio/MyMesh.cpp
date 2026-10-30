@@ -2341,10 +2341,37 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     }
     return true;
   }
+  if (memcmp(command, "set ble.sync ", 13) == 0) {
+    int ms = atoi(&command[13]);
+    if (ms < 0 || ms > 1000) {
+      strcpy(reply, "Error, sync must be 0-1000 ms (0 = never switch)");
+    } else {
+      _prefs.ble_sync_ms = ms;
+      savePrefs();
+      strcpy(reply, "OK - applies on next connection");
+    }
+    return true;
+  }
+  if (memcmp(command, "set ble.quiet ", 14) == 0) {
+    int secs = atoi(&command[14]);
+    if (secs < 1 || secs > 3600) {
+      strcpy(reply, "Error, quiet must be 1-3600 s");
+    } else {
+      _prefs.ble_quiet_s = secs;
+      savePrefs();
+      strcpy(reply, "OK - applies immediately");
+    }
+    return true;
+  }
   if (strcmp(command, "get ble") == 0) {
     sprintf(reply, "> adv=%u tx=%d conn=%u lat=%u",
             (unsigned)_prefs.ble_adv_ms, (int)_prefs.ble_tx_dbm,
             (unsigned)_prefs.ble_conn_ms, (unsigned)_prefs.ble_conn_latency);
+    return true;
+  }
+  if (strcmp(command, "get ble.sync") == 0) {
+    sprintf(reply, "> sync=%u quiet=%u",
+            (unsigned)_prefs.ble_sync_ms, (unsigned)_prefs.ble_quiet_s);
     return true;
   }
 
