@@ -98,16 +98,22 @@ void SerialBLEInterface::applyConnParams() {
   uint8_t latency = _fast ? 0 : _conn_latency;
   if (!interval_ms) return;
 
-  uint16_t interval = bleIntervalUnits(interval_ms, BLE_INTERVAL_UNIT_MS);
-  // Spec: supervision timeout > (1 + latency) * interval * 2. Keep 25% margin,
-  // never below 4 s, never above the 6 s BLE maximum.
-  uint32_t period_ms = (uint32_t) interval * 5 / 4;
+  // Ask for a min/max window rather than min == max: Apple's accessory rules
+  // require max >= min + 15 ms, and a request that breaks them can be dropped
+  // outright (leaving the phone's own timing in place, i.e. no savings on iOS).
+  uint16_t min_interval = bleIntervalUnits(interval_ms, BLE_INTERVAL_UNIT_MS);
+  uint16_t max_interval = min_interval + (uint16_t)(15.0f / BLE_INTERVAL_UNIT_MS);
+
+  // Spec: supervision timeout > (1 + latency) * interval * 2; Apple adds
+  // < interval * (1 + latency) * 3 and <= 6 s. Size it from the max interval with
+  // 25% margin, floored at 4 s so a slow link still has slack.
+  uint32_t period_ms = (uint32_t) max_interval * 5 / 4;
   uint32_t timeout = period_ms * 2 * (1 + latency) / 10;   // units of 10 ms
   timeout += timeout / 4;
   if (timeout < 400) timeout = 400;
   if (timeout > 600) timeout = 600;
 
-  pServer->updateConnParams(_peer_bda, interval, interval, latency, timeout);
+  pServer->updateConnParams(_peer_bda, min_interval, max_interval, latency, timeout);
 }
 
 void SerialBLEInterface::noteActivity() {

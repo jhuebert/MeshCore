@@ -193,6 +193,14 @@ get ble.sync       # > sync=30 quiet=10
 the next connection. `conn`/`lat`/`sync` are a *request* — iOS in particular may
 keep its own interval, Android usually honours it.
 
+**iOS.** The request is shaped to Apple's accessory guidelines, which the phone
+enforces: latency ≤ 4, max interval ≥ min + 15 ms (so a window is requested
+rather than min == max), max × (latency + 1) ≤ 2 s, supervision timeout ≤ 6 s.
+Your values sit inside those: `conn 200` + `lat 4` is an effective 1 s between
+required events, `sync 30` is well above the 15 ms floor. What iOS may still do
+is ignore the update and keep 15-30 ms / latency 0 — check with nRF Connect if
+the power doesn't drop on an iPhone but does on Android.
+
 **Adaptive timing.** A slow connection interval is what makes light sleep pay
 off, but it also makes the app's first sync crawl (every round trip waits for a
 connection event). So the link runs on two profiles: it starts on `sync` (fast,
