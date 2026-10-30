@@ -6,9 +6,7 @@
 #include "esp_pm.h"
 #include "esp_bt.h"
 #include <esp_err.h>
-#include "esp_sleep.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #endif
 
 class PowerSaving {
@@ -28,13 +26,5 @@ public:
     // retry instead of latching a state that never took effect.
     static bool applyCompanionPowerSaving(const CompanionConfig& cfg);
     static esp_err_t configurePowerManagement(int max_freq_mhz, int min_freq_mhz, bool light_sleep_enable);
-
-    // Radio IRQ (DIO1) as a light sleep wake source, so a packet ends the sleep
-    // at once instead of waiting for the next loop tick. Arm it around the idle
-    // wait and disarm it right after: waking on a level needs the pin to be
-    // level-triggered, and leaving it that way floods the CPU with interrupts
-    // the moment the radio asserts the line (fire and forget is what a TX does).
-    static void armRadioWakeup(int gpio);
-    static void disarmRadioWakeup(int gpio);
     #endif
 };

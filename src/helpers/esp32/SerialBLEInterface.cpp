@@ -116,13 +116,16 @@ void SerialBLEInterface::applyConnParams() {
   pServer->updateConnParams(_peer_bda, min_interval, max_interval, latency, timeout);
 }
 
+// "The app is talking": only frames *from* the phone count. Pushes towards it
+// (raw-RX log, adverts, queued messages) are driven by mesh traffic, and counting
+// those would keep flipping a busy link back to the fast profile forever.
 void SerialBLEInterface::noteActivity() {
   _last_activity = millis();
   if (_fast || !_conn_ms || !_sync_ms) return;   // switching disabled, or already fast
 
   if (++_burst < SYNC_BURST_FRAMES) return;
 
-  BLE_DEBUG_PRINTLN("SerialBLEInterface -> sync burst, fast conn params");
+  BLE_DEBUG_PRINTLN("SerialBLEInterface -> app burst, fast conn params");
   _fast = true;
   _burst = 0;
   applyConnParams();
@@ -305,7 +308,6 @@ size_t SerialBLEInterface::checkRecvFrame(uint8_t dest[]) {
     _last_write = millis();
     pTxCharacteristic->setValue(send_queue[0].buf, send_queue[0].len);
     pTxCharacteristic->notify();
-    noteActivity();
 
     BLE_DEBUG_PRINTLN("writeBytes: sz=%d, hdr=%d", (uint32_t)send_queue[0].len, (uint32_t) send_queue[0].buf[0]);
 

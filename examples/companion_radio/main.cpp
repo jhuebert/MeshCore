@@ -164,23 +164,14 @@ static uint32_t idleTickMs(bool light_sleep) {
   return the_mesh.getNodePrefs()->sleep_tick_ms;
 }
 
-// Hand the idle task a slot so the PM block can light-sleep. With light sleep
-// on, the radio's IRQ pin is armed for the wait and disarmed right after: the
-// wake needs a level trigger, and leaving the pin level-triggered floods the CPU
-// with interrupts as soon as the radio asserts it (every TX does).
+// Hand the idle task a slot so the PM block can light-sleep. RX latency is
+// bounded by the tick: a packet sits in the radio's FIFO until the loop reads
+// it, so a few tens of ms costs nothing. Waking on the radio IRQ instead would
+// need DIO1 to be level-triggered, and a level on a line that asserts for the
+// whole packet storms the CPU with interrupts (interrupt watchdog seen in the
+// field) - not worth the milliseconds.
 static void idleDelay(bool light_sleep) {
-  int irq_gpio = (int) board.getIRQGpio();
-  uint32_t tick_ms = idleTickMs(light_sleep);
-  // An already-asserted IRQ would keep the level wake firing; let the mesh drain
-  // it first (the repeater's sleep() skips the same case).
-  if (!light_sleep || irq_gpio < 0 || digitalRead(irq_gpio) == HIGH) {
-    vTaskDelay(pdMS_TO_TICKS(tick_ms));
-    return;
-  }
-
-  PowerSaving::armRadioWakeup(irq_gpio);
-  vTaskDelay(pdMS_TO_TICKS(tick_ms));
-  PowerSaving::disarmRadioWakeup(irq_gpio);
+  vTaskDelay(pdMS_TO_TICKS(idleTickMs(light_sleep)));
 }
 #endif
 

@@ -33,26 +33,6 @@ bool PowerSaving::applyCompanionPowerSaving(const CompanionConfig& cfg) {
   return false;
 }
 
-// The pin is level-triggered only while it is a wake source; see the note in
-// PowerSaving.h. Restore the pin's own (disabled) interrupt type afterwards -
-// gpio_wakeup_disable() does not, and the repeater's sleep() restores it for the
-// same reason.
-void PowerSaving::armRadioWakeup(int gpio) {
-  if (gpio < 0) return;
-
-  gpio_num_t pin = (gpio_num_t) gpio;
-  gpio_wakeup_enable(pin, GPIO_INTR_HIGH_LEVEL);   // DIO1 goes high on a packet
-  esp_sleep_enable_gpio_wakeup();
-}
-
-void PowerSaving::disarmRadioWakeup(int gpio) {
-  if (gpio < 0) return;
-
-  gpio_num_t pin = (gpio_num_t) gpio;
-  gpio_wakeup_disable(pin);
-  gpio_set_intr_type(pin, GPIO_INTR_DISABLE);
-}
-
 esp_err_t PowerSaving::configurePowerManagement(int max_freq_mhz, int min_freq_mhz, bool light_sleep_enable) {
   // Configure Power Management
 #if CONFIG_IDF_TARGET_ESP32C3

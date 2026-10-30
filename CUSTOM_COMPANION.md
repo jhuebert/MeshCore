@@ -126,11 +126,14 @@ set lightsleep tick 50    # OK - idle tick is now 50 ms
 ```
 
 Turns on ESP32 **automatic light sleep** (PM/tickless): the idle task stops the
-CPU between events and wakes for each connection event or for a LoRa packet
-(the radio's DIO1 pin is armed as a wake source for the duration of the idle wait
-only — it is level-triggered, so leaving it armed would turn every TX into an
-interrupt storm). This is the only knob that removes the ~20 mA an awake CPU
+CPU between events. This is the only knob that removes the ~20 mA an awake CPU
 costs; the rest are a few mA each. Applied immediately, no reboot.
+
+The radio's IRQ pin is deliberately *not* used as a wake source: waking on it
+needs a level trigger, and a level on a line that stays asserted for a whole
+packet storms the CPU (the interrupt watchdog reboots the node). No loss in
+practice — a received packet waits in the radio's FIFO until the loop next runs,
+i.e. at most one `tick`.
 
 `tick` is how often the idle loop wakes, in ms (default `10`, the responsive
 cadence). Fewer wake-ups means less current — each one is an exit from light

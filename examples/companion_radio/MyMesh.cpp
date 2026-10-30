@@ -4,6 +4,9 @@
 #ifdef ENABLE_WIFI_INTERFACE
 #include <WiFi.h>
 #endif
+#if defined(ESP32)
+#include <esp_system.h>
+#endif
 #include <Mesh.h>
 
 #define CMD_APP_START                 1
@@ -2107,6 +2110,26 @@ void MyMesh::enterCLIRescue() {
 // `set lightsleep` / `get lightsleep` levels, indexed by the pref value.
 static const char* const LIGHT_SLEEP_NAMES[] = {"off", "idle", "always"};
 
+#if defined(ESP32)
+// Why the last boot happened - brownout and a code panic look the same from the
+// outside (both "it restarted"), and they need opposite fixes.
+static const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external pin";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic/exception";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "other watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+#endif
+
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
   while (*command == ' ') command++; // skip leading spaces
 
@@ -2406,6 +2429,23 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     uint8_t level = _prefs.light_sleep_level < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0])
                     ? _prefs.light_sleep_level : 0;   // tolerate a value written by a newer build
     sprintf(reply, "> %s tick=%u", LIGHT_SLEEP_NAMES[level], (unsigned)_prefs.sleep_tick_ms);
+    return true;
+  }
+
+#if defined(ESP32)
+  if (strcmp(command, "get reset") == 0) {
+    sprintf(reply, "> %s", resetReasonName(esp_reset_reason()));
+    return true;
+  }
+  if (strcmp(command, "get heap") == 0) {
+    sprintf(reply, "> heap=%u min=%u stack=%u",
+            (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+            (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    return true;
+  }
+#endif
+  if (strcmp(command, "get radio.state") == 0) {
+    sprintf(reply, "> %s", radio_driver.isInRecvMode() ? "rx" : "not-rx");
     return true;
   }
 
