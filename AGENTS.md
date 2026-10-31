@@ -252,7 +252,7 @@ where an upstream sync is most likely to conflict. Resolutions are mechanical:
 | File | Fork surface | On conflict |
 |---|---|---|
 | `RadioLibWrappers.h` | `RxPowerSavingControl` base, `_rx_ps_*`/`_nf_*` members, ~12 declarations, ctor init | keep upstream's shape, re-add the fork block |
-| `RadioLibWrappers.cpp` | `loop()` and `startRecv()` replaced; hooks in `begin`/`idle`/`powerOff`/`resetAGC`/`recvRaw`/`startSendRaw`/`onSendFinished`; the new function block | take upstream's function, re-apply the fork's 1-6 lines; the new functions are additive |
+| `RadioLibWrappers.cpp` | `loop()` and `startRecv()` replaced; hooks in `begin`/`idle`/`powerOff`/`resetAGC`/`recvRaw`/`startSendRaw`/`onSendFinished`; the additive functions live in one fork section at the end of the file | take upstream's function, re-apply the fork's 1-6 lines; the end section is additive |
 | `CustomSX1262.h`, `CustomSX1262Wrapper.h`, `CustomLR1110*`, `CustomLR2021.h` | `begin()` + TCXO helper, per-family arm/stop, wrapper overrides | keep both; upstream has not touched these in 3+ months |
 | `CommonRadioPrefs.h/.cpp` | include, `_active_sf/_active_bw`, virtual + apply, two CLI branches | keep both sides |
 | `CommonCLI.h` | `cpu_freq_mhz`, `rxps`, 6 `def(...)` keys | add the keys to upstream's structure |
