@@ -141,9 +141,9 @@ reboot
 
 get lightsleep               # > always tick=100
 get ble                      # > adv=1000 tx=3 conn=200 lat=4 sync=30 quiet=5
-get radio.rxps               # > ...,level=6,...,effective=armed,err=0,fail=0
-get radio.rxgain             # > off
-get led                      # > off
+get radio.rxps              # > ...,level=6,...,effective=armed,err=0,fail=0
+get radio.rxgain            # > off
+get led                     # > off
 get wifi.enabled             # > 0
 ```
 
@@ -155,6 +155,49 @@ is for; everything else applies immediately. For an OTA, put Wi-Fi back with
 parameters are the ones the profile above was validated with - `conn 200 / lat 4`
 after `quiet`, `sync 30` while the app is active. If the node also repeats
 (`set repeat on`), put the RX gain back with `set radio.rxgain on`.
+
+### Best tested profile: t1000e (nRF52 + LR1110)
+
+A different set: the ESP32 knobs (`lightsleep`, `ble.*`, the Wi-Fi OTA page) do
+not exist there. An nRF52840 already sleeps in microamps under `powersaving`
+(`board.sleep()` -> `sd_app_evt_wait()`), so what is left is the receiver - and
+the LR11x0 does support the same RX duty cycle. This block comes from the t1000e
+board definitions and the LR11x0 wrapper rather than a bench run; the `get`s at
+the bottom are what confirms it on a real node.
+
+```
+powersaving on              # MCU event-driven sleep between interrupts
+set radio.rxps level 6      # RX duty cycle: the big lever on this board
+set radio.rxgain off        # non-boosted gain (1-2 dB less sensitivity)
+set led off                 # status LED on P0.24
+set buzzer off              # also drives PIN_BUZZER_EN low
+gps off                     # off unless you need fixes; it swamps everything else
+
+get radio.rxps              # > desired=on,effective=armed,supported=yes,err=0,fail=0,level=6,...
+get radio.rxgain            # > off
+get led                     # > off
+get buzzer                  # > off
+powersaving                 # > on
+gps                         # > off
+```
+
+On this board the LoRa receiver is almost the whole idle budget, so replacing
+continuous RX with a ~36% duty cycle is worth much more, relatively, than the
+same knob on an ESP32 companion where an awake CPU was the larger cost. Check
+`effective=armed` in the `get radio.rxps` reply: `effective=continuous` means the
+duty cycle could not be armed and the radio is still listening flat out.
+
+Two traps:
+
+- `set lightsleep ...`, `set ble.*` and the ESP32 web OTA page are ESP32-only.
+  nRF52 builds still *accept* those commands and store prefs nothing reads;
+  `start ota` on nRF52 puts the node into BLE DFU instead.
+- The persisted `rxgain` pref is applied at boot and overrides the build-time
+  `RX_BOOSTED_GAIN`, so check `get radio.rxgain` rather than assuming.
+
+With `powersaving on`, `gps on` reports `on (powersaving)` and the GPS is
+duty-cycled automatically - but a GPS fix is still far more expensive than
+everything in this block combined.
 
 ### `set lightsleep off|idle|always` / `get lightsleep`
 
