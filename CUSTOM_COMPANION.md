@@ -237,11 +237,74 @@ found: a reset on every received packet looked like deafness, not a crash.
 
 ### Measuring
 
-Change one knob at a time, let the display time out (15 s) and the radio settle,
-then read a USB power meter or an inline meter for a minute. The order that
-usually shows the biggest steps is `lightsleep`, then `tick`, then `adv`, then
-WiFi off, then `conn`/`lat`/`tx`. `get lightsleep` and `get ble` show every
-value, so a measurement is easy to reproduce.
+Change one knob at a time, hold each state for a few minutes and read a bench
+PSU or inline meter; the RX duty cycle makes an average meter jump between ~3
+and ~6 mA, so compare the middle of the range rather than a single sample. A
+long `tick` looks calm on the meter but is not free: after every received
+packet the radio sits in continuous RX until the loop picks it up, so a busy
+mesh pays back part of the saving.
+
+Measured on the Xiao S3 WIO (SX1262, SF7 / 62.5 kHz), idle - no BLE client, no
+Wi-Fi, LED off. `radio.rxps` was level 8 throughout; level 6 measures the same
+within the meter's resolution.
+
+| Setting | Current |
+|---|---|
+| stock (`lightsleep off`, `adv 500`, `rxgain on`) | ~25-35 mA |
+| `lightsleep always`, `tick 25` | ~9 mA |
+| `tick 50` | ~6-7 mA |
+| `tick 100` | ~6 mA |
+| `tick 100` + `radio.rxgain off` | ~5-6 mA |
+| `tick 100`, `rxgain off` + `ble.adv 1000` | ~5 mA |
+
+`tick 250` and `tick 500` measured the same as `tick 100` within the meter's
+resolution, so `tick 100` is the floor worth setting. `ble.adv 2000` measured
+*higher* than 1000 (more 8 mA spikes), so that is the bottom of its curve too.
+`radio.rxgain off` gives up 1-2 dB of sensitivity for the last mA - reasonable
+for a companion that does not forward, not for a node that also repeats
+(`get repeat`).
+
+`radio.rxps` level 8 is the lossless maximum on the datasheet scale: the guard
+needs `sleep <= preamble - capture`, MeshCore sends a 32-symbol preamble
+(65.5 ms at SF7 / 62.5 kHz) against an 8.2-symbol capture cost, and level 8's
+48.7 ms is exactly that. Levels 9-10 run past the guarantee and trade packets
+for ~0.4 mA.
+
+Level 6 is the one to actually run (10.2 symbols caught, sleep 44.6 ms). It
+costs ~0.2 mA over level 8 because a shorter sleep forces a longer listen
+window to satisfy the SX1262 duty-cycle timer guard (rx 25.3 ms, 36.2% duty vs
+32.3%), and it buys 1.8 symbols of capture margin - worth it for a receiver that
+has to hear other nodes' timing. Measured delivery was the same as level 8
+(59/60 vs 89/90 over 90 commands).
+
+Recommended profile (~5 mA), persisted:
+
+```
+set radio.rxps level 6
+set lightsleep always
+set lightsleep tick 100
+set ble.adv 1000          # reboot to apply
+set radio.rxgain off
+set led off
+set wifi.enabled 0        # reboot to apply; turn it back on for OTA
+```
+
+Measured end to end over a 0-hop path with this profile: 59/60 CLI round trips
+idle with `rxps 6` (89/90 at level 8), 60/60 with a phone connected over BLE, and
+29/30 while the app was actively syncing - a flat ~1% loss from CRC/collisions,
+not from BLE or the duty cycle. Median round trip ~2.0 s. No resets across 20+
+minutes of soaks.
+
+### BLE link
+
+The MeshCore Android app (Pixel 7) against `adv 1000`: the node appears in the
+scan quickly, connecting takes up to ~1 s longer than at `adv 500` and now and
+then shows the app's brief retry screen (2 of 3 reconnects were instant). Once
+connected, sync is immediate - the connection-parameter request is accepted -
+and the link drops to `conn 200 / lat 4` after `quiet` seconds of silence. A
+message sent while the app was backgrounded arrived normally and the app
+re-synced on return.
+
 
 ## `start ota`
 
