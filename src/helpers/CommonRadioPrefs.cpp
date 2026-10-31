@@ -3,6 +3,34 @@
 #include "Utils.h"
 #include "target.h"
 
+// PowerSaving variant
+#include "radiolib/RXPowerSavingCLI.h"
+
+static RxPowerSavingControl* rxpsControl() {
+#ifdef WRAPPER_CLASS
+  return &radio_driver;
+#else
+  return nullptr;
+#endif
+}
+
+// PowerSaving variant
+bool CommonRadioPrefs::applyRxPowerSaving(uint8_t sf, float bw) {
+  _active_sf = sf;
+  _active_bw = bw;
+  RxPowerSavingConfig* config = getRxPowerSavingConfig();
+  if (!config) return false;
+  // Temporary radio parameters must not replace the persisted automatic periods.
+  RxPowerSavingConfig active = *config;
+  return applyRxPowerSavingConfig(&active, sf, bw, rxpsControl());
+}
+
+// PowerSaving variant
+bool CommonRadioPrefs::isRxPowerSavingCalibrationActive() const {
+  const auto* control = rxpsControl();
+  return control && control->isRxPowerSavingCalibrationActive();
+}
+
 bool CommonRadioPrefs::getByKey(const char* key, char* value, size_t max_len) {
   if (strcmp(key, "fem_rxgain") == 0) {
     snprintf(value, max_len, "%d", (uint32_t)getFEMRxGain());
@@ -29,6 +57,30 @@ bool CommonRadioPrefs::setByKey(const char* key, const char* value) {
 }
 
 bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
+  // PowerSaving variant
+  if (strncmp(command, "get radio.rxps", 14) == 0 &&
+      (command[14] == 0 || command[14] == ' ')) {
+    const char* suffix = command + 14;
+    while (*suffix == ' ') ++suffix;
+    if (*suffix) return false;
+    auto* config = getRxPowerSavingConfig();
+    if (!config) { strcpy(reply, "Error: unsupported"); return true; }
+    const uint8_t sf = _active_sf ? _active_sf : getSpreadFactor();
+    const float bw = _active_sf ? _active_bw : getBandwidth();
+    RxPowerSavingConfig active = *config;
+    normalizeRxPowerSavingConfig(&active, sf, bw,
+        rxPowerSavingCaptureCost(rxpsControl()), rxPowerSavingTransition(rxpsControl()));
+    RXPowerSavingCLI::get(&active, rxpsControl(), sf, bw, reply, 160);
+    return true;
+  }
+  if (strncmp(command, "set radio.rxps ", 15) == 0) {
+    auto* config = getRxPowerSavingConfig();
+    if (!config) { strcpy(reply, "Error: unsupported"); return true; }
+    if (RXPowerSavingCLI::set(command + 15,
+        _active_sf ? _active_sf : getSpreadFactor(), _active_sf ? _active_bw : getBandwidth(),
+        config, rxpsControl(), reply, 160)) markDirty();
+    return true;
+  }
   if (strcmp(command, "get radio") == 0) {
     char freq[16], bw[16];
     strcpy(freq, StrHelper::ftoa(getFreq()));
@@ -50,7 +102,16 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
       setCodingRate(cr);
       setFreq(freq);
       setBandwidth(bw);
-      strcpy(reply, "OK - reboot to apply");
+
+      // PowerSaving variant
+      auto* rxps = getRxPowerSavingConfig();
+      const bool timing_ok = !rxps || !rxps->enabled || normalizeRxPowerSavingConfig(
+          rxps, sf, bw, rxPowerSavingCaptureCost(rxpsControl()), rxPowerSavingTransition(rxpsControl()));
+      if (!timing_ok && rxpsControl()) {
+        rxpsControl()->setRxPowerSaving(false, rxps->rx_us, rxps->sleep_us);
+        rxpsControl()->setRxPowerSavingConfigError(true);
+      }
+      strcpy(reply, timing_ok ? "OK - reboot to apply" : "OK - reboot to apply; RXPS continuous: invalid timing");
     } else {
       strcpy(reply, "Error, invalid radio params");
     }
@@ -110,7 +171,9 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
   }
 
   if (strcmp(command, "get cad") == 0) {
-    sprintf(reply, "> %s", isCadEnabled() ? "on" : "off");
+    // PowerSaving variant
+    sprintf(reply, "> %s; channel busy: %lu", isCadEnabled() ? "on" : "off",
+            (unsigned long)radio_driver.getCADBusyCount());
     return true;
   }
   if (memcmp(command, "set cad ", 8) == 0) {
