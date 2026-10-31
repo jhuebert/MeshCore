@@ -66,6 +66,7 @@ public:
   float adc_multiplier = 0;
   char owner_info[120];
   uint8_t rx_boosted_gain = 0; // power settings
+  RxPowerSavingConfig rxps;    // SX126x receive duty cycle (power setting)
   uint8_t radio_fem_rxgain = 0; // LoRa FEM RX gain setting
   uint8_t radio_fem_txgain = 0; // LoRa FEM TX gain setting
   uint8_t path_hash_mode = 0;   // which path mode to use when sending
@@ -95,9 +96,15 @@ private:
       def("agc_int", _parent->agc_reset_interval);
       def("hash_mode", _parent->path_hash_mode);
       def("multi_ack", _parent->multi_acks);
+      def("rxps_en", _parent->rxps.enabled);
+      def("rxps_rx_us", _parent->rxps.rx_us);
+      def("rxps_sleep_us", _parent->rxps.sleep_us);
+      def("rxps_level", _parent->rxps.level);
+      def("rxps_preamble", _parent->rxps.preamble);
     }
   public:
     RadioPrefs(NodePrefs* parent) : _parent(parent) { }
+    RxPowerSavingConfig* getRxPowerSavingConfig() override { return &_parent->rxps; }
     // CommonRadioPrefs interface
     float getFreq() const override { return _parent->freq; }
     void setFreq(float f) override { _parent->freq = f; markDirty(); }
