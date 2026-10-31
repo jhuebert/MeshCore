@@ -58,7 +58,7 @@ public:
   char bridge_secret[16]; // for XOR encryption of bridge packets (ESP-NOW only)
   // Power setting
   uint8_t powersaving_enabled = 0; // boolean
-  uint16_t cpu_freq_mhz = 0;       // 0 = board default; applied at boot
+  uint16_t cpu_freq_mhz = 240;     // ESP32 default; 0 = whatever the board booted with
   // Gps settings
   uint8_t gps_enabled = 0;
   uint32_t gps_interval = 0; // in seconds
