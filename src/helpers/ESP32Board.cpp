@@ -10,6 +10,7 @@
 #include <AsyncElegantOTA.h>
 
 #include <SPIFFS.h>
+#include <Update.h>
 
 #if defined(ENABLE_WIFI_OTA)
   #define OTA_DEVICE_TYPE "Companion"
@@ -50,6 +51,39 @@ bool ESP32Board::startOTAUpdate(const char* id, char reply[]) {
   server->on("/log", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(SPIFFS, "/packet_log", "text/plain");
   });
+
+#if defined(ENABLE_WIFI_OTA)
+  // ElegantOTA's page is a 53 KB gzipped PROGMEM blob, and streaming it jams the
+  // TCP stack on this board: the transfer crawls to ~100 B/s and the node stops
+  // answering ARP until it reboots (uploads are unaffected). Serve a plain page
+  // instead, and take the upload on our own endpoint so the MD5-less browser form
+  // works - ElegantOTA's POST stays registered as the CLI fallback.
+  server->on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html",
+                  "<!DOCTYPE html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                  "<h3>Firmware update</h3><form method=POST action=/fw enctype=multipart/form-data>"
+                  "<input type=file name=update accept=.bin required><p><input type=submit value=Upload></form>"
+                  "<p><small>The node reboots when the upload finishes; a connection error at the end is normal.</small>");
+  });
+  server->on("/fw", HTTP_POST, [](AsyncWebServerRequest *request) {
+    bool ok = !Update.hasError();
+    request->send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+    if (ok) {   // let the task flush the response before the radio goes down
+      delay(1000);
+      ESP.restart();
+    }
+  }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+    if (index == 0) {
+      Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+    }
+    if (len) {
+      Update.write(data, len);
+    }
+    if (final) {
+      Update.end(true);
+    }
+  });
+#endif
 
   AsyncElegantOTA.setID(id_buf);
   AsyncElegantOTA.begin(server);    // Start ElegantOTA

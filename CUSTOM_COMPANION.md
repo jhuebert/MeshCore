@@ -263,6 +263,18 @@ start ota
 Upload the **non-merged** `.bin`; the `-merged` image is only for a fresh USB
 flash. The device reboots into the new firmware when the upload completes.
 
+The page at `/update` is a tiny form; it posts the image to `/fw` without an MD5
+and reboots when it is done, so a connection error at the very end is normal.
+The browser form only exists for companions (`ENABLE_WIFI_OTA`); the repeater's
+ElegantOTA page is unchanged, and its `POST /update` (with the `MD5` form field)
+still works on companions too - that is the form to script:
+`curl -F MD5=<md5> -F update=@firmware.bin http://<ip>/update`.
+
+ElegantOTA's own page must not be served from a companion: it is a 53 KB gzipped
+PROGMEM blob, and streaming it jams this board's TCP stack - the transfer crawls
+to ~100 B/s and the node stops answering ARP (still reporting `wifi.status`
+`connected`) until it reboots. Uploads themselves are fine.
+
 Enabled on the `Xiao_S3_WIO_companion_radio_{usb,ble,serial,wifi}` targets. To
 enable it on another ESP32 companion target, add `-D ENABLE_WIFI_OTA=1` to its
 `build_flags` and `${esp32_ota.lib_deps}` to its `lib_deps`; any ESP32 target
@@ -289,6 +301,7 @@ PowerSaving firmware. The diff against `PowerSaving-v18` is:
 - `src/helpers/esp32/SerialBLEInterface.{h,cpp}` — advertising interval, TX
   power and preferred connection parameters.
 - `src/helpers/ESP32Board.cpp` — serve the ESP32 OTA page on the current Wi-Fi
-  network when connected, otherwise the usual `MeshCore-OTA` hotspot.
+  network when connected, otherwise the usual `MeshCore-OTA` hotspot; keep one
+  server per boot, and disable light sleep while an update is being served.
 - `variants/xiao_s3_wio/platformio.ini` — enable OTA on the Xiao S3 WIO
   companion targets.
