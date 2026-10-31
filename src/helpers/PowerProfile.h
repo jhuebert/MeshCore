@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 // PowerProfile.h — the fork's power settings that are not radio-driver code:
+// (see POWER.md, and AGENTS.md for the upstream touchpoints of the RXPS layer)
 //   * the CPU clock cap (`cpu.freq`), applied at boot and on change;
 //   * the repeater's power defaults (RX power saving on, balanced level);
 //   * the hook that pushes the stored RXPS config into the radio.
