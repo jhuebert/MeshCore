@@ -20,19 +20,21 @@ class SerialBLEInterface : public BaseSerialInterface, BLESecurityCallbacks, BLE
   unsigned long _last_write;
   unsigned long adv_restart_time;
 
-  // BLE power tuning (see setPowerPrefs)
-  uint16_t _adv_ms;
-  int8_t   _tx_dbm;
-  uint16_t _conn_ms;
-  uint8_t  _conn_latency;
-  uint16_t _sync_ms;          // interval while the app is talking; 0 = never switch
-  uint16_t _quiet_s;          // silence before dropping to the idle interval
-  bool     _fast;             // currently on the sync profile
-  uint8_t  _burst;            // frames counted towards the next fast switch
+  // BLE power tuning (see setPowerPrefs). Defaults mirror NodePrefs', so the
+  // interface behaves the same if setPowerPrefs() is never called.
+  uint16_t _adv_ms = 0;        // 0 = stack default
+  int8_t   _tx_dbm = 3;
+  uint16_t _conn_ms = 0;       // 0 = leave the interval to the phone
+  uint8_t  _conn_latency = 0;
+  uint16_t _sync_ms = 30;      // interval while the app is talking; 0 = never switch
+  uint16_t _quiet_s = 10;      // silence before dropping to the idle interval
+  bool     _fast;              // currently on the sync profile
+  uint8_t  _burst;             // frames counted towards the next fast switch
   unsigned long _last_activity;
   esp_bd_addr_t _peer_bda;
 
   void applyConnParams();
+  void setFastProfile(bool fast);
   void noteActivity();
   void pollConnParams();
 
@@ -77,12 +79,6 @@ public:
     _isEnabled = false;
     _last_write = 0;
     last_conn_id = 0;
-    _adv_ms = 0;
-    _tx_dbm = 3;
-    _conn_ms = 0;
-    _conn_latency = 0;
-    _sync_ms = 0;
-    _quiet_s = 10;
     _fast = false;
     _burst = 0;
     _last_activity = 0;

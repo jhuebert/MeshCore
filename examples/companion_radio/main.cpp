@@ -342,13 +342,14 @@ void loop() {
   external_watchdog.loop();
 #endif
 
+  bool powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
 #if defined(ESP32_PLATFORM)
   // Light sleep only happens while every task is blocked, so an idle loop has
   // to give the idle task a slot - with either power knob on.
   bool light_sleep = lightSleepAllowed();
-  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled || light_sleep;
+  bool idle_yields = powersaving || light_sleep;
 #else
-  bool idle_yields = the_mesh.getNodePrefs()->powersaving_enabled;
+  bool idle_yields = powersaving;
 #endif
   if (idle_yields && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
@@ -371,7 +372,6 @@ void loop() {
   // or the `idle` level seeing a client connect/disconnect.
   static uint8_t applied_power = 0xFF;
   static uint32_t power_retry_at = 0;
-  bool powersaving = the_mesh.getNodePrefs()->powersaving_enabled;
   uint8_t power = (powersaving ? 1 : 0) | (light_sleep ? 2 : 0);
   if (power != applied_power && (int32_t)(millis() - power_retry_at) >= 0) {
     if (PowerSaving::applyCompanionPowerSaving(powersaving, light_sleep)) {

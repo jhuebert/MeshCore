@@ -2106,6 +2106,7 @@ void MyMesh::enterCLIRescue() {
 
 // `set lightsleep` / `get lightsleep` levels, indexed by the pref value.
 static const char* const LIGHT_SLEEP_NAMES[] = {"off", "idle", "always"};
+static constexpr uint8_t LIGHT_SLEEP_LEVELS = sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]);
 
 // Shared shape of the numeric knobs: `set <name> <int>`, range-checked, persisted.
 // Returns false when the command belongs to a different knob.
@@ -2124,6 +2125,20 @@ static bool setIntKnob(MyMesh& mesh, const char* command, const char* name, T& t
   target = (T) value;
   mesh.savePrefs();
   strcpy(reply, done_msg);
+  return true;
+}
+
+// `set <name> on|off` for a pref that stores the muted state (1 = off, like
+// `set repeat`). Returns false when the command belongs to a different knob.
+template <typename T>
+static bool setMuteKnob(MyMesh& mesh, const char* command, const char* name, T& quiet,
+                        const char* what, char* reply) {
+  size_t name_len = strlen(name);
+  if (memcmp(command, name, name_len) != 0) return false;
+
+  quiet = memcmp(&command[name_len], "off", 3) == 0;
+  mesh.savePrefs();
+  sprintf(reply, "OK - %s is now %s", what, quiet ? "OFF" : "ON");
   return true;
 }
 
@@ -2292,23 +2307,13 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 
   // Same flags the UI button combo flips, reachable without the buttons. The
   // ui-*/UITask.cpp loops apply both to the live hardware within one tick.
-  if (memcmp(command, "set buzzer ", 11) == 0) {
-    _prefs.buzzer_quiet = memcmp(&command[11], "off", 3) == 0 ? 1 : 0;
-    savePrefs();
-    strcpy(reply, _prefs.buzzer_quiet ? "OK - buzzer is now OFF" : "OK - buzzer is now ON");
-    return true;
-  }
+  if (setMuteKnob(*this, command, "set buzzer ", _prefs.buzzer_quiet, "buzzer", reply)) return true;
   if (strcmp(command, "get buzzer") == 0) {
     sprintf(reply, "> %s", _prefs.buzzer_quiet ? "off" : "on");
     return true;
   }
 
-  if (memcmp(command, "set led ", 8) == 0) {
-    _prefs.led_quiet = memcmp(&command[8], "off", 3) == 0 ? 1 : 0;
-    savePrefs();
-    strcpy(reply, _prefs.led_quiet ? "OK - status LED is now OFF" : "OK - status LED is now ON");
-    return true;
-  }
+  if (setMuteKnob(*this, command, "set led ", _prefs.led_quiet, "status LED", reply)) return true;
   if (strcmp(command, "get led") == 0) {
     sprintf(reply, "> %s", _prefs.led_quiet ? "off" : "on");
     return true;
@@ -2357,7 +2362,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
   if (memcmp(command, "set lightsleep ", 15) == 0) {
     const char* arg = &command[15];
     int value = -1;
-    for (size_t i = 0; i < sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]); i++) {
+    for (uint8_t i = 0; i < LIGHT_SLEEP_LEVELS; i++) {
       if (strcmp(arg, LIGHT_SLEEP_NAMES[i]) == 0) { value = i; break; }
     }
     if (value < 0) {
@@ -2370,8 +2375,7 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     return true;
   }
   if (strcmp(command, "get lightsleep") == 0) {
-    size_t levels = sizeof(LIGHT_SLEEP_NAMES) / sizeof(LIGHT_SLEEP_NAMES[0]);
-    uint8_t level = _prefs.light_sleep_level < levels ? _prefs.light_sleep_level : 0;  // tolerate junk
+    uint8_t level = _prefs.light_sleep_level < LIGHT_SLEEP_LEVELS ? _prefs.light_sleep_level : 0;
     sprintf(reply, "> %s tick=%u", LIGHT_SLEEP_NAMES[level], (unsigned)_prefs.sleep_tick_ms);
     return true;
   }

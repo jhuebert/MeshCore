@@ -116,6 +116,13 @@ void SerialBLEInterface::applyConnParams() {
   pServer->updateConnParams(_peer_bda, min_interval, max_interval, latency, timeout);
 }
 
+// Flip between the two profiles and tell the phone about it.
+void SerialBLEInterface::setFastProfile(bool fast) {
+  _fast = fast;
+  _burst = 0;
+  applyConnParams();
+}
+
 // "The app is talking": only frames *from* the phone count. Pushes towards it
 // (raw-RX log, adverts, queued messages) are driven by mesh traffic, and counting
 // those would keep flipping a busy link back to the fast profile forever.
@@ -126,9 +133,7 @@ void SerialBLEInterface::noteActivity() {
   if (++_burst < SYNC_BURST_FRAMES) return;
 
   BLE_DEBUG_PRINTLN("SerialBLEInterface -> app burst, fast conn params");
-  _fast = true;
-  _burst = 0;
-  applyConnParams();
+  setFastProfile(true);
 }
 
 void SerialBLEInterface::pollConnParams() {
@@ -139,9 +144,7 @@ void SerialBLEInterface::pollConnParams() {
     if (quiet_ms <= (unsigned long) _quiet_s * 1000UL) return;
 
     BLE_DEBUG_PRINTLN("SerialBLEInterface -> idle, slow conn params");
-    _fast = false;
-    _burst = 0;
-    applyConnParams();
+    setFastProfile(false);
   } else if (_burst && quiet_ms > SYNC_BURST_WINDOW_MS) {
     _burst = 0;   // frames too far apart to be a sync burst
   }
@@ -175,9 +178,7 @@ void SerialBLEInterface::onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
     // Start on the fast profile so the app's first sync is quick; the link
     // drops to the idle profile once it goes quiet (see pollConnParams).
     _last_activity = millis();
-    _burst = 0;
-    _fast = (_conn_ms && _sync_ms);
-    applyConnParams();
+    setFastProfile(_conn_ms && _sync_ms);
   } else {
     BLE_DEBUG_PRINTLN(" - SecurityCallback - Authentication Failure*");
 
