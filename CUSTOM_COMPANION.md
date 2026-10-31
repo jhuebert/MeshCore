@@ -117,12 +117,51 @@ does: it has to stay awake for the BLE connection events. Everything below is
 persisted and off-by-default (except where noted), so each knob can be tried on
 its own with a meter.
 
+### Best tested profile
+
+One-shot block for everything measured to hold up: ~5 mA idle on the Xiao S3
+WIO with no phone and no Wi-Fi, 100% of 60 CLI round trips with a phone
+connected, and 29/30 while the app was actively syncing. Paste the commands,
+reboot, then check the reply of each `get`.
+
+```
+set radio.rxps level 6       # RX duty cycle, 10.2 symbols caught (~2 mA of the budget)
+set lightsleep always        # light sleep whenever the active profile allows it
+set lightsleep tick 100      # 10 loop wake-ups/s instead of 40: the biggest single win
+set ble.adv 1000             # advertising interval; slowest one that still connects quickly
+set ble.tx 3                 # advertising TX power
+set ble.conn 200             # idle connection interval
+set ble.lat 4                # idle slave latency (also the iOS-safe cap)
+set ble.sync 30              # fast interval while the app is talking
+set ble.quiet 5              # seconds of BLE silence before dropping to conn/lat
+set radio.rxgain off         # non-boosted RX gain: 1-2 dB less sensitivity, ~0.5 mA
+set led off                  # status LED
+set wifi.enabled 0           # Wi-Fi off unless an OTA is coming
+reboot
+
+get lightsleep               # > always tick=100
+get ble                      # > adv=1000 tx=3 conn=200 lat=4 sync=30 quiet=5
+get radio.rxps               # > ...,level=6,...,effective=armed,err=0,fail=0
+get radio.rxgain             # > off
+get led                      # > off
+get wifi.enabled             # > 0
+```
+
+`ble.adv` and `wifi.enabled` are read once at boot, which is what the `reboot`
+is for; everything else applies immediately. For an OTA, put Wi-Fi back with
+`set wifi.enabled 1` then `reboot`, and turn it off again afterwards.
+
+`adv` is the only BLE value swept here (500 / 1000 / 2000); the connection
+parameters are the ones the profile above was validated with - `conn 200 / lat 4`
+after `quiet`, `sync 30` while the app is active. If the node also repeats
+(`set repeat on`), put the RX gain back with `set radio.rxgain on`.
+
 ### `set lightsleep off|idle|always` / `get lightsleep`
 
 ```
 get lightsleep            # > off tick=10
 set lightsleep idle       # OK - light sleep is now idle
-set lightsleep tick 50    # OK - idle tick is now 50 ms
+set lightsleep tick 50    # OK - applies immediately
 ```
 
 Turns on ESP32 **automatic light sleep** (PM/tickless): the idle task stops the
@@ -277,23 +316,12 @@ window to satisfy the SX1262 duty-cycle timer guard (rx 25.3 ms, 36.2% duty vs
 has to hear other nodes' timing. Measured delivery was the same as level 8
 (59/60 vs 89/90 over 90 commands).
 
-Recommended profile (~5 mA), persisted:
-
-```
-set radio.rxps level 6
-set lightsleep always
-set lightsleep tick 100
-set ble.adv 1000          # reboot to apply
-set radio.rxgain off
-set led off
-set wifi.enabled 0        # reboot to apply; turn it back on for OTA
-```
-
 Measured end to end over a 0-hop path with this profile: 59/60 CLI round trips
 idle with `rxps 6` (89/90 at level 8), 60/60 with a phone connected over BLE, and
 29/30 while the app was actively syncing - a flat ~1% loss from CRC/collisions,
 not from BLE or the duty cycle. Median round trip ~2.0 s. No resets across 20+
-minutes of soaks.
+minutes of soaks. The commands are collected in
+[Best tested profile](#best-tested-profile).
 
 ### BLE link
 
