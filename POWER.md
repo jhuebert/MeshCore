@@ -19,6 +19,24 @@ The CPU knob does not show at idle — the CPU is asleep almost all the time —
 but it cuts every awake window roughly in half (54 → 32 mA in the two-minute
 window after boot, and during any packet work).
 
+## Attribution
+
+Only one of the three knobs is this fork's own work, and the credit matters:
+
+- **`powersaving` (light sleep)** is **upstream MeshCore**
+  ([meshcore-dev/MeshCore](https://github.com/meshcore-dev/MeshCore)) and is
+  used here unchanged.
+- **`radio.rxps` (the receive duty cycle)** comes from **EasySkyMesh** —
+  [IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore), branch
+  `PowerSaving-v18` (the source behind the EasySkyMesh PowerSaving18 release,
+  by Kevin Le). The policy, level ladder, preamble guard, CLI and radio-wrapper
+  integration are theirs; this fork's copies of `RXPowerSaving.*` and
+  `RXPowerSavingCLI.*` are byte-identical to their tree, and the host tests are
+  their cases wired into this repo's test runner.
+- This fork added the port into the repeater/observer firmware, the persisted
+  **`cpu.freq`** setting, the `PowerProfile` glue, the pre-feature defaults,
+  and this guide.
+
 ---
 
 ## Purpose
