@@ -139,12 +139,16 @@ and do not paste the output anywhere.
 and `max` trade latency for power. The observer manages Wi-Fi and reconnects
 automatically — do not run two things that fight over the Wi-Fi interface.
 
-`start ota` uses that station link: while Wi-Fi is connected it serves the
-update page on the node's own address (`Started: http://192.0.2.10/update`)
-instead of starting the `MeshCore-OTA` hotspot. Without a station link the
-command falls back to the usual hotspot. To force the hotspot on a configured
-observer, disable both broker slots (`set mqtt1.enabled off` /
-`set mqtt2.enabled off`, which powers Wi-Fi down) and run `start ota` again.
+`start ota` serves the update page on the node's own address
+(`Started: http://192.0.2.10/update`) instead of starting the `MeshCore-OTA`
+hotspot. It needs no broker for that: with Wi-Fi credentials stored it brings
+the station up itself (waiting up to 10 s for the association) even when both
+broker slots are off, and leaves the link up so the page keeps answering. That
+link is RAM-only — the reboot that ends an OTA session returns the node to
+Wi-Fi off, and `get wifi.status` shows the address while it is up. Without
+credentials, or when the station does not associate, the command falls back to
+the usual hotspot. Note that `start ota` waits for that association, so the
+loop is busy for a few seconds while it runs.
 
 The observer gets UTC from NTP before it connects anywhere. The default server
 is `pool.ntp.org` with `time.google.com` and `time.cloudflare.com` as fallbacks;
