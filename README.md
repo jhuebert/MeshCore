@@ -35,6 +35,16 @@ flapping, and the admin can check voltage and tune thresholds over the mesh.
 
 → Full guide: **[BATTERY.md](./BATTERY.md)**
 
+### ⚡ Power profile
+
+Three runtime knobs take an idle repeater from ~54 mA to ~4 mA: ESP32 light
+sleep (`powersaving`), the radio's receive duty cycle (`radio.rxps`) and the CPU
+clock (`cpu.freq`). All are persisted and revertible from the CLI — the
+duty-cycle levels are chosen so the datasheet's preamble-capture guarantee still
+holds, so the savings do not quietly turn into lost packets.
+
+→ Full guide: **[POWER.md](./POWER.md)**
+
 ### 🕒 Mesh clock sync
 
 A repeater with no GPS, NTP, or battery-backed RTC can estimate UTC from signed
@@ -111,6 +121,7 @@ Prebuilt binaries for all supported boards are on the
 
 Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI,
-[FLEET.md](./FLEET.md) if you are running a fleet, or
+[FLEET.md](./FLEET.md) if you are running a fleet,
+[POWER.md](./POWER.md) if the node runs on solar or battery, or
 [MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
 Observer builds ship in the same releases as the plain repeater firmware.

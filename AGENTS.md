@@ -42,6 +42,10 @@ should not need to explore beyond them before making a change.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
 - `MESHCLOCK.md` — mesh clock sync behavior, CLI, defaults and caveats.
+- `POWER.md` — power profile user manual: `powersaving` (light sleep),
+  `radio.rxps` (receive duty cycle, the level scale and its preamble guard,
+  presets/raw/level forms), `cpu.freq`, persistence, the measured profile, and
+  what the profile deliberately does not do. First stop for any power question.
 - `MQTT_OBSERVER.md` — the optional MQTT observer firmware's user manual:
   build targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS),
   topic templates and the status/packet/raw schemas, the capture and delivery
@@ -97,6 +101,24 @@ commit** — the guides are user-facing API documentation, not optional docs.
   drain).
 - `main.cpp` — upstream's serial CLI entry (no fork lines).
 
+**Power (`src/helpers/` + the upstream radio layer):**
+- `PowerProfile.h/.cpp` — the fork's power glue kept out of upstream files: the
+  persisted CPU cap (`cpu.freq` parsing/apply, `0`/default restore), the
+  repeater's power defaults (RXPS off, balanced level carried), and the hook
+  that pushes the stored RXPS config into the radio. `loadPrefs()`/`handleSetCmd`
+  /`handleGetCmd`/`MyMesh` carry only the call lines.
+- `radiolib/RXPowerSaving.h/.cpp` — the duty-cycle policy: the level ladders per
+  preamble profile, the datasheet timer guard, period calculation, config
+  normalisation and the arm-retry state. Byte-identical to easyskymesh's copy.
+- `radiolib/RXPowerSavingCLI.h/.cpp` — `get radio.rxps` / `set radio.rxps`
+  (presets, `level N`, `preamble 16|32`, raw periods) and the status report.
+- The integration into the radio lives in upstream files and is the fork's
+  largest upstream diff: `radiolib/RadioLibWrappers.*` (duty-cycle arming,
+  re-arm around TX/receive, noise-floor calibration), `CustomSX1262*` and
+  `CustomLR1110*`/`CustomLR2021` (per-family arming + TCXO delay), and
+  `CommonRadioPrefs.*` (CLI hook + apply). See the merge playbook below before
+  resolving a conflict in them.
+
 **Code (`examples/mqtt_observer/`, compiled only under `WITH_MQTT_OBSERVER`):**
 - `MQTTObserver.h/.cpp` — the ESP32-only observer: Wi-Fi/NTP, up to two broker
   slots, Ed25519 JWT or user/pass auth, the receive/TX capture hooks, a bounded
@@ -128,7 +150,10 @@ upgrades, CLI surface, TinyRegex, PatternMatch), `test/test_fleet/` (runner
 grammar, tag targeting, acknowledgements, scheduling, persistence, CLI surface,
 the battery exemption contract), `test/test_battery_gate/` (suspension
 behavior, persistence, CLI), `test/test_mesh_clock/` (sample collection, quorum
-decision, persistence, CLI) and `test/test_mqtt_observer/` (config codec +
+decision, persistence, CLI), `test/test_rx_power_saving/` (the duty-cycle
+level ladders and preamble guard, timer-condition validation, config
+normalisation, presets/raw parsing and the `get radio.rxps` report) and
+`test/test_mqtt_observer/` (config codec +
 record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
 connect gates, queue/retry policy, the liveness probe, and the
 status/packet/raw JSON schema). Test-only shims:
@@ -138,10 +163,11 @@ status/packet/raw JSON schema). Test-only shims:
 **Build & CI:** `pio test -e native_packet_filter` / `-e
 native_battery_gate` / `-e native_fleet` / `-e native_fleet_noack` (the fleet
 suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
-other env compiles) / `-e native_mesh_clock` / `-e native_mqtt_observer`
+other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e native_mqtt_observer`
 (host-native, no hardware), plus `-e
 native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_fleet_san` /
-`-e native_mesh_clock_san` / `-e native_mqtt_observer_san` for ASan+UBSan;
+`-e native_mesh_clock_san` / `-e native_rx_power_saving_san` / `-e
+native_mqtt_observer_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 `build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
 target being `Xiao_S3_WIO_repeater` (observer builds add
@@ -192,10 +218,14 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
+- `src/helpers/PowerProfile.h/.cpp`,
+  `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`
 - `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
-  `test/test_mesh_clock/`, `test/test_mqtt_observer/`
+  `test/test_mesh_clock/`, `test/test_rx_power_saving/`,
+  `test/test_mqtt_observer/`
 - `examples/mqtt_observer/`, `observer_targets.ini`
-- `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `MQTT_OBSERVER.md`
+- `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `POWER.md`,
+  `MQTT_OBSERVER.md`
 - `scripts/local-release-build.sh`, `scripts/tests/`
 - `.github/workflows/filter-release.yml`,
   `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
@@ -213,6 +243,45 @@ fork's own. Everything else is upstream: apply the change discipline below
 *even more strictly* there, and match the existing style (`.clang-format`:
 2-space indent, `camelCase` functions, `UpperCamelCase` classes, lines < ~100
 chars).
+
+### Merge playbook — the RXPS layer
+
+The power feature is the fork's largest edit inside upstream files, so it is
+where an upstream sync is most likely to conflict. Resolutions are mechanical:
+
+| File | Fork surface | On conflict |
+|---|---|---|
+| `RadioLibWrappers.h` | `RxPowerSavingControl` base, `_rx_ps_*`/`_nf_*` members, ~12 declarations, ctor init | keep upstream's shape, re-add the fork block |
+| `RadioLibWrappers.cpp` | `loop()` and `startRecv()` replaced; hooks in `begin`/`idle`/`powerOff`/`resetAGC`/`recvRaw`/`startSendRaw`/`onSendFinished`; the additive functions live in one fork section at the end of the file | take upstream's function, re-apply the fork's 1-6 lines; the end section is additive |
+| `CustomSX1262.h`, `CustomSX1262Wrapper.h`, `CustomLR1110*`, `CustomLR2021.h` | `begin()` + TCXO helper, per-family arm/stop, wrapper overrides | keep both; upstream has not touched these in 3+ months |
+| `CommonRadioPrefs.h/.cpp` | include, `_active_sf/_active_bw`, virtual + apply, two CLI branches | keep both sides |
+| `CommonCLI.h` | `cpu_freq_mhz`, `rxps`, 6 `def(...)` keys | add the keys to upstream's structure |
+| `MyMesh.cpp` | 4 call lines (`powerApplyDefaults`, `powerApplyRadioProfile`) | one line each |
+
+1. Take upstream's version of a conflicting *function* first, then re-apply the
+   fork's lines. Never hand-merge the two bodies.
+2. A conflict in the additive functions (`startReceiveMode`,
+   `noiseFloorCalibCheck`, ...) means upstream added a function at the same
+   spot: keep both.
+3. After any conflict in the radio layer the check is behavioural, not just a
+   build: flash, confirm `get radio.rxps` reports `effective=armed`, then send a
+   direct CLI command and see it ACKed. A wrong delegation makes the node deaf
+   while it still transmits.
+4. `test/test_rx_power_saving` covers the policy, not the integration — only
+   the on-air check catches a broken delegation.
+
+Upstream churn (12 months to 2026-10): `RadioLibWrappers.cpp` 23 commits (5 in
+the last 3), `CommonRadioPrefs.cpp` 7 (all in 3), `CustomSX1262.h` 13 (0 in 3),
+`CommonCLI.h` 40 (15 in 3), `MyMesh.cpp` 103 (14 in 3). The frequently edited
+files carry the small hunks; the large functions live in the rare ones, so the
+expected cost is a few 5-minute resolutions a year plus an occasional 30-minute
+one in the wrapper.
+
+The planned simplification is `RxPowerSavingRuntime`: move the duty-cycle state
+machine and its state (including the file-static `state`/ISR in
+`RadioLibWrappers.cpp`) into a fork-owned class the wrapper friends, leaving
+~30 lines of delegates. Do that when the wrapper diff starts actually
+conflicting, not before.
 
 ## Change discipline — every change (fork or upstream)
 
@@ -373,7 +442,7 @@ All green, and every touched line required — together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_mqtt_observer
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_mqtt_observer
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks

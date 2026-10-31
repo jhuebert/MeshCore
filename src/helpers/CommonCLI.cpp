@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "CommonCLI.h"
+#include "PowerProfile.h"
 #include "TxtDataHelpers.h"
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
@@ -44,6 +45,7 @@ void CommonCLI::loadPrefs(FILESYSTEM* fs) {
   //    fs->remove("/com_prefs");  // remove old
     }
   }
+  powerApplyCpuFrequency(*_prefs);
 }
 
 void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy prefs loader
@@ -486,7 +488,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
 void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
 
-  if (memcmp(config, "allow.read.only ", 16) == 0) {
+  bool power_changed = false;
+  if (powerCliSet(config, *_prefs, reply, &power_changed)) {
+    if (power_changed) savePrefs();
+  } else if (memcmp(config, "allow.read.only ", 16) == 0) {
     _prefs->allow_read_only = memcmp(&config[16], "on", 2) == 0;
     savePrefs();
     strcpy(reply, "OK");
@@ -700,7 +705,8 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
 
 void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
-  if (memcmp(config, "allow.read.only", 15) == 0) {
+  if (powerCliGet(config, *_prefs, reply)) {
+  } else if (memcmp(config, "allow.read.only", 15) == 0) {
     sprintf(reply, "> %s", _prefs->allow_read_only ? "on" : "off");
   } else if (memcmp(config, "flood.advert.interval", 21) == 0) {
     sprintf(reply, "> %d", ((uint32_t) _prefs->flood_advert_interval));
