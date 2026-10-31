@@ -33,8 +33,10 @@ two costs that dominate idle:
   time spent listening when nothing is on air).
 
 Each knob is independent and each can be reverted with one command. The
-defaults are conservative: light sleep off, RX duty cycle on at the balanced
-level, CPU at the board default.
+defaults reproduce the pre-power-feature behaviour exactly — light sleep off,
+RX duty cycle off (continuous RX), CPU at 240 MHz — so an existing installation
+sees no change until it opts in. `set radio.rxps on` and `powersaving on` are
+one command each; `cpu.freq 0` restores the board default.
 
 ## Behaviour
 

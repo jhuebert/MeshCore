@@ -23,7 +23,10 @@ void powerApplyCpuFrequency(const NodePrefs& prefs) {
 }
 
 void powerApplyDefaults(NodePrefs& prefs) {
-  prefs.rxps.enabled = 1;
+  // Pre-power-feature behaviour: continuous RX, no CPU cap. The level/preamble
+  // defaults are carried so `set radio.rxps on` has something sane to start
+  // from, but nothing is armed until the operator asks for it.
+  prefs.rxps.enabled = 0;
   prefs.rxps.level = RX_POWERSAVING_BALANCED_LEVEL;
   prefs.rxps.preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
 }
