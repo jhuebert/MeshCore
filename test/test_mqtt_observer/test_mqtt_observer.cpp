@@ -984,6 +984,23 @@ TEST(MQTTObserverQueuePolicy, RetryScheduleStaysWithinJitterWindow) {
   EXPECT_EQ(retryDecision(false, kMaxQos0RetryAttempts, 1000).action, RetryAction::Drop);
 }
 
+TEST(MQTTObserverOtaStationPolicy, ArmsOnlyForStartOtaWithCredentialsAndNoLink) {
+  using namespace MQTTObserverOtaStationPolicy;
+  EXPECT_TRUE(isOtaCommand("start ota"));
+  EXPECT_FALSE(isOtaCommand("start ota now"));
+  EXPECT_FALSE(isOtaCommand("start otax"));
+  EXPECT_FALSE(isOtaCommand("start"));
+  EXPECT_FALSE(isOtaCommand(nullptr));
+
+  EXPECT_TRUE(wantsStation(true, false));
+  EXPECT_FALSE(wantsStation(true, true));    // a broker's link already serves the page
+  EXPECT_FALSE(wantsStation(false, false));  // nothing to associate with
+
+  EXPECT_TRUE(keepStation(true, true));
+  EXPECT_FALSE(keepStation(true, false));    // credentials cleared: no link to keep
+  EXPECT_FALSE(keepStation(false, true));
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

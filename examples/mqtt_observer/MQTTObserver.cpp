@@ -100,7 +100,7 @@ MQTTObserver::MQTTObserver()
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
       _queue(), _raw_stager(), _brokers{}, _wifi_started(false),
-      _recover_requested(false), _queue_disconnected_since(0), _last_ntp_request(0),
+      _recover_requested(false), _ota_station_hold(false), _queue_disconnected_since(0), _last_ntp_request(0),
       _device_id{}, _json{},
       _state(STATE_OFF), _save_state(), _received(0), _published(0),
       _disconnected_drops(0), _queue_drops(0), _publish_drops(0) {
@@ -628,13 +628,35 @@ void MQTTObserver::worker() {
         _brokers[i].state.store(_work_config.brokers[i].enabled ? STATE_CONFIG : STATE_OFF,
                                 std::memory_order_relaxed);
       }
-      if (_wifi_started) {
+      // `start ota` can ask for the station with no broker to publish to (see
+      // MQTTObserverOtaStationPolicy): join it and keep it up so the update page
+      // is served on the LAN address. Nothing is published on this link.
+      bool ota_station = MQTTObserverOtaStationPolicy::keepStation(
+          _ota_station_hold.load(std::memory_order_relaxed), _work_config.wifi_ssid[0]);
+      if (ota_station) {
+        bool creds_changed = _wifi_started &&
+            (strcmp(active_ssid, _work_config.wifi_ssid) != 0 ||
+             strcmp(active_password, _work_config.wifi_password) != 0);
+        if (!_wifi_started || creds_changed) {
+          if (_wifi_started) {
+            WiFi.disconnect(true, false);
+            _wifi_started = false;
+          }
+          WiFi.mode(WIFI_STA);
+          WiFi.setAutoReconnect(true);
+          WiFi.begin(_work_config.wifi_ssid, _work_config.wifi_password);
+          memcpy(active_ssid, _work_config.wifi_ssid, sizeof(active_ssid));
+          memcpy(active_password, _work_config.wifi_password, sizeof(active_password));
+          _wifi_started = true;
+          active_wifi_power_save = 0xff;
+        }
+      } else if (_wifi_started) {
         WiFi.disconnect(true, false);
         WiFi.mode(WIFI_OFF);
         _wifi_started = false;
       }
       runtime_config_initialized = false;
-      _state.store(STATE_CONFIG, std::memory_order_relaxed);
+      _state.store(ota_station ? STATE_WIFI : STATE_CONFIG, std::memory_order_relaxed);
       trackDisconnectedQueue(now);
       vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
@@ -1082,6 +1104,27 @@ bool MQTTObserver::handleCommand(char* command, char* reply) {
     snprintf(reply, CLI_REPLY_MAX, "OK - Wi-Fi reset requested");
     return true;
   }
+#if defined(ADMIN_PASSWORD) && !defined(DISABLE_WIFI_OTA)   // matches ESP32Board's OTA gate
+  if (MQTTObserverOtaStationPolicy::isOtaCommand(command)) {
+    // The common CLI starts the update server next and picks the address from
+    // WiFi.status(). Associating here (and holding the link) is what makes that
+    // the LAN address instead of the setup hotspot; the wait is bounded so a
+    // wrong password still ends at the hotspot, exactly as before.
+    portENTER_CRITICAL(&_config_mux);
+    bool have_credentials = _config.wifi_ssid[0] != 0;
+    portEXIT_CRITICAL(&_config_mux);
+    if (MQTTObserverOtaStationPolicy::wantsStation(have_credentials,
+                                                  WiFi.status() == WL_CONNECTED)) {
+      _ota_station_hold.store(true, std::memory_order_relaxed);
+      uint32_t started = millis();
+      while (WiFi.status() != WL_CONNECTED &&
+             millis() - started < MQTTObserverOtaStationPolicy::kAssociateTimeoutMs) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    }
+    return false;   // the common CLI serves the page (station or hotspot)
+  }
+#endif
   MQTTObserverCliFacts facts;
   cliFacts(facts);
   bool changed = false;

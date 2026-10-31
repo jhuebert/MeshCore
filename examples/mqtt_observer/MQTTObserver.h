@@ -111,6 +111,7 @@ class MQTTObserver {
   BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
   std::atomic<bool> _recover_requested;   // reset the Wi-Fi station and reconnect
+  std::atomic<bool> _ota_station_hold;    // `start ota` armed the station with no broker
   uint32_t _queue_disconnected_since;
   uint32_t _last_ntp_request;
   char _device_id[2 * PUB_KEY_SIZE + 1];
