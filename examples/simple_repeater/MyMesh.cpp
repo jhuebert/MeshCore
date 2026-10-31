@@ -1,4 +1,5 @@
 #include "MyMesh.h"
+#include <helpers/PowerProfile.h>
 #include <algorithm>
 
 /* ------------------------------ Config -------------------------------- */
@@ -944,11 +945,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   region_load_active = false;
   recv_pkt_region = NULL;
 
-  // RX power saving on by default: the balanced level keeps the datasheet's
-  // preamble-capture guarantee on every radio family this fork builds.
-  _prefs.rxps.enabled = 1;
-  _prefs.rxps.level = RX_POWERSAVING_BALANCED_LEVEL;
-  _prefs.rxps.preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
+  powerApplyDefaults(_prefs);
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -1139,7 +1136,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 #endif
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-  _prefs.getRadioPrefs()->applyRxPowerSaving(_prefs.sf, _prefs.bw);
+  powerApplyRadioProfile(_prefs);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
@@ -1513,14 +1510,14 @@ void MyMesh::loop() {
   if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
     set_radio_at = 0;                                     // clear timer
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
-    _prefs.getRadioPrefs()->applyRxPowerSaving(pending_sf, pending_bw);
+    powerApplyRadioProfile(_prefs, pending_sf, pending_bw);
     MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
   if (revert_radio_at && millisHasNowPassed(revert_radio_at)) { // revert radio params to orig
     revert_radio_at = 0;                                        // clear timer
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-    _prefs.getRadioPrefs()->applyRxPowerSaving(_prefs.sf, _prefs.bw);
+    powerApplyRadioProfile(_prefs);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
 

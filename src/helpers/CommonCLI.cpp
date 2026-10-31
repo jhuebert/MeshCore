@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "CommonCLI.h"
+#include "PowerProfile.h"
 #include "TxtDataHelpers.h"
 #include "AdvertDataHelpers.h"
 #include "TxtDataHelpers.h"
@@ -44,24 +45,7 @@ void CommonCLI::loadPrefs(FILESYSTEM* fs) {
   //    fs->remove("/com_prefs");  // remove old
     }
   }
-  applyCpuFrequency();
-}
-
-void CommonCLI::applyCpuFrequency() {
-#if defined(ESP32)
-  // Captured on the first call (boot, before any change) so "default" can
-  // restore the frequency the board started with.
-  static uint16_t boot_mhz = getCpuFrequencyMhz();
-  uint16_t mhz = _prefs->cpu_freq_mhz ? _prefs->cpu_freq_mhz : boot_mhz;
-  if (mhz && !setCpuFrequencyMhz(mhz)) {
-    MESH_DEBUG_PRINTLN("CPU frequency %u MHz was not applied", (unsigned)mhz);
-  }
-#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
-  // A UART console derives its baud divider from the APB clock; re-init it so
-  // the console survives the clock change. USB CDC consoles are unaffected.
-  Serial.begin(115200);
-#endif
-#endif
+  powerApplyCpuFrequency(*_prefs);
 }
 
 void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy prefs loader
@@ -504,26 +488,9 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* re
 void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
 
-  if (memcmp(config, "cpu.freq ", 9) == 0) {
-#if defined(ESP32)
-    const char* value = &config[9];
-    char* end = nullptr;
-    long mhz = strtol(value, &end, 10);
-    if (*value == 0 || end == nullptr || *end != 0 ||
-        !(mhz == 0 || mhz == 40 || mhz == 80 || mhz == 160 || mhz == 240)) {
-      strcpy(reply, "Err - cpu.freq must be 0, 40, 80, 160 or 240");
-    } else {
-      _prefs->cpu_freq_mhz = (uint16_t)mhz;
-      savePrefs();
-      applyCpuFrequency();
-      if (mhz)
-        snprintf(reply, 160, "OK - %u MHz", (unsigned)mhz);
-      else
-        strcpy(reply, "OK - default");
-    }
-#else
-    strcpy(reply, "Board not supported");
-#endif
+  bool power_changed = false;
+  if (powerCliSet(config, *_prefs, reply, &power_changed)) {
+    if (power_changed) savePrefs();
   } else if (memcmp(config, "allow.read.only ", 16) == 0) {
     _prefs->allow_read_only = memcmp(&config[16], "on", 2) == 0;
     savePrefs();
@@ -738,11 +705,7 @@ void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* rep
 
 void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* reply) {
   const char* config = &command[4];
-  if (memcmp(config, "cpu.freq", 8) == 0 && (config[8] == 0 || config[8] == ' ')) {
-    if (_prefs->cpu_freq_mhz)
-      snprintf(reply, 160, "> %u", (unsigned)_prefs->cpu_freq_mhz);
-    else
-      strcpy(reply, "> default");
+  if (powerCliGet(config, *_prefs, reply)) {
   } else if (memcmp(config, "allow.read.only", 15) == 0) {
     sprintf(reply, "> %s", _prefs->allow_read_only ? "on" : "off");
   } else if (memcmp(config, "flood.advert.interval", 21) == 0) {
