@@ -42,10 +42,11 @@ should not need to explore beyond them before making a change.
 - `BATTERY.md` — battery gate user manual: behavior, what suspension does
   not touch, persistence, CLI reference.
 - `MESHCLOCK.md` — mesh clock sync behavior, CLI, defaults and caveats.
-- `POWER.md` — power profile user manual: `powersaving` (light sleep),
-  `radio.rxps` (receive duty cycle, the level scale and its preamble guard,
-  presets/raw/level forms), `cpu.freq`, persistence, the measured profile, and
-  what the profile deliberately does not do. First stop for any power question.
+- `POWER.md` — power profile user manual: `powersaving` (upstream light
+  sleep), `radio.rxps` (the receive duty cycle ported from EasySkyMesh, the
+  level scale and its preamble guard, presets/raw/level forms), `cpu.freq`,
+  persistence, the measured profile, attribution and what the profile
+  deliberately does not do. First stop for any power question.
 - `MQTT_OBSERVER.md` — the optional MQTT observer firmware's user manual:
   build targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS),
   topic templates and the status/packet/raw schemas, the capture and delivery
@@ -109,7 +110,8 @@ commit** — the guides are user-facing API documentation, not optional docs.
   /`handleGetCmd`/`MyMesh` carry only the call lines.
 - `radiolib/RXPowerSaving.h/.cpp` — the duty-cycle policy: the level ladders per
   preamble profile, the datasheet timer guard, period calculation, config
-  normalisation and the arm-retry state. Byte-identical to easyskymesh's copy.
+  normalisation and the arm-retry state. Ported from EasySkyMesh
+  (`IoTThinks/MeshCore`, branch `PowerSaving-v18`); byte-identical to their tree.
 - `radiolib/RXPowerSavingCLI.h/.cpp` — `get radio.rxps` / `set radio.rxps`
   (presets, `level N`, `preamble 16|32`, raw periods) and the status report.
 - The integration into the radio lives in upstream files and is the fork's
