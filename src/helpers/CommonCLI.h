@@ -58,6 +58,7 @@ public:
   char bridge_secret[16]; // for XOR encryption of bridge packets (ESP-NOW only)
   // Power setting
   uint8_t powersaving_enabled = 0; // boolean
+  uint16_t cpu_freq_mhz = 0;       // 0 = board default; applied at boot
   // Gps settings
   uint8_t gps_enabled = 0;
   uint32_t gps_interval = 0; // in seconds
@@ -178,6 +179,7 @@ private:
     void structure() override {
       def("adc_mult", _parent->adc_multiplier);
       def("pwr_sav_en", _parent->powersaving_enabled);
+      def("cpu_mhz", _parent->cpu_freq_mhz);
     }
   public:
     PowerPrefs(NodePrefs* parent) : _parent(parent) { }
@@ -326,6 +328,7 @@ public:
 
   void loadPrefs(FILESYSTEM* _fs);
   bool savePrefs(FILESYSTEM* _fs);
+  void applyCpuFrequency();
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   uint8_t buildAdvertData(uint8_t node_type, uint8_t* app_data);
 };

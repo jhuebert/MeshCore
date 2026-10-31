@@ -36,13 +36,6 @@ static unsigned long userBtnDownAt = 0;
 #endif
 
 void setup() {
-#if defined(POWER_TEST_CPU_MHZ)
-  // Power profile: cap the CPU clock before the UART is configured, so the
-  // baud divider is computed against the final APB frequency. Repeater work is
-  // I/O-bound; this cuts the current of every awake window (~54 -> ~32 mA on
-  // the Xiao S3 WIO) without changing protocol timing.
-  setCpuFrequencyMhz(POWER_TEST_CPU_MHZ);
-#endif
   Serial.begin(115200);
   delay(1000);
 
