@@ -156,12 +156,13 @@ if [[ ${1:-} == __worker ]]; then
   # (codegen unchanged, consumed by the stack gate below) + version string
   export PLATFORMIO_BUILD_FLAGS="-fstack-usage -DFIRMWARE_BUILD_DATE='\"${firmware_build_date}\"' -DFIRMWARE_VERSION='\"${firmware_version_string}\"'"
 
-  # wio-e5-mini_repeater is ~4.5 KB over its 224 KB flash region and
-  # wio-e5-repeater_bridge_rs232 is 152 B over it. LTO on the
-  # framework/libraries recovers the space; project sources stay non-LTO so
-  # the stack gate below still gets their .su files. Fork-owned override: the
-  # upstream variant does not carry it.
-  if [[ $target == wio-e5-mini_repeater || $target == wio-e5-repeater_bridge_rs232 ]]; then
+  # wio-e5-mini_repeater is ~4.5 KB over its 224 KB flash region,
+  # wio-e5-repeater_bridge_rs232 is 152 B over it, and wio-e5_repeater is 96 B
+  # over it with the STM32 RXPS gate. LTO on the framework/libraries recovers
+  # the space; project sources stay non-LTO so the stack gate below still gets
+  # their .su files. Fork-owned override: the upstream variant does not carry
+  # it.
+  if [[ $target == wio-e5-mini_repeater || $target == wio-e5-repeater_bridge_rs232 || $target == wio-e5_repeater ]]; then
     export PLATFORMIO_BUILD_FLAGS="$PLATFORMIO_BUILD_FLAGS -flto"
     export PLATFORMIO_BUILD_SRC_FLAGS="${PLATFORMIO_BUILD_SRC_FLAGS:-} -fno-lto"
   fi

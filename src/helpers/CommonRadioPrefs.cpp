@@ -20,6 +20,7 @@ bool looksLikeANumber(const char* s) {
 }  // namespace
 
 // PowerSaving variant
+#if !defined(STM32_PLATFORM)
 #include "radiolib/RXPowerSavingCLI.h"
 
 static RxPowerSavingControl* rxpsControl() {
@@ -29,9 +30,17 @@ static RxPowerSavingControl* rxpsControl() {
   return nullptr;
 #endif
 }
+#endif
 
 // PowerSaving variant
 bool CommonRadioPrefs::applyRxPowerSaving(uint8_t sf, float bw) {
+#if defined(STM32_PLATFORM)
+  // The STM32WL radio has no receive duty cycle, and compiling the runtime in
+  // costs ~4.6 KB of its 224 KB flash region.
+  (void)sf;
+  (void)bw;
+  return false;
+#else
   _active_sf = sf;
   _active_bw = bw;
   RxPowerSavingConfig* config = getRxPowerSavingConfig();
@@ -39,12 +48,17 @@ bool CommonRadioPrefs::applyRxPowerSaving(uint8_t sf, float bw) {
   // Temporary radio parameters must not replace the persisted automatic periods.
   RxPowerSavingConfig active = *config;
   return applyRxPowerSavingConfig(&active, sf, bw, rxpsControl());
+#endif
 }
 
 // PowerSaving variant
 bool CommonRadioPrefs::isRxPowerSavingCalibrationActive() const {
+#if defined(STM32_PLATFORM)
+  return false;
+#else
   const auto* control = rxpsControl();
   return control && control->isRxPowerSavingCalibrationActive();
+#endif
 }
 
 bool CommonRadioPrefs::getByKey(const char* key, char* value, size_t max_len) {
@@ -74,6 +88,7 @@ bool CommonRadioPrefs::setByKey(const char* key, const char* value) {
 
 bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
   // PowerSaving variant
+#if !defined(STM32_PLATFORM)
   if (strncmp(command, "get radio.rxps", 14) == 0 &&
       (command[14] == 0 || command[14] == ' ')) {
     const char* suffix = command + 14;
@@ -97,6 +112,16 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
         config, rxpsControl(), reply, 160)) markDirty();
     return true;
   }
+#else
+  if (strncmp(command, "get radio.rxps", 14) == 0) {
+    strcpy(reply, "Error: unsupported");
+    return true;
+  }
+  if (strncmp(command, "set radio.rxps ", 15) == 0) {
+    strcpy(reply, "Error: unsupported");
+    return true;
+  }
+#endif
   if (strcmp(command, "get radio") == 0) {
     char freq[16], bw[16];
     strcpy(freq, StrHelper::ftoa(getFreq()));
@@ -119,6 +144,9 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
       setFreq(freq);
       setBandwidth(bw);
 
+#if defined(STM32_PLATFORM)
+      strcpy(reply, "OK - reboot to apply");
+#else
       // PowerSaving variant
       auto* rxps = getRxPowerSavingConfig();
       const bool timing_ok = !rxps || !rxps->enabled || normalizeRxPowerSavingConfig(
@@ -128,6 +156,7 @@ bool CommonRadioPrefs::handleCommand(const char* command, uint32_t sender_timest
         rxpsControl()->setRxPowerSavingConfigError(true);
       }
       strcpy(reply, timing_ok ? "OK - reboot to apply" : "OK - reboot to apply; RXPS continuous: invalid timing");
+#endif
     } else {
       strcpy(reply, "Error, invalid radio params");
     }
