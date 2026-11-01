@@ -86,7 +86,7 @@ jobs:
 
       # --prune: a full release needs ~50 GB of per-target build trees, which
       # this runner does not have; each target's tree goes as soon as its
-      # artifacts are collected
+      # artifacts are collected (or the target is given up on)
       - name: Build and upload
         shell: bash
         env:
@@ -98,10 +98,35 @@ jobs:
         run: |
           # a target that does not build is reported by the script and is
           # visible as a missing asset on the release, but it must not fail the
-          # job: a release ships what built, and a rerun with `filter` rebuilds
+          # job: a release ships what built, and the retry step below rebuilds
           # just the targets that failed.
           args=(--prune --jobs "$JOBS" --allow-build-failures)
           [[ -n $FILTER ]] && args+=(--filter "$FILTER")
+          [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
+          bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
+
+      # The build pool is as wide as the runner's cores, so a target can fail
+      # on memory/disk pressure or a registry hiccup and then build fine once
+      # it has the machine to itself. Rebuild only the first pass's failures,
+      # with two workers: a deterministic failure simply fails again and stays
+      # missing from the release.
+      - name: Retry failed targets
+        if: always() && !cancelled()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ inputs.release }}
+          NO_UPLOAD: ${{ inputs.no_upload }}
+        run: |
+          shopt -s nullglob
+          failed=("$HOME"/.cache/meshcore-release-build/*/.state/failed/*)
+          shopt -u nullglob
+          if (( ${#failed[@]} == 0 )); then
+            echo "no failed targets to retry"
+            exit 0
+          fi
+          echo "retrying ${#failed[@]} failed target(s) with 2 workers"
+          args=(--prune --jobs 2 --allow-build-failures --retry-failed)
           [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
           bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
 

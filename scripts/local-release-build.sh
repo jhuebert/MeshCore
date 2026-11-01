@@ -15,21 +15,26 @@
 #     --targets LIST      comma/space/newline-separated target list
 #                         (default: every repeater target, observers included)
 #     --filter REGEX      build only targets matching REGEX (subset of default)
+#     --retry-failed      rebuild only the targets the previous run failed: a
+#                         second pass for failures a busy runner causes
+#                         (resource exhaustion, registry hiccups), once the
+#                         first pass has left the machine to itself
 #     --no-upload         build and collect artifacts only
 #     --no-warmup         skip the serial first-build-per-platform phase (faster
 #                         start, but concurrent first-time toolchain installs
 #                         into the PlatformIO home can race)
 #     --prune             delete a target's .pio/build and .pio/libdeps dirs as
-#                         soon as its artifacts are collected: a full release
-#                         needs ~50 GB of per-target trees otherwise, which no
-#                         hosted runner has (reruns stop being incremental)
+#                         soon as its artifacts are collected, and as soon as a
+#                         failed target is given up on: a full release needs
+#                         ~50 GB of per-target trees otherwise, which no hosted
+#                         runner has (reruns stop being incremental)
 #     --build-dir DIR     persistent work dir
 #                         (default: ~/.cache/meshcore-release-build/<tag>)
 #     --allow-build-failures
 #                         report targets that failed to build but exit 0: the
 #                         release keeps the targets that did build (a rerun with
-#                         --filter rebuilds the rest). An incomplete run or a
-#                         failed upload still exits non-zero.
+#                         --filter or --retry-failed rebuilds the rest). An
+#                         incomplete run or a failed upload still exits non-zero.
 #     --dry-run           resolve the release, list targets, exit
 #     -h, --help          this help
 #
@@ -42,8 +47,10 @@
 #      included, so every release ships the full set).
 #   4. Builds them N at a time, mirroring build.sh's per-target logic (it cannot
 #      be called directly in parallel: it wipes out/ on every invocation).
-#      A target that fails on a transient registry/toolchain download is
-#      retried automatically; a compile or link error fails at once.
+#      A target that fails on a transient registry, toolchain or host-resource
+#      error is retried automatically; a compile or link error fails at once.
+#      The tail of a failed target's log is printed, so the job log keeps the
+#      reason after the runner is gone.
 #   5. Uploads each target's artifacts as soon as it finishes (a small capped
 #      pool of gh release upload --clobber runs beside the build pool).
 #
@@ -70,6 +77,18 @@ set -euo pipefail
 
 die() { echo "local-release-build: $*" >&2; exit 1; }
 info() { echo "local-release-build: $*"; }
+
+# Hosted runners pair a four-core CPU with a small disk, and a full release
+# plus the restored PlatformIO cache sits close to both limits. Log the
+# headroom at the start and end so a resource-driven failure can be told from a
+# compile error instead of reading like a random target failure.
+resource_report() {
+  df -Pk "$build_dir" 2>/dev/null \
+    | awk 'NR == 2 { printf "local-release-build: disk: %.1f GB free\n", $4 / 1048576 }'
+  if command -v free >/dev/null 2>&1; then
+    free -h 2>/dev/null | awk '/^Mem:/ { print "local-release-build: memory: " $7 " available of " $2 }'
+  fi
+}
 
 # Ctrl-C must take the whole tree down: the build workers and the uploader run
 # as asynchronous commands, which bash makes ignore SIGINT when job control is
@@ -267,6 +286,7 @@ WARMUP=1
 PRUNE=0
 DRY_RUN=0
 ALLOW_BUILD_FAILURES=0
+RETRY_FAILED=0
 BUILD_ATTEMPTS=3   # total tries for a target whose failure looks transient
 TARGETS_INPUT=""
 FILTER_ARG=""
@@ -281,6 +301,7 @@ while [[ $# -gt 0 ]]; do
     --prune) PRUNE=1; shift;;
     --targets) TARGETS_INPUT=$2; shift 2;;
     --filter) FILTER_ARG=$2; shift 2;;
+    --retry-failed) RETRY_FAILED=1; shift;;
     --build-dir) BUILD_DIR_BASE=$2; shift 2;;
     --allow-build-failures) ALLOW_BUILD_FAILURES=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
@@ -290,6 +311,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n $RELEASE_ARG ]] || { usage; exit 1; }
+if [[ $RETRY_FAILED == 1 && (-n $TARGETS_INPUT || -n $FILTER_ARG) ]]; then
+  die "--retry-failed selects the previous run's failures; do not combine it with --targets/--filter"
+fi
 command -v gh >/dev/null || die "gh is required"
 command -v git >/dev/null || die "git is required"
 ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))) \
@@ -363,14 +387,28 @@ if [[ ! -e "$build_dir/.git" ]]; then
 fi
 
 state_dir="$build_dir/.state"
+# --retry-failed rebuilds the previous pass's failures, so read that list before
+# the run state is reset below (the first pass has already written it)
+retry_targets=()
+if [[ $RETRY_FAILED == 1 ]]; then
+  [[ -d $state_dir/failed ]] \
+    || die "--retry-failed: no previous run state under $build_dir"
+  mapfile -t retry_targets < <(cd "$state_dir/failed" && ls -1 | LC_ALL=C sort)
+  ((${#retry_targets[@]} > 0)) \
+    || die "--retry-failed: the previous run had no failed targets"
+fi
 # fresh run state every time (builds/upload markers must not leak between runs);
-# the worktree itself is kept — that is where the .pio build cache lives
-rm -rf "$state_dir"
+# the worktree itself is kept — that is where the .pio build cache lives. A
+# dry run reads the previous state and must leave it intact for the real pass.
+if [[ $DRY_RUN != 1 ]]; then
+  rm -rf "$state_dir"
+fi
 mkdir -p "$state_dir"/{logs,files,done,uploaded,upfail,uploading,failed}
 # out/ is never wiped between runs: uploads are driven by the explicit
 # per-target file list, and keeping old artifacts means a failed rerun does
 # not destroy the previous run's successful builds
 mkdir -p "$build_dir/out"
+resource_report
 
 # -------------------------------------------------------- build tool ----
 # dedicated venv: PlatformIO is isolated from system packages; the toolchains
@@ -394,7 +432,10 @@ run_tool() {
 command -v python3 >/dev/null || die "python3 is required"
 
 # ---------------------------------------------------------- targets ----
-if [[ -n $TARGETS_INPUT ]]; then
+if ((${#retry_targets[@]} > 0)); then
+  info "retrying ${#retry_targets[@]} target(s) that failed in the previous run"
+  targets=("${retry_targets[@]}")
+elif [[ -n $TARGETS_INPUT ]]; then
   mapfile -t targets < <(tr ' ,\n' '\n' <<<"$TARGETS_INPUT" | sed '/^$/d')
 else
   info "listing repeater targets (observers included) in the release tree"
@@ -440,8 +481,9 @@ for line in "${platform_lines[@]}"; do
   fi
 done
 
-# only retry failures that look like a download/network problem: a compiler or
-# linker error will not match, and must keep failing on the first attempt
+# only retry failures that can clear on their own: registry/network problems
+# and host-resource exhaustion (four builds share the runner). A genuine compile
+# or linker error will not match, and keeps failing on the first attempt.
 transient_build_error() {  # transient_build_error <log>
   grep -qE \
     -e 'HTTPClientError' \
@@ -453,6 +495,14 @@ transient_build_error() {  # transient_build_error <log>
     -e 'SSL certificate problem' \
     -e 'unable to access' \
     -e 'The remote end hung up' \
+    -e 'No space left on device' \
+    -e 'out of memory' \
+    -e 'virtual memory exhausted' \
+    -e 'Cannot allocate memory' \
+    -e 'internal compiler error' \
+    -e 'ld terminated with signal' \
+    -e 'Killed signal' \
+    -e 'collect2: fatal error' \
     "$1"
 }
 
@@ -473,6 +523,15 @@ run_one() {  # run_one <target> <platform> — build, record artifacts, queue up
     if ((attempt >= BUILD_ATTEMPTS)) || ! transient_build_error "$log"; then
       : >"$state_dir/failed/$t"
       info "FAILED: $t (log: $log)"
+      # the runner (and its per-target log) is gone with the job; keep the
+      # reason in the job log for whoever triages the failure
+      info "last 20 log lines from $t:"
+      tail -n 20 "$log" 2>/dev/null | sed 's/^/  | /'
+      # a failed target's tree is the bulk of a run's disk use; with --prune
+      # only the in-flight targets' trees are kept
+      if [[ $PRUNE == 1 ]]; then
+        rm -rf "$build_dir/.pio/build/$t" "$build_dir/.pio/libdeps/$t"
+      fi
       return
     fi
     attempt=$((attempt + 1))
@@ -567,6 +626,7 @@ n_upfail=$(ls "$state_dir/upfail" 2>/dev/null | wc -l)
 n_fail=$(ls "$state_dir/failed" 2>/dev/null | wc -l)
 mins=$(( (SECONDS - start) / 60 ))
 info "built $n_ok/$total in ${mins}m; artifacts: $build_dir/out"
+resource_report
 if [[ $UPLOAD == 1 ]]; then
   info "uploaded $n_up to $tag ($n_upfail upload failures)"
   n_assets=$(gh release view "$tag" --repo "$release_repo" --json assets --jq '.assets | length')

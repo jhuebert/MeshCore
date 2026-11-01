@@ -185,7 +185,11 @@ only; the firmware assets are built locally with
 targets, so they ship in the same release — no separate observer channel) and
 uploaded to the release with `gh`
 (CI no longer builds firmware — the wide runner fan-out got Actions
-shut down). `sync-upstream.yml` merges upstream into the chosen channel branch
+shut down). The build job prints the tail of a failed target's log, prunes a
+failed target's build tree, and retries the failed set once with two workers
+(`--retry-failed`) after the main pass, so runner-resource flakes do not leave
+assets missing; a deterministic failure simply fails again.
+`sync-upstream.yml` merges upstream into the chosen channel branch
 and `promote-stable.yml` cherry-picks the filter commits from `repeater-filter`
 onto `repeater-filter-stable`; both are manual-dispatch only (never on a
 schedule) and neither cuts a release — use Filter Release for that. A conflict
