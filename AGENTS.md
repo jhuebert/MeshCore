@@ -198,6 +198,14 @@ quality gate (the native suites plus the build-tooling tests in
 `scripts/tests/`) before it publishes. Upstream's own docs live in `docs/`
 (MeshCore protocol/CLI generally) — not fork-filter documentation.
 
+Some repeater targets fail on the upstream tree too, and are deliberately left
+failing: `Heltec_ct62_repeater_bridge_espnow`,
+`Tenstar_C3_sx1262_repeater_bridge_espnow` and
+`Tenstar_C3_sx1268_repeater_bridge_espnow` (all absent from
+`filter-v1.18.0-r1`; `ESPNowBridge::recv_cb`'s `int32_t` parameter does not
+match `esp_now_recv_cb_t` on RISC-V). They are upstream's to fix — do not patch
+them as part of a fork fix; the release simply ships without those assets.
+
 ## Branch model
 
 - `repeater-filter` — dev release channel; the integration branch for all
