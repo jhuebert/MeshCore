@@ -14,8 +14,8 @@
 // /meshclock. The feature shares no state with AdvertRateLimiter or the filter,
 // so it can be deleted cleanly if upstream ever adds its own clock feature.
 //
-// CLI: "clock mesh on|off" and a bare "clock mesh" status, handled by
-// meshClockCLI() (see MeshClockSync.cpp).
+// CLI: "clock mesh on|off" and a bare "clock mesh" status (with the node's
+// current UTC time), handled by meshClockCLI() (see MeshClockSync.cpp).
 
 #ifndef _MESH_CLOCK_SYNC_H
 #define _MESH_CLOCK_SYNC_H
@@ -107,7 +107,10 @@ private:
 };
 
 // CLI command handler: invoke with the command after "clock mesh" (prefix
-// removed). Replies must fit the 160-byte CLI reply buffer.
-void meshClockCLI(MeshClockSync& clock, const char* command, char* reply);
+// removed). `now` is the node's current time, preformatted as an ISO 8601 UTC
+// timestamp ("YYYY-MM-DDTHH:MM:SSZ"); the device layer supplies it so this
+// unit stays free of RTClib and host-testable. Replies must fit the fork's
+// bounded CLI reply buffer.
+void meshClockCLI(MeshClockSync& clock, const char* now, const char* command, char* reply);
 
 #endif // _MESH_CLOCK_SYNC_H

@@ -216,33 +216,36 @@ void MeshClockSync::load(FILESYSTEM* fs) {
 
 #define MESHCLOCK_USAGE "Err - clock mesh takes on|off"
 
-static void clockStatus(MeshClockSync& c, char* reply) {
-  if (!c.isEnabled()) {
-    strcpy(reply, "off");
-    return;
-  }
+static void clockStatus(MeshClockSync& c, const char* now, char* reply) {
   CliBuf buf(reply, CLI_REPLY_MAX);
-  buf.add("on samples=%d/%d last=", c.getSampleCount(), MESHCLOCK_SLOTS);
-  switch (c.getLastResult()) {
-    case MeshClockSync::SET_CLOCK:
-      buf.add("set(%+lds)", (long)c.getLastDeltaSecs());
-      break;
-    case MeshClockSync::IN_SYNC: {
-      long d = (long)c.getLastDeltaSecs();
-      if (d < 0) d = -d;
-      buf.add("in-sync(%lds)", d);
-      break;
+  if (c.isEnabled()) {
+    buf.add("on samples=%d/%d last=", c.getSampleCount(), MESHCLOCK_SLOTS);
+    switch (c.getLastResult()) {
+      case MeshClockSync::SET_CLOCK:
+        buf.add("set(%+lds)", (long)c.getLastDeltaSecs());
+        break;
+      case MeshClockSync::IN_SYNC: {
+        long d = (long)c.getLastDeltaSecs();
+        if (d < 0) d = -d;
+        buf.add("in-sync(%lds)", d);
+        break;
+      }
+      case MeshClockSync::NO_CONSENSUS:
+        buf.add("no-consensus");
+        break;
+      default:
+        buf.add("idle");
+        break;
     }
-    case MeshClockSync::NO_CONSENSUS:
-      buf.add("no-consensus");
-      break;
-    default:
-      buf.add("idle");
-      break;
+  } else {
+    buf.addStr("off");
   }
+  // One append point: the time shows in both states and cannot drift between
+  // them.
+  buf.add(" now=%s", now);
 }
 
-void meshClockCLI(MeshClockSync& clock, const char* command, char* reply) {
+void meshClockCLI(MeshClockSync& clock, const char* now, const char* command, char* reply) {
   // An oversized command is refused whole rather than acted on as a prefix, and
   // unbalanced quotes are an error rather than a silent misparse.
   char scratch[MAX_PACKET_PAYLOAD + 1];
@@ -252,7 +255,7 @@ void meshClockCLI(MeshClockSync& clock, const char* command, char* reply) {
 
   if (cmd == NULL) {
     if (!cliNoExtra(p, reply, MESHCLOCK_USAGE)) return;
-    clockStatus(clock, reply);
+    clockStatus(clock, now, reply);
   } else if (strcmp(cmd, "on") == 0) {
     if (!cliNoExtra(p, reply, MESHCLOCK_USAGE)) return;
     clock.setEnabled(true);
