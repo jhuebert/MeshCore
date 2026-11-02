@@ -61,7 +61,7 @@ collected over hours and its samples still cluster within seconds.
 
 | Command | Effect |
 |---|---|
-| `clock mesh` | Status: `off`, or `on samples=<n>/<cap> last=<result>` |
+| `clock mesh` | Status: `off now=<iso-time>`, or `on samples=<n>/<cap> last=<result> now=<iso-time>` |
 | `clock mesh on` | Enable |
 | `clock mesh off` | Disable |
 
@@ -82,21 +82,26 @@ The status `last=` field is one of:
 
 `last=` is status only — it is **not** persisted, so a reboot reports `idle`.
 
+`now=` is the node's current RTC time as an ISO 8601 UTC timestamp
+(`YYYY-MM-DDTHH:MM:SSZ`), e.g. `2026-11-01T14:05:00Z`; the trailing `Z` means
+UTC. It is shown in both states, so you can see what the node currently believes
+even while sync is off.
+
 ### Examples
 
 ```
 > clock mesh
-off
+off now=2026-11-01T14:02:00Z
 
 > clock mesh on
 OK - mesh clock sync on
 
 > clock mesh
-on samples=12/33 last=idle
+on samples=12/33 last=idle now=2026-11-01T14:05:00Z
 
 # later, once a batch of 33 distinct sources has agreed
 > clock mesh
-on samples=0/33 last=set(+31536000s)
+on samples=0/33 last=set(+31536000s) now=2027-11-01T14:05:00Z
 ```
 
 ## Persistence

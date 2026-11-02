@@ -1354,6 +1354,14 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
+// ISO 8601 UTC ("2026-11-01T14:05:00Z"), the form `clock mesh` reports the
+// node time in; one helper keeps that rendering in a single place.
+static void formatIsoTime(uint32_t epoch, char* out, size_t cap) {
+  DateTime dt(epoch);
+  snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02dZ", dt.year(), dt.month(), dt.day(),
+           dt.hour(), dt.minute(), dt.second());
+}
+
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
@@ -1460,9 +1468,11 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     fleetCLI(fleet, sub, reply);
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it
+    char now[32];
+    formatIsoTime(getRTCClock()->getCurrentTime(), now, sizeof(now));
     const char* sub = command + 10;
     while (*sub == ' ') sub++;
-    meshClockCLI(meshClock, sub, reply);
+    meshClockCLI(meshClock, now, sub, reply);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }

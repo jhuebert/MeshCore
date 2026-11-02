@@ -17,6 +17,10 @@
 static const uint32_t TRUE_NOW  = 1800000000UL;   // 2027-01-15 UTC
 static const uint32_t WRONG_NOW = 1700000000UL;   // 2023-11-14 UTC
 
+// the node time the CLI is handed, already formatted as an ISO 8601 UTC
+// timestamp ("YYYY-MM-DDTHH:MM:SSZ")
+static const char* NOW_TEXT = "2026-11-01T14:05:00Z";
+
 // ------------------------------------------------------------------ helpers
 
 // A distinct advert key per source id: the fingerprint samples pubkey bytes
@@ -342,24 +346,24 @@ TEST_F(ClockTest, ResetClearsBatchAndFlag) {
 TEST_F(ClockTest, CliSurface) {
   char reply[CLI_REPLY_MAX];
 
-  meshClockCLI(clock, "", reply);
-  EXPECT_STREQ(reply, "off");
+  meshClockCLI(clock, NOW_TEXT, "", reply);
+  EXPECT_STREQ(reply, "off now=2026-11-01T14:05:00Z");
 
-  meshClockCLI(clock, "on", reply);
+  meshClockCLI(clock, NOW_TEXT, "on", reply);
   EXPECT_STREQ(reply, "OK - mesh clock sync on");
   EXPECT_TRUE(clock.isEnabled());
 
-  meshClockCLI(clock, "", reply);
-  EXPECT_STREQ(reply, "on samples=0/33 last=idle");
+  meshClockCLI(clock, NOW_TEXT, "", reply);
+  EXPECT_STREQ(reply, "on samples=0/33 last=idle now=2026-11-01T14:05:00Z");
 
-  meshClockCLI(clock, "bogus", reply);
+  meshClockCLI(clock, NOW_TEXT, "bogus", reply);
   EXPECT_STREQ(reply, "Err - clock mesh takes on|off");
 
-  meshClockCLI(clock, "on extra", reply);
+  meshClockCLI(clock, NOW_TEXT, "on extra", reply);
   EXPECT_STREQ(reply, "Err - clock mesh takes on|off");
   EXPECT_TRUE(clock.isEnabled());   // a refused command changed nothing
 
-  meshClockCLI(clock, "off", reply);
+  meshClockCLI(clock, NOW_TEXT, "off", reply);
   EXPECT_STREQ(reply, "OK - mesh clock sync off");
   EXPECT_FALSE(clock.isEnabled());
 }
@@ -368,8 +372,8 @@ TEST_F(ClockTest, CliStatusShowsLastResult) {
   clock.setEnabled(true);
   for (int i = 0; i < MESHCLOCK_SLOTS; i++) feed(clock, i, TRUE_NOW, WRONG_NOW);
   char reply[CLI_REPLY_MAX];
-  meshClockCLI(clock, "", reply);
-  EXPECT_STREQ(reply, "on samples=0/33 last=set(+100000000s)");
+  meshClockCLI(clock, NOW_TEXT, "", reply);
+  EXPECT_STREQ(reply, "on samples=0/33 last=set(+100000000s) now=2026-11-01T14:05:00Z");
 }
 
 int main(int argc, char **argv) {
