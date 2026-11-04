@@ -69,9 +69,10 @@ jobs:
             // Filter commits are the ones on the source branch that are not
             // part of upstream dev. Fetch it fresh (without moving any branch)
             // so a stale fork mirror can never misclassify a merged upstream
-            // commit as a filter commit.
+            // commit as a filter commit. main is stable's upstream source (see
+            // sync-upstream.yml) and is only needed by the skip check below.
             run('remote', 'add', 'upstream', 'https://github.com/meshcore-dev/MeshCore.git');
-            run('fetch', 'upstream', 'dev');
+            run('fetch', 'upstream', 'dev', 'main');
 
             const source = process.env.STABLE_SOURCE || 'repeater-filter';
             const resolved = git('rev-parse', '--verify', `refs/remotes/origin/${source}`);
@@ -137,17 +138,30 @@ jobs:
             // delivered its content some other way. Prove it: every path the
             // source changed since its upstream merge base must match the
             // source revision here, so a skip that really lost a commit fails
-            // the promotion instead of publishing a partial one. (Paths that
-            // upstream also touched after the merge base rightly land here
-            // too: that is a conflict a human has to resolve.)
+            // the promotion instead of publishing a partial one.
+            //
+            // The two channels track different upstream branches (dev follows
+            // upstream dev, stable follows upstream main) and a promotion only
+            // carries filter commits, never upstream ones. So between upstream
+            // releases a path upstream changed in that gap differs here even
+            // though no fork commit was lost, and comparing it would fail every
+            // promotion run until main catches up with dev. Exclude those paths;
+            // the skipped commits' own paths are still covered.
             if (skipped.length > 0) {
               const base = run('merge-base', 'upstream/dev', sourceSha).trim();
-              const forkOwned = run('diff', '--name-only', base, sourceSha)
+              const stableBase = run('merge-base', 'upstream/main', stableBefore).trim();
+              const upstreamGap = new Set(run('diff', '--name-only', base, stableBase)
+                .split('\n').filter(Boolean));
+              const changed = run('diff', '--name-only', base, sourceSha)
                 .split('\n').filter(Boolean);
-              const missing = forkOwned.length > 0
-                ? run('diff', '--name-only', sourceSha, 'HEAD', '--', ...forkOwned)
-                  .split('\n').filter(Boolean)
-                : [`${source} changed nothing since its merge base`];
+              const forkOwned = changed.filter((f) => !upstreamGap.has(f));
+              let missing = [];
+              if (changed.length === 0) {
+                missing = [`${source} changed nothing since its merge base`];
+              } else if (forkOwned.length > 0) {
+                missing = run('diff', '--name-only', sourceSha, 'HEAD', '--', ...forkOwned)
+                  .split('\n').filter(Boolean);
+              }
               if (missing.length > 0) {
                 const skipLines = skipped.map((s) =>
                   `[skipped] ${s} ${run('log', '-1', '--format=%s', s).trim()}`);
@@ -158,6 +172,10 @@ jobs:
                 // stable is still intact on the remote; nothing was pushed.
                 // The failure is raised by the issue step below.
                 return;
+              }
+              if (upstreamGap.size > 0) {
+                core.info(`ignored ${upstreamGap.size} path(s) that upstream dev and main differ on; `
+                  + 'the channels carry different upstream content between releases');
               }
               core.info(`skipped ${skipped.length} already-applied commit(s); tree matches the source`);
             }

@@ -197,7 +197,9 @@ in either one opens (or updates) an issue through
 `.github/actions/open-conflict-issue/` and fails the run; the promotion also
 skips a pick that conflicts when the source branch later rewrote that commit
 (squash) and only publishes if the branch then matches the source for every
-file the source changed since its upstream merge base. The promotion runs a
+file the source changed since its upstream merge base — except paths where the
+two channels' upstream branches (dev's `dev`, stable's `main`) differ, which
+are upstream drift rather than a lost filter commit. The promotion runs a
 quality gate (the native suites plus the build-tooling tests in
 `scripts/tests/`) before it publishes. Upstream's own docs live in `docs/`
 (MeshCore protocol/CLI generally) — not fork-filter documentation.
