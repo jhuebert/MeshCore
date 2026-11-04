@@ -219,6 +219,10 @@ Group-text messages look like `SenderName: message text` after decryption.
   `DF)EQ4X:: hello` has the sender `DF)EQ4X:`, and a colon-space in the text
   (`Alice: note: hi`) does not split it. A message with no `: ` at all
   (`Alice:hi`) still splits on the bare colon.
+- A name that itself contains `: ` cannot be recovered — the first `: ` is
+  always the boundary, exactly as the official client splits it. So
+  `some: name: test: this is a test: hello` has the sender `some` and the text
+  `name: test: this is a test: hello`; use `text=` as well to target the rest.
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
   field unless you anchor it. The three most common shapes, at a glance:
 

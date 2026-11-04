@@ -945,6 +945,28 @@ TEST_F(FilterTest, TextColonSpaceDoesNotSplitSender) {
             FILTER_ACT_DROP);
 }
 
+// A name that itself contains ": " is inherently ambiguous. The official
+// client splits on the first ": " too, so "some: name: test: ..." has the
+// sender "some" — pin that so it stays deliberate rather than drifting.
+TEST_F(FilterTest, SenderNameWithColonSpaceSplitsAtFirstDelimiter) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  expectOk(filter, "add sender=^some$ text=\"^name: test: this is\"");
+  auto payload = makeGroupText("some: name: test", "this is a test: hello");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
+                                payload.len, nullptr),
+            FILTER_ACT_DROP);
+
+  // the full intended name is not recoverable, so an anchored pattern for it
+  // cannot match
+  filter.clearRules();
+  expectOk(filter, "add sender=\"^some: name: test$\"");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
+                                payload.len, nullptr),
+            FILTER_ACT_ALLOW);
+}
+
 TEST_F(FilterTest, SenderRegexIsUnanchoredByDefault) {
   expectOk(filter, "add sender=Spam");   // substring, case-sensitive
   auto payload = makeGroupText("theSpamBot", "hi");
