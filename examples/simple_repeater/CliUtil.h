@@ -326,9 +326,19 @@ inline void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t
   if (term != NULL) n = (size_t)(term - p);
   else n = len - 5;
 
+  // The on-air form is "<sender>: <text>". A sender name may itself contain a
+  // colon (clients do not all enforce the node-name rule), so split on the
+  // first ": " — the separator a sender actually writes — and fall back to a
+  // bare ':' only when there is no ": " at all ("Alice:hi"), keeping the
+  // historical split for clients that omit the space.
   const uint8_t* colon = NULL;
-  for (size_t i = 0; i < n; i++) {
-    if (p[i] == ':') { colon = &p[i]; break; }
+  for (size_t i = 0; i + 1 < n; i++) {
+    if (p[i] == ':' && p[i + 1] == ' ') { colon = &p[i]; break; }
+  }
+  if (colon == NULL) {
+    for (size_t i = 0; i < n; i++) {
+      if (p[i] == ':') { colon = &p[i]; break; }
+    }
   }
 
   if (colon == NULL) {   // no sender extractable; whole remainder is text

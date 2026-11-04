@@ -905,6 +905,46 @@ TEST_F(FilterTest, SenderAndTextExtractedFromPayload) {
             FILTER_ACT_DROP);
 }
 
+// A sender name may contain a colon (clients do not all enforce the node-name
+// rule that forbids it), so the separator is the first ": " rather than the
+// first ':' — otherwise the name is cut short and an exact-length pattern
+// misses it.
+TEST_F(FilterTest, SenderNameMayContainColon) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  expectOk(filter, "add sender=^........$ text=^hi$");
+  const char* names[] = { "DF)EQ4X:", "XNC:Q-C/", "XE:P0AMN" };
+  for (const char* name : names) {
+    auto payload = makeGroupText(name, "hi");
+    EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
+                                  payload.len, nullptr),
+              FILTER_ACT_DROP) << name;
+  }
+}
+
+// The separator is the first ": ", so a colon-space inside the message text is
+// not mistaken for the sender boundary.
+TEST_F(FilterTest, TextColonSpaceDoesNotSplitSender) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  expectOk(filter, "add sender=^Alice$ text=\"^note: hi$\"");
+  auto payload = makeGroupText("Alice", "note: hi");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, payload.data,
+                                payload.len, nullptr),
+            FILTER_ACT_DROP);
+
+  // a sender without a colon still falls back to the bare ':' separator
+  filter.clearRules();
+  expectOk(filter, "add sender=^Alice$ text=^hi$");
+  uint8_t raw[MAX_PACKET_PAYLOAD] = {0};
+  raw[4] = TXT_TYPE_PLAIN;
+  memcpy(raw + 5, "Alice:hi", 8);
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, raw, sizeof(raw), nullptr),
+            FILTER_ACT_DROP);
+}
+
 TEST_F(FilterTest, SenderRegexIsUnanchoredByDefault) {
   expectOk(filter, "add sender=Spam");   // substring, case-sensitive
   auto payload = makeGroupText("theSpamBot", "hi");

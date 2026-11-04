@@ -214,6 +214,11 @@ Group-text messages look like `SenderName: message text` after decryption.
   of any length can be matched, and a pattern anchored with `$` sees the real end
   of the field rather than a shortened copy. A message with no `:` has no sender
   field at all — `sender=` cannot match it, not even with `^$`.
+- A sender name may contain a colon, so the split is on the first **`: `**
+  (colon-space) — the separator senders write — rather than the first `:`.
+  `DF)EQ4X:: hello` has the sender `DF)EQ4X:`, and a colon-space in the text
+  (`Alice: note: hi`) does not split it. A message with no `: ` at all
+  (`Alice:hi`) still splits on the bare colon.
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
   field unless you anchor it. The three most common shapes, at a glance:
 
@@ -616,7 +621,8 @@ matches any region condition.
 ### `sender`
 
 Match the name without its colon. For `SpamBot: BEACON 123`, the sender is
-`SpamBot`.
+`SpamBot`. The split is on the first `: `, so a name that contains a colon keeps
+it (`DF)EQ4X:: hello` has the sender `DF)EQ4X:`).
 
 | Command | What matches |
 |---|---|
