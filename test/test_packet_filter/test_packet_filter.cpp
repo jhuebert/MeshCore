@@ -967,6 +967,35 @@ TEST_F(FilterTest, SenderNameWithColonSpaceSplitsAtFirstDelimiter) {
             FILTER_ACT_ALLOW);
 }
 
+// `.` counts UTF-8 bytes, not displayed characters (see FILTER.md's Unicode
+// note). An eight-character name with two two-byte '£' is ten bytes, so the
+// eight-dot pattern cannot match it; the same pattern does match an eight-byte
+// ASCII name.
+TEST_F(FilterTest, SenderPatternDotCountsUtf8Bytes) {
+  auto pkt = makePacket(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 20);
+  auto chan = channelFromStore(filter, 0);
+
+  expectOk(filter, "add chan=Public sender=^........$");
+  auto ascii = makeGroupText("58D6>AF5", "hi");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, ascii.data,
+                                ascii.len, nullptr),
+            FILTER_ACT_DROP);
+
+  // "P/M£<$£H" is 8 characters but 10 UTF-8 bytes
+  filter.clearRules();
+  expectOk(filter, "add sender=^........$");
+  auto utf8 = makeGroupText("P/M\xC2\xA3<$\xC2\xA3H", "hi");
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, utf8.data,
+                                utf8.len, nullptr),
+            FILTER_ACT_ALLOW);
+
+  filter.clearRules();
+  expectOk(filter, "add sender=^..........$");   // ten bytes
+  EXPECT_EQ(filter.checkContent(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, utf8.data,
+                                utf8.len, nullptr),
+            FILTER_ACT_DROP);
+}
+
 TEST_F(FilterTest, SenderRegexIsUnanchoredByDefault) {
   expectOk(filter, "add sender=Spam");   // substring, case-sensitive
   auto payload = makeGroupText("theSpamBot", "hi");

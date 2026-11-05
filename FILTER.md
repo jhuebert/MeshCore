@@ -223,6 +223,10 @@ Group-text messages look like `SenderName: message text` after decryption.
   always the boundary, exactly as the official client splits it. So
   `some: name: test: this is a test: hello` has the sender `some` and the text
   `name: test: this is a test: hello`; use `text=` as well to target the rest.
+- `.` counts **bytes**, not displayed characters. A name with accented letters
+  or symbols is longer than it looks: `P/M£<$£H` is 8 characters but 10 bytes,
+  so `sender=^........$` does not match it (use the literal name, or count the
+  real bytes — see [Unicode and emoji notes](#unicode-and-emoji-notes)).
 - Matching is **case-sensitive**, and a pattern matches *anywhere* in the
   field unless you anchor it. The three most common shapes, at a glance:
 
@@ -1124,8 +1128,10 @@ always confirm what the repeater actually stored with `filter get <idx>`.
 ### Unicode and emoji notes
 
 - Literal text with emoji or accented letters works: `sender=^John😀$` is fine.
-- Internally each emoji counts as several characters, so `.` won't match a
-  whole emoji and emoji length eats into the [pattern-length limits](#limits-and-good-to-knows).
+- Internally each emoji or accented character counts as several **bytes**, so
+  `.` won't match a whole one and that byte length eats into the
+  [pattern-length limits](#limits-and-good-to-knows). For example `£` is two
+  bytes, so `P/M£<$£H` is ten bytes even though it looks like eight characters.
   Exact literal matches are safest for non-ASCII names.
 - There is no case-insensitive option. Use explicit choices like `[Bb]` — and
   note that accented letters can't be handled that way; match them literally.
@@ -1149,6 +1155,8 @@ filter stats
 | `filter list` stops at a `...` line, or a rule ends with `..` | The listing did not fit one reply: run `filter list <last-index + 1>` (the number after the last line shown) for the rest. A rule ending in `..` was too large for its line — `filter get <idx>` shows more of it. A reply the fleet cut to fit one packet ends with `...` too — see [FLEET.md](./FLEET.md) |
 | Rule gets no hits | Is the filter on (`filter on`)? Is the rule enabled? Did an earlier rule match first? |
 | Sender/text never matches | Can the repeater decrypt the channel? Is it group text? Are you matching the right field (sender without colon, text without name)? |
+| A `sender=^........$`-style length rule misses a name | `.` counts UTF-8 bytes, so accented letters and symbols count as several — see [Unicode and emoji notes](#unicode-and-emoji-notes) |
+| Message still arrives despite a matching rule | This repeater only controls its own relaying: another repeater or a direct path can still deliver it. On this node check `filter get <idx>` (hits), `filter stats`, `filter status`, and `battery` (suspension skips content rules) |
 | Matches too broadly | Add `^`/`$` anchors; escape literal dots; remember `sender=Bot` matches `MyBot2` |
 | Combined rule matches nothing | Every condition must be true — test each one alone; check `route=`/case |
 | Pattern from an online tester misbehaves | Remove `/slashes/`, flags, groups, `{counts}`, `\b` — see the table above |
