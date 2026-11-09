@@ -60,8 +60,9 @@ static uint32_t toUs(float v) {
   return (uint32_t)(v + 0.5f);
 }
 
-// capture/bound from RADIO2.md §9.3, with the preamble length mirroring
-// RadioLibWrapper::preambleLengthForSF().
+// Visit bounds: a capture window is long enough to latch the sender's preamble,
+// and the opposite visit is short enough that the preamble survives to the next
+// visit. The preamble length mirrors RadioLibWrapper::preambleLengthForSF().
 static void profileTiming(const Radio2Profile& p, float capture_symbols,
                           uint32_t* capture_us, uint32_t* bound_us) {
   uint32_t preamble_symbols = p.sf <= 8 ? 32 : 16;

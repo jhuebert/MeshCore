@@ -562,9 +562,9 @@ bool RadioLibWrapper::isReceiveInProgress() {
 
 bool RadioLibWrapper::retune(float freq, float bw, uint8_t sf, uint8_t cr,
                              bool abort_receive) {
-  // RADIO2.md: retune() is never valid while RXPS is armed. Radio2 refuses to
-  // start with RXPS on; treat a broken invariant as a busy radio, not a
-  // silently re-armed duty cycle.
+  // RXPS and radio2 are mutually exclusive. Radio2 refuses to start with RXPS
+  // on; treat a broken invariant as a busy radio, not a silently re-armed duty
+  // cycle.
   if (_rx_ps_enabled) return false;
   if (hasCompletedReceive()) return false;
   if ((state & ~STATE_INT_READY) == STATE_TX_WAIT) return false;
