@@ -40,6 +40,7 @@
 #include "BatteryGate.h"
 #include "FleetManager.h"
 #include "MeshClockSync.h"
+#include "Radio2.h"
 #ifdef WITH_MQTT_OBSERVER
 #include "../mqtt_observer/MQTTObserver.h"
 #endif
@@ -85,6 +86,23 @@ struct NeighbourInfo {
 
 #define PACKET_LOG_FILE  "/packet_log"
 
+// Thin adapter over the board's radio driver: keeps the radio2 scheduler free
+// of any variant/radio-family knowledge.
+class Radio2DeviceImpl : public Radio2Device {
+public:
+  bool retune(float freq, float bw, uint8_t sf, uint8_t cr,
+              bool abort_receive = false) override {
+    return radio_driver.retune(freq, bw, sf, cr, abort_receive);
+  }
+  bool hasCompletedReceive() const override { return radio_driver.hasCompletedReceive(); }
+  bool isReceiveInProgress() override { return radio_driver.isReceiveInProgress(); }
+  bool isInRecvMode() const override { return radio_driver.isInRecvMode(); }
+  int getNoiseFloor() const override { return radio_driver.getNoiseFloor(); }
+  float captureCostSymbols() const override {
+    return radio_driver.rxPowerSavingCaptureCostSymbols();
+  }
+};
+
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FILESYSTEM* _fs;
   uint32_t last_millis;
@@ -107,6 +125,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   BatteryGate battGate;
   FleetManager fleet;
   MeshClockSync meshClock;
+  Radio2DeviceImpl radio2_device;
+  Radio2 radio2;
+  bool rx_forward_allowed = true;
 #ifdef WITH_MQTT_OBSERVER
   MQTTObserver mqttObserver;
   // supplies the observer's status-message stats from live node state
@@ -142,6 +163,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 
   File openAppend(const char* fname);
   bool isLooped(const mesh::Packet* packet, const uint8_t max_counters[]);
+  void radio2QueueDuplicate(mesh::Packet* pkt, mesh::DispatcherAction action, uint8_t origin);
 
 protected:
   float getAirtimeBudgetFactor() const override {
@@ -275,6 +297,9 @@ public:
 
   // To check if there is pending work
   bool hasPendingWork() const;
+
+  // Timed sleep deadline for powersaving (0 = no radio2 scan deadline).
+  uint32_t getSleepMs();
 
   bool setRxBoostedGain(bool enable) override;
 

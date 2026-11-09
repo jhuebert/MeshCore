@@ -538,3 +538,32 @@ RxPowerSavingStatus RadioLibWrapper::getRxPowerSavingStatus() const {
   status.effective_sleep_us = _rx_ps_eff_sleep_us;
   return status;
 }
+
+// ---------------------------------------------------------------------------
+// Fork: radio profile switching (radio2). Additive to upstream's wrapper.
+// ---------------------------------------------------------------------------
+bool RadioLibWrapper::hasCompletedReceive() const {
+  return (state & STATE_INT_READY) != 0;
+}
+
+bool RadioLibWrapper::isReceiveInProgress() {
+  return isReceivingPacket();
+}
+
+bool RadioLibWrapper::retune(float freq, float bw, uint8_t sf, uint8_t cr,
+                             bool abort_receive) {
+  // RADIO2.md: retune() is never valid while RXPS is armed. Radio2 refuses to
+  // start with RXPS on; treat a broken invariant as a busy radio, not a
+  // silently re-armed duty cycle.
+  if (_rx_ps_enabled) return false;
+  if (hasCompletedReceive()) return false;
+  if ((state & ~STATE_INT_READY) == STATE_TX_WAIT) return false;
+  if (!abort_receive && isReceiveInProgress()) return false;
+
+  idle();                 // stops RXPS if armed, standby, state = IDLE
+  setParams(freq, bw, sf, cr);
+  int16_t err = startReceiveMode();
+  if (err != RADIOLIB_ERR_NONE) return false;
+  state = STATE_RX;
+  return true;
+}

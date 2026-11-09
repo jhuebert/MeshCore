@@ -273,8 +273,13 @@ void Dispatcher::processRecvPacket(Packet* pkt) {
 }
 
 void Dispatcher::checkSend() {
-  if (_mgr->getOutboundCount(_ms->getMillis()) == 0) return;
-  
+  const uint32_t now = _ms->getMillis();
+  if (_mgr->getOutboundCount(now) == 0) return;
+
+  Packet* next = _mgr->peekNextOutbound(now);
+  if (!next) return;
+  if (!_radio->selectTxProfile(next->getTxProfile())) return;
+
   updateTxBudget();
   
   uint32_t est_airtime = _radio->getEstAirtimeFor(MAX_TRANS_UNIT);
@@ -304,7 +309,7 @@ void Dispatcher::checkSend() {
   }
   cad_busy_start = 0;  // reset busy state
 
-  outbound = _mgr->getNextOutbound(_ms->getMillis());
+  outbound = _mgr->getNextOutbound(now);
   if (outbound) {
     int len = 0;
     uint8_t raw[MAX_TRANS_UNIT];
@@ -360,6 +365,8 @@ Packet* Dispatcher::obtainNewPacket() {
   } else {
     pkt->payload_len = pkt->path_len = 0;
     pkt->_snr = 0;
+    pkt->setTxProfile(_default_tx_profile);
+    pkt->setRxProfile(RADIO_PROFILE_UNKNOWN);
   }
   return pkt;
 }

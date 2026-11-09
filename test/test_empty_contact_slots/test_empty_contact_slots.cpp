@@ -72,6 +72,7 @@ public:
   mesh::Packet* allocNew() override { return nullptr; }
   void free(mesh::Packet*) override {}
   void queueOutbound(mesh::Packet*, uint8_t, uint32_t) override {}
+  mesh::Packet* peekNextOutbound(uint32_t) override { return nullptr; }
   mesh::Packet* getNextOutbound(uint32_t) override { return nullptr; }
   int getOutboundCount(uint32_t) const override { return 0; }
   int getOutboundTotal() const override { return 0; }

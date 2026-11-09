@@ -4,6 +4,7 @@
 #include <RadioLib.h>
 // PowerSaving variant
 #include "RXPowerSaving.h"
+#include "RadioProfileControl.h"
 
 #ifdef USE_CC310_HW_CRYPTO
 #include <Adafruit_nRFCrypto.h>
@@ -42,6 +43,8 @@ protected:
   int16_t _rx_ps_last_error;
   uint32_t n_rx_ps_arm_failures;
   RxPowerSavingArmRetryState _rx_ps_arm_retry;
+
+  RadioProfileControl* _profile_control = nullptr;
 
   bool _nf_calib_active;
   unsigned long _nf_last_calib;
@@ -118,6 +121,25 @@ public:
 
     return isChannelActive();
   }
+
+  void setProfileControl(RadioProfileControl* control) { _profile_control = control; }
+
+  bool selectTxProfile(uint8_t profile) override {
+    return _profile_control ? _profile_control->selectTxProfile(profile) : true;
+  }
+
+  // True when a complete packet is waiting to be read by recvRaw().
+  // Defined in RadioLibWrappers.cpp: `state` is file-static.
+  bool hasCompletedReceive() const;
+
+  // True while a preamble/header/payload is being received.
+  bool isReceiveInProgress();
+
+  // Stop RX, apply a new preset, restart continuous RX. Returns false if a
+  // complete packet is pending, if a receive is in progress and
+  // `abort_receive` is false, or if the radio rejects the change.
+  bool retune(float freq, float bw, uint8_t sf, uint8_t cr,
+              bool abort_receive = false);
 
   virtual void setParams(float freq, float bw, uint8_t sf, uint8_t cr) = 0;
   uint32_t getRngSeed();

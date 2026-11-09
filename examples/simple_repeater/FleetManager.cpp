@@ -179,11 +179,12 @@ void FleetManager::onGroupData(const mesh::Packet* packet, uint8_t type,
   if (inFlight(meta.key)) { runner.noteDup(); return; }
 
   if (meta.scheduled) {
-    admitScheduled(text, meta, channel);
+    admitScheduled(text, meta, channel, packet->getRxProfile());
   } else {
     // mark-at-enqueue happens inside; refusals are counted there too. Nothing
-    // executes in the receive path — runScripts() drains later.
-    runner.enqueue(text, channel.secret, channel.hash[0]);
+    // executes in the receive path — runScripts() drains later. The origin
+    // profile rides along so the acknowledgement goes back the same way.
+    runner.enqueue(text, channel.secret, channel.hash[0], packet->getRxProfile());
   }
 }
 
@@ -195,7 +196,7 @@ bool FleetManager::inFlight(const char* key) const {
 }
 
 void FleetManager::admitScheduled(const char* text, const CliScriptMeta& meta,
-                                  const mesh::GroupChannel& chan) {
+                                  const mesh::GroupChannel& chan, uint8_t radio_profile) {
   // the runner stays clock-free: staleness and clock-floor refusals are
   // manager decisions, made with the node RTC
   // A key already seen is a duplicate whatever the clock says: the job ran (or
@@ -219,6 +220,7 @@ void FleetManager::admitScheduled(const char* text, const CliScriptMeta& meta,
   s->due_epoch = meta.due_epoch;
   memcpy(s->chan_secret, chan.secret, sizeof(s->chan_secret));
   s->chan_hash = chan.hash[0];
+  s->radio_profile = radio_profile;
   runner.markKeySeen(meta.key);
 }
 
@@ -233,6 +235,7 @@ void FleetManager::scheduleAckIfNeeded(const CliRunResult& res) {
   memcpy(r->summary, res.summary, FLEET_REPLY_SUMMARY_LEN);
   memcpy(r->chan_secret, res.chan_secret, sizeof(r->chan_secret));
   r->chan_hash = res.chan_hash;
+  r->radio_profile = res.radio_profile;
   // uniform-random jitter against reply storms, measured from when the script
   // finished; without an injected RNG the reply goes out immediately
   uint32_t jitter = jitter_fn ? jitter_fn(jitter_ctx, reply_window_ms) : 0;
@@ -262,7 +265,7 @@ void FleetManager::runScripts(CliExecFn fn, void* exec_ctx) {
       if ((int32_t)(now - sched[i].due_epoch) < 0) { i++; continue; }
       if (!runner.enqueueValidated(sched[i].text, sched[i].key, sched[i].ack,
                                    sched[i].body_off, sched[i].chan_secret,
-                                   sched[i].chan_hash)) {
+                                   sched[i].chan_hash, sched[i].radio_profile)) {
         break;   // run queue full: keep the script armed, retry next pass
       }
       memmove(&sched[i], &sched[i + 1], (sched_count - i - 1) * sizeof(sched[0]));
@@ -340,7 +343,7 @@ void FleetManager::serviceReplies() {
         continue;
       }
       bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, r.tx_ts, r.sender_name,
-                           body.c_str(), NULL);
+                           body.c_str(), r.radio_profile, NULL);
       if (!sent) {
         // packet pool refused the retry: it was not sent, so retain the slot and
         // try again after the same bounded backoff as an initial-send refusal
@@ -365,7 +368,7 @@ void FleetManager::serviceReplies() {
     uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
     uint8_t hash[MAX_HASH_SIZE];
     bool sent = send_fn(send_ctx, r.chan_secret, r.chan_hash, ts, r.sender_name,
-                         body.c_str(), hash);
+                         body.c_str(), r.radio_profile, hash);
     if (!sent) {
       // packet pool refused the send: no attempt used, try again shortly. The
       // attempts are capped: a reply that can never be sent must not hold its
@@ -415,7 +418,9 @@ bool FleetManager::sendAlert(const char* body) {
   if (!enabled || psk_len == 0 || send_fn == NULL) return false;
   uint32_t ts = time_fn ? time_fn(time_ctx) : 0;
   const char* name = name_fn ? name_fn(name_ctx) : "";
-  return send_fn(send_ctx, psk, chan_hash, ts, name, body, NULL);   // one-shot: no retry
+  // unsolicited alerts are locally originated: primary profile
+  return send_fn(send_ctx, psk, chan_hash, ts, name, body,
+                 RADIO_PROFILE_PRIMARY, NULL);   // one-shot: no retry
 }
 
 // ---------------------------------------------------------------- relay side

@@ -200,7 +200,7 @@ CliEnqueue CliScriptRunner::parse(const char* text, CliScriptMeta* meta) {
 }
 
 CliEnqueue CliScriptRunner::enqueue(const char* text, const uint8_t* chan_secret,
-                                    uint8_t chan_hash) {
+                                    uint8_t chan_hash, uint8_t radio_profile) {
   CliScriptMeta meta;
   CliEnqueue rc = parse(text, &meta);
   if (rc == CLI_ENQUEUE_NO_ID) { noid++; return rc; }
@@ -219,6 +219,7 @@ CliEnqueue CliScriptRunner::enqueue(const char* text, const uint8_t* chan_secret
   strcpy(slot->key, meta.key);   // validated by validKey()
   slot->ack = meta.ack;
   slot->body_off = meta.body_off;
+  slot->radio_profile = radio_profile;
   if (chan_secret != NULL) {
     memcpy(slot->chan_secret, chan_secret, sizeof(slot->chan_secret));
     slot->chan_hash = chan_hash;
@@ -229,7 +230,7 @@ CliEnqueue CliScriptRunner::enqueue(const char* text, const uint8_t* chan_secret
 
 bool CliScriptRunner::enqueueValidated(const char* text, const char* key, uint8_t ack,
                                        uint16_t body_off, const uint8_t* chan_secret,
-                                       uint8_t chan_hash) {
+                                       uint8_t chan_hash, uint8_t radio_profile) {
   if (pending_count >= FLEET_CLI_QUEUE_DEPTH) return false;
   if (strlen(key) > FLEET_CLI_KEY_LEN) return false;   // defensive; callers pass parsed keys
   CliPendingScript* slot = &pending[pending_count++];
@@ -238,6 +239,7 @@ bool CliScriptRunner::enqueueValidated(const char* text, const char* key, uint8_
   strcpy(slot->key, key);
   slot->ack = ack;
   slot->body_off = body_off;
+  slot->radio_profile = radio_profile;
   if (chan_secret != NULL) {
     memcpy(slot->chan_secret, chan_secret, sizeof(slot->chan_secret));
     slot->chan_hash = chan_hash;
@@ -338,6 +340,7 @@ bool CliScriptRunner::run(CliExecFn fn, void* ctx, CliRunResult* out) {
     out->error = slot->first_err[0] != 0;
     memcpy(out->chan_secret, slot->chan_secret, sizeof(out->chan_secret));
     out->chan_hash = slot->chan_hash;
+    out->radio_profile = slot->radio_profile;
   }
 
   pending_count--;

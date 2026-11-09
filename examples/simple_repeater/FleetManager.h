@@ -49,7 +49,7 @@ typedef uint32_t (*FleetJitterFn)(void* ctx, uint32_t window);
 typedef const char* (*FleetNameFn)(void* ctx);
 typedef bool (*FleetSendFn)(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
                             uint32_t ts, const char* sender_name, const char* body,
-                            uint8_t* out_pkt_hash);
+                            uint8_t radio_profile, uint8_t* out_pkt_hash);
 
 // ---------------------------------------------------------------- /fleet_cfg
 
@@ -106,6 +106,7 @@ class FleetManager {
     uint16_t body_off;                   // command-body offset from the parse
     uint8_t chan_secret[PUB_KEY_SIZE];   // captured channel of arrival
     uint8_t chan_hash;
+    uint8_t radio_profile;               // captured origin profile
     uint32_t due_epoch;                  // unix seconds UTC
   };
   FleetSched sched[FLEET_SCHED_STORE];
@@ -128,6 +129,7 @@ class FleetManager {
     char summary[FLEET_REPLY_SUMMARY_LEN];
     uint8_t chan_secret[PUB_KEY_SIZE];
     uint8_t chan_hash;
+    uint8_t radio_profile;               // captured origin profile
     uint32_t deadline_ms;                // awaiting==0: jitter deadline;
                                          // awaiting==1: retry deadline
     uint32_t tx_ts;                      // frozen group-text timestamp, so the
@@ -278,7 +280,7 @@ private:
   // scheduled-script admission (staleness, clock floor, store capacity) and
   // the acknowledgement machinery behind runScripts()
   void admitScheduled(const char* text, const CliScriptMeta& meta,
-                      const mesh::GroupChannel& chan);
+                      const mesh::GroupChannel& chan, uint8_t radio_profile);
   void scheduleAckIfNeeded(const CliRunResult& res);
   // a script with this key is armed or queued: a re-send must not run it twice
   bool inFlight(const char* key) const;
