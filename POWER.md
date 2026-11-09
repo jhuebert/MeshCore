@@ -52,9 +52,10 @@ two costs that dominate idle:
 
 Each knob is independent and each can be reverted with one command. The
 defaults reproduce the pre-power-feature behaviour exactly — light sleep off,
-RX duty cycle off (continuous RX), CPU at 240 MHz — so an existing installation
-sees no change until it opts in. `set radio.rxps on` and `powersaving on` are
-one command each; `cpu.freq 0` restores the board default.
+RX duty cycle off (continuous RX), CPU at the board's compiled clock
+(`ESP32_CPU_FREQ` where a variant sets it, otherwise 240 MHz) — so an existing
+installation sees no change until it opts in. `set radio.rxps on` and
+`powersaving on` are one command each; `cpu.freq 0` restores the board default.
 
 ## Behaviour
 
@@ -125,7 +126,9 @@ on-air protocol.
 
 `set cpu.freq <mhz>` caps the CPU clock while the node is awake. Supported
 values are **40, 80, 160 and 240**; `0` restores the frequency the board booted
-with. The setting is applied immediately and again at boot.
+with. A new install defaults to `0`, so a variant's compiled `ESP32_CPU_FREQ`
+(80/160 MHz on many boards) is preserved until the operator asks otherwise. The
+setting is applied immediately and again at boot.
 
 Repeater work is I/O-bound: packet handling is dominated by SPI and airtime,
 and the filter's pattern matcher is bounded by a **step budget**, not a time

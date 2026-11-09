@@ -25,10 +25,13 @@ void powerApplyCpuFrequency(const NodePrefs& prefs) {
 void powerApplyDefaults(NodePrefs& prefs) {
   // Pre-power-feature behaviour: continuous RX, no CPU cap. The level/preamble
   // defaults are carried so `set radio.rxps on` has something sane to start
-  // from, but nothing is armed until the operator asks for it.
+  // from, but nothing is armed until the operator asks for it. "No CPU cap"
+  // means the board's own clock (ESP32_CPU_FREQ where a variant sets it), not
+  // an assumed 240 MHz.
   prefs.rxps.enabled = 0;
   prefs.rxps.level = RX_POWERSAVING_BALANCED_LEVEL;
   prefs.rxps.preamble = RX_POWERSAVING_PROFILE_PREAMBLE;
+  prefs.cpu_freq_mhz = 0;
 }
 
 void powerApplyRadioProfile(NodePrefs& prefs) {
