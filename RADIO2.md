@@ -190,6 +190,33 @@ There is one shared noise floor, as today. No per-profile floor. `radio2`
 status may show the current value. If `int.thresh` is enabled, the value is a
 blend while scanning; this is accepted.
 
+### 4.9 Isolation when off
+
+radio2 is off by default. Once it is off and settled (`enabled=0`, no pending
+apply, already back on primary), the feature is inert:
+
+- no profile controller is installed on the radio: `selectTxProfile()` is the
+  core's default no-op;
+- `radio2.loop()` is not called (`needsService()` is false) — no retunes, no
+  timers, no lazy-save passes;
+- `logRx`/`logTx` and the receive policy hook are skipped; receive, forwarding,
+  battery, filter, fleet and observer code take their original paths;
+- `getSleepMs()` returns 0, so `main.cpp` takes exactly the same sleep/no-sleep
+  branch it took before the feature existed;
+- no packet is duplicated and `radio2 advert both` is inert;
+- `/radio2_cfg` is read only at boot (two `exists` checks plus a 22-byte read
+  when present) and written only after a radio2 CLI change.
+
+The residual cost while off is boolean checks, not actions: one
+`needsService()` per main loop, one `isScanning()` per packet, one
+profile-control pointer check per transmit attempt, and two local metadata bytes
+per packet. No RF activity, no timer, no wakeup, no extra filesystem write.
+
+The only window that is not fully "off" is the deliberate deferred apply after
+`radio2 off` (up to `RADIO2_APPLY_DELAY_MS`, then until a packet in progress
+finishes): the radio may still be on the secondary preset for that moment and
+is retuned back to primary before the scanner stops.
+
 ---
 
 ## 5. Architecture

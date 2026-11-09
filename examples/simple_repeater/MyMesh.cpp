@@ -526,11 +526,13 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
-  // logRx() runs before onRecvPacket(): stamp and count the profile recvRaw()
-  // just read from, so the observer and later hooks see the origin.
-  const uint8_t rx = radio2.currentProfile();
-  pkt->setRxProfile(rx);
-  radio2.noteRx(rx);
+  if (radio2.isScanning()) {
+    // logRx() runs before onRecvPacket(): stamp and count the profile recvRaw()
+    // just read from, so the observer and later hooks see the origin.
+    const uint8_t rx = radio2.currentProfile();
+    pkt->setRxProfile(rx);
+    radio2.noteRx(rx);
+  }
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.capture(pkt, score);
 #endif
@@ -562,7 +564,7 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 }
 
 void MyMesh::logTx(mesh::Packet *pkt, int len) {
-  radio2.noteTx(pkt->getTxProfile());
+  if (radio2.isScanning()) radio2.noteTx(pkt->getTxProfile());
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.captureTx(pkt);
 #endif
@@ -617,14 +619,20 @@ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
 }
 
 mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
-  // The scanner's current profile is the one recvRaw() just read from.
-  const uint8_t rx_profile = radio2.currentProfile();
-  const Radio2Action rx_action = radio2.actionFor(rx_profile, pkt);
-  rx_forward_allowed = rx_action != RADIO2_ACTION_DROP;
+  rx_forward_allowed = true;   // the off path must never inherit a stale drop
+  const bool radio2_rx = radio2.isScanning();
+  uint8_t rx_profile = RADIO_PROFILE_PRIMARY;
+  Radio2Action rx_action = RADIO2_ACTION_SAME;
+  if (radio2_rx) {
+    // The scanner's current profile is the one recvRaw() just read from.
+    rx_profile = radio2.currentProfile();
+    rx_action = radio2.actionFor(rx_profile, pkt);
+    rx_forward_allowed = rx_action != RADIO2_ACTION_DROP;
 
-  pkt->setRxProfile(rx_profile);
-  pkt->setTxProfile(radio2.targetFor(rx_action, rx_profile));
-  if (rx_profile == RADIO_PROFILE_PRIMARY) radio2.notePrimaryPacket();
+    pkt->setRxProfile(rx_profile);
+    pkt->setTxProfile(radio2.targetFor(rx_action, rx_profile));
+    if (rx_profile == RADIO_PROFILE_PRIMARY) radio2.notePrimaryPacket();
+  }
 
   if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
     recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
@@ -644,16 +652,21 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   // the forwarding hook at all.
   filter.clearContentVerdict();
 
-  // Replies created anywhere below (core ACK/path return, CLI, fleet) inherit
-  // the origin profile through obtainNewPacket().
-  const uint8_t previous_default = getDefaultTxProfile();
-  setDefaultTxProfile(radio2.replyProfile(rx_profile));
-  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
-  setDefaultTxProfile(previous_default);
+  mesh::DispatcherAction action;
+  if (radio2_rx) {
+    // Replies created anywhere below (core ACK/path return, CLI, fleet) inherit
+    // the origin profile through obtainNewPacket().
+    const uint8_t previous_default = getDefaultTxProfile();
+    setDefaultTxProfile(radio2.replyProfile(rx_profile));
+    action = Mesh::onRecvPacket(pkt);
+    setDefaultTxProfile(previous_default);
+  } else {
+    action = Mesh::onRecvPacket(pkt);
+  }
 
   filter.clearContentVerdict();
 
-  if (rx_action == RADIO2_ACTION_BOTH &&
+  if (radio2_rx && rx_action == RADIO2_ACTION_BOTH &&
       action != ACTION_RELEASE && action != ACTION_MANUAL_HOLD) {
     radio2QueueDuplicate(pkt, action, rx_profile);
   }
@@ -1139,7 +1152,6 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // load persisted prefs
   _cli.loadPrefs(_fs);
   radio2.begin(_fs);
-  radio_driver.setProfileControl(&radio2);
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.begin(_fs, &self_id, _prefs.node_name, board.getManufacturerName(),
                      FIRMWARE_VERSION, _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
@@ -1190,6 +1202,9 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
   radio2.setPrimary(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio2.start(_prefs.rxps.enabled, _prefs.extra_sf[0] != 0);
+  // With radio2 off the radio layer keeps its upstream default behaviour: no
+  // profile controller is installed at all.
+  radio_driver.setProfileControl(radio2.isScanning() ? &radio2 : nullptr);
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
@@ -1589,7 +1604,14 @@ void MyMesh::loop() {
 
   mesh::Mesh::loop();
 
-  radio2.loop(_fs, _mgr->getOutboundTotal() == 0);
+  if (radio2.needsService()) {
+    radio2.loop(_fs, _mgr->getOutboundTotal() == 0);
+    // Keep the radio layer free of radio2 whenever it is not needed: with
+    // radio2 off and on primary, selectTxProfile() is the upstream default.
+    radio_driver.setProfileControl(
+        (radio2.isScanning() || radio2.currentProfile() != RADIO_PROFILE_PRIMARY)
+            ? &radio2 : nullptr);
+  }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();

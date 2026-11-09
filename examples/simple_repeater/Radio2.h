@@ -99,6 +99,12 @@ public:
   bool isScanning() const { return active; }
   bool isPaused() const { return paused; }
   bool hasPendingApply() const { return pending_apply; }
+  // True only while the scheduler/save machinery has something to do. When
+  // radio2 is off and settled this is false, so MyMesh skips radio2.loop().
+  bool needsService() const {
+    return active || paused || pending_apply || current != RADIO_PROFILE_PRIMARY ||
+           save_flag.isDirty();
+  }
   uint8_t currentProfile() const { return current; }
   Radio2Conflict conflict() const { return conflict_state; }
 
@@ -106,7 +112,7 @@ public:
   Radio2Action actionFor(uint8_t origin, const mesh::Packet* pkt) const;
   uint8_t targetFor(Radio2Action action, uint8_t origin) const;
   uint8_t replyProfile(uint8_t origin) const;
-  bool advertBoth() const { return cfg.advert == RADIO2_ADVERT_BOTH && active; }
+  bool advertBoth() const { return cfg.advert == RADIO2_ADVERT_BOTH && active && !paused; }
   uint8_t getPolicyPrimary() const { return cfg.policy_primary; }
   uint8_t getPolicySecondary() const { return cfg.policy_secondary; }
   uint8_t getAdvert() const { return cfg.advert; }

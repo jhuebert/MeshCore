@@ -372,6 +372,63 @@ TEST(Radio2Timing, SleepDeadline) {
 
 // ---------------------------------------------------------------- scheduler
 
+TEST(Radio2Isolation, DisabledIsInert) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+
+  EXPECT_FALSE(r.needsService());
+  EXPECT_FALSE(r.start(false, false));
+  EXPECT_FALSE(r.needsService());
+  EXPECT_FALSE(r.isScanning());
+  EXPECT_EQ(r.getSleepMs(), 0u);
+
+  // A secondary-target packet falls back to primary without any retune.
+  EXPECT_TRUE(r.selectTxProfile(RADIO_PROFILE_SECONDARY));
+  EXPECT_EQ(dev.retunes, 0);
+
+  r.loop(&scheduler_fs, true);
+  EXPECT_EQ(dev.retunes, 0);
+}
+
+TEST(Radio2Isolation, DisableSettlesBackToIdle) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  ASSERT_EQ(r.setPreset(915.0f, 125.0f, 10, 5), RADIO2_SET_OK);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
+  ASSERT_TRUE(r.isScanning());
+
+  r.setEnabled(false);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
+  EXPECT_FALSE(r.isScanning());
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_PRIMARY);
+
+  g_mock_millis += LAZY_SAVE_DELAY_MS + 1;   // let the config write finish
+  r.loop(&scheduler_fs, true);
+  EXPECT_FALSE(r.needsService());   // nothing left to service while off
+}
+
+TEST(Radio2Isolation, PausedDoesNotAdvertiseOnBoth) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  ASSERT_EQ(r.setPreset(915.0f, 125.0f, 10, 5), RADIO2_SET_OK);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
+  r.setAdvert(RADIO2_ADVERT_BOTH);
+  ASSERT_TRUE(r.advertBoth());
+
+  r.pauseForPrimaryChange();
+  EXPECT_FALSE(r.advertBoth());
+  EXPECT_TRUE(r.needsService());
+}
+
 TEST(Radio2Scheduler, DisabledDoesNotStart) {
   g_mock_millis = 0;
   FakeDevice dev;
