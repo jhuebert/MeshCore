@@ -119,6 +119,10 @@ void RadioLibWrapper::resetAGC() {
   _num_floor_samples = 0;
   _floor_sample_sum = 0;
 
+  // With RXPS off this is the pre-RXPS reset: leave the samples at zero and
+  // let loop() reconverge, as it did before the power feature.
+  if (!_rx_ps_enabled) return;
+
   // PowerSaving variant
   _nf_calib_active = true;  // force startReceiveMode() into continuous RX
   bool packet_in_progress = false;
@@ -297,11 +301,16 @@ bool RadioLibWrapper::isChannelActive() {
 
 float RadioLibWrapper::getLastRSSI() const {
   // PowerSaving variant
+  // With RXPS off, read the radio exactly as before the feature. The cached
+  // value only exists because a duty-cycled radio may be asleep when a caller
+  // asks for the metrics of the packet it just read.
+  if (!_rx_ps_enabled) return _radio->getRSSI();
   if (_last_metrics_valid) return _last_rssi;
   return _rx_ps_armed ? 0 : _radio->getRSSI();
 }
 float RadioLibWrapper::getLastSNR() const {
   // PowerSaving variant
+  if (!_rx_ps_enabled) return _radio->getSNR();
   if (_last_metrics_valid) return _last_snr;
   return _rx_ps_armed ? 0 : _radio->getSNR();
 }
@@ -515,6 +524,7 @@ bool RadioLibWrapper::setRxPowerSaving(bool enabled, uint32_t rx_us, uint32_t sl
   if (enabled && !supportsRxPowerSaving()) return false;
 
   _rx_ps_enabled = enabled;
+  _last_metrics_valid = false;   // metrics from the old mode must not leak
   _rx_ps_rx_us = rx_us;
   _rx_ps_sleep_us = sleep_us;
   _rx_ps_last_error = RADIOLIB_ERR_NONE;

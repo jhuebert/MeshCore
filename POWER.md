@@ -113,6 +113,14 @@ is sampled during a short continuous-RX calibration instead of in passing, so
 radio parameters (`set radio …`) re-normalises the periods for the new spreading
 factor and bandwidth and reports `reboot to apply` as usual.
 
+With RXPS off, the radio wrapper takes the pre-RXPS path: continuous RX, no
+duty cycle, no RXPS calibration, and `getLastRSSI`/`getLastSNR` read the radio
+directly instead of returning the cached packet metrics. Two fork-wide changes
+remain visible while RXPS is off: the TCXO start-up delay is 1.6 ms
+(RadioLib's default is 5 ms), applied at radio begin, and `get cad` also
+reports the CAD-busy count. Neither changes the receive/sleep state or the
+on-air protocol.
+
 ### CPU frequency — `cpu.freq`
 
 `set cpu.freq <mhz>` caps the CPU clock while the node is awake. Supported
