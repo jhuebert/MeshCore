@@ -120,11 +120,18 @@ radio2 timing
 > primary=49ms; secondary=73ms; split=39/61; switch=3ms; mode=idle
 ```
 
-If the pair cannot be used:
+If the pair cannot be used, the reply names the bound that failed. It may be
+either direction:
 
 ```text
 > unusable: secondary capture 49ms > primary-safe 20ms
+> unusable: primary capture 16ms > secondary-safe 8ms
 ```
+
+The numbers depend on the radio family: an LR11x0 chip needs a few more preamble
+symbols than an SX126x, so a pair that is accepted on one can be refused on the
+other. `unusable: no preset configured` means no secondary preset has been set
+yet.
 
 The switch time defaults to a conservative 3 ms. Retuning is hardware-specific;
 the default is deliberately not aggressive.

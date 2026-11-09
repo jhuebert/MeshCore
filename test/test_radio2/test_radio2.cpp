@@ -45,6 +45,14 @@ void setPrimary(Radio2& r) {
 // may fall due while the mock clock advances.
 NativeFS scheduler_fs;
 
+void writeRadio2Config(NativeFS& fs, const Radio2CfgRecord& rec) {
+  uint8_t buf[RADIO2_CFG_RECORD_BYTES];
+  memcpy(buf, &rec, RADIO2_CFG_PAYLOAD_BYTES);
+  uint16_t crc = crc16_ccitt(buf, RADIO2_CFG_PAYLOAD_BYTES);
+  memcpy(&buf[RADIO2_CFG_PAYLOAD_BYTES], &crc, 2);
+  fs.files[RADIO2_CFG_FILE].assign(buf, buf + RADIO2_CFG_RECORD_BYTES);
+}
+
 mesh::Packet makePacket(uint8_t payload_type, uint8_t route_type) {
   mesh::Packet p;
   p.header = (uint8_t)((payload_type << PH_TYPE_SHIFT) | route_type);
@@ -308,6 +316,67 @@ TEST(Radio2Timing, KnownPresetMath) {
   EXPECT_EQ(t.primary_bound_us, 73920u);
   EXPECT_EQ(t.secondary_bound_us, 73920u);
   EXPECT_TRUE(t.usable);
+}
+
+TEST(Radio2Timing, UserPairOnSx126x) {
+  FakeDevice dev;   // SX126x: 6-symbol capture cost
+  Radio2 r(dev);
+  r.setPrimary(910.525f, 62.5f, 7, 8);
+
+  ASSERT_EQ(r.setPreset(911.5f, 500.0f, 10, 8), RADIO2_SET_OK);
+  Radio2Timing t;
+  ASSERT_TRUE(r.timing(&t));
+  EXPECT_EQ(t.primary_capture_us, 12288u);
+  EXPECT_EQ(t.secondary_bound_us, 12480u);
+}
+
+TEST(Radio2Timing, UserPairRejectedOnLr11x0) {
+  FakeDevice dev;
+  dev.capture = 8.0f;   // LR11x0
+  Radio2 r(dev);
+  r.setPrimary(910.525f, 62.5f, 7, 8);
+
+  EXPECT_EQ(r.setPreset(911.5f, 500.0f, 10, 8), RADIO2_SET_UNSCANNABLE);
+}
+
+TEST(Radio2Timing, ReportsWhichBoundFailed) {
+  NativeFS fs;
+  FakeDevice dev;
+  dev.capture = 8.0f;   // LR11x0
+  Radio2 r(dev);
+
+  // A persisted pair is only range-checked on load; the timing check happens
+  // against the current radio and primary, so this can still be unusable.
+  Radio2CfgRecord rec;
+  memset(&rec, 0, sizeof(rec));
+  memcpy(rec.magic, RADIO2_CFG_MAGIC, 4);
+  rec.version = RADIO2_CFG_VERSION;
+  rec.enabled = 1;
+  rec.policy_primary = RADIO2_ACTION_SAME;
+  rec.policy_secondary = RADIO2_ACTION_SAME;
+  rec.advert = RADIO2_ADVERT_PRIMARY;
+  rec.sf = 10;
+  rec.cr = 8;
+  rec.freq_mhz = 911.5f;
+  rec.bw_khz = 500.0f;
+  writeRadio2Config(fs, rec);
+  r.load(&fs);
+  ASSERT_EQ(r.getSecondaryProfile().freq, 911.5f);
+  r.setPrimary(910.525f, 62.5f, 7, 8);
+
+  char reply[CLI_REPLY_MAX];
+  radio2CLI(r, false, false, "timing", reply);
+  EXPECT_STREQ(reply, "unusable: primary capture 16ms > secondary-safe 8ms");
+}
+
+TEST(Radio2Timing, ReportsNoPreset) {
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+
+  char reply[CLI_REPLY_MAX];
+  radio2CLI(r, false, false, "timing", reply);
+  EXPECT_STREQ(reply, "unusable: no preset configured");
 }
 
 TEST(Radio2Timing, ActiveAndIdleShares) {

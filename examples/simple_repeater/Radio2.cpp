@@ -630,10 +630,19 @@ static void radio2Status(Radio2& r, char* reply) {
 static void radio2TimingReply(Radio2& r, char* reply) {
   Radio2Timing t;
   if (!r.timing(&t)) {
-    snprintf(reply, CLI_REPLY_MAX,
-             "unusable: secondary capture %lums > primary-safe %lums",
-             (unsigned long)(t.secondary_capture_us / 1000),
-             (unsigned long)(t.primary_bound_us / 1000));
+    if (t.primary_capture_us == 0 && t.secondary_capture_us == 0) {
+      snprintf(reply, CLI_REPLY_MAX, "unusable: no preset configured");
+    } else if (t.secondary_capture_us > t.primary_bound_us) {
+      snprintf(reply, CLI_REPLY_MAX,
+               "unusable: secondary capture %lums > primary-safe %lums",
+               (unsigned long)(t.secondary_capture_us / 1000),
+               (unsigned long)(t.primary_bound_us / 1000));
+    } else {
+      snprintf(reply, CLI_REPLY_MAX,
+               "unusable: primary capture %lums > secondary-safe %lums",
+               (unsigned long)(t.primary_capture_us / 1000),
+               (unsigned long)(t.secondary_bound_us / 1000));
+    }
     return;
   }
   uint32_t total = t.primary_visit_us + t.secondary_visit_us;
