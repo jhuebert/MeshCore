@@ -318,6 +318,37 @@ conflicting, not before.
   written, not what an agent would. Comments explain *why* (invariants,
   protocol quirks, on-air format constraints), not what.
 
+## Default-off parity with upstream
+
+Every fork feature is opt-in, and **off must mean off**. With every feature
+disabled (the fresh-install default), the node must behave like the official
+(upstream `meshcore-dev/MeshCore`) firmware for that role, within reason: same
+on-air behaviour, same forwarding decisions, same RF activity, same sleep/wake
+behaviour and the same default power state. Flashing this fork over an official
+node must be undetectable until the operator enables a feature.
+
+- **Do not override the board's compiled configuration.** "No cap"/"off" means
+  the board's own value (e.g. `ESP32_CPU_FREQ`), not a convenient default such
+  as 240 MHz.
+- **Official persisted config loads unchanged.** New keys ride with defaults;
+  an upgrade must never switch a feature on or change a clock behind the
+  operator's back.
+- **When off, take the upstream path.** Hot-path hooks are skipped or branch to
+  the original code — not computed and discarded — and no feature may install a
+  radio/profile/timer/sleep hook while off.
+- **"Within reason"** allows additive CLI/status output, new config keys, and
+  boot-time setup that does not change a running node's RF, forwarding or
+  sleep/wake behaviour.
+- **Verify the off path explicitly**: default value, RF command trace,
+  sleep/wake path, forwarding decision and CLI surface. "It compiles" is not
+  evidence.
+
+The exception is an overlap between fork features that must work in tandem
+(e.g. the fleet channel's battery-gate exemption, the filter's channel store
+and the fleet PSK, radio2's RXPS mutual exclusion). Those interactions may
+change behaviour for the participating features, are documented where they are
+defined, and must not affect an otherwise-off node.
+
 ## Behavior — principle of least surprise
 
 CLI and filter semantics must work the way a user would guess without reading
