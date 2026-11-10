@@ -528,10 +528,13 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
   if (radio2.isScanning()) {
     // logRx() runs before onRecvPacket(): stamp and count the profile recvRaw()
-    // just read from, so the observer and later hooks see the origin.
+    // just read from, so the observer and later hooks see the origin. The stamp
+    // must be taken here, not when the packet is processed: a flood packet can
+    // sit in the delayed-inbound queue across a scheduler retune.
     const uint8_t rx = radio2.currentProfile();
     pkt->setRxProfile(rx);
     radio2.noteRx(rx);
+    if (rx == RADIO_PROFILE_PRIMARY) radio2.notePrimaryPacket();
   }
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.capture(pkt, score);
@@ -564,7 +567,10 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 }
 
 void MyMesh::logTx(mesh::Packet *pkt, int len) {
-  if (radio2.isScanning()) radio2.noteTx(pkt->getTxProfile());
+  // The scanner's current preset is the one selectTxProfile() just tuned for;
+  // a fallback send (paused/inactive) goes out on primary whatever the packet
+  // asked for.
+  if (radio2.isScanning()) radio2.noteTx(radio2.currentProfile());
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.captureTx(pkt);
 #endif
@@ -624,14 +630,17 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   uint8_t rx_profile = RADIO_PROFILE_PRIMARY;
   Radio2Action rx_action = RADIO2_ACTION_SAME;
   if (radio2_rx) {
-    // The scanner's current profile is the one recvRaw() just read from.
-    rx_profile = radio2.currentProfile();
+    // The origin is the profile stamped at reception, not the scanner's
+    // current preset: a delayed flood packet may be processed after a retune.
+    rx_profile = pkt->getRxProfile();
+    if (rx_profile != RADIO_PROFILE_PRIMARY && rx_profile != RADIO_PROFILE_SECONDARY) {
+      rx_profile = radio2.currentProfile();
+    }
     rx_action = radio2.actionFor(rx_profile, pkt);
     rx_forward_allowed = rx_action != RADIO2_ACTION_DROP;
 
     pkt->setRxProfile(rx_profile);
     pkt->setTxProfile(radio2.targetFor(rx_action, rx_profile));
-    if (rx_profile == RADIO_PROFILE_PRIMARY) radio2.notePrimaryPacket();
   }
 
   if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
@@ -1262,6 +1271,10 @@ void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
     MESH_DEBUG_PRINTLN("ERROR: unable to create advertisement packet!");
     return;
   }
+  // A local advert follows `radio2 advert`, not the preset that triggered it
+  // (a remote `advert` command arrives on one preset, but the node's own
+  // advert is primary by default).
+  pkt->setTxProfile(RADIO_PROFILE_PRIMARY);
 
   // Copy before queueing the first packet: the queued packet stays valid, but
   // copying first keeps the two independent from the start.
@@ -1614,15 +1627,12 @@ void MyMesh::loop() {
   }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    uint32_t delay_millis = 0;
-    if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+    sendSelfAdvertisement(0, true);
 
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)
   } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendZeroHop(pkt);
+    sendSelfAdvertisement(0, false);
 
     updateAdvertTimer(); // schedule next local advert
   }

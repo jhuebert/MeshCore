@@ -353,6 +353,9 @@ void NRF52Board::sleepMs(uint32_t ms) {
       __WFE();
       __WFE();
     }
+    // A radio/other interrupt brought the CPU back: return now so the loop can
+    // service it. The RTC deadline is re-armed by the next sleepMs() call.
+    if (!rtc2_fired) break;
   }
 
   NRF_RTC2->INTENCLR = RTC_INTENCLR_COMPARE0_Msk;

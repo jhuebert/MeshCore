@@ -285,6 +285,9 @@ bool Radio2::selectTxProfile(uint8_t profile) {
   // secondary-target packet falls back to it; while a retune back is pending,
   // wait so nothing is ever transmitted on the wrong preset.
   if (!active) return current == RADIO_PROFILE_PRIMARY;
+  // A paused scanner only permits the primary preset: a queued secondary-target
+  // packet must not retune the radio away from a temporary primary change.
+  if (paused) return current == RADIO_PROFILE_PRIMARY;
   if (current == profile) return true;
   if (device.hasCompletedReceive() || device.isReceiveInProgress()) return false;
   if (!switchTo(profile, false)) return current == profile;   // busy or failed: retry
@@ -390,7 +393,19 @@ bool Radio2::applyPending() {
 }
 
 uint32_t Radio2::getSleepMs() {
-  if (!active || paused || pending_apply) return 0;
+  // A deferred apply is a deadline like any other: without it the MCU may take
+  // the stock (30 s) sleep and turn radio2 on/off far later than documented.
+  if (pending_apply) {
+    int32_t delta = (int32_t)(pending_apply_at_ms - millis());
+    if (delta <= 0) return 1;
+    return (uint32_t)delta < RADIO2_SLEEP_MAX_MS ? (uint32_t)delta : RADIO2_SLEEP_MAX_MS;
+  }
+  if (!active || paused) {
+    // Nothing is being scanned, but a retune back to primary may still be owed
+    // (e.g. a disable that landed while a receive was in progress). Wake for
+    // it instead of taking the stock sleep with the radio off-home.
+    return current != RADIO_PROFILE_PRIMARY ? RADIO2_SWITCH_RETRY_MS : 0;
+  }
   if (!device.isInRecvMode() || device.hasCompletedReceive() ||
       device.isReceiveInProgress()) {
     return 1;   // wake soon; never sleep through a packet
@@ -673,8 +688,8 @@ static void radio2SetPreset(Radio2& r, const char* tuple, bool rxps_enabled,
     snprintf(reply, CLI_REPLY_MAX, "Err - radio2 preset must be <freq>,<bw>,<sf>,<cr>");
     return;
   }
-  const char* parts[4];
-  int n = mesh::Utils::parseTextParts(scratch, parts, 4);
+  const char* parts[5];
+  int n = mesh::Utils::parseTextParts(scratch, parts, 5);
   if (n != 4) {
     snprintf(reply, CLI_REPLY_MAX, "Err - radio2 preset must be <freq>,<bw>,<sf>,<cr>");
     return;
@@ -778,7 +793,9 @@ void radio2CLI(Radio2& r, bool rxps_enabled, bool extra_sf_enabled,
   }
 
   // Anything else is a preset tuple. nextToken() only split on spaces, so the
-  // token still holds the whole comma list.
+  // token still holds the whole comma list. Reject anything after it: a preset
+  // command is a complete command line, not a prefix.
+  if (!cliNoExtra(p, reply, RADIO2_USAGE)) return;
   radio2SetPreset(r, sub, rxps_enabled, extra_sf_enabled, reply);
 }
 

@@ -421,7 +421,7 @@ TEST(Radio2Timing, OverlapRejected) {
   EXPECT_EQ(r.getSecondaryProfile().freq, 0.0f);
 }
 
-TEST(Radio2Timing, SleepDeadline) {
+TEST(Radio2Scheduler, SleepDeadline) {
   FakeDevice dev;
   Radio2 r(dev);
   setPrimary(r);
@@ -435,8 +435,55 @@ TEST(Radio2Timing, SleepDeadline) {
   EXPECT_EQ(r.getSleepMs(), 1u);
   dev.completed = false;
 
+  // Turning it off is deferred too, so the deadline still matters until the
+  // apply lands and the radio is back on primary.
   r.setEnabled(false);
+  EXPECT_GT(r.getSleepMs(), 0u);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
   EXPECT_EQ(r.getSleepMs(), 0u);
+}
+
+TEST(Radio2Scheduler, SleepCoversDeferredApply) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  ASSERT_EQ(r.setPreset(915.0f, 125.0f, 10, 5), RADIO2_SET_OK);
+  ASSERT_TRUE(r.hasPendingApply());
+
+  // The deferred apply is a wake deadline; the stock sleep would delay it.
+  uint32_t ms = r.getSleepMs();
+  EXPECT_GT(ms, 0u);
+  EXPECT_LE(ms, RADIO2_SLEEP_MAX_MS);
+
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  EXPECT_EQ(r.getSleepMs(), 1u);
+  r.loop(&scheduler_fs, true);
+  EXPECT_FALSE(r.hasPendingApply());
+}
+
+TEST(Radio2Scheduler, SleepCoversRetuneHome) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  r.setPreset(915.0f, 125.0f, 10, 5);
+  ASSERT_TRUE(r.start(false, false));
+  g_mock_millis += 200;
+  r.loop(&scheduler_fs, true);
+  ASSERT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+
+  // The disable lands while a receive blocks the retune home: the deadline to
+  // get back to primary must survive the stock sleep path.
+  dev.in_progress = true;
+  r.setEnabled(false);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
+  EXPECT_FALSE(r.isScanning());
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+  EXPECT_GT(r.getSleepMs(), 0u);
+  EXPECT_LE(r.getSleepMs(), RADIO2_SWITCH_RETRY_MS);
 }
 
 // ---------------------------------------------------------------- scheduler
@@ -496,6 +543,30 @@ TEST(Radio2Isolation, PausedDoesNotAdvertiseOnBoth) {
   r.pauseForPrimaryChange();
   EXPECT_FALSE(r.advertBoth());
   EXPECT_TRUE(r.needsService());
+
+  char reply[CLI_REPLY_MAX];
+  radio2CLI(r, false, false, "status", reply);
+  EXPECT_STREQ(reply, "off; paused");
+}
+
+TEST(Radio2Isolation, PausedSendsOnPrimary) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  ASSERT_EQ(r.setPreset(915.0f, 125.0f, 10, 5), RADIO2_SET_OK);
+  g_mock_millis += RADIO2_APPLY_DELAY_MS;
+  r.loop(&scheduler_fs, true);
+  ASSERT_TRUE(r.isScanning());
+
+  r.pauseForPrimaryChange();
+  int retunes = dev.retunes;
+  EXPECT_FALSE(r.isScanning());
+  // A queued secondary-target packet must not retune away from the temporary
+  // primary change; it falls back to the current primary.
+  EXPECT_TRUE(r.selectTxProfile(RADIO_PROFILE_SECONDARY));
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_PRIMARY);
+  EXPECT_EQ(dev.retunes, retunes);
 }
 
 TEST(Radio2Scheduler, DisabledDoesNotStart) {
@@ -826,6 +897,12 @@ TEST(Radio2Cli, Errors) {
   radio2CLI(r, false, false, "status junk", reply);
   EXPECT_EQ(strncmp(reply, "Err - usage:", 12), 0);
   EXPECT_LE(strlen(reply), (size_t)CLI_REPLY_MAX - 1);
+
+  radio2CLI(r, false, false, "915,125,10,5 junk", reply);
+  EXPECT_EQ(strncmp(reply, "Err - usage:", 12), 0);
+
+  radio2CLI(r, false, false, "915,125,10,5,6", reply);
+  EXPECT_STREQ(reply, "Err - radio2 preset must be <freq>,<bw>,<sf>,<cr>");
 }
 
 TEST(Radio2Cli, Timing) {

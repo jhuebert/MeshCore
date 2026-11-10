@@ -96,7 +96,10 @@ public:
   void resumeAfterPrimaryChange(bool rxps_enabled, bool extra_sf_enabled);
 
   bool isEnabled() const { return cfg.enabled != 0; }
-  bool isScanning() const { return active; }
+  // True only while the scanner is actually time-sharing. A paused scanner
+  // (temporary primary change) reports false, matching the `off; paused` status
+  // and keeping policy/counters off the radio until it resumes.
+  bool isScanning() const { return active && !paused; }
   bool isPaused() const { return paused; }
   bool hasPendingApply() const { return pending_apply; }
   // True only while the scheduler/save machinery has something to do. When
