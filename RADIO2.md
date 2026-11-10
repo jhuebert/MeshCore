@@ -571,9 +571,10 @@ preset a packet arrived on.
 - **`both` duplicates traffic.** Use one bridge or `other` where possible.
 - **`powersaving` saves nothing on non-nRF52/ESP32 boards** when radio2 is
   scanning.
-- **The wio-e5 repeater does not fit its flash budget.** This is an upstream
-  flash limitation that predates radio2; the release simply has no asset for
-  that target.
+- **The wio-e5 repeater no longer fits its flash budget.** Its 224 KB STM32
+  part was already at ~98.5 % before radio2; this feature takes it over the
+  limit even with the release build's library LTO, so the release has no asset
+  for that target. Use a board with more flash.
 - **Retune time is a conservative estimate.** Hardware may be faster or slower;
   the 3 ms default is deliberately safe.
 

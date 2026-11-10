@@ -51,6 +51,12 @@ should not need to explore beyond them before making a change.
   build targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS),
   topic templates and the status/packet/raw schemas, the capture and delivery
   model, recipes, troubleshooting and limits.
+- `RADIO2.md` — the second radio preset user manual: the shared transceiver
+  model, preset validation (overlap + scannability), the policy matrix
+  (`same`/`other`/`both`/`drop`, broadcast-flood-only crossing), reply-origin
+  rules, the active/idle visit scheduler, the full CLI reference, feature
+  interactions (RXPS, `extra.sf`, tempradio, filter, battery/fleet, powersaving)
+  and tradeoffs.
 
 **When behavior changes, the matching guide section is updated in the same
 commit** — the guides are user-facing API documentation, not optional docs.
@@ -94,13 +100,19 @@ commit** — the guides are user-facing API documentation, not optional docs.
   RAM-only one-shot suspend/resume transition readout (`takeStateChange`).
 - `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h` — advert
   sample collection, median/quorum decision, enabled-flag persistence and CLI.
+- `Radio2.h/.cpp`, `Radio2Config.h` — the second radio preset: config record
+  and staged persistence (`/radio2_cfg`), preset/timing validation against the
+  primary, the policy matrix, the active/idle visit scheduler, the deferred
+  apply, and `radio2CLI`. `Radio2Device` is its only radio surface, so the
+  native suite drives a fake; MyMesh supplies the adapter over `radio_driver`.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
-  (`allowPacketForward`, `onGroupDataRecv`, `logRx` (ack repeat detector),
-  `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`, CLI
-  dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
-  the fleet device-service injections and the `batteryAlerts` transition
-  drain).
-- `main.cpp` — upstream's serial CLI entry (no fork lines).
+  (`allowPacketForward`, `onGroupDataRecv`, `logRx` (profile stamp + ack repeat
+  detector), `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`,
+  CLI dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
+  the fleet device-service injections, the `batteryAlerts` transition drain, the
+  radio2 scheduler/profile-control hooks and `getSleepMs`).
+- `main.cpp` — upstream's serial CLI entry, plus the fork's radio2 sleep deadline
+  (`getSleepMs()`/`sleepMs()`) on the powersaving path.
 
 **Power (`src/helpers/` + the upstream radio layer):**
 - `PowerProfile.h/.cpp` — the fork's power glue kept out of upstream files: the
@@ -154,8 +166,10 @@ the battery exemption contract), `test/test_battery_gate/` (suspension
 behavior, persistence, CLI), `test/test_mesh_clock/` (sample collection, quorum
 decision, persistence, CLI), `test/test_rx_power_saving/` (the duty-cycle
 level ladders and preamble guard, timer-condition validation, config
-normalisation, presets/raw parsing and the `get radio.rxps` report) and
-`test/test_mqtt_observer/` (config codec +
+normalisation, presets/raw parsing and the `get radio.rxps` report),
+`test/test_radio2/` (core profile metadata and outbound peek, policy matrix,
+timing bounds, scheduler states, deferred apply, persistence and the `radio2`
+CLI) and `test/test_mqtt_observer/` (config codec +
 record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
 connect gates, queue/retry policy, the liveness probe, and the
 status/packet/raw JSON schema). Test-only shims:
@@ -165,10 +179,12 @@ status/packet/raw JSON schema). Test-only shims:
 **Build & CI:** `pio test -e native_packet_filter` / `-e
 native_battery_gate` / `-e native_fleet` / `-e native_fleet_noack` (the fleet
 suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
-other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e native_mqtt_observer`
+other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e
+native_radio2` / `-e native_mqtt_observer`
 (host-native, no hardware), plus `-e
 native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_fleet_san` /
 `-e native_mesh_clock_san` / `-e native_rx_power_saving_san` / `-e
+native_radio2_san` / `-e
 native_mqtt_observer_san` for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 `build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
@@ -234,14 +250,16 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
+- `examples/simple_repeater/Radio2.h/.cpp`, `Radio2Config.h`
 - `src/helpers/PowerProfile.h/.cpp`,
-  `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`
+  `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`,
+  `src/helpers/radiolib/RadioProfileControl.h`
 - `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
-  `test/test_mesh_clock/`, `test/test_rx_power_saving/`,
+  `test/test_mesh_clock/`, `test/test_rx_power_saving/`, `test/test_radio2/`,
   `test/test_mqtt_observer/`
 - `examples/mqtt_observer/`, `observer_targets.ini`
 - `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `POWER.md`,
-  `MQTT_OBSERVER.md`
+  `RADIO2.md`, `MQTT_OBSERVER.md`
 - `scripts/local-release-build.sh`, `scripts/tests/`
 - `.github/workflows/filter-release.yml`,
   `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
@@ -482,6 +500,7 @@ pio test -e native_battery_gate     # battery gate
 pio test -e native_fleet            # fleet manager + runner + CLI + persistence
 pio test -e native_fleet_noack      # the same, with FLEET_ACK_RETRY=0 (the off switch)
 pio test -e native_mesh_clock       # mesh clock sync
+pio test -e native_radio2           # second radio preset (policy/scheduler/persistence/CLI + core profile byte)
 pio test -e native_mqtt_observer    # observer config/format/policy
 ```
 
@@ -489,7 +508,7 @@ All green, and every touched line required — together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_mqtt_observer
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks
