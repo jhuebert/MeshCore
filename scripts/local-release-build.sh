@@ -130,7 +130,15 @@ usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0
 # channel). build.sh list already covers envs from observer_targets.ini.
 if [[ ${1:-} == __list ]]; then
   cd "$WORKER_DIR"
-  bash build.sh list | grep -i repeater
+  # STM32WLE5 repeaters (256 KB flash, ~224 KB app region) no longer fit the
+  # fork's repeater firmware at HEAD (radio2 etc. overflow .rodata):
+  # wio-e5_repeater by 5.7 KB even with library LTO, RAK_3x72_repeater and
+  # Tiny_Relay_repeater without it, wio-e5-mini_repeater and
+  # wio-e5-repeater_bridge_rs232 by 7.8/8.0 KB with it. Excluded from the
+  # release build; the envs remain in the tree for upstream parity.
+  # See RADIO2.md.
+  bash build.sh list | grep -i repeater \
+    | grep -vE '^(wio-e5_repeater|wio-e5-repeater_bridge_rs232|wio-e5-mini_repeater|RAK_3x72_repeater|Tiny_Relay_repeater)$'
   exit 0
 fi
 
@@ -174,18 +182,6 @@ if [[ ${1:-} == __worker ]]; then
   # flags release firmware has always been built with: stack usage metadata
   # (codegen unchanged, consumed by the stack gate below) + version string
   export PLATFORMIO_BUILD_FLAGS="-fstack-usage -DFIRMWARE_BUILD_DATE='\"${firmware_build_date}\"' -DFIRMWARE_VERSION='\"${firmware_version_string}\"'"
-
-  # wio-e5-mini_repeater is ~4.5 KB over its 224 KB flash region, and
-  # wio-e5-repeater_bridge_rs232 is 152 B over it with the STM32 RXPS gate. LTO
-  # on the framework/libraries recovers that space; project sources stay
-  # non-LTO so the stack gate below still gets their .su files. Fork-owned
-  # override: the upstream variant does not carry it. (wio-e5_repeater used to
-  # fit this way, but radio2 pushes it over even with LTO; it is expected to
-  # fail and ship no asset — see RADIO2.md.)
-  if [[ $target == wio-e5-mini_repeater || $target == wio-e5-repeater_bridge_rs232 || $target == wio-e5_repeater ]]; then
-    export PLATFORMIO_BUILD_FLAGS="$PLATFORMIO_BUILD_FLAGS -flto"
-    export PLATFORMIO_BUILD_SRC_FLAGS="${PLATFORMIO_BUILD_SRC_FLAGS:-} -fno-lto"
-  fi
 
   file_base="${target}-${firmware_version_string}"
   mkdir -p out
