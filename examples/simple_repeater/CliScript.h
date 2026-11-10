@@ -98,6 +98,7 @@ struct CliRunResult {
   bool error;                             // at least one command line replied "Err ..."
   uint8_t chan_secret[PUB_KEY_SIZE];      // the captured channel, echoed back
   uint8_t chan_hash;
+  uint8_t radio_profile;                  // captured origin profile
 };
 
 // One queued script: the full message text plus the key string, which is only
@@ -117,6 +118,7 @@ struct CliPendingScript {
                                        // signed-difference comparison in run()
   uint8_t chan_secret[PUB_KEY_SIZE];   // captured channel (zero-padded secret)
   uint8_t chan_hash;                   // its 1-byte on-air hash
+  uint8_t radio_profile;               // captured origin profile
   // reply-summary accumulation, updated as lines execute
   uint16_t ran_count;                  // command lines executed so far
   char last_reply[FLEET_REPLY_SUMMARY_LEN];   // reply of the most recent line
@@ -171,7 +173,8 @@ public:
   // authoritative parser, and the parse cost of a 184-byte message is noise
   // next to the radio.)
   CliEnqueue enqueue(const char* text, const uint8_t* chan_secret = NULL,
-                     uint8_t chan_hash = 0);
+                     uint8_t chan_hash = 0,
+                     uint8_t radio_profile = RADIO_PROFILE_PRIMARY);
 
   // Queue an already-parsed script (a scheduled script firing) without
   // touching the seen ring — its key was marked when the job was first
@@ -180,7 +183,8 @@ public:
   // Returns false when the queue is full; the caller keeps the script and
   // retries.
   bool enqueueValidated(const char* text, const char* key, uint8_t ack, uint16_t body_off,
-                        const uint8_t* chan_secret, uint8_t chan_hash);
+                        const uint8_t* chan_secret, uint8_t chan_hash,
+                        uint8_t radio_profile = RADIO_PROFILE_PRIMARY);
 
   // Is a script with this key queued or sleeping right now? The manager checks
   // this (and its armed store) so a forgotten key cannot run twice at once.

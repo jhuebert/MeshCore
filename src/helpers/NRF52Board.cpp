@@ -268,6 +268,20 @@ bool NRF52Board::isExternalPowered() {
   }
 }
 
+// RTC2 is unused by the Adafruit core and the SoftDevice (RTC0), so it can
+// supply a one-shot low-power deadline without disturbing millis()/FreeRTOS
+// (RTC1). The interrupt only marks the event: the loop below owns clearing it.
+#if defined(NRF_RTC2) && defined(RTC2_IRQn)
+static volatile bool rtc2_fired = false;
+
+extern "C" void RTC2_IRQHandler(void) {
+  if (NRF_RTC2->EVENTS_COMPARE[0]) {
+    NRF_RTC2->EVENTS_COMPARE[0] = 0;
+    rtc2_fired = true;
+  }
+}
+#endif
+
 void NRF52Board::sleep(uint32_t secs) {
   // Clear FPU interrupt flags to avoid insomnia
   // see errata 87 for details https://docs.nordicsemi.com/bundle/errata_nRF52840_Rev3/page/ERR/nRF52840/Rev3/latest/anomaly_840_87.html
@@ -292,6 +306,65 @@ void NRF52Board::sleep(uint32_t secs) {
     __WFE();
     __WFE();
   }
+}
+
+void NRF52Board::sleepMs(uint32_t ms) {
+  if (ms == 0) {
+    sleep(0);   // event-driven only: no deadline to arm
+    return;
+  }
+
+  // Clear FPU interrupt flags to avoid insomnia (errata 87, as sleep())
+  #if (__FPU_USED == 1)
+  __set_FPSCR(__get_FPSCR() & ~(0x0000009F));
+  (void) __get_FPSCR();
+  NVIC_ClearPendingIRQ(FPU_IRQn);
+  #endif
+
+#if defined(NRF_RTC2) && defined(RTC2_IRQn)
+  if (!rtc2_initialised) {
+    NRF_RTC2->TASKS_STOP = 1;
+    NRF_RTC2->TASKS_CLEAR = 1;
+    NRF_RTC2->PRESCALER = 0;              // 32768 Hz
+    NVIC_SetPriority(RTC2_IRQn, 6);       // SoftDevice reserves the top priorities
+    NVIC_EnableIRQ(RTC2_IRQn);
+    rtc2_initialised = true;
+  }
+
+  // RTC compare is 24-bit; radio2 caps a sleep at 1000 ms, well inside it.
+  uint32_t ticks = (uint32_t)(((uint64_t)ms * 32768ULL + 999ULL) / 1000ULL);
+  if (ticks == 0) ticks = 1;
+  if (ticks > 0xFFFFFFUL) ticks = 0xFFFFFFUL;
+
+  rtc2_fired = false;
+  NRF_RTC2->TASKS_CLEAR = 1;
+  NRF_RTC2->CC[0] = ticks;
+  NRF_RTC2->EVENTS_COMPARE[0] = 0;
+  NRF_RTC2->INTENSET = RTC_INTENSET_COMPARE0_Msk;
+  NRF_RTC2->TASKS_START = 1;
+
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  while (!rtc2_fired) {
+    if (sd_enabled) {
+      sd_app_evt_wait();
+    } else {
+      __SEV();
+      __WFE();
+      __WFE();
+    }
+    // A radio/other interrupt brought the CPU back: return now so the loop can
+    // service it. The RTC deadline is re-armed by the next sleepMs() call.
+    if (!rtc2_fired) break;
+  }
+
+  NRF_RTC2->INTENCLR = RTC_INTENCLR_COMPARE0_Msk;
+  NRF_RTC2->EVENTS_COMPARE[0] = 0;
+#else
+  // No free timer on this part: correct, but not low power.
+  MESH_DEBUG_PRINTLN("NRF52Board: no RTC2, sleepMs() falls back to delay()");
+  delay(ms);
+#endif
 }
 
 // Temperature from NRF52 MCU

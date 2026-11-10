@@ -52,9 +52,10 @@ two costs that dominate idle:
 
 Each knob is independent and each can be reverted with one command. The
 defaults reproduce the pre-power-feature behaviour exactly — light sleep off,
-RX duty cycle off (continuous RX), CPU at 240 MHz — so an existing installation
-sees no change until it opts in. `set radio.rxps on` and `powersaving on` are
-one command each; `cpu.freq 0` restores the board default.
+RX duty cycle off (continuous RX), CPU at the board's compiled clock
+(`ESP32_CPU_FREQ` where a variant sets it, otherwise 240 MHz) — so an existing
+installation sees no change until it opts in. `set radio.rxps on` and
+`powersaving on` are one command each; `cpu.freq 0` restores the board default.
 
 ## Behaviour
 
@@ -113,11 +114,21 @@ is sampled during a short continuous-RX calibration instead of in passing, so
 radio parameters (`set radio …`) re-normalises the periods for the new spreading
 factor and bandwidth and reports `reboot to apply` as usual.
 
+With RXPS off, the radio wrapper takes the pre-RXPS path: continuous RX, no
+duty cycle, no RXPS calibration, and `getLastRSSI`/`getLastSNR` read the radio
+directly instead of returning the cached packet metrics. Two fork-wide changes
+remain visible while RXPS is off: the TCXO start-up delay is 1.6 ms
+(RadioLib's default is 5 ms), applied at radio begin, and `get cad` also
+reports the CAD-busy count. Neither changes the receive/sleep state or the
+on-air protocol.
+
 ### CPU frequency — `cpu.freq`
 
 `set cpu.freq <mhz>` caps the CPU clock while the node is awake. Supported
 values are **40, 80, 160 and 240**; `0` restores the frequency the board booted
-with. The setting is applied immediately and again at boot.
+with. A new install defaults to `0`, so a variant's compiled `ESP32_CPU_FREQ`
+(80/160 MHz on many boards) is preserved until the operator asks otherwise. The
+setting is applied immediately and again at boot.
 
 Repeater work is I/O-bound: packet handling is dominated by SPI and airtime,
 and the filter's pattern matcher is bounded by a **step budget**, not a time

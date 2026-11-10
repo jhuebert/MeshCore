@@ -192,6 +192,7 @@ jobs:
               const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
                 '-e', 'native_packet_filter', '-e', 'native_battery_gate', '-e', 'native_fleet',
                 '-e', 'native_fleet_noack', '-e', 'native_mesh_clock',
+                '-e', 'native_rx_power_saving', '-e', 'native_radio2',
                 '-e', 'native_mqtt_observer'],
                 { stdio: 'inherit' });
               if (gate.status !== 0) {

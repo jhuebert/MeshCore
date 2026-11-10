@@ -72,6 +72,11 @@ public:
 protected:
   // PowerSaving variant
   int16_t startContinuousReceive() override {
+    // Pre-RXPS behaviour: the LF clock was never switched, so no restore (and
+    // no extra standby) is needed. stopDutyCycleHardware() restores the clock
+    // when the duty cycle is disarmed.
+    if (!_rx_ps_enabled) return _radio->startReceive();
+
     // Also covers a stopDutyCycleHardware() whose clock restore failed.
     int16_t err = _radio->standby();
     if (err == RADIOLIB_ERR_NONE) err = ((CustomLR1110*)_radio)->restoreLfClock();
