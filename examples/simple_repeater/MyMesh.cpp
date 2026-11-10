@@ -445,7 +445,11 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   // suspended); every other packet is the gate's to count and gate exactly
   // as before.
   if (fleet.checkForward(packet) && !battGate.checkForward()) return false;   // battery gate: repeating suspended (low battery)
-  if (filter.checkPacket(packet, millis(), recv_pkt_region, _radio->getEstAirtimeFor(packet->getRawLength())) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
+  // est_air_ms only feeds the filter's airtime telemetry, so it is computed
+  // only when the filter is enabled; with `filter off` nothing about the
+  // receive path is spent on it (the value would never be read).
+  const uint32_t filter_air_ms = filter.isEnabled() ? _radio->getEstAirtimeFor(packet->getRawLength()) : 0;
+  if (filter.checkPacket(packet, millis(), recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -498,7 +502,8 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
   // Forwarding admission stays in allowPacketForward(), which counts once.
   if (battGate.isSuspended()) return;
 
-  if (filter.checkContent(packet, type, channel, data, len, recv_pkt_region, _radio->getEstAirtimeFor(packet->getRawLength())) == FILTER_ACT_DROP) {
+  const uint32_t filter_air_ms = filter.isEnabled() ? _radio->getEstAirtimeFor(packet->getRawLength()) : 0;
+  if (filter.checkContent(packet, type, channel, data, len, recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) {
     MESH_DEBUG_PRINTLN("filter: dropping group packet by content rule");
     packet->markDoNotRetransmit();
   }
@@ -777,8 +782,12 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
                           const uint8_t *app_data, size_t app_data_len) {
   mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len); // chain to super impl
 
-  // mesh clock sync: one vote per signature-verified advert source
-  meshClock.onAdvert(timestamp, id.pub_key, getRTCClock()->getCurrentTime());
+  // mesh clock sync: one vote per signature-verified advert source. Gated at
+  // the call site so a disabled feature costs nothing on the receive path
+  // (the getCurrentTime() call in particular).
+  if (meshClock.isEnabled()) {
+    meshClock.onAdvert(timestamp, id.pub_key, getRTCClock()->getCurrentTime());
+  }
 
   // if this a zero hop advert (and not via 'Share'), add it to neighbours
   if (packet->getPathHashCount() == 0 && !isShare(packet)) {

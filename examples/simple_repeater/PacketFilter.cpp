@@ -551,6 +551,9 @@ uint8_t FilterRules::checkContent(mesh::Packet* pkt, uint8_t type, const mesh::G
   clearContentVerdict();
   if (!enabled) return FILTER_ACT_ALLOW;
   if (type != PAYLOAD_TYPE_GRP_TXT && type != PAYLOAD_TYPE_GRP_DATA) return FILTER_ACT_ALLOW;
+  // An empty store can match nothing, so a fresh node does no content work at
+  // all: no parse, no stack buffers, no packet hash for the stash.
+  if (num_rules == 0) return FILTER_ACT_ALLOW;
 
   // single pass over the WHOLE rule list in listed order: packet-level
   // predicates and content predicates alike — every predicate is computable
