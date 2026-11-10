@@ -372,6 +372,24 @@ and the fleet PSK, radio2's RXPS mutual exclusion). Those interactions may
 change behaviour for the participating features, are documented where they are
 defined, and must not affect an otherwise-off node.
 
+The fork-wide convention is a gate at the top of the feature's receive/
+loop-path hook (or at the call site): a disabled feature may not compute a
+value nothing downstream reads. All features follow it — RXPS and radio2 take
+the upstream path when off (`needsService()`, no profile controller installed),
+`filter off` branches every gate to upstream behaviour and `checkContent`
+skips an empty rule store entirely, the battery gate samples the ADC only
+while enabled, the fleet and mesh clock sync early-return before any crypto
+or RTC read (the advert hook is gated at the call site), and the boot path
+makes no clock-changing call when the requested CPU frequency equals the
+running one. Accepted residuals, so nobody re-flags them: fresh nodes
+pre-provision the built-in Public channel (core MAC-verifies Public group
+traffic — the documented `filter chan list` contract, pinned by the CLI
+tests); the fleet's relay-side auth (the just-decrypted fleet packet's content
+hash) is not cleared after the receive bracket, so a later same-tag group
+packet pays one SHA-256 in the battery-gate exemption; in observer builds the
+worker task is always created (1 Hz idle, Wi-Fi off with no broker configured);
+and the fresh first boot writes `/filter_cfg` once (the Public provision).
+
 ## Behavior — principle of least surprise
 
 CLI and filter semantics must work the way a user would guess without reading
@@ -481,6 +499,13 @@ FILTER.md:
 
 ## Tests & verification — all code paths covered
 
+- PlatformIO's project checksum is derived from the global build flags, so
+  `build.sh` (release `-D` flags) and plain `pio test` produce different
+  signatures — and each flip wipes `.pio/build` (all environments) before
+  rebuilding. Alternate between the two as little as possible; a firmware
+  build that dies with `…/.sconsign314.dblite: No such file or directory`
+  right after a native test run was almost certainly a checksum flip mid-run —
+  rerun it alone and it will succeed.
 - Every behavior change ships with tests covering its new or changed code
   paths, added in the same commit. The suites are behavior-level (native
   googletest); reach them via the same CLI/`checkPacket`/`checkContent`
