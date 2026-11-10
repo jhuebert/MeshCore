@@ -10,12 +10,18 @@
 // batch (a 4-byte fingerprint of its advert key); when the batch fills, the
 // batch's median predicted "now" is taken, and if enough sources agree it steps
 // the RTC once and clears. The batch, the last result and its delta are
-// RAM-only: a reboot starts an empty batch. Only the enabled flag persists, in
-// /meshclock. The feature shares no state with AdvertRateLimiter or the filter,
-// so it can be deleted cleanly if upstream ever adds its own clock feature.
+// RAM-only: a reboot starts an empty batch. The enabled flag and the tuning
+// knobs persist, in /meshclock. The feature shares no state with
+// AdvertRateLimiter or the filter, so it can be deleted cleanly if upstream
+// ever adds its own clock feature.
 //
-// CLI: "clock mesh on|off" and a bare "clock mesh" status (with the node's
-// current UTC time), handled by meshClockCLI() (see MeshClockSync.cpp).
+// CLI: "clock mesh on|off", "clock mesh slots <slots> <min-agree>",
+// "clock mesh tolerance <tolerance-s> <min-diff-s>", and a bare "clock mesh"
+// status (with the node's current UTC time), handled by meshClockCLI() (see
+// MeshClockSync.cpp). `clock mesh slots` sets the batch size and quorum (the
+// compile-time MESHCLOCK_SLOTS is the shipped default and the upper bound —
+// the sample array is sized for it). Both commands take both values — nothing
+// is derived — and are rejected whole on a bad pair.
 
 #ifndef _MESH_CLOCK_SYNC_H
 #define _MESH_CLOCK_SYNC_H
@@ -37,16 +43,21 @@ struct MeshClockSample {
 };
 static_assert(sizeof(MeshClockSample) == 8, "clock sample must stay 8 bytes");
 
-// Persisted /meshclock record: the enabled flag plus a CRC-16 over it. A torn
-// write of exactly the right length is otherwise undetectable on a record this
-// small, and the CRC rides v1 from day one (no older format to stay compatible
-// with).
+// Persisted /meshclock record: the enabled flag plus the runtime tuning knobs
+// and a CRC-16 over them. A torn write of exactly the right length is otherwise
+// undetectable on a record this small. v1 records (enabled flag only) are still
+// accepted by load() and migrated forward: the flag carries and the knobs take
+// the compile-time defaults.
 struct MeshClockCfg {
   uint8_t  version;   // MESHCLOCK_CFG_VERSION
   uint8_t  enabled;   // 0/1
-  uint16_t crc;       // crc16_ccitt over the version + enabled bytes
+  uint8_t  slots;     // runtime batch capacity
+  uint8_t  min_agree; // agreeing sources required to step the clock
+  uint16_t tolerance; // seconds an inlier may sit from the median
+  uint16_t min_diff;  // seconds: closer than this to the node clock is "in sync"
+  uint16_t crc;       // crc16_ccitt over the preceding bytes
 };
-static_assert(sizeof(MeshClockCfg) == 4, "clock config must stay 4 bytes");
+static_assert(sizeof(MeshClockCfg) == 10, "clock config must stay 10 bytes");
 
 class MeshClockSync {
 public:
@@ -65,6 +76,14 @@ public:
   bool isEnabled() const { return enabled; }
   void setEnabled(bool on);     // persists; clears the batch on change
 
+  // Runtime tuning, persisted like the enabled flag. Both values must be sent
+  // and are validated as a pair; on any change the batch is dropped (like
+  // setEnabled), so samples gathered under old rules never decide under new
+  // ones. Tolerance is the inlier window, min_diff the deadband. Return false
+  // (nothing applied) on bad values.
+  bool setSlots(uint8_t slots, uint8_t min_agree);
+  bool setTolerance(uint16_t tolerance, uint16_t min_diff);
+
   // Feed one signature-verified advert (the core verifies the signature before
   // MyMesh::onAdvertRecv). advert_ts is the signed timestamp, pub_key the
   // PUB_KEY_SIZE origin key, local_now this node's RTC now.
@@ -78,15 +97,25 @@ public:
   int getSampleCount() const { return count; }
   Result getLastResult() const { return last_result; }
   int32_t getLastDeltaSecs() const { return last_delta; }   // signed for display
+  int getSlots() const { return slots; }
+  int getMinAgree() const { return min_agree; }
+  int getToleranceSecs() const { return tolerance; }
+  int getMinDiffSecs() const { return min_diff; }
 
   // Lower plausibility bound for an advert timestamp: this firmware's build
   // epoch. Adverts dated earlier are refused. Exposed for the boundary test.
   static uint32_t buildFloor();
 
 private:
+  // sized for the compile-time maximum; the runtime `slots` caps how much of
+  // it is used
   MeshClockSample samples[MESHCLOCK_SLOTS];
   int count;
   bool enabled;
+  uint8_t slots;           // runtime batch capacity (<= MESHCLOCK_SLOTS)
+  uint8_t min_agree;       // runtime quorum
+  uint16_t tolerance;      // runtime inlier window, seconds
+  uint16_t min_diff;       // runtime deadband, seconds
   Result last_result;
   int32_t last_delta;
   LazySave save_flag;      // needs save, written back by loop()
