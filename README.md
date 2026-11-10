@@ -132,8 +132,8 @@ fork is for operators who want policy and resilience at the node:
 Prebuilt binaries for all supported boards are on the
 [Releases page](https://github.com/jhuebert/MeshCore/releases) — except the
 STM32WLE5 boards (wio-e5, wio-e5-mini, the wio-e5 bridge, RAK3172 and Tiny
-Relay), which no longer fit the fork's repeater firmware and ship no build;
-see [RADIO2.md](./RADIO2.md). Two channels:
+Relay), which no longer fit the fork's repeater firmware and ship no build.
+Two channels:
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|

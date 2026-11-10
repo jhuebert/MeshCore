@@ -136,7 +136,6 @@ if [[ ${1:-} == __list ]]; then
   # Tiny_Relay_repeater without it, wio-e5-mini_repeater and
   # wio-e5-repeater_bridge_rs232 by 7.8/8.0 KB with it. Excluded from the
   # release build; the envs remain in the tree for upstream parity.
-  # See RADIO2.md.
   bash build.sh list | grep -i repeater \
     | grep -vE '^(wio-e5_repeater|wio-e5-repeater_bridge_rs232|wio-e5-mini_repeater|RAK_3x72_repeater|Tiny_Relay_repeater)$'
   exit 0

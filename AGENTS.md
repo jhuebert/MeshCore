@@ -203,7 +203,7 @@ only; the firmware assets are built locally with
 targets, so they ship in the same release — no separate observer channel; the
 STM32WLE5 repeaters — wio-e5, wio-e5-mini, wio-e5-repeater_bridge_rs232,
 RAK_3x72_repeater, Tiny_Relay_repeater — exceed the flash budget and are
-excluded from the target set; see RADIO2.md) and
+excluded from the target set) and
 uploaded to the release with `gh`
 (CI no longer builds firmware — the wide runner fan-out got Actions
 shut down). The build job prints the tail of a failed target's log, prunes a

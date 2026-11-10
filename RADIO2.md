@@ -573,13 +573,6 @@ preset a packet arrived on.
 - **`both` duplicates traffic.** Use one bridge or `other` where possible.
 - **`powersaving` saves nothing on non-nRF52/ESP32 boards** when radio2 is
   scanning.
-- **The STM32WLE5 repeaters no longer fit their flash budget and are no
-  longer built or shipped by the fork's releases.** wio-e5, wio-e5-mini and
-  wio-e5-repeater_bridge_rs232 (with library LTO in the release build) and
-  RAK_3x72_repeater and Tiny_Relay_repeater (without) overflow the ~224 KB
-  app region by 5.7–8.8 KB at HEAD; v1.18.0-r3 still shipped them with
-  8–3,048 bytes to spare. They stay in the tree for upstream parity; for one,
-  flash v1.18.0-r3 or older, or use a board with more flash.
 - **Retune time is a conservative estimate.** Hardware may be faster or slower;
   the 3 ms default is deliberately safe.
 
