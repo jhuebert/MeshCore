@@ -11,7 +11,9 @@ void powerApplyCpuFrequency(const NodePrefs& prefs) {
   // restore the frequency the board started with.
   static uint16_t boot_mhz = getCpuFrequencyMhz();
   uint16_t mhz = prefs.cpu_freq_mhz ? prefs.cpu_freq_mhz : boot_mhz;
-  if (mhz && !setCpuFrequencyMhz(mhz)) {
+  if (mhz == getCpuFrequencyMhz()) return;   // nothing to change: no clock call,
+                                             // and the UART is left alone
+  if (!setCpuFrequencyMhz(mhz)) {
     MESH_DEBUG_PRINTLN("CPU frequency %u MHz was not applied", (unsigned)mhz);
   }
 #if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
