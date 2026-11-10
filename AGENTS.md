@@ -191,14 +191,19 @@ firmware via `bash build.sh build-firmware <target>` (`bash build.sh list` —
 target being `Xiao_S3_WIO_repeater` (observer builds add
 `Xiao_S3_WIO_repeater_observer`). **Compile-check every filesystem
 family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
-`RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_repeater` — host-native
+`RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_kiss_modem` — host-native
 tests cannot catch a platform-specific API difference, and one did (the nRF52
-file type has no default constructor).
+file type has no default constructor). The STM32WLE5 repeaters no longer fit
+their flash budget, so the smallest STM32 env that still links stands in for
+them (same `InternalFS` path).
 `.github/workflows/filter-release.yml` cuts release channels (dev →
 `repeater-filter`, stable → `repeater-filter-stable`) — tag + release object
 only; the firmware assets are built locally with
 `scripts/local-release-build.sh` (the default target set includes the observer
-targets, so they ship in the same release — no separate observer channel) and
+targets, so they ship in the same release — no separate observer channel; the
+STM32WLE5 repeaters — wio-e5, wio-e5-mini, wio-e5-repeater_bridge_rs232,
+RAK_3x72_repeater, Tiny_Relay_repeater — exceed the flash budget and are
+excluded from the target set; see RADIO2.md) and
 uploaded to the release with `gh`
 (CI no longer builds firmware — the wide runner fan-out got Actions
 shut down). The build job prints the tail of a failed target's log, prunes a
@@ -513,7 +518,7 @@ pio test -e native -e native_kiss_modem -e native_packet_filter -e native_batter
 
 Touching firmware-hook or persistence code additionally warrants compile checks
 of `Xiao_S3_WIO_repeater`, `RAK_4631_repeater`, `PicoW_repeater` and
-`wio-e5_repeater`. Note that PlatformIO does **not** track the
+`wio-e5_kiss_modem`. Note that PlatformIO does **not** track the
 force-included `test/test_packet_filter/NativeShim.h` as a dependency: after
 changing a struct it defines, clean the native envs (`pio run -e
 native_packet_filter -t clean`) or the stale objects will silently disagree
