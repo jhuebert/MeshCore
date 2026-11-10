@@ -36,7 +36,6 @@ static_assert(sizeof(Radio2CfgRecord) == RADIO2_CFG_PAYLOAD_BYTES,
 #define RADIO2_LOOP_MARGIN_US        2000UL
 #define RADIO2_MIN_VISIT_US          5000UL
 #define RADIO2_ACTIVE_SECONDARY_DIV  4U
-#define RADIO2_HOLD_POLL_MS          5UL
 #define RADIO2_SLEEP_MAX_MS          1000UL
 #define RADIO2_APPLY_DELAY_MS        2000UL
 #define RADIO2_MAX_SWITCH_FAILURES   10U

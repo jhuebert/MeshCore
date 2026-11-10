@@ -392,6 +392,7 @@ TEST(Radio2Timing, ActiveAndIdleShares) {
   EXPECT_EQ(t.secondary_visit_us, 49152u);
   EXPECT_EQ(t.primary_visit_us, 4 * 49152u);
   EXPECT_TRUE(t.secondary_lossy);
+  EXPECT_EQ(t.secondary_max_airtime_us, 2320384u);   // one max-length SF10/125k packet
 
   g_mock_millis += RADIO2_ACTIVE_HOLD_MS + 1;
   ASSERT_TRUE(r.timing(&t));
@@ -623,7 +624,7 @@ TEST(Radio2Scheduler, PrimaryInProgressDefers) {
   EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
 }
 
-TEST(Radio2Scheduler, ActiveAbortsSecondaryReceive) {
+TEST(Radio2Scheduler, ActiveKeepsSecondaryReceive) {
   g_mock_millis = 0;
   FakeDevice dev;
   Radio2 r(dev);
@@ -635,8 +636,49 @@ TEST(Radio2Scheduler, ActiveAbortsSecondaryReceive) {
   r.loop(&scheduler_fs, true);
   ASSERT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
 
+  // The primary is busy, but a packet has started: switching away would lose
+  // it and cost the primary at most one packet, so the receive is allowed to
+  // finish instead of being abandoned at the visit deadline.
   dev.in_progress = true;
   g_mock_millis += 50;
+  r.loop(&scheduler_fs, true);
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+  EXPECT_EQ(r.getAborts(), 0u);
+
+  // Completion is handed to the core before the scheduler may retune.
+  dev.in_progress = false;
+  dev.completed = true;
+  r.loop(&scheduler_fs, true);
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+
+  dev.completed = false;
+  g_mock_millis += 2;
+  r.loop(&scheduler_fs, true);
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_PRIMARY);
+  EXPECT_EQ(r.getAborts(), 0u);
+}
+
+TEST(Radio2Scheduler, ActiveAbortsRunawaySecondaryReceive) {
+  g_mock_millis = 0;
+  FakeDevice dev;
+  Radio2 r(dev);
+  setPrimary(r);
+  r.setPreset(915.0f, 125.0f, 10, 5);
+  ASSERT_TRUE(r.start(false, false));
+
+  g_mock_millis += 200;
+  r.loop(&scheduler_fs, true);
+  ASSERT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+
+  // A receive that never completes is bounded by one full packet's airtime.
+  dev.in_progress = true;
+  g_mock_millis += 50;
+  r.loop(&scheduler_fs, true);
+  EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_SECONDARY);
+
+  Radio2Timing t;
+  ASSERT_TRUE(r.timing(&t));
+  g_mock_millis += (t.secondary_max_airtime_us + 999) / 1000 + 10;
   r.loop(&scheduler_fs, true);
   EXPECT_EQ(r.currentProfile(), RADIO_PROFILE_PRIMARY);
   EXPECT_EQ(r.getAborts(), 1u);

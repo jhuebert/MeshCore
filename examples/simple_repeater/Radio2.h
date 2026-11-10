@@ -61,6 +61,10 @@ struct Radio2Timing {
   uint32_t secondary_bound_us;
   uint32_t primary_visit_us;
   uint32_t secondary_visit_us;
+  // Longest packet the secondary preset can carry. Once a secondary receive
+  // has started, the scheduler lets it finish for at most this long, so one
+  // packet (not an arbitrary stuck receive) can hold the primary.
+  uint32_t secondary_max_airtime_us;
 };
 
 // The radio surface Radio2 needs. MyMesh supplies a thin adapter over
@@ -177,6 +181,7 @@ private:
   Phase phase = PHASE_PRIMARY;
   uint8_t current = RADIO_PROFILE_PRIMARY;
   uint32_t phase_end_ms = 0;
+  uint32_t secondary_rx_deadline_ms = 0;   // bound on one secondary receive
   uint32_t last_primary_packet_ms = 0;
   uint8_t switch_failures = 0;
 

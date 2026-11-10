@@ -233,7 +233,7 @@ on; at=primary; mode=idle; split=39/61; nf=-117; sw=12; swf=0; rx=4/9; tx=1/6; b
 | `both` | Duplicate copies queued by a `both` policy. |
 | `bdrop` | Duplicate copies that could not be queued because the packet pool was full. |
 | `drop` | Packets not repeated because of a `drop` policy. |
-| `abrt` | Secondary receives abandoned at an active-mode deadline. |
+| `abrt` | Secondary receives abandoned because they ran past the one-packet airtime bound. |
 
 Other forms:
 
@@ -354,11 +354,11 @@ bounded periods.
 - **Primary in progress:** if a primary packet is already being received when a
   secondary visit would start, the visit is deferred. Primary traffic always
   wins.
-- **Secondary in progress at a deadline:** in active mode the receive is
-  abandoned so the node can return to primary; this is counted as `abrt`. In
-  idle mode the packet is allowed to finish, even if that extends the primary's
-  blind time. That is the explicit tradeoff for “do not drop secondary traffic
-  while the primary is idle”.
+- **Secondary in progress:** once a secondary packet has started, it is allowed
+  to finish, in both modes. Switching away mid-packet would lose it, and the
+  primary stands to miss only that one packet. The wait is bounded by the
+  largest packet the secondary preset can carry; a receive that somehow exceeds
+  that bound is abandoned and counted as `abrt`.
 - **Transmit:** the radio never abandons a transmission to switch presets. The
   scheduler waits for it. A transmit targeted at a preset retunes first, then
   sends.
@@ -560,11 +560,13 @@ preset a packet arrived on.
 
 - **One transceiver.** The node cannot receive both presets at once. The
   secondary is a bonus and may miss traffic.
-- **Primary protection can cost secondary packets.** In active mode a long
-  secondary packet is abandoned at the deadline.
-- **Idle hold can cost a primary packet.** In idle mode a long secondary packet
-  is allowed to finish, which can extend the primary's blind time after a long
-  primary silence. That is the tradeoff for not dropping secondary traffic.
+- **Primary protection can cost a primary packet.** A secondary packet that has
+  started is allowed to finish, up to one maximum-length packet, so the primary
+  can be blind for that long. The scheduler still prefers the primary between
+  packets.
+- **Idle hold lets secondary traffic finish.** In idle mode a long secondary
+  packet is allowed to finish too, which can extend the primary's blind time
+  after a long primary silence.
 - **Only broadcast flood crosses.** Direct messages, ACKs, path returns,
   traces and unicast flood DMs stay on their origin preset.
 - **No per-preset filters or noise floor** in this version.

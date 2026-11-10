@@ -77,6 +77,24 @@ static void profileTiming(const Radio2Profile& p, float capture_symbols,
 static uint32_t maxUs(uint32_t a, uint32_t b) { return a > b ? a : b; }
 static uint32_t usToMs(uint32_t us) { return (us + 999) / 1000; }
 
+// Longest packet the preset can carry, using MeshCore's maximum on-air length
+// (payload + path + header/transport) with an explicit header and payload CRC.
+// Once a secondary receive has started the scheduler must not switch away (that
+// guarantees a lost packet); this is the upper bound on how long it may keep
+// the primary waiting. Low-data-rate optimization is assumed on for SF11/12,
+// which over-estimates rather than under-estimates the bound.
+static uint32_t profileMaxAirtimeUs(const Radio2Profile& p) {
+  static constexpr uint32_t kMaxOnAirBytes = MAX_PACKET_PAYLOAD + MAX_PATH_SIZE + 6;
+  uint32_t preamble_symbols = p.sf <= 8 ? 32 : 16;
+  float symbol_us = ((float)(1UL << p.sf) * 1000.0f) / p.bw;
+  uint32_t de = p.sf >= 11 ? 1 : 0;
+  float num = 8.0f * (float)kMaxOnAirBytes - 4.0f * (float)p.sf + 28.0f + 16.0f;
+  float den = 4.0f * (float)(p.sf - 2 * de);
+  uint32_t payload_symbols = 8 + (uint32_t)ceilf(num / den) * (uint32_t)p.cr;
+  float symbols = (float)preamble_symbols + 4.25f + (float)payload_symbols;
+  return toUs(symbols * symbol_us);
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 Radio2::Radio2(Radio2Device& dev) : device(dev) {
@@ -102,6 +120,7 @@ void Radio2::resetToDefaults() {
   phase = PHASE_PRIMARY;
   current = RADIO_PROFILE_PRIMARY;
   phase_end_ms = 0;
+  secondary_rx_deadline_ms = 0;
   last_primary_packet_ms = 0;
   switch_failures = 0;
 
@@ -144,6 +163,7 @@ bool Radio2::start(bool rxps_enabled, bool extra_sf_enabled) {
 
 void Radio2::pauseForPrimaryChange() {
   paused = true;
+  secondary_rx_deadline_ms = 0;
   if (active && current != RADIO_PROFILE_PRIMARY) {
     switchTo(RADIO_PROFILE_PRIMARY, false);   // loop() retries if busy
   }
@@ -227,6 +247,7 @@ bool Radio2::timing(Radio2Timing* out) const {
   out->secondary_visit_us = secondaryVisitUs(*out);
   out->secondary_lossy = out->active_mode &&
                          out->primary_visit_us > out->secondary_bound_us;
+  out->secondary_max_airtime_us = profileMaxAirtimeUs(secondary);
   return out->usable;
 }
 
@@ -250,6 +271,7 @@ uint32_t Radio2::secondaryVisitUs(const Radio2Timing& t) const {
 void Radio2::scheduleFromNow() {
   Radio2Timing t;
   if (!timing(&t)) return;
+  secondary_rx_deadline_ms = 0;
   phase = current == RADIO_PROFILE_SECONDARY ? PHASE_SECONDARY : PHASE_PRIMARY;
   phase_end_ms = millis() + usToMs(current == RADIO_PROFILE_SECONDARY
                                    ? secondaryVisitUs(t) : primaryVisitUs(t));
@@ -334,6 +356,7 @@ void Radio2::loop(FILESYSTEM* fs, bool quiet) {
     }
     if (switchTo(RADIO_PROFILE_SECONDARY, false)) {
       phase = PHASE_SECONDARY;
+      secondary_rx_deadline_ms = 0;
       phase_end_ms = now + usToMs(secondaryVisitUs(t));
     } else if (active) {
       phase_end_ms = now + RADIO2_SWITCH_RETRY_MS;
@@ -343,21 +366,26 @@ void Radio2::loop(FILESYSTEM* fs, bool quiet) {
 
   // PHASE_SECONDARY
   if (device.isReceiveInProgress()) {
-    if (t.active_mode) {
-      // Primary is busy: abandon the secondary receive rather than miss it.
-      if (switchTo(RADIO_PROFILE_PRIMARY, true)) {
-        noteAbort();
-        phase = PHASE_PRIMARY;
-        phase_end_ms = now + usToMs(primaryVisitUs(t));
-      } else if (active) {
-        phase_end_ms = now + RADIO2_SWITCH_RETRY_MS;
-      }
-    } else {
-      // Primary is idle: let the long secondary packet finish.
-      phase_end_ms = now + RADIO2_HOLD_POLL_MS;
+    // A packet has started. Switching away now guarantees its loss, and the
+    // primary only stands to miss one packet, so let it finish. The wait is
+    // bounded by the largest packet the secondary preset can carry: a receive
+    // that never completes is abandoned (and counted) rather than holding the
+    // primary indefinitely.
+    if (secondary_rx_deadline_ms == 0) {
+      secondary_rx_deadline_ms = now + usToMs(t.secondary_max_airtime_us) + 1;
+    }
+    if ((int32_t)(now - secondary_rx_deadline_ms) < 0) return;
+    if (switchTo(RADIO_PROFILE_PRIMARY, true)) {
+      noteAbort();
+      secondary_rx_deadline_ms = 0;
+      phase = PHASE_PRIMARY;
+      phase_end_ms = now + usToMs(primaryVisitUs(t));
+    } else if (active) {
+      phase_end_ms = now + RADIO2_SWITCH_RETRY_MS;
     }
     return;
   }
+  secondary_rx_deadline_ms = 0;
   if (switchTo(RADIO_PROFILE_PRIMARY, false)) {
     phase = PHASE_PRIMARY;
     phase_end_ms = now + usToMs(primaryVisitUs(t));
