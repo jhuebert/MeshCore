@@ -192,11 +192,7 @@ static bool parseMilliVolts(const char* tok, uint16_t* out) {
 // why a millivolt token was refused: all digits but out of range, or not a
 // number at all (which is a usage mistake, not a value mistake)
 static void badMilliVolts(const char* tok, char* reply) {
-  bool numeric = (tok != NULL && tok[0] != 0);
-  for (const char* q = tok; numeric && *q; q++) {
-    if (*q < '0' || *q > '9') numeric = false;
-  }
-  if (numeric) {
+  if (allDigits(tok)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - millivolts must be %d..%d", BATT_MV_MIN, BATT_MV_MAX);
   } else {
     snprintf(reply, CLI_REPLY_MAX, "%s", BATT_USAGE);

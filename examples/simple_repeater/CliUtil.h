@@ -365,6 +365,17 @@ inline void parseGroupText(const uint8_t* data, size_t len, char* sender, size_t
   text[cpy] = 0;
 }
 
+// Is a token entirely ASCII digits (and not empty)? Used alongside
+// parseIntRange to tell "digits but out of range" (a value mistake) apart from
+// "not a number" (a usage mistake) so the error can say which it was.
+inline bool allDigits(const char* tok) {
+  if (tok == NULL || tok[0] == 0) return false;
+  for (const char* q = tok; *q; q++) {
+    if (*q < '0' || *q > '9') return false;
+  }
+  return true;
+}
+
 // Parse a decimal token that must be entirely a number in [lo, hi]: a trailing
 // byte ("12x", "0x10"), an empty token and an out-of-range value are all
 // refused. Callers keep their own error wording, which is why this only
