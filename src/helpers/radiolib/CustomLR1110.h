@@ -61,12 +61,14 @@ class CustomLR1110 : public LR1110 {
     uint32_t getTcxoDelay() const { return tcxoDelay; }
 
     // Restores the LF clock configuration RadioLib's begin() installs. Arming
-    // the duty cycle switches it to RC + BUSY-release (required by Semtech for
+    // the duty cycle switches it to RC (required by Semtech for
     // SetRxDutyCycle); without this the change would outlive RXPS being turned
     // off, and it also alters what the BUSY pin means to isChipBusy().
+    // Keep LF RC: the LF XOSC never starts on this board (LF_XOSC_START_ERR),
+    // so restoring it wedges every BUSY wait forever.
     int16_t restoreLfClock() {
       return configLfClock(
-          RADIOLIB_LR11X0_LF_BUSY_RELEASE_DISABLED | RADIOLIB_LR11X0_LF_CLK_XOSC);
+          RADIOLIB_LR11X0_LF_BUSY_RELEASE_DISABLED | RADIOLIB_LR11X0_LF_CLK_RC);
     }
 
     // effectiveRxPeriod reports the RX window actually programmed, which may be
@@ -101,8 +103,17 @@ class CustomLR1110 : public LR1110 {
 
       int16_t state = standby(RADIOLIB_LR11X0_STANDBY_RC);
       RADIOLIB_ASSERT(state);
-      // Semtech requires the RC standby/RTC setup before SetRxDutyCycle.
-      state = configLfClock(RADIOLIB_LR11X0_LF_CLK_RC | RADIOLIB_LR11X0_LF_BUSY_RELEASE_ENABLED);
+      // Semtech requires the RC standby/RTC setup before SetRxDutyCycle. BUSY
+      // release must not wait for the 32k Xtal (LF_BUSY_RELEASE_DISABLED): the
+      // crystal never starts on the T1000-E (LF_XOSC_START_ERR), and gating
+      // BUSY on it leaves the chip unreachable after the first arm.
+      state = configLfClock(RADIOLIB_LR11X0_LF_CLK_RC | RADIOLIB_LR11X0_LF_BUSY_RELEASE_DISABLED);
+      RADIOLIB_ASSERT(state);
+      // A pending LF_XOSC_START_ERR (the crystal never started on this board)
+      // is cleared before the duty cycle arms, mirroring RadioLib's GNSS
+      // sequence, which clears errors around the LF clock config for the same
+      // reason.
+      state = clearErrors();
       RADIOLIB_ASSERT(state);
       RadioModeConfig_t cfg = {
         .receive = {
