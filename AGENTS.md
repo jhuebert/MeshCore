@@ -123,9 +123,17 @@ commit** — the guides are user-facing API documentation, not optional docs.
 - `radiolib/RXPowerSaving.h/.cpp` — the duty-cycle policy: the level ladders per
   preamble profile, the datasheet timer guard, period calculation, config
   normalisation and the arm-retry state. Ported from EasySkyMesh
-  (`IoTThinks/MeshCore`, branch `PowerSaving-v18`); byte-identical to their tree.
+  (`IoTThinks/MeshCore`): the `PowerSaving-v18` branch, plus the SX1262
+  post-preamble-timer fix from `Dev-PS18` (PR #27, Dom4n) ported unchanged —
+  see the `SX1262RxPowerSaving.h` entry. The LR1110 arm path additionally
+  carries this fork's LF-clock fix (BUSY release must not wait on a 32 kHz
+  Xtal that never starts on the T1000-E).
+- `radiolib/SX1262RxPowerSaving.h` — the SX1262-only effective RX-period
+  computation applied at arm time (Dom4n's measured post-preamble timer
+  model; `R` chosen so the timer covers a P32 sender's header).
 - `radiolib/RXPowerSavingCLI.h/.cpp` — `get radio.rxps` / `set radio.rxps`
   (presets, `level N`, `preamble 16|32`, raw periods) and the status report.
+  `preamble=0` in the reply means the profile follows the SF (SF<=8 -> P32).
 - The integration into the radio lives in upstream files and is the fork's
   largest upstream diff: `radiolib/RadioLibWrappers.*` (duty-cycle arming,
   re-arm around TX/receive, noise-floor calibration), `CustomSX1262*` and
@@ -258,7 +266,7 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/Radio2.h/.cpp`, `Radio2Config.h`
 - `src/helpers/PowerProfile.h/.cpp`,
   `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`,
-  `src/helpers/radiolib/RadioProfileControl.h`
+  `src/helpers/radiolib/SX1262RxPowerSaving.h`, `src/helpers/radiolib/RadioProfileControl.h`
 - `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
   `test/test_mesh_clock/`, `test/test_rx_power_saving/`, `test/test_radio2/`,
   `test/test_mqtt_observer/`

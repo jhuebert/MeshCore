@@ -45,8 +45,10 @@ holds, so the savings do not quietly turn into lost packets.
 
 Credit where it is due: `powersaving` is upstream MeshCore, and the RXPS
 duty-cycle subsystem is ported from **EasySkyMesh**
-([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore), `PowerSaving-v18`);
-this fork added the `cpu.freq` setting, the port and the guide.
+([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore),
+`PowerSaving-v18` + the SX1262 post-preamble-timer fix from `Dev-PS18`,
+PR #27 by Dom4n); this fork added the `cpu.freq` setting, the port and the
+guide.
 
 → Full guide: **[POWER.md](./POWER.md)**
 

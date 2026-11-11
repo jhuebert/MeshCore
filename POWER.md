@@ -172,6 +172,11 @@ SX1262 are adjusted at arm time for its measured post-preamble timer
 (P32-sender headers are covered even when the node is set up for the
 16-symbol profile).
 
+`preamble=0` in the report means the profile follows the spreading factor
+(SF ≤ 8 → the 32-symbol profile, matching MeshCore's senders at SF ≤ 8);
+`16` or `32` mean the explicit profile was set. Set the profile explicitly
+when the network is not SF ≤ 8.
+
 ## Persistence
 
 All three live in the normal preference file (`/prefs.json`), so they survive
