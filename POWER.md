@@ -31,8 +31,11 @@ Only one of the three knobs is this fork's own work, and the credit matters:
   `PowerSaving-v18` (the source behind the EasySkyMesh PowerSaving18 release,
   by Kevin Le). The policy, level ladder, preamble guard, CLI and radio-wrapper
   integration are theirs; this fork's copies of `RXPowerSaving.*` and
-  `RXPowerSavingCLI.*` are byte-identical to their tree, and the host tests are
-  their cases wired into this repo's test runner.
+  `RXPowerSavingCLI.*` are their code, and the host tests are their cases
+  wired into this repo's test runner. The SX1262 post-preamble-timer fix is
+  by **Dom4n** ([PR #27](https://github.com/IoTThinks/MeshCore/pull/27),
+  measured on eight boards including a XIAO S3 WIO); it arrived on EasySkyMesh's
+  `Dev-PS18` branch and is ported here unchanged.
 - This fork added the port into the repeater/observer firmware, the persisted
   **`cpu.freq`** setting, the `PowerProfile` glue, the pre-feature defaults,
   and this guide.
@@ -164,6 +167,10 @@ the new bus clock; USB CDC consoles are unaffected.
 the requested ones: `effective=armed` means the cycle is programmed, `err`
 is the last driver error, `fail` counts consecutive arm failures, and
 `catch=N.N` is the preamble margin the configured periods really give.
+`erx`/`eslp` report the periods the driver actually programmed, which on
+SX1262 are adjusted at arm time for its measured post-preamble timer
+(P32-sender headers are covered even when the node is set up for the
+16-symbol profile).
 
 ## Persistence
 
