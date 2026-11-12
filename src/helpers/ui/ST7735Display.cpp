@@ -513,6 +513,7 @@ void ST7735Display::turnOn() {
   if (!_isOn) {
     if (_peripher_power) _peripher_power->claim();
 
+#if defined(HELTEC_T096)
     // Restore GPIOs
     pinMode(PIN_TFT_CS, OUTPUT);
     pinMode(PIN_TFT_DC, OUTPUT);
@@ -520,6 +521,7 @@ void ST7735Display::turnOn() {
     pinMode(PIN_TFT_SCL, OUTPUT);
     pinMode(PIN_TFT_RST, OUTPUT);
     pinMode(PIN_TFT_LEDA_CTL, OUTPUT);
+#endif
 
     _resetAndInit();
     sendCommand(ST77XX_DISPON);
@@ -538,6 +540,7 @@ void ST7735Display::turnOff() {
     // Now turn off the backlight
     digitalWrite(PIN_TFT_LEDA_CTL, !PIN_TFT_LEDA_CTL_ACTIVE);
 
+#if defined(HELTEC_T096)
     // Prevent back-powering to save 3.5mA (from 12.6 down to 9.1mA)
     pinMode(PIN_TFT_CS, INPUT);
     pinMode(PIN_TFT_DC, INPUT);
@@ -545,6 +548,7 @@ void ST7735Display::turnOff() {
     pinMode(PIN_TFT_SCL, INPUT);
     pinMode(PIN_TFT_RST, INPUT);
     pinMode(PIN_TFT_LEDA_CTL, INPUT);
+#endif
 
     _isOn = false;
 
