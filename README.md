@@ -1,9 +1,9 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream automatically (synced weekly) and adds seven
-repeater-focused capabilities on top of stock firmware. Everything else —
-supported boards, clients, protocols, build system — is identical to upstream;
+It tracks upstream `main` releases (merged on demand, not on a schedule) and
+adds seven repeater-focused capabilities on top of stock firmware. Everything
+else — supported boards, clients, protocols, build system — is identical to upstream;
 see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
 general project, hardware support, and getting-started guide.
