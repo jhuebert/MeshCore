@@ -139,7 +139,7 @@ Two channels:
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|
-| dev | `repeater-filter` | upstream `dev` (merged weekly by CI) | `filter-v*-dev.N` |
+| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `filter-v*-dev.N` |
 | stable | `repeater-filter-stable` | upstream `main` releases | `filter-v*` |
 
 Flash as you would stock firmware, then follow

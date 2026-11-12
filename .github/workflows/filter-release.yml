@@ -97,21 +97,20 @@ jobs:
             }
 
             let branch = 'repeater-filter';
-            let baseRef = 'origin/dev';
+            // both channels are based on upstream main; used to count only
+            // fork commits for the stable release decision
+            let baseRef = 'origin/main';
             if (channel === 'stable') {
               branch = 'repeater-filter-stable';
-              baseRef = 'origin/main';
             }
             // via env, not an Actions expression: input text must never become
             // shell syntax
             if (process.env.BRANCH_INPUT) branch = process.env.BRANCH_INPUT;
 
-            // upstream base version, X.Y.Z only. Upstream tags each release on
-            // the main merge commit (companion-v1.18.0 -> main's "Merge branch
-            // 'dev'"), which is NOT reachable from the dev-based channel branch,
-            // so the reachable companion-v* tag is the *previous* release. The
-            // '* version X.Y.Z' commit the tag mirrors IS reachable, so prefer
-            // it (v1.18.0); fall back to the tag for trees that lack it.
+            // upstream base version, X.Y.Z only. Both channels are main-based,
+            // so upstream tags on the main merge commit are reachable; prefer
+            // the '* version X.Y.Z' commit they mirror over fallback describe
+            // (companion-v1.18.0 -> commit "* version 1.18.0").
             let upstreamVersion = 'untagged';
             const versionCommit = git('log', '--format=%s', 'HEAD')
               .split('\n')
@@ -186,7 +185,7 @@ jobs:
             if (skip) {
               // build when any commit since the channel's last release touches
               // code (dev channel counts upstream commits too; stable excludes
-              // upstream history so only cherry-picked filter commits count)
+              // upstream main history so only fork commits count)
               // merges INCLUDED: a merge commit can carry a hand-resolved conflict,
               // which is a real code change that --no-merges would hide
               const revListArgs = ['rev-list', range];

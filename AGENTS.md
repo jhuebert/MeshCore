@@ -218,20 +218,18 @@ shut down). The build job prints the tail of a failed target's log, prunes a
 failed target's build tree, and retries the failed set once with two workers
 (`--retry-failed`) after the main pass, so runner-resource flakes do not leave
 assets missing; a deterministic failure simply fails again.
-`sync-upstream.yml` merges upstream into the chosen channel branch
-and `promote-stable.yml` cherry-picks the filter commits from `repeater-filter`
-onto `repeater-filter-stable`; both are manual-dispatch only (never on a
-schedule) and neither cuts a release — use Filter Release for that. A conflict
-in either one opens (or updates) an issue through
-`.github/actions/open-conflict-issue/` and fails the run; the promotion also
-skips a pick that conflicts when the source branch later rewrote that commit
-(squash) and only publishes if the branch then matches the source for every
-file the source changed since its upstream merge base — except paths where the
-two channels' upstream branches (dev's `dev`, stable's `main`) differ, which
-are upstream drift rather than a lost filter commit. The promotion runs a
-quality gate (the native suites plus the build-tooling tests in
-`scripts/tests/`) before it publishes. Upstream's own docs live in `docs/`
-(MeshCore protocol/CLI generally) — not fork-filter documentation.
+`sync-upstream.yml` merges upstream `main` into `repeater-filter-stable`
+(channel=stable) or `repeater-filter-stable` into `repeater-filter` (dev);
+`promote-stable.yml` fast-forwards `repeater-filter-stable` to
+`repeater-filter` after running the native suites plus the build-tooling
+tests in `scripts/tests/` — it never merges; if stable is not an ancestor of
+dev it fails and tells you to merge stable into dev first (run
+`sync-upstream.yml` with channel=dev). Both are manual-dispatch only (never
+on a schedule) and neither cuts a release — use Filter Release for that. A
+conflict in a sync opens (or updates) an issue through
+`.github/actions/open-conflict-issue/` and fails the run. Upstream's own
+docs live in `docs/` (MeshCore protocol/CLI generally) — not fork-filter
+documentation.
 
 Some repeater targets fail on the upstream tree too, and are deliberately left
 failing: `Heltec_ct62_repeater_bridge_espnow`,
@@ -243,15 +241,26 @@ them as part of a fork fix; the release simply ships without those assets.
 
 ## Branch model
 
-- `repeater-filter` — dev release channel; the integration branch for all
-  filter work. Default branch of the fork.
-- `repeater-filter-stable` — stable release channel; updated from
-  `repeater-filter` deliberately via `promote-stable.yml`, not automatically.
+- `repeater-filter-stable` — stable release channel; tracks upstream `main`,
+  synced by the manually-dispatched `sync-upstream.yml` (channel=stable).
+- `repeater-filter` — dev release channel; based on `repeater-filter-stable`,
+  the integration branch for all fork work. Default branch of the fork.
+- Changes reach stable by fast-forward via `promote-stable.yml` (gate included),
+  never by a merge commit on stable; dev absorbs stable via `sync-upstream.yml`
+  (channel=dev) after every sync or promotion that moves `repeater-filter-stable`.
+  Keep the invariant that stable is an ancestor of dev: every commit on stable
+  is reachable from dev. Never commit directly to `repeater-filter-stable`;
+  never merge dev into stable with a merge commit.
 - Work branches: `repeater-filter-<topic>` cut from `repeater-filter`, merged
-  back with `--no-ff` (keep feature commits traceable).
-- Upstream is tracked via the manually-dispatched `sync-upstream.yml`
-  workflow; do not hand-merge upstream `dev` locally unless fixing a sync
-  failure.
+  back with `--no-ff` (keep feature commits traceable). Topic branches cut
+  before 2026-11-12 from the old dev lineage must be rebased onto the new
+  dev — never merged raw (merging drags upstream `dev` back in).
+- The 2026-11 branch swap: the old dev lineage (tracking upstream `dev`) is
+  archived at tag `archive/repeater-filter-2026-11-12`; `repeater-filter` was
+  restarted from `repeater-filter-stable` after verifying the fork content was
+  identical across the two (the remaining tree diff is upstream dev/main drift).
+- Do not hand-merge upstream `main` locally; use `sync-upstream.yml` and
+  resolve conflicts in the branch if the run fails.
 
 ## Fork-owned vs upstream code
 

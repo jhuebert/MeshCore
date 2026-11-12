@@ -61,31 +61,33 @@ jobs:
               core.setFailed("channel must be 'dev' or 'stable'");
               return;
             }
-            // the channel's upstream source and the fork branch it feeds
-            const upstreamBranch = channel === 'dev' ? 'dev' : 'main';
+            // the channel's sync source and the fork branch it feeds:
+            // stable merges upstream main; dev merges stable (the fork dev
+            // branch is based on stable, so upstream changes reach it that way)
             const target = channel === 'dev' ? 'repeater-filter' : 'repeater-filter-stable';
+            const sourceRef = channel === 'dev' ? 'origin/repeater-filter-stable' : 'origin/main';
+            const sourceName = channel === 'dev' ? 'repeater-filter-stable' : 'main';
 
-            run('remote', 'add', 'upstream', 'https://github.com/meshcore-dev/MeshCore.git');
-
-            // keep the fork's pristine mirror of the upstream branch a true
-            // fast-forward, so origin/<upstreamBranch> stays an honest upstream
-            // pointer (the promotion's cherry base and the release version job
-            // both read it)
-            run('fetch', 'upstream', upstreamBranch);
-            run('checkout', '-B', upstreamBranch, `origin/${upstreamBranch}`);
-            const merge = git('merge', '--ff-only', `upstream/${upstreamBranch}`);
-            if (merge.status !== 0) {
-              core.setFailed(`fork/${upstreamBranch} has diverged from upstream/${upstreamBranch}; refusing to force-push.`);
-              return;
+            if (channel === 'stable') {
+              run('remote', 'add', 'upstream', 'https://github.com/meshcore-dev/MeshCore.git');
+              // keep the fork's pristine mirror of upstream main a true
+              // fast-forward, so origin/main stays an honest upstream pointer
+              run('fetch', 'upstream', 'main');
+              run('checkout', '-B', 'main', 'origin/main');
+              const merge = git('merge', '--ff-only', 'upstream/main');
+              if (merge.status !== 0) {
+                core.setFailed('fork/main has diverged from upstream/main; refusing to force-push.');
+                return;
+              }
+              run('push', 'origin', 'main');
             }
-            run('push', 'origin', upstreamBranch);
 
             // --no-commit so the fork-owned README can be restored before the
             // merge commit is created
             run('checkout', target);
             // the status is inspected, not just thrown: only a real conflict is
             // tolerated, any other git failure is reported below
-            const branchMerge = git('merge', `origin/${upstreamBranch}`, '--no-commit', '--no-ff');
+            const branchMerge = git('merge', sourceRef, '--no-commit', '--no-ff');
             if (branchMerge.error) throw branchMerge.error;
             // README.md is fork-owned: force it back to this branch's version no
             // matter what the merge did (clean take of upstream changes or conflict)
@@ -95,7 +97,7 @@ jobs:
               return;
             }
             if (!fs.existsSync('.git/MERGE_HEAD')) {
-              core.info(`Already up to date with ${upstreamBranch}`);
+              core.info(`Already up to date with ${sourceName}`);
               core.setOutput('merged', 'false');
               return;
             }
@@ -117,7 +119,7 @@ jobs:
         with:
           marker: ${{ inputs.channel == 'stable' && '[filter-sync-conflict-stable]' || '[filter-sync-conflict]' }}
           files-file: conflicted-files.txt
-          title: ${{ inputs.channel == 'stable' && 'Upstream sync conflict in repeater-filter-stable' || 'Upstream merge conflict in repeater-filter' }}
-          intro: ${{ inputs.channel == 'stable' && 'Automatic merge of `main` into `repeater-filter-stable` failed with conflicts.' || 'Automatic merge of `dev` into `repeater-filter` failed with conflicts.' }}
+          title: ${{ inputs.channel == 'stable' && 'Upstream sync conflict in repeater-filter-stable' || 'Merge conflict in repeater-filter' }}
+          intro: ${{ inputs.channel == 'stable' && 'Automatic merge of `main` into `repeater-filter-stable` failed with conflicts.' || 'Automatic merge of `repeater-filter-stable` into `repeater-filter` failed with conflicts.' }}
           closing: 'Resolve the conflicts locally, push the merge, then close this issue.'
-          failure-message: ${{ inputs.channel == 'stable' && 'Upstream sync conflict in repeater-filter-stable; resolve locally, push the merge, then close this issue.' || 'Upstream merge conflict in repeater-filter; resolve locally, push the merge, then close this issue.' }}
+          failure-message: ${{ inputs.channel == 'stable' && 'Upstream sync conflict in repeater-filter-stable; resolve locally, push the merge, then close this issue.' || 'Merge conflict in repeater-filter; resolve locally, push the merge, then close this issue.' }}
