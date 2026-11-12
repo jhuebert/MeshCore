@@ -69,6 +69,9 @@ public:
   virtual void onBootComplete() { /* no op */ }
   virtual uint32_t getIRQGpio() { return -1; } // not supported. Returns DIO1 (SX1262) and DIO0 (SX127x)
   virtual void sleep(uint32_t secs)  { /* no op */ }
+  // Sleep for at most `ms` milliseconds, waking on the timer or a radio
+  // interrupt. Default preserves the old whole-second behaviour.
+  virtual void sleepMs(uint32_t ms) { sleep((ms + 999) / 1000); }
   virtual uint32_t getGpio() { return 0; }
   virtual void setGpio(uint32_t values) {}
   virtual uint8_t getStartupReason() const = 0;

@@ -39,6 +39,13 @@ public:
   virtual float packetScore(float snr, int packet_len) = 0;
 
   /**
+   * \brief  select the profile the next transmission will use.
+   * \returns false when it is not safe to retune yet; try again next loop.
+   *          Default: no profile support.
+   */
+  virtual bool selectTxProfile(uint8_t profile) { (void)profile; return true; }
+
+  /**
    * \brief  starts the raw packet send. (no wait)
    * \param  bytes   the raw packet data
    * \param  len  the length in bytes
@@ -90,6 +97,7 @@ public:
   virtual void free(Packet* packet) = 0;
 
   virtual void queueOutbound(Packet* packet, uint8_t priority, uint32_t scheduled_for) = 0;
+  virtual Packet* peekNextOutbound(uint32_t now) = 0;   // same pick as getNextOutbound(), without removing
   virtual Packet* getNextOutbound(uint32_t now) = 0;    // by priority
   virtual int getOutboundCount(uint32_t now) const = 0;
   virtual int getOutboundTotal() const = 0;
@@ -131,6 +139,7 @@ class Dispatcher {
   unsigned long tx_budget_ms;
   unsigned long last_budget_update;
   unsigned long duty_cycle_window_ms;
+  uint8_t _default_tx_profile = 0;
 
   void processRecvPacket(Packet* pkt);
   void updateTxBudget();
@@ -180,6 +189,9 @@ public:
   bool isTransmitting() const { return outbound != nullptr; }
   void begin();
   void loop();
+
+  void setDefaultTxProfile(uint8_t p) { _default_tx_profile = p & 0x03; }
+  uint8_t getDefaultTxProfile() const { return _default_tx_profile; }
 
   Packet* obtainNewPacket();
   void releasePacket(Packet* packet);

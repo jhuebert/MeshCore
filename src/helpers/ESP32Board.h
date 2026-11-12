@@ -75,7 +75,7 @@ public:
     return P_LORA_DIO_1; // default for SX1262
   }
 
-  void sleep(uint32_t secs) override {
+  void sleepUs(uint64_t us) {
     // Skip if not allow to sleep
     if (inhibit_sleep || (int32_t)(inhibit_sleep_until - millis()) > 0) {
       delay(1); // Give MCU to OTA to run
@@ -86,8 +86,8 @@ public:
     gpio_num_t wakeupPin = (gpio_num_t)getIRQGpio();
 
     // Configure timer wakeup
-    if (secs > 0) {
-      esp_sleep_enable_timer_wakeup(secs * 1000000ULL); // Wake up periodically to do scheduled jobs
+    if (us > 0) {
+      esp_sleep_enable_timer_wakeup(us); // Wake up periodically to do scheduled jobs
     }
 
     // Disable CPU interrupt servicing
@@ -126,6 +126,9 @@ public:
     // Enable CPU interrupt servicing
     portEXIT_CRITICAL(&sleepMux);
   }
+
+  void sleep(uint32_t secs) override { sleepUs((uint64_t)secs * 1000000ULL); }
+  void sleepMs(uint32_t ms) override { sleepUs((uint64_t)ms * 1000ULL); }
 
   uint8_t getStartupReason() const override { return startup_reason; }
 

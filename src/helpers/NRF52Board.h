@@ -28,6 +28,7 @@ struct PowerMgtConfig {
 class NRF52Board : public mesh::MainBoard {
 private:
   bool pwrmgt_initialised = false;
+  bool rtc2_initialised = false;
 
 protected:
   uint8_t startup_reason;
@@ -58,6 +59,7 @@ public:
   virtual bool getBootloaderVersion(char* version, size_t max_len) override;
   virtual bool startOTAUpdate(const char *id, char reply[]) override;
   virtual void sleep(uint32_t secs) override;
+  virtual void sleepMs(uint32_t ms) override;
   bool isExternalPowered() override;
 
   void attachDynamicPrefs(KeyValueStore* prefs) { }  // no-op

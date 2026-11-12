@@ -36,6 +36,10 @@ namespace mesh {
 #define PAYLOAD_VER_3       0x02   // FUTURE
 #define PAYLOAD_VER_4       0x03   // FUTURE
 
+#define RADIO_PROFILE_PRIMARY    0
+#define RADIO_PROFILE_SECONDARY  1
+#define RADIO_PROFILE_UNKNOWN    3
+
 /**
  * \brief  The fundamental transmission unit.
 */
@@ -49,6 +53,20 @@ public:
   uint8_t path[MAX_PATH_SIZE];
   uint8_t payload[MAX_PACKET_PAYLOAD];
   int8_t _snr;
+
+  // Local-only routing metadata. Never written on air, never hashed.
+  // bits 0-1: TX target profile (0 primary, 1 secondary)
+  // bits 2-3: RX origin profile (0 primary, 1 secondary, 3 unknown/local)
+  uint8_t radio_profiles = 0;
+
+  uint8_t getTxProfile() const { return radio_profiles & 0x03; }
+  void setTxProfile(uint8_t p) {
+    radio_profiles = (uint8_t)((radio_profiles & ~0x03) | (p & 0x03));
+  }
+  uint8_t getRxProfile() const { return (radio_profiles >> 2) & 0x03; }
+  void setRxProfile(uint8_t p) {
+    radio_profiles = (uint8_t)((radio_profiles & ~0x0C) | ((p & 0x03) << 2));
+  }
 
   /**
    * \brief calculate the hash of payload + type
@@ -110,5 +128,8 @@ public:
    */
   bool readFrom(const uint8_t src[], uint8_t len);
 };
+
+static_assert(sizeof(Packet) == 260,
+              "Packet must stay 260 bytes: the profile byte lives in tail padding");
 
 }
