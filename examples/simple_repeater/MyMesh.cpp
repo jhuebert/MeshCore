@@ -433,6 +433,12 @@ void MyMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, ui
 }
 
 bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
+  // A policy drop is a deliberate routing decision, evaluated before the
+  // battery/filter gates and counted on its own.
+  if (!rx_forward_allowed) {
+    radio2.notePolicyDrop();
+    return false;
+  }
   // Fleet-channel packets bypass the battery gate (fleet.checkForward returns
   // false for them, which short-circuits before the gate is consulted, so a
   // fleet packet is never counted as a battery drop and relays even while
@@ -525,6 +531,16 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 }
 
 void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
+  if (radio2.isScanning()) {
+    // logRx() runs before onRecvPacket(): stamp and count the profile recvRaw()
+    // just read from, so the observer and later hooks see the origin. The stamp
+    // must be taken here, not when the packet is processed: a flood packet can
+    // sit in the delayed-inbound queue across a scheduler retune.
+    const uint8_t rx = radio2.currentProfile();
+    pkt->setRxProfile(rx);
+    radio2.noteRx(rx);
+    if (rx == RADIO_PROFILE_PRIMARY) radio2.notePrimaryPacket();
+  }
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.capture(pkt, score);
 #endif
@@ -556,6 +572,10 @@ void MyMesh::logRx(mesh::Packet *pkt, int len, float score) {
 }
 
 void MyMesh::logTx(mesh::Packet *pkt, int len) {
+  // The scanner's current preset is the one selectTxProfile() just tuned for;
+  // a fallback send (paused/inactive) goes out on primary whatever the packet
+  // asked for.
+  if (radio2.isScanning()) radio2.noteTx(radio2.currentProfile());
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.captureTx(pkt);
 #endif
@@ -610,6 +630,24 @@ uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
 }
 
 mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
+  rx_forward_allowed = true;   // the off path must never inherit a stale drop
+  const bool radio2_rx = radio2.isScanning();
+  uint8_t rx_profile = RADIO_PROFILE_PRIMARY;
+  Radio2Action rx_action = RADIO2_ACTION_SAME;
+  if (radio2_rx) {
+    // The origin is the profile stamped at reception, not the scanner's
+    // current preset: a delayed flood packet may be processed after a retune.
+    rx_profile = pkt->getRxProfile();
+    if (rx_profile != RADIO_PROFILE_PRIMARY && rx_profile != RADIO_PROFILE_SECONDARY) {
+      rx_profile = radio2.currentProfile();
+    }
+    rx_action = radio2.actionFor(rx_profile, pkt);
+    rx_forward_allowed = rx_action != RADIO2_ACTION_DROP;
+
+    pkt->setRxProfile(rx_profile);
+    pkt->setTxProfile(radio2.targetFor(rx_action, rx_profile));
+  }
+
   if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
     recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
   } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
@@ -627,9 +665,38 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   // core decides to do in between — including returning early or never reaching
   // the forwarding hook at all.
   filter.clearContentVerdict();
-  mesh::DispatcherAction action = Mesh::onRecvPacket(pkt);
+
+  mesh::DispatcherAction action;
+  if (radio2_rx) {
+    // Replies created anywhere below (core ACK/path return, CLI, fleet) inherit
+    // the origin profile through obtainNewPacket().
+    const uint8_t previous_default = getDefaultTxProfile();
+    setDefaultTxProfile(radio2.replyProfile(rx_profile));
+    action = Mesh::onRecvPacket(pkt);
+    setDefaultTxProfile(previous_default);
+  } else {
+    action = Mesh::onRecvPacket(pkt);
+  }
+
   filter.clearContentVerdict();
+
+  if (radio2_rx && rx_action == RADIO2_ACTION_BOTH &&
+      action != ACTION_RELEASE && action != ACTION_MANUAL_HOLD) {
+    radio2QueueDuplicate(pkt, action, rx_profile);
+  }
   return action;
+}
+
+void MyMesh::radio2QueueDuplicate(mesh::Packet* pkt, mesh::DispatcherAction action,
+                                  uint8_t origin) {
+  uint8_t priority = (uint8_t)((action >> 24) - 1);
+  uint32_t delay = action & 0xFFFFFF;
+  mesh::Packet* copy = obtainNewPacket();
+  if (!copy) { radio2.noteBothDrop(); return; }
+  *copy = *pkt;
+  copy->setTxProfile(origin ^ 1);
+  sendPacket(copy, priority, delay);
+  radio2.noteBoth();
 }
 
 void MyMesh::onAnonDataRecv(mesh::Packet *packet, const uint8_t *secret, const mesh::Identity &sender,
@@ -935,6 +1002,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
     : mesh::Mesh(radio, ms, rng, rtc, *new StaticPoolPacketManager(32), tables),
       region_map(key_store), temp_map(key_store),
       _cli(board, rtc, sensors, region_map, acl, &_prefs, this),
+      radio2(radio2_device),
       telemetry(MAX_PACKET_PAYLOAD - 4),
       discover_limiter(4, 120),  // max 4 every 2 minutes
       anon_limiter(4, 180)   // max 4 every 3 minutes
@@ -1046,7 +1114,7 @@ static const char* fleetNodeName(void* ctx) {
 // retry reproduces the exact same packet (hash).
 static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_hash,
                            uint32_t ts, const char* sender_name, const char* body,
-                           uint8_t* out_pkt_hash) {
+                           uint8_t radio_profile, uint8_t* out_pkt_hash) {
   MyMesh* m = (MyMesh*)ctx;
   mesh::GroupChannel chan;
   memset(&chan, 0, sizeof(chan));
@@ -1065,6 +1133,7 @@ static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg,
                                              5 + strlen((char*)&msg[5]));
   if (!pkt) return false;   // pool empty: FleetManager retries later
+  pkt->setTxProfile(radio_profile);
   if (out_pkt_hash) pkt->calculatePacketHash(out_pkt_hash);
   // flood is the only reply route (group texts carry no pubkey); the hook
   // method applies the repeater's configured path-hash size and its default
@@ -1100,6 +1169,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   _fs = fs;
   // load persisted prefs
   _cli.loadPrefs(_fs);
+  radio2.begin(_fs);
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.begin(_fs, &self_id, _prefs.node_name, board.getManufacturerName(),
                      FIRMWARE_VERSION, _prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
@@ -1147,6 +1217,12 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   powerApplyRadioProfile(_prefs);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
+
+  radio2.setPrimary(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  radio2.start(_prefs.rxps.enabled, _prefs.extra_sf[0] != 0);
+  // With radio2 off the radio layer keeps its upstream default behaviour: no
+  // profile controller is installed at all.
+  radio_driver.setProfileControl(radio2.isScanning() ? &radio2 : nullptr);
 
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
@@ -1200,14 +1276,35 @@ bool MyMesh::formatFileSystem() {
 
 void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
   mesh::Packet *pkt = createSelfAdvert();
-  if (pkt) {
-    if (flood) {
-      sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
-    } else {
-      sendZeroHop(pkt, delay_millis);
+  if (!pkt) {
+    MESH_DEBUG_PRINTLN("ERROR: unable to create advertisement packet!");
+    return;
+  }
+  // A local advert follows `radio2 advert`, not the preset that triggered it
+  // (a remote `advert` command arrives on one preset, but the node's own
+  // advert is primary by default).
+  pkt->setTxProfile(RADIO_PROFILE_PRIMARY);
+
+  // Copy before queueing the first packet: the queued packet stays valid, but
+  // copying first keeps the two independent from the start.
+  mesh::Packet* copy = NULL;
+  if (radio2.advertBoth()) {
+    copy = obtainNewPacket();
+    if (copy) *copy = *pkt;
+  }
+
+  if (flood) {
+    sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+    if (copy) {
+      copy->setTxProfile(RADIO_PROFILE_SECONDARY);
+      sendFloodScoped(default_scope, copy, delay_millis, _prefs.path_hash_mode + 1);
     }
   } else {
-    MESH_DEBUG_PRINTLN("ERROR: unable to create advertisement packet!");
+    sendZeroHop(pkt, delay_millis);
+    if (copy) {
+      copy->setTxProfile(RADIO_PROFILE_SECONDARY);
+      sendZeroHop(copy, delay_millis);
+    }
   }
 }
 
@@ -1475,6 +1572,23 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 5;
     while (*sub == ' ') sub++;
     fleetCLI(fleet, sub, reply);
+  } else if (memcmp(command, "radio2", 6) == 0 && (command[6] == 0 || command[6] == ' ')) {
+    const char* sub = command + 6;
+    while (*sub == ' ') sub++;
+    // Preset/off changes wait for a temporary primary to revert; read-only and
+    // policy/advert commands are safe at any time.
+    bool changes_rf = (*sub != 0 && strcmp(sub, "off") == 0) || strchr(sub, ',') != NULL;
+    if (changes_rf && (set_radio_at || revert_radio_at)) {
+      strcpy(reply, "Err - tempradio active; wait for it to revert");
+    } else {
+      radio2CLI(radio2, _prefs.rxps.enabled, _prefs.extra_sf[0] != 0, sub, reply);
+    }
+  } else if ((radio2.isEnabled() || radio2.isScanning()) &&
+             cliStartsWith(command, "set radio.rxps ") &&
+             strncmp(command + 15, "off", 3) != 0) {
+    // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
+    // available so the operator can recover, and `get radio.rxps` is read-only.
+    strcpy(reply, "Err - radio2 is on; set radio2 off first");
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it
     char now[32];
@@ -1512,24 +1626,32 @@ void MyMesh::loop() {
 
   mesh::Mesh::loop();
 
+  if (radio2.needsService()) {
+    radio2.loop(_fs, _mgr->getOutboundTotal() == 0);
+    // Keep the radio layer free of radio2 whenever it is not needed: with
+    // radio2 off and on primary, selectTxProfile() is the upstream default.
+    radio_driver.setProfileControl(
+        (radio2.isScanning() || radio2.currentProfile() != RADIO_PROFILE_PRIMARY)
+            ? &radio2 : nullptr);
+  }
+
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    uint32_t delay_millis = 0;
-    if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+    sendSelfAdvertisement(0, true);
 
     updateFloodAdvertTimer(); // schedule next flood advert
     updateAdvertTimer();      // also schedule local advert (so they don't overlap)
   } else if (next_local_advert && millisHasNowPassed(next_local_advert)) {
-    mesh::Packet *pkt = createSelfAdvert();
-    if (pkt) sendZeroHop(pkt);
+    sendSelfAdvertisement(0, false);
 
     updateAdvertTimer(); // schedule next local advert
   }
 
   if (set_radio_at && millisHasNowPassed(set_radio_at)) { // apply pending (temporary) radio params
     set_radio_at = 0;                                     // clear timer
+    radio2.pauseForPrimaryChange();
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
     powerApplyRadioProfile(_prefs, pending_sf, pending_bw);
+    radio2.setPrimary(pending_freq, pending_bw, pending_sf, pending_cr);
     MESH_DEBUG_PRINTLN("Temp radio params");
   }
 
@@ -1537,6 +1659,8 @@ void MyMesh::loop() {
     revert_radio_at = 0;                                        // clear timer
     radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
     powerApplyRadioProfile(_prefs);
+    radio2.setPrimary(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+    radio2.resumeAfterPrimaryChange(_prefs.rxps.enabled, _prefs.extra_sf[0] != 0);
     MESH_DEBUG_PRINTLN("Radio params restored");
   }
 
@@ -1567,6 +1691,10 @@ void MyMesh::loop() {
   uint32_t now = millis();
   uptime_millis += now - last_millis;
   last_millis = now;
+}
+
+uint32_t MyMesh::getSleepMs() {
+  return radio2.getSleepMs();
 }
 
 // To check if there is pending work
