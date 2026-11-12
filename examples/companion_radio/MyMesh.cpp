@@ -551,11 +551,15 @@ mesh::DispatcherAction MyMesh::onRecvPacket(mesh::Packet* pkt) {
   if (radio2_rx) {
     // Replies created anywhere below (core ACK/path return, CLI answers)
     // inherit the origin profile through obtainNewPacket().
-    const uint8_t previous_default = getDefaultTxProfile();
+    in_onrecv_bracket = true;
     setDefaultTxProfile(radio2.replyProfile(rx_profile));
     action = BaseChatMesh::onRecvPacket(pkt);
-    setDefaultTxProfile(previous_default);
+    // Re-read the knob: a `radio2 tx ...` run inside this receive (remote CLI)
+    // moved it, and locally originated sends must follow it once we leave.
+    setDefaultTxProfile(radio2.localTxProfile());
+    in_onrecv_bracket = false;
   } else {
+    in_onrecv_bracket = false;
     action = BaseChatMesh::onRecvPacket(pkt);
   }
 
@@ -2241,19 +2245,20 @@ static bool setMuteKnob(MyMesh& mesh, const char* command, const char* name, T& 
 bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
   while (*command == ' ') command++; // skip leading spaces
 
-  // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
-  // available so the operator can recover, and `get radio.rxps` is read-only.
-  if ((radio2.isEnabled() || radio2.isScanning()) &&
-      cliStartsWith(command, "set radio.rxps ") && strncmp(command + 15, "off", 3) != 0) {
-    strcpy(reply, "Err - radio2 is on; set radio2 off first");
-    return true;
-  }
-
   if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
     memcpy(reply, command, 3);                    // reflect the prefix back
     reply += 3;
     *reply = 0;
     command += 3;
+  }
+
+  // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
+  // available so the operator can recover, and `get radio.rxps` is read-only.
+  // (After the prefix strip so a prefixed command cannot bypass it.)
+  if ((radio2.isEnabled() || radio2.isScanning()) &&
+      cliStartsWith(command, "set radio.rxps ") && strncmp(command + 15, "off", 3) != 0) {
+    strcpy(reply, "Err - radio2 is on; set radio2 off first");
+    return true;
   }
 
   if (_prefs.getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {  // is radio CLI command?
@@ -2271,8 +2276,10 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
     const char* sub = command + 6;
     while (*sub == ' ') sub++;
     radio2CLI(radio2, _prefs.rxps.enabled, /* extra_sf */ false, sub, reply);
-    // The local TX knob may have moved; make locally originated sends follow it.
-    setDefaultTxProfile(radio2.localTxProfile());
+    // The local TX knob may have moved; make locally originated sends follow
+    // it. Inside a receive bracket the replies must keep the origin preset —
+    // the bracket restore re-reads the knob when the receive completes.
+    if (!in_onrecv_bracket) setDefaultTxProfile(radio2.localTxProfile());
     return true;
   }
 

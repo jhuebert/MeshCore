@@ -412,11 +412,11 @@ itself, which is always available as the recovery path.
   `radio2 tx primary|secondary` (get/set). There is deliberately no
   `tx both` — you choose where your messages go.
 - **Replies follow the preset the request arrived on** — ACKs, login and
-  telemetry replies, CLI answers created while the packet is processed.
-  A peer living only on the secondary network is therefore reachable.
-  Exception: replies queued with a delay (the `TXT_ACK_DELAY` flood ACKs)
-  are created after the receive handler returns and go on the **local TX
-  preset** — accepted limitation; it matches the repeater.
+  telemetry replies, CLI answers. Flood ACKs queued with a delay (the
+  `TXT_ACK_DELAY` ones) behave the same: the packet is created while the
+  request is processed, so it is stamped with the origin preset — the radio
+  retunes to it at send time if the scanner has moved on. A peer living
+  only on the secondary network is therefore reachable.
 - **Replies, adverts and direct traffic are never duplicated** onto the
   other preset.
 

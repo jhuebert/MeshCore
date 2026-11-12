@@ -270,6 +270,9 @@ private:
   Radio2DeviceImpl radio2_device;
   Radio2 radio2;
   bool rx_forward_allowed = true;
+  // True while a receive path holds the default TX profile at the origin
+  // preset; `handleCommand` must not retarget it mid-receive.
+  bool in_onrecv_bracket = false;
 
   DataStore* _store;
   NodePrefs _prefs;
