@@ -95,8 +95,9 @@ public:
   // Returns true when scanning is active.
   bool start(bool rxps_enabled, bool extra_sf_enabled);
   void setPrimary(float freq, float bw, uint8_t sf, uint8_t cr);
-  // tempradio: stop scanning while a temporary primary is active, revalidate
-  // once it reverts.
+  // Stop scanning (e.g. while a temporary primary change is active) and
+  // revalidate once it reverts; the companion never pauses today, but the
+  // host tests and the repeater exercise the same code path.
   void pauseForPrimaryChange();
   void resumeAfterPrimaryChange(bool rxps_enabled, bool extra_sf_enabled);
 

@@ -4,7 +4,8 @@ Fork-only, unpublished notes for the `custom-companion-easysky` branch. That
 branch is `IoTThinks/MeshCore`'s `PowerSaving-v18` — the source behind the
 EasySkyMesh PowerSaving18 release — plus a deliberately small diff so it stays
 easy to rebase: it adds a handful of commands to the companion (client)
-firmware's CLI, LED/buzzer muting and a set of power-tuning switches.
+firmware's CLI, LED/buzzer muting, a set of power-tuning switches and the
+radio2 second preset.
 
 This is not a release channel — no CI, no release workflow. Build and flash
 locally.
@@ -377,6 +378,128 @@ message sent while the app was backgrounded arrived normally and the app
 re-synced on return.
 
 
+## Radio2 second preset
+
+Radio2 lets this node **hear a second LoRa preset as well as the primary** —
+the same feature the repeater branch has, adapted for the companion. One
+radio, two presets: it listens on the primary, visits the secondary for
+bounded windows, and goes back. It is **off by default**; with it off the
+firmware behaves exactly as before.
+
+```
+radio2 869.618,62.5,8,5   # enable: <freq MHz>,<bw kHz>,<sf>,<cr>
+radio2 status             # on/off, mode, timing, counters
+radio2 timing             # visit lengths and split
+radio2 off                # disable (keeps the preset, policy and tx knob)
+```
+
+Prerequisite, once: **the companion ships with RX duty cycle (`rxps`) on**,
+and radio2 refuses to start while it is enabled. Run this first:
+
+```
+set radio.rxps off
+```
+
+(`radio2 <preset>` then fails with `Err - radio.rxps is on; set radio.rxps off
+first` if you forget.) `set radio.rxps ...` is refused while radio2 is on,
+with `Err - radio2 is on; set radio2 off first`, except `set radio.rxps off`
+itself, which is always available as the recovery path.
+
+### What arrives how
+
+- **Locally originated traffic** (your app-sent DMs, group messages, adverts
+  by default) goes on the **local TX preset**, default **primary**:
+  `radio2 tx primary|secondary` (get/set). There is deliberately no
+  `tx both` — you choose where your messages go.
+- **Replies follow the preset the request arrived on** — ACKs, login and
+  telemetry replies, CLI answers created while the packet is processed.
+  A peer living only on the secondary network is therefore reachable.
+  Exception: replies queued with a delay (the `TXT_ACK_DELAY` flood ACKs)
+  are created after the receive handler returns and go on the **local TX
+  preset** — accepted limitation; it matches the repeater.
+- **Replies, adverts and direct traffic are never duplicated** onto the
+  other preset.
+
+### What the app sees
+
+Nothing new: no frame changes, no extra commands. RSSI/SNR in received
+messages reflect whichever preset was heard last (one radio, one noise
+floor — shared). The only indication of which preset carried what:
+
+```
+radio2 status     # rx=P/S counters, tx=P/S counters, drop counters
+```
+
+and `[radio2]` log tags under a `MESH_PACKET_LOGGING=1` build.
+
+### Repeating is a separate decision
+
+Radio2's cross-preset policy applies to **forwarded** traffic, and the
+companion only forwards with `set repeat on` (default **off**). While
+repeat is off, the `radio2 policy` matrix has no effect at all — packets are
+processed locally as usual. With repeat on, the companion forwards and the
+matrix decides what crosses:
+
+```
+radio2 policy              # > primary=same,secondary=same
+radio2 policy both         # forward flood adverts/group traffic on both presets
+radio2 policy other drop   # forward on the *other* preset; drop secondary-origin traffic
+```
+
+Actions are per origin preset: `same` (default), `other` (forward on the
+other preset), `both` (duplicate on both — extra airtime, opt-in), `drop`
+(never forward). Only **broadcast flood** traffic may cross — `ADVERT`, and
+`GRP_TXT`/`GRP_DATA` in flood routing. Direct messages, ACKs, path returns,
+traces and unicast flood DMs stay on their origin preset always. Policy
+drops are counted in `radio2 status` (`drop=`).
+
+```
+radio2 advert primary      # default: node adverts always on primary
+radio2 advert both         # explicit duplication of node adverts on both presets
+```
+
+`radio2 advert both` also duplicates zero-hop adverts (the button path).
+It is the one place a message is intentionally sent twice.
+
+### Power and sleep notes
+
+Scanning costs a retune (TCXO re-settle) at every preset switch, and the
+radio can no longer sit in continuous low-power RX on one preset. The idle
+loop is shortened while scanning: on ESP32 the `lightsleep tick` is clamped
+to the scanner's next deadline (still at least 10 ms), so `set lightsleep
+tick 1000` does not starve radio2; keep the tick ≤ 100 while scanning
+(default 10 is fine). On nRF52 the idle path arms an RTC2 one-shot deadline
+(`board.sleepMs()`) instead of sleeping with no timeout. Expect idle
+current to rise while scanning is on.
+
+### Troubleshooting
+
+- **`Err - radio.rxps is on; set radio.rxps off first`** — see above.
+- **Overlap rejected** — the secondary must not overlap the primary in
+  frequency (`Err - radio2 overlaps radio`); pick a channel pair with
+  separation ≥ a few bandwidths.
+- **Unusable preset** — the pair can't time-share without degrading the
+  primary (`Err - radio2 preset cannot be scanned ...`); pick a slower SF,
+  narrower BW, or a closer SF together. `radio2 timing` reports the bound
+  that failed.
+- **`radio.rxps` vs `radio2`** — they are mutually exclusive and refuse to
+  run together. `powersaving` (light sleep / `board.sleep(0)`) is
+  compatible and required for the low-power path above.
+- **Secondary packets missed in bursts** — while the primary is actively in
+  use, the secondary already gets only a capped share per switch interval;
+  under a busy primary that share is small by design.
+- **Persistence** — the preset, policy, advert mode and local TX preset are
+  stored in `/radio2_cfg` (v2; survives reboot; `radio2 off` keeps them).
+  Changing the preset applies ~2 s later, after outbound queues drain, so an
+  in-flight remote reply leaves on the old preset.
+
+**Safety.** Everything the repeater's radio2 docs warn about applies here:
+bridging two networks is airtime the whole cell pays for. `radio2 policy
+both` doubles the flood cost of adverts and group traffic; enable it
+deliberately, on a quiet channel pair, and remember the companion only does
+it when `set repeat on` is also set (or for adverts, with `radio2 advert
+both`).
+
 ## `start ota`
 
 Start an over-the-air firmware update, like the repeater/room-server command:
@@ -422,7 +545,8 @@ attempts may briefly disturb the hotspot.
 Only these commands and prefs are ours; everything else is IoTThinks'
 PowerSaving firmware. The diff against `PowerSaving-v18` is:
 
-- `examples/companion_radio/MyMesh.cpp` — the CLI commands.
+- `examples/companion_radio/MyMesh.cpp` — the CLI commands and the radio2 glue
+  (onRecvPacket override, TX-preset stamping, advert duplication, sleep bounds).
 - `examples/companion_radio/NodePrefs.h` — the `led_q`, `lsleep` and
   `ble.{adv,tx,conn,lat}` prefs (`buzzer_quiet` already exists upstream; `set
   buzzer` only reaches it from the CLI).
@@ -439,3 +563,11 @@ PowerSaving firmware. The diff against `PowerSaving-v18` is:
   server per boot, and disable light sleep while an update is being served.
 - `variants/xiao_s3_wio/platformio.ini` — enable OTA on the Xiao S3 WIO
   companion targets.
+- `src/Packet.h`, `src/Dispatcher.{h,cpp}`, `src/helpers/StaticPoolPacketManager.{h,cpp}`,
+  `src/helpers/radiolib/{RadioLibWrappers.{h,cpp},RadioProfileControl.h}` — the fork's
+  radio profile support (`radio_profiles` byte, pre-TX profile selection, `retune()`).
+- `src/MeshCore.h`, `src/helpers/{ESP32Board.h,NRF52Board.{h,cpp}}` — `sleepMs()` with
+  a millisecond/RTC2 one-shot deadline.
+- `examples/companion_radio/{Radio2.{h,cpp},Radio2Config.h,CliUtil.h,PersistUtil.h}` —
+  the radio2 feature itself (example-local copy, same files as the repeater branch).
+- `test/test_radio2/`, `[env:native_radio2{,_san}]` — host tests for the above.

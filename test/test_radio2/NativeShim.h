@@ -2,7 +2,7 @@
 // included by [env:native_radio2] in platformio.ini.
 //
 // Radio2 (and the core helpers it pulls in) use the Arduino-flavoured
-// FILESYSTEM/File typedefs and ltoa(); neither exists on the host. This shim
+// FILESYSTEM/File typedefs; they do not exist on the host. This shim
 // provides minimal in-memory stand-ins so the code builds unmodified.
 //
 // Must be force-included (-include) BEFORE any radio2/core header, because
@@ -18,8 +18,6 @@
 #include <map>
 #include <string>
 #include <vector>
-
-char* ltoa(long value, char* str, int base);   // Arduino libc extra; unused by the radio2 sources
 
 // In-memory stand-in for the Arduino File class (only the operations
 // Radio2::load()/save() use). Writes go straight to the owning NativeFS
