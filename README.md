@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream automatically (synced weekly) and adds five
+It tracks upstream automatically (synced weekly) and adds seven
 repeater-focused capabilities on top of stock firmware. Everything else —
 supported boards, clients, protocols, build system — is identical to upstream;
 see the
@@ -45,10 +45,25 @@ holds, so the savings do not quietly turn into lost packets.
 
 Credit where it is due: `powersaving` is upstream MeshCore, and the RXPS
 duty-cycle subsystem is ported from **EasySkyMesh**
-([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore), `PowerSaving-v18`);
-this fork added the `cpu.freq` setting, the port and the guide.
+([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore),
+`PowerSaving-v18` + the SX1262 post-preamble-timer fix from `Dev-PS18`,
+PR #27 by Dom4n); this fork added the `cpu.freq` setting, the port and the
+guide.
 
 → Full guide: **[POWER.md](./POWER.md)**
+
+### 📻 Second radio preset
+
+One transceiver, two LoRa presets. The repeater keeps its normal preset as the
+protected home channel and visits a second preset for short windows, so it can
+repeat adverts and group flood traffic between two nearby networks — or simply
+listen to a second preset. Direct messages, ACKs, path returns and traces never
+cross, replies go back on the preset the request arrived on, and the existing
+packet filter applies to both. Off by default: with radio2 off the node behaves
+like stock firmware.
+
+→ Full guide, including the policy recipes, CLI reference and tradeoffs:
+**[RADIO2.md](./RADIO2.md)**
 
 ### 🕒 Mesh clock sync
 
@@ -117,7 +132,10 @@ fork is for operators who want policy and resilience at the node:
 ## Getting the firmware
 
 Prebuilt binaries for all supported boards are on the
-[Releases page](https://github.com/jhuebert/MeshCore/releases). Two channels:
+[Releases page](https://github.com/jhuebert/MeshCore/releases) — except the
+STM32WLE5 boards (wio-e5, wio-e5-mini, the wio-e5 bridge, RAK3172 and Tiny
+Relay), which no longer fit the fork's repeater firmware and ship no build.
+Two channels:
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|
@@ -127,6 +145,7 @@ Prebuilt binaries for all supported boards are on the
 Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI,
 [FLEET.md](./FLEET.md) if you are running a fleet,
-[POWER.md](./POWER.md) if the node runs on solar or battery, or
+[POWER.md](./POWER.md) if the node runs on solar or battery,
+[RADIO2.md](./RADIO2.md) if it should listen on a second preset, or
 [MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
 Observer builds ship in the same releases as the plain repeater firmware.
