@@ -1128,8 +1128,10 @@ static mesh::Packet makeGroupPacket(uint8_t type, uint8_t hash, const GroupTextP
 
 // deliver a decrypted group message to the hook the way MyMesh does
 static void groupRecv(FleetManager& f, uint8_t type, const mesh::GroupChannel& c,
-                      const GroupTextPayload& p) {
+                      const GroupTextPayload& p,
+                      uint8_t radio_profile = RADIO_PROFILE_PRIMARY) {
   mesh::Packet pkt = makeGroupPacket(type, c.hash[0], p);
+  pkt.setRxProfile(radio_profile);
   f.onGroupData(&pkt, type, c, p.data, p.len);
 }
 
@@ -1145,6 +1147,7 @@ static void hearRepeat(FleetManager& f, const mesh::Packet& sent, uint8_t hops =
 struct SentReply {
   uint8_t secret[PUB_KEY_SIZE];
   uint8_t hash;                        // channel hash
+  uint8_t radio_profile = RADIO_PROFILE_PRIMARY;
   uint32_t ts = 0;                     // group-text timestamp
   std::string name;                    // the sender name the reply carried
   std::string body;
@@ -1170,12 +1173,14 @@ struct HookEnv {
   }
   static const char* nameFn(void* ctx) { return ((HookEnv*)ctx)->name.c_str(); }
   static bool sendFn(void* ctx, const uint8_t* secret, uint8_t hash, uint32_t ts,
-                     const char* sender_name, const char* body, uint8_t* out_pkt_hash) {
+                     const char* sender_name, const char* body, uint8_t radio_profile,
+                     uint8_t* out_pkt_hash) {
     auto* e = (HookEnv*)ctx;
     if (e->next_send_fails) { e->next_send_fails = false; return false; }
     if (e->send_failures > 0) { e->send_failures--; return false; }
     SentReply r;
     r.hash = hash;
+    r.radio_profile = radio_profile;
     r.ts = ts;
     r.name = sender_name;
     r.body = body;
@@ -1307,6 +1312,17 @@ TEST_F(FleetHooksTest, AckAlwaysRepliesJitteredInChannel) {
   EXPECT_EQ(fleet.getReplyCount(), 0);
   // the jitter window came from the (default) config
   EXPECT_EQ(env.last_window, (uint32_t)FLEET_REPLY_WINDOW_MS);
+}
+
+TEST_F(FleetHooksTest, AckKeepsSecondaryOrigin) {
+  GroupTextPayload p = makeGroupText("alice", "!id k2\n!ack\nfilter stats");
+  groupRecv(fleet, PAYLOAD_TYPE_GRP_TXT, chan, p, RADIO_PROFILE_SECONDARY);
+  ASSERT_TRUE(pass());
+
+  g_mock_millis += env.jitter;
+  fleet.runScripts(ExecRecorder::fn, &env.rec);
+  ASSERT_EQ(env.sent.size(), (size_t)1);
+  EXPECT_EQ(env.sent[0].radio_profile, RADIO_PROFILE_SECONDARY);
 }
 
 // The jitter deadline crosses the millis() rollover: the reply is still due

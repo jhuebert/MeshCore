@@ -19,7 +19,7 @@ int PacketQueue::countBefore(uint32_t now) const {
   return n;
 }
 
-mesh::Packet* PacketQueue::get(uint32_t now) {
+int PacketQueue::findBest(uint32_t now) const {
   uint8_t min_pri = 0xFF;
   int best_idx = -1;
   for (int j = 0; j < _num; j++) {
@@ -29,6 +29,16 @@ mesh::Packet* PacketQueue::get(uint32_t now) {
       best_idx = j;
     }
   }
+  return best_idx;
+}
+
+mesh::Packet* PacketQueue::peek(uint32_t now) const {
+  int best_idx = findBest(now);
+  return best_idx < 0 ? NULL : _table[best_idx];
+}
+
+mesh::Packet* PacketQueue::get(uint32_t now) {
+  int best_idx = findBest(now);
   if (best_idx < 0) return NULL;   // empty, or all items are still in the future
 
   mesh::Packet* top = _table[best_idx];
@@ -75,12 +85,21 @@ StaticPoolPacketManager::StaticPoolPacketManager(int pool_size): unused(pool_siz
   }
 }
 
+StaticPoolPacketManager::~StaticPoolPacketManager() {
+  // Each packet lives in exactly one queue. The repeater keeps this manager for
+  // its lifetime; the destructor exists so host tests can own one without leaks.
+  for (int i = 0; i < unused.count(); i++) delete unused.itemAt(i);
+  for (int i = 0; i < send_queue.count(); i++) delete send_queue.itemAt(i);
+  for (int i = 0; i < rx_queue.count(); i++) delete rx_queue.itemAt(i);
+}
+
 mesh::Packet* StaticPoolPacketManager::allocNew() {
   return unused.removeByIdx(0);  // just get first one (returns NULL if empty)
 }
 
 void StaticPoolPacketManager::free(mesh::Packet* packet) {
   if (packet == NULL) return;
+  packet->radio_profiles = 0;
   if (!unused.add(packet, 0, 0)) {
     MESH_DEBUG_PRINTLN("free: unused queue full, possible double-free detected");
   }

@@ -28,6 +28,7 @@ class LazySave {
 public:
   LazySave() : dirty(false), dirty_since(0) {}
   void markDirty() { dirty = true; dirty_since = millis(); }
+  bool isDirty() const { return dirty; }
   bool due() const { return dirty && (uint32_t)(millis() - dirty_since) >= LAZY_SAVE_DELAY_MS; }
 
   // The config reached the disk. Only call this after a confirmed write.
