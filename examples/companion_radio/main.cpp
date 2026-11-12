@@ -363,15 +363,23 @@ void loop() {
 #endif
   if (idle_yields && !the_mesh.hasPendingWork()) {
 #if defined(NRF52_PLATFORM)
-    board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
+    uint32_t sleep_ms = the_mesh.getSleepMs();
+    if (sleep_ms) board.sleepMs(sleep_ms);  // radio2 retune deadline: bounded sleep
+    else board.sleep(0); // nrf ignores seconds param, sleeps whenever possible
 #elif defined(ESP32_PLATFORM)
+    // While radio2 is scanning, never wait longer than the next scheduler
+    // deadline; light sleep re-arms an earlier PM timer instead.
+    uint32_t idle_tick = idleTickMs(light_sleep);
+    uint32_t r2_tick = the_mesh.getSleepMs();
+    if (r2_tick && r2_tick < idle_tick) idle_tick = r2_tick;
+    if (idle_tick < 10) idle_tick = 10;   // FreeRTOS tick granularity
   #if defined(BLE_PIN_CODE)
       if (!bluetooth_interface.isReadBusy() && !bluetooth_interface.isWriteBusy()) {
-        vTaskDelay(pdMS_TO_TICKS(idleTickMs(light_sleep)));
+        vTaskDelay(pdMS_TO_TICKS(idle_tick));
       }
   #elif defined(ENABLE_USB_INTERFACE)
       if (!usb_serial_interface.isReadBusy() && !usb_serial_interface.isWriteBusy()) {
-        vTaskDelay(pdMS_TO_TICKS(idleTickMs(light_sleep)));
+        vTaskDelay(pdMS_TO_TICKS(idle_tick));
       }
   #endif
 #endif

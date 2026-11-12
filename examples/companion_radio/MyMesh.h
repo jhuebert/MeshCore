@@ -67,6 +67,25 @@
 #endif
 
 #include <helpers/BaseChatMesh.h>
+#include "Radio2.h"
+
+// Thin adapter over the board's radio driver: keeps the radio2 scheduler free
+// of any variant/radio-family knowledge.
+class Radio2DeviceImpl : public Radio2Device {
+public:
+  bool retune(float freq, float bw, uint8_t sf, uint8_t cr,
+              bool abort_receive = false) override {
+    return radio_driver.retune(freq, bw, sf, cr, abort_receive);
+  }
+  bool hasCompletedReceive() const override { return radio_driver.hasCompletedReceive(); }
+  bool isReceiveInProgress() override { return radio_driver.isReceiveInProgress(); }
+  bool isInRecvMode() const override { return radio_driver.isInRecvMode(); }
+  int getNoiseFloor() const override { return radio_driver.getNoiseFloor(); }
+  float captureCostSymbols() const override {
+    return radio_driver.rxPowerSavingCaptureCostSymbols();
+  }
+};
+
 #include <helpers/TransportKeyStore.h>
 
 /* -------------------------------------------------------------------------------------- */
@@ -179,6 +198,10 @@ protected:
   void onTraceRecv(mesh::Packet *packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
                    const uint8_t *path_snrs, const uint8_t *path_hashes, uint8_t path_len) override;
 
+  mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override;
+  void logRx(mesh::Packet* pkt, int len, float score) override;
+  void logTx(mesh::Packet* pkt, int len) override;
+
   uint32_t calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const override;
   uint32_t calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const override;
   void onSendTimeout() override;
@@ -212,6 +235,9 @@ public:
   }
 #endif
 
+  // Timed sleep deadline for powersaving (0 = no radio2 scan deadline).
+  uint32_t getSleepMs() { return radio2.getSleepMs(); }
+
   // To check if there is pending work
   bool hasPendingWork() const;
 
@@ -231,6 +257,8 @@ private:
   }
 
   void checkCLIRescueCmd();
+  void radio2QueueDuplicate(mesh::Packet* pkt, mesh::DispatcherAction action, uint8_t origin);
+  void sendSelfAdvert(mesh::Packet* pkt, bool flood);
   bool handleCommand(const char* text, uint32_t sender_timestamp, char* reply);
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
@@ -238,6 +266,10 @@ private:
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts();
+
+  Radio2DeviceImpl radio2_device;
+  Radio2 radio2;
+  bool rx_forward_allowed = true;
 
   DataStore* _store;
   NodePrefs _prefs;
