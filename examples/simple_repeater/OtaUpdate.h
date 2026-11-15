@@ -197,7 +197,6 @@ public:
   bool rollbackCommand(char* reply);
 
   State state() const { return _state; }
-  bool isUnsupported() const { return _io == nullptr; }
 
   // Test-only: inject a RAM-backed slot instead of the ESP32 partitions.
   void setSlotIo(OtaSlotIo* io) { _io = io; }

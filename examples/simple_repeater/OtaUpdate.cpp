@@ -99,6 +99,15 @@ static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32])
   return true;
 }
 
+// Flip the boot partition to the inactive slot and reboot. Returns false when
+// the partition cannot be selected (the node keeps running the current
+// firmware); on-device reboot() does not return.
+static bool flipAndReboot(OtaSlotIo* io, mesh::MainBoard* board) {
+  if (io == nullptr || !io->setInactiveAsBoot()) return false;
+  if (board != nullptr) board->reboot();   // does not return on-device
+  return true;
+}
+
 // --------------------------------------------------------------- session
 
 OtaUpdate::OtaUpdate() = default;
@@ -461,9 +470,7 @@ void OtaUpdate::rollbackToPrevious(const char* why) {
   MESH_DEBUG_PRINTLN("ota: %s; rolling back", why);
   writePendRecord(OTA_PEND_ROLLED, _health_size, _health_sha);   // best-effort marker
   _health_pending = false;
-  if (_io != nullptr && _io->setInactiveAsBoot() && _board != nullptr) {
-    _board->reboot();
-  }
+  flipAndReboot(_io, _board);
 }
 
 // --------------------------------------------------------------------- CLI
@@ -574,11 +581,10 @@ bool OtaUpdate::applyCommand(char* reply) {
     snprintf(reply, CLI_REPLY_MAX, "Err - could not arm boot health record");
     return false;
   }
-  if (!_io->setInactiveAsBoot()) {
+  if (!flipAndReboot(_io, _board)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
     return false;
   }
-  if (_board != nullptr) _board->reboot();   // does not return on-device
   snprintf(reply, CLI_REPLY_MAX, "OK - applied; rebooting");
   return true;
 }
@@ -596,11 +602,10 @@ bool OtaUpdate::abortCommand(char* reply) {
 bool OtaUpdate::rollbackCommand(char* reply) {
   uint8_t zero[32] = {0};
   writePendRecord(OTA_PEND_ROLLED, 0, zero);   // best-effort marker for the old image
-  if (_io == nullptr || !_io->setInactiveAsBoot()) {
+  if (!flipAndReboot(_io, _board)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
     return false;
   }
-  if (_board != nullptr) _board->reboot();   // does not return on-device
   snprintf(reply, CLI_REPLY_MAX, "OK - rolling back; rebooting");
   return true;
 }
