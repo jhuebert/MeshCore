@@ -449,7 +449,11 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   // only when the filter is enabled; with `filter off` nothing about the
   // receive path is spent on it (the value would never be read).
   const uint32_t filter_air_ms = filter.isEnabled() ? _radio->getEstAirtimeFor(packet->getRawLength()) : 0;
-  if (filter.checkPacket(packet, millis(), recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
+  // OTA op packets (payload magic 'O','T') must never be dropped by a filter
+  // rule: a type=raw rule anywhere in the path would sever an update in
+  // transit. The battery gate and the stock checks still apply.
+  if (!otaIsOtaPacket(packet)
+      && filter.checkPacket(packet, millis(), recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -584,6 +588,7 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
     bridge.sendPacket(pkt);
   }
 #endif
+  ota.onTxResult(pkt, true);
 
   if (_logging) {
     File f = openAppend(PACKET_LOG_FILE);
@@ -604,6 +609,7 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
 }
 
 void MyMesh::logTxFail(mesh::Packet *pkt, int len) {
+  ota.onTxResult(pkt, false);
   if (_logging) {
     File f = openAppend(PACKET_LOG_FILE);
     if (f) {
@@ -981,6 +987,13 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   }
 }
 
+// OTA op packets (payload magic 'O','T') ride DIRECT raw-custom payloads;
+// anything that is not a valid OTA frame is inert. The node arms only via
+// OP_START, so a stray packet from a stranger configures nothing.
+void MyMesh::onRawDataRecv(mesh::Packet* packet) {
+  ota.onPacket(packet);
+}
+
 void MyMesh::sendNodeDiscoverReq() {
   uint8_t data[10];
   data[0] = CTL_TYPE_NODE_DISCOVER_REQ; // prefix_only=0
@@ -1164,6 +1177,25 @@ void MyMesh::mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& sta
 }
 #endif
 
+// OTA replies are originated here: zero-hop, or DIRECT along the return path
+// the app supplied in OP_START. A RAW_CUSTOM payload carries no sender
+// identity, so this is the only route back to the app.
+static bool otaSend(void* ctx, const uint8_t* payload, size_t len,
+                    const uint8_t* ret_path, uint8_t ret_path_len) {
+  MyMesh* m = (MyMesh*)ctx;
+  mesh::Packet* pkt = m->obtainNewPacket();
+  if (!pkt) return false;
+  pkt->header = (PAYLOAD_TYPE_RAW_CUSTOM << PH_TYPE_SHIFT);
+  pkt->payload_len = (uint16_t)len;
+  memcpy(pkt->payload, payload, len);
+  if (ret_path_len != 0) {
+    m->sendDirect(pkt, ret_path, ret_path_len);
+  } else {
+    m->sendZeroHop(pkt, (uint32_t)0);
+  }
+  return true;
+}
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
@@ -1178,6 +1210,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   filter.begin(fs);
   battGate.begin(fs);
+  ota.begin(fs, &battGate, &board, FIRMWARE_VERSION);
+  ota.setSender(otaSend, this);
   fleet.setClock(fleetClock, this);
   fleet.setJitter(fleetJitter, this);
   fleet.setNameProvider(fleetNodeName, this);
@@ -1589,6 +1623,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
     // available so the operator can recover, and `get radio.rxps` is read-only.
     strcpy(reply, "Err - radio2 is on; set radio2 off first");
+  } else if (memcmp(command, "ota", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
+    const char* sub = command + 3;
+    while (*sub == ' ') sub++;
+    otaCLI(ota, sub, reply);
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it
     char now[32];
@@ -1623,6 +1661,8 @@ void MyMesh::loop() {
   // One sample per interval, not one per packet.
   battGate.loop(_fs, board);
   batteryAlerts(battGate, fleet);
+  // OTA boot health check (only active right after a freshly-applied boot)
+  ota.loop();
 
   mesh::Mesh::loop();
 

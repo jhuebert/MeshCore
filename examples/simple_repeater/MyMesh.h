@@ -41,6 +41,7 @@
 #include "FleetManager.h"
 #include "MeshClockSync.h"
 #include "Radio2.h"
+#include "OtaUpdate.h"
 #ifdef WITH_MQTT_OBSERVER
 #include "../mqtt_observer/MQTTObserver.h"
 #endif
@@ -125,6 +126,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   BatteryGate battGate;
   FleetManager fleet;
   MeshClockSync meshClock;
+  OtaUpdate ota;
   Radio2DeviceImpl radio2_device;
   Radio2 radio2;
   bool rx_forward_allowed = true;
@@ -212,6 +214,7 @@ protected:
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onControlDataRecv(mesh::Packet* packet) override;
+  void onRawDataRecv(mesh::Packet* packet) override;
 
   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 

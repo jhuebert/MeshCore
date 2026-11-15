@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds seven repeater-focused capabilities
+It tracks upstream `main` releases and adds eight repeater-focused capabilities
 on top of stock firmware. Everything else — supported boards, clients,
 protocols, build system — is identical to upstream;
 see the
@@ -109,6 +109,23 @@ bounded best-effort queue that rides out broker outages.
 
 → Full guide, including the build targets, broker setup, CLI reference, and the
 message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
+
+### 📲 LoRa OTA
+
+Over-the-air firmware updates for ESP32 repeaters: the update rides the
+existing mesh as zero-hop or explicit-path DIRECT packets (never flooded), the
+image is staged into the inactive A/B app slot and verified byte-for-byte
+against the contract's SHA-256 before anything is applied, and a freshly
+applied image re-verifies itself at boot — on any failure it flips back to
+the previous firmware automatically. Unchanged bytes are sent as copy ops, so
+release-to-release updates are a fraction of a full image. The node side is a
+receive contract and a verifier; an Android app drives the transfer. Stock
+relays in the path need no changes. `ota status` is the progress feed;
+`ota abort` discards a session, `ota rollback` flips back manually.
+
+Boards without a dual app partition and non-ESP32 builds report the feature
+unsupported. The OTA wire format and `ota status` layout are frozen in the
+M0 milestone of the plan.
 
 ## Why run this instead of stock repeater firmware?
 
