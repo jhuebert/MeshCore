@@ -33,16 +33,17 @@
 //   ch0   'O' 0x4F
 //   ch1   'T' 0x54
 //   ch2   op
-//   ch3   seq (u16, little endian) — OP_START is 0; each later packet +1
+//   ch3   seq (u16, little endian) — op packets only: OP_START/OP_COPY/
+//             OP_LITERAL/OP_END. OP_ASK, OP_REPORT and OP_NOP carry no seq.
 //   ch4.. opcode-specific body
 //   last.. last-1
 //   crc16 (u16, LE) — CRC-16/CCITT-FALSE over everything before it
 //
-//   OP_START  0x01  size:u32 sha256[32] target:u32 fw:u32 token:u32 ret_path_len:u8 [ret_path]
+//   OP_START  0x01  size:u32 sha256[32] target:u32 token:u32
 //   OP_COPY   0x02  base_off:u32 len:u16          copy running-slot bytes into the staged image
 //   OP_LITERAL 0x03 len:u16 data[len]             write data into the staged image
 //   OP_END    0x04                              finish; SHA-256 the slot; if OK, ready
-//   OP_ASK    0x05                              request an OP_REPORT (after a window)
+//   OP_ASK    0x05  ret_path_len:u8 [ret_path]    request an OP_REPORT (after a window)
 //   OP_REPORT 0x06  next_expected:u16           (repeater → app)
 //   OP_NOP    0x00                              boot health probe; never answered
 //
@@ -51,11 +52,12 @@
 // this costs nothing on the wire and no reassembly buffer is needed. The
 // app's recovery from a lost op is "re-send from next_expected".
 //
-// ret_path_len / ret_path in OP_START carry the return itinerary in the
-// repeater→app travel order (encoded exactly like a packet's path_len
-// byte). DIRECT paths are consumed hop by hop as they travel, so the final
-// hop cannot learn the reverse itinerary — without it OP_REPORTs cannot
-// cross a multi-hop path. Empty (0) = the app is zero-hop.
+// ret_path_len / ret_path in OP_ASK carry the return itinerary for the
+// OP_REPORT being requested, in the repeater→app travel order (encoded
+// exactly like a packet's path_len byte). DIRECT paths are consumed hop by
+// hop as they travel, so the final hop cannot learn the reverse itinerary —
+// without it OP_REPORTs cannot cross a multi-hop path. The path travels
+// with each ask and is used once; nothing is stored. Empty (0) = zero hop.
 //
 // /ota_pend is an 8-byte marker (magic "OTAP", a random nonce, CRC-16): its mere presence means an apply just booted and the boot health
 // check owes the board a verdict. Success deletes the marker; failure flips
@@ -97,9 +99,10 @@
 #define OTA_MAGIC0     0x4F          // 'O'
 #define OTA_MAGIC1     0x54          // 'T'
 
-// every OTA frame: magic(2) + op(1) + seq(2) + body + crc16(2)
+// OTA frames carrying an op: magic(2) + op(1) + seq(2) + body + crc16(2).
+// ASK/REPORT/NOP carry no seq.
 #define OTA_FRAME_OVERHEAD (2 + 1 + 2 + 2)
-#define OTA_OP_START_MIN   (4 + 32 + 4 + 4 + 4 + 1)     // without ret_path
+#define OTA_OP_START_MIN   (4 + 32 + 4 + 4)   // size + sha256 + target + token
 #define OTA_HEALTH_LEN     7         // NOP(3) nonce(2) crc(2)
 #define OTA_PENDING_TTL_MS 120000    // a pending arm lives two minutes
 #define OTA_PEND_FILE      "/ota_pend"
@@ -123,7 +126,7 @@ inline bool otaIsOtaPacket(const mesh::Packet* pkt) {
   if (pkt == nullptr) return false;
   if (pkt->getPayloadType() != PAYLOAD_TYPE_RAW_CUSTOM) return false;
   const size_t n = pkt->payload_len;
-  if (n < OTA_FRAME_OVERHEAD) return false;
+  if (n < 5) return false;   // magic(2) + op(1) + crc(2); ops carry a seq, ASK/REPORT/NOP do not
   if (pkt->payload[0] != OTA_MAGIC0 || pkt->payload[1] != OTA_MAGIC1) return false;
   const uint16_t stored = (uint16_t)pkt->payload[n - 2] | ((uint16_t)pkt->payload[n - 1] << 8);
   return crc16_ccitt(pkt->payload, n - 2) == stored;
@@ -221,7 +224,6 @@ private:
   uint16_t _expect = 1;                     // next seq to apply (OP_START = 0)
   uint32_t _size = 0, _written = 0;
   uint8_t _expected_sha[32] = {0};
-  uint8_t _ret_path_len = 0, _ret_path[MAX_PATH_SIZE] = {0};
 
   bool _running_sha_valid = false;
   uint8_t _running_sha[32] = {0};
@@ -236,13 +238,13 @@ private:
   void resetSession();                      // back to Idle
   void clearPending() { _pending.valid = false; }
   void abortStaging(uint8_t err);           // scrap the staged slot on failure
-  bool armSession(uint32_t size, const uint8_t sha[32], const uint8_t* ret_path, uint8_t ret_path_len);
+  bool armSession(uint32_t size, const uint8_t sha[32]);
   void handleStart(const uint8_t* body, uint16_t body_len);
   void applyOp(const uint8_t* body, uint16_t body_len, uint8_t op);
   bool applyCopy(uint32_t base_off, uint16_t len);
   bool applyLiteral(const uint8_t* data, uint16_t len);
   uint32_t ownTargetId() const;
-  void sendReport(uint16_t ask_seq);
+  void sendReport(const uint8_t* ret_path, uint8_t ret_path_len);
   bool sendHealthProbe();
   void rollbackToPrevious(const char* why);
   bool writePend();

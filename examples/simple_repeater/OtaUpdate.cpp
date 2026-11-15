@@ -168,7 +168,6 @@ void OtaUpdate::resetSession() {
   _size = 0;
   _written = 0;
   _expect = 1;
-  _ret_path_len = 0;
 }
 
 void OtaUpdate::abortStaging(uint8_t err) {
@@ -178,8 +177,7 @@ void OtaUpdate::abortStaging(uint8_t err) {
   _err = err;
 }
 
-bool OtaUpdate::armSession(uint32_t size, const uint8_t sha[32],
-                            const uint8_t* ret_path, uint8_t ret_path_len) {
+bool OtaUpdate::armSession(uint32_t size, const uint8_t sha[32]) {
   if (_state != State::Idle) return false;   // a busy session keeps its place
   if (_io == nullptr) { _err = OTA_ERR_SLOT; return false; }
   if (_gate != nullptr && _gate->isSuspended()) {
@@ -198,10 +196,6 @@ bool OtaUpdate::armSession(uint32_t size, const uint8_t sha[32],
   _written = 0;
   _expect = 1;
   memcpy(_expected_sha, sha, 32);
-  _ret_path_len = ret_path_len;
-  if (ret_path_len != 0 && ret_path != nullptr) {
-    memcpy(_ret_path, ret_path, (ret_path_len & 63) * ((ret_path_len >> 6) + 1));
-  }
   _state = State::Staging;
   _err = OTA_ERR_NONE;
   return true;
@@ -230,22 +224,32 @@ void OtaUpdate::onPacket(const mesh::Packet* pkt) {
   if (crc16_ccitt(payload, n - 2) != stored_crc) return;   // bad CRC: drop
 
   const uint8_t op = payload[2];
+
+  if (_io == nullptr) return;   // not an ESP32 (or slot lookup failed): inert
+
+  if (op == OTA_OP_NOP || op == OTA_OP_REPORT) return;
+
+  if (op == OTA_OP_ASK) {
+    if (!stagingArmed()) return;
+    const uint8_t* body = payload + 3;
+    const uint16_t body_len = (uint16_t)(n - 5);
+    if (body_len < 1) return;
+    const uint8_t ret_path_len = body[0];
+    if (!mesh::Packet::isValidPathLen(ret_path_len)) return;   // malformed ask: drop
+    const uint16_t path_bytes = (uint16_t)((ret_path_len & 63) * ((ret_path_len >> 6) + 1));
+    if (body_len != (uint16_t)(1 + path_bytes)) return;
+    sendReport(body + 1, ret_path_len);
+    return;
+  }
+
   const uint16_t seq = le16(payload + 3);
   const uint8_t* body = payload + 5;
   const uint16_t body_len = (uint16_t)(n - OTA_FRAME_OVERHEAD);
 
-  if (_io == nullptr) return;   // not an ESP32 (or slot lookup failed): inert
-
   switch (op) {
-    case OTA_OP_NOP:
-    case OTA_OP_REPORT:
-      return;
     case OTA_OP_START:
       if (seq != 0) return;          // OP_START is always seq 0
       handleStart(body, body_len);
-      return;
-    case OTA_OP_ASK:
-      if (stagingArmed()) sendReport(seq);
       return;
     default:
       break;
@@ -258,20 +262,11 @@ void OtaUpdate::onPacket(const mesh::Packet* pkt) {
 }
 
 void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
-  if (len < OTA_OP_START_MIN || len > OTA_OP_START_MIN + MAX_PATH_SIZE) { _err = OTA_ERR_BOUNDS; return; }
+  if (len != OTA_OP_START_MIN) { _err = OTA_ERR_BOUNDS; return; }
   uint32_t size = le32(body);
   const uint8_t* sha = body + 4;
   uint32_t target_id = le32(body + 36);
-  const uint8_t* token = body + 44;
-  uint8_t ret_path_len = body[48];
-  if (ret_path_len != 0) {
-    if (!mesh::Packet::isValidPathLen(ret_path_len)) { _err = OTA_ERR_BOUNDS; return; }
-    uint16_t path_bytes = (uint16_t)((ret_path_len & 63) * ((ret_path_len >> 6) + 1));
-    if (len != OTA_OP_START_MIN + path_bytes) { _err = OTA_ERR_BOUNDS; return; }
-  } else if (len != OTA_OP_START_MIN) {
-    _err = OTA_ERR_BOUNDS;
-    return;
-  }
+  const uint8_t* token = body + 40;
   if (target_id != ownTargetId()) { _err = OTA_ERR_TARGET; return; }
   if (_state != State::Idle) return;   // a busy session keeps its place
 
@@ -288,8 +283,7 @@ void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
   }
   clearPending();           // consumed by this arm
 
-  // fw (body+40) is opaque to the node — carried for the app, not used here
-  armSession(size, sha, body + OTA_OP_START_MIN, ret_path_len);
+  armSession(size, sha);
 }
 
 void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
@@ -348,20 +342,18 @@ bool OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
   return true;
 }
 
-void OtaUpdate::sendReport(uint16_t ask_seq) {
-  uint8_t p[10];
+void OtaUpdate::sendReport(const uint8_t* ret_path, uint8_t ret_path_len) {
+  uint8_t p[7];
   p[0] = OTA_MAGIC0;
   p[1] = OTA_MAGIC1;
   p[2] = OTA_OP_REPORT;
-  p[3] = (uint8_t)(ask_seq & 0xFF);
-  p[4] = (uint8_t)(ask_seq >> 8);
-  p[5] = (uint8_t)(_expect & 0xFF);
-  p[6] = (uint8_t)(_expect >> 8);
-  uint16_t crc = crc16_ccitt(p, 7);
-  p[7] = (uint8_t)(crc & 0xFF);
-  p[8] = (uint8_t)(crc >> 8);
+  p[3] = (uint8_t)(_expect & 0xFF);
+  p[4] = (uint8_t)(_expect >> 8);
+  uint16_t crc = crc16_ccitt(p, 5);
+  p[5] = (uint8_t)(crc & 0xFF);
+  p[6] = (uint8_t)(crc >> 8);
   if (_send != nullptr) {
-    _send(_send_ctx, p, sizeof(p), _ret_path_len != 0 ? _ret_path : nullptr, _ret_path_len);
+    _send(_send_ctx, p, sizeof(p), ret_path, ret_path_len);
   }
 }
 
