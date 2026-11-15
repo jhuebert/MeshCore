@@ -113,15 +113,18 @@ message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
 ### 📲 LoRa OTA
 
 Over-the-air firmware updates for ESP32 repeaters: the update rides the
-existing mesh as zero-hop or explicit-path DIRECT packets (never flooded), the
-image is staged into the inactive A/B app slot and verified byte-for-byte
-against the contract's SHA-256 before anything is applied, and a freshly
-applied image re-verifies itself at boot — on any failure it flips back to
-the previous firmware automatically. Unchanged bytes are sent as copy ops, so
-release-to-release updates are a fraction of a full image. The node side is a
-receive contract and a verifier; an Android app drives the transfer. Stock
-relays in the path need no changes. `ota status` is the progress feed;
-`ota abort` discards a session, `ota rollback` flips back manually.
+existing mesh as zero-hop or explicit-path DIRECT packets (never flooded),
+the image is staged into the inactive A/B app slot and verified byte-for-byte
+against the armed contract's SHA-256 before anything is applied, and a
+freshly applied image must prove its radio at boot — on any failure it
+flips back to the previous firmware automatically. Arming requires one
+operator action: `ota stage` (authenticated) registers the exact image and
+returns a one-time token; the repeater arms only that contract. Unchanged
+bytes are sent as copy ops, so release-to-release updates are a fraction of
+a full image. The node side is a receive contract and a verifier; an
+Android app drives the transfer. Stock relays in the path need no changes.
+`ota status` is the progress feed; `ota abort` discards a session,
+`ota rollback` flips back manually.
 
 Boards without a dual app partition and non-ESP32 builds report the feature
 unsupported. The OTA wire format and `ota status` layout are frozen in the

@@ -1210,7 +1210,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   filter.begin(fs);
   battGate.begin(fs);
-  ota.begin(fs, &battGate, &board, FIRMWARE_VERSION);
+  ota.begin(fs, &battGate, &board, FIRMWARE_VERSION, getRNG());
   ota.setSender(otaSend, this);
   fleet.setClock(fleetClock, this);
   fleet.setJitter(fleetJitter, this);

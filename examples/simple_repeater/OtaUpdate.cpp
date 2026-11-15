@@ -1,6 +1,6 @@
 // OtaUpdate.cpp — the LoRa OTA engine for the ESP32 simple_repeater firmware.
-// See OtaUpdate.h for the wire format, the op semantics, the /ota_pend boot
-// health record, and the CLI contract. Personal fork feature; fork-owned.
+// See OtaUpdate.h for the wire format, the arm/token contract, and the
+// boot-health marker. Fork-owned.
 
 #include "OtaUpdate.h"
 
@@ -15,8 +15,6 @@
 #include <esp_ota_ops.h>
 #endif
 
-#include <new>
-
 #define OTA_USAGE "Usage: ota [status|stage <size> <sha256> <ver>|apply|abort|rollback]"
 
 static uint16_t le16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -28,9 +26,8 @@ static uint32_t le32(const uint8_t* p) {
 
 #if defined(ESP32)
 
-// The only code in this file that knows about partitions. Wraps esp_ota_* and
-// the Arduino FILESYSTEM-facing calls; everything else is flash-agnostic and
-// host-tested against a fake.
+// The only code in this file that knows about partitions. Wraps esp_ota_*;
+// everything else is flash-agnostic and host-tested against a fake.
 class Esp32SlotIo : public OtaSlotIo {
   const esp_partition_t* _inactive = esp_ota_get_next_update_partition(nullptr);
   const esp_partition_t* _running = esp_ota_get_running_partition();
@@ -38,7 +35,7 @@ class Esp32SlotIo : public OtaSlotIo {
   bool _begun = false;
 
 public:
-  Esp32SlotIo() = default;   // ctor is trivial; partitions are looked up statically
+  Esp32SlotIo() = default;   // partitions looked up statically at load
 
   uint32_t slotSize() const override { return _inactive ? _inactive->size : 0; }
   uint32_t sourceSize() const override { return _running ? _running->size : 0; }
@@ -83,8 +80,8 @@ public:
 
 #endif   // ESP32
 
-// SHA-256 over `size` bytes of one slot, read in 1 KB slices. The layered
-// helper is shared by OP_END verification and the boot health check.
+// SHA-256 over `size` bytes of one slot, read in 1 KB slices. Shared by the
+// OP_END verification and `ota status` (the app's delta base match).
 static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32]) {
   SHA256 sha;
   uint8_t buf[1024];
@@ -113,29 +110,22 @@ static bool flipAndReboot(OtaSlotIo* io, mesh::MainBoard* board) {
 OtaUpdate::OtaUpdate() = default;
 OtaUpdate::~OtaUpdate() { resetSession(); }
 
-void OtaUpdate::begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board, const char* firmware_version) {
+void OtaUpdate::begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board, const char* firmware_version, mesh::RNG* rng) {
   _fs = fs;
   _gate = gate;
   _board = board;
+  _rng = rng;
   _version = firmware_version ? firmware_version : "";
 
 #if defined(ESP32)
   if (_io == nullptr) _io = new Esp32SlotIo();   // lives for the board's lifetime
 #endif
 
-  uint8_t state;
-  uint32_t size;
-  uint8_t sha[32];
-  if (readPend(&state, &size, sha)) {
-    if (state == OTA_PEND_PENDING) {
-      // A freshly-applied image is booting: verify + probe before declaring health.
-      _health_pending = true;
-      _health_size = size;
-      _health_nonce = ((uint32_t)sha[0] << 8) | sha[1];
-      memcpy(_health_sha, sha, 32);
-    } else if (state == OTA_PEND_ROLLED) {
-      _rolledback = true;
-    }
+  uint16_t nonce;
+  if (readPend(&nonce)) {
+    // A freshly-applied image is booting: owe the board a verdict
+    _health_pending = true;
+    _health_nonce = nonce;
   }
 }
 
@@ -150,12 +140,6 @@ void OtaUpdate::loop() {
   _health_checked = true;
   if (!_health_pending) return;
 
-  uint8_t sha[32];
-  if (_io == nullptr || !hashSlot(_io, /*staged=*/false, _health_size, sha) ||
-      memcmp(sha, _health_sha, 32) != 0) {
-    rollbackToPrevious("health slot digest mismatch");
-    return;
-  }
   if (sendHealthProbe()) {
     _health_sent = true;
     _health_deadline = millis() + kHealthTimeoutMs;
@@ -168,7 +152,7 @@ void OtaUpdate::onTxResult(const mesh::Packet* pkt, bool ok) {
   if (!_health_pending || !_health_sent) return;
   if (pkt == nullptr || pkt->payload_len != OTA_HEALTH_LEN) return;
   if (pkt->payload[0] != OTA_MAGIC0 || pkt->payload[1] != OTA_MAGIC1 || pkt->payload[2] != OTA_OP_NOP) return;
-  if (le16(pkt->payload + 3) != (uint16_t)(_health_nonce & 0xFFFF)) return;
+  if (le16(pkt->payload + 3) != _health_nonce) return;
   if (ok) {
     deletePend();
     _health_pending = false;
@@ -179,14 +163,11 @@ void OtaUpdate::onTxResult(const mesh::Packet* pkt, bool ok) {
 
 void OtaUpdate::resetSession() {
   if (_io != nullptr) _io->abortWrite();
-  delete[] _slots;
-  _slots = nullptr;
   _state = State::Idle;
   _err = OTA_ERR_NONE;
   _size = 0;
   _written = 0;
   _expect = 1;
-  _arrived = 0;
   _ret_path_len = 0;
 }
 
@@ -209,21 +190,13 @@ bool OtaUpdate::armSession(uint32_t size, const uint8_t sha[32],
     _err = OTA_ERR_SLOT;
     return false;
   }
-  _slots = new (std::nothrow) WindowSlot[OTA_WINDOW];
-  if (_slots == nullptr) {
-    _err = OTA_ERR_IO;
-    return false;
-  }
   if (!_io->beginWrite(size)) {
-    delete[] _slots;
-    _slots = nullptr;
     _err = OTA_ERR_IO;
     return false;
   }
   _size = size;
   _written = 0;
   _expect = 1;
-  _arrived = 0;
   memcpy(_expected_sha, sha, 32);
   _ret_path_len = ret_path_len;
   if (ret_path_len != 0 && ret_path != nullptr) {
@@ -277,16 +250,11 @@ void OtaUpdate::onPacket(const mesh::Packet* pkt) {
     default:
       break;
   }
-  if (!stagingArmed() || _slots == nullptr) return;
+  if (!stagingArmed()) return;
+  if (seq != _expect) return;   // strictly in-order delivery; everything else is a gap or a dup
 
-  int32_t d = (int32_t)(int16_t)(seq - _expect);   // modular: handles the u16 wrap
-  if (d < 0) return;                               // already applied / future window overflow
-  if (d >= OTA_WINDOW) return;                     // beyond the window: drop
-  _slots[d].len = (uint16_t)(body_len + 1);
-  _slots[d].data[0] = op;
-  memcpy(_slots[d].data + 1, body, body_len);
-  _arrived |= (uint16_t)(1u << d);
-  drainWindow();
+  applyOp(body, body_len, op);
+  if (_state == State::Staging) _expect++;   // Ready/Error need no watermark
 }
 
 void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
@@ -294,7 +262,8 @@ void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
   uint32_t size = le32(body);
   const uint8_t* sha = body + 4;
   uint32_t target_id = le32(body + 36);
-  uint8_t ret_path_len = body[44];
+  const uint8_t* token = body + 44;
+  uint8_t ret_path_len = body[48];
   if (ret_path_len != 0) {
     if (!mesh::Packet::isValidPathLen(ret_path_len)) { _err = OTA_ERR_BOUNDS; return; }
     uint16_t path_bytes = (uint16_t)((ret_path_len & 63) * ((ret_path_len >> 6) + 1));
@@ -304,21 +273,23 @@ void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
     return;
   }
   if (target_id != ownTargetId()) { _err = OTA_ERR_TARGET; return; }
+  if (_state != State::Idle) return;   // a busy session keeps its place
+
+  // The armed contract decides: single-use, time-boxed, bound to {size, sha256}
+  if (!_pending.valid) { _err = OTA_ERR_TOKEN; return; }
+  if ((uint32_t)(millis() - _pending.expires_at) < 0x80000000u) {   // expired
+    clearPending();
+    _err = OTA_ERR_TOKEN;
+    return;
+  }
+  if (_pending.size != size || memcmp(_pending.sha, sha, 32) != 0 || memcmp(_pending.token, token, 4) != 0) {
+    _err = OTA_ERR_TOKEN;   // stranger: leave the pending arm intact
+    return;
+  }
+  clearPending();           // consumed by this arm
 
   // fw (body+40) is opaque to the node — carried for the app, not used here
   armSession(size, sha, body + OTA_OP_START_MIN, ret_path_len);
-}
-
-void OtaUpdate::drainWindow() {
-  while (_slots != nullptr && (_arrived & 1)) {
-    WindowSlot slot = _slots[0];
-    applyOp(slot.data + 1, (uint16_t)(slot.len - 1), slot.data[0]);
-    if (_slots == nullptr) return;   // session ended inside applyOp
-    _arrived >>= 1;
-    memmove(_slots, _slots + 1, (OTA_WINDOW - 1) * sizeof(WindowSlot));
-    _expect++;
-    if (_state != State::Staging) return;
-  }
 }
 
 void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
@@ -345,13 +316,10 @@ void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
         }
         if (!_io->endWrite()) { abortStaging(OTA_ERR_END); return; }
       }
-      delete[] _slots;
-      _slots = nullptr;
-      _arrived = 0;
       _state = State::Ready;
       return;
     default:
-      abortStaging(OTA_ERR_BOUNDS);   // unknown op in a committed window
+      abortStaging(OTA_ERR_BOUNDS);   // unknown op in the stream
       return;
   }
 }
@@ -381,7 +349,7 @@ bool OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
 }
 
 void OtaUpdate::sendReport(uint16_t ask_seq) {
-  uint8_t p[12];
+  uint8_t p[10];
   p[0] = OTA_MAGIC0;
   p[1] = OTA_MAGIC1;
   p[2] = OTA_OP_REPORT;
@@ -389,12 +357,9 @@ void OtaUpdate::sendReport(uint16_t ask_seq) {
   p[4] = (uint8_t)(ask_seq >> 8);
   p[5] = (uint8_t)(_expect & 0xFF);
   p[6] = (uint8_t)(_expect >> 8);
-  uint16_t gaps = (uint16_t)~_arrived;   // bit i = seq expect+i never arrived
-  p[7] = (uint8_t)(gaps & 0xFF);
-  p[8] = (uint8_t)(gaps >> 8);
-  uint16_t crc = crc16_ccitt(p, 10);
-  p[10] = (uint8_t)(crc & 0xFF);
-  p[11] = (uint8_t)(crc >> 8);
+  uint16_t crc = crc16_ccitt(p, 7);
+  p[7] = (uint8_t)(crc & 0xFF);
+  p[8] = (uint8_t)(crc >> 8);
   if (_send != nullptr) {
     _send(_send_ctx, p, sizeof(p), _ret_path_len != 0 ? _ret_path : nullptr, _ret_path_len);
   }
@@ -412,21 +377,23 @@ bool OtaUpdate::sendHealthProbe() {
 // ------------------------------------------------------------------ /ota_pend
 
 #define OTA_PEND_MAGIC   "OTAP"
-#define OTA_PEND_VERSION 1
-// magic(4) ver(1) state(1) size(4) sha256(32) crc16(2)
-#define OTA_PEND_SIZE    44
+// magic(4) nonce(2) crc16(2)
+#define OTA_PEND_SIZE    8
 
-bool OtaUpdate::writePendRecord(uint8_t state, uint32_t size, const uint8_t sha[32]) {
+bool OtaUpdate::writePend() {
   if (_fs == nullptr) return false;
+  uint16_t nonce;
+  uint8_t nb[2];
+  if (_rng != nullptr) _rng->random(nb, 2); else { nb[0] = (uint8_t)(millis() & 0xFF); nb[1] = (uint8_t)((millis() >> 8) & 0xFF); }
+  nonce = (uint16_t)nb[0] | ((uint16_t)nb[1] << 8);
+
   uint8_t rec[OTA_PEND_SIZE];
   memcpy(rec, OTA_PEND_MAGIC, 4);
-  rec[4] = OTA_PEND_VERSION;
-  rec[5] = state;
-  for (int i = 0; i < 4; i++) rec[6 + i] = (uint8_t)(size >> (8 * i));
-  memcpy(rec + 10, sha, 32);
+  rec[4] = nb[0];
+  rec[5] = nb[1];
   uint16_t crc = crc16_ccitt(rec, OTA_PEND_SIZE - 2);
-  rec[42] = (uint8_t)(crc & 0xFF);
-  rec[43] = (uint8_t)(crc >> 8);
+  rec[6] = (uint8_t)(crc & 0xFF);
+  rec[7] = (uint8_t)(crc >> 8);
 
   File f = fsOpenWrite(_fs, OTA_PEND_FILE);
   if (!f) return false;
@@ -435,16 +402,12 @@ bool OtaUpdate::writePendRecord(uint8_t state, uint32_t size, const uint8_t sha[
   f.close();
   if (n != sizeof(rec)) { _fs->remove(OTA_PEND_FILE); return false; }
 
-
-  // read back before it is allowed to gate anything
-  uint8_t back_state;
-  uint32_t back_size;
-  uint8_t back_sha[32];
-  if (!readPend(&back_state, &back_size, back_sha)) return false;
-  return back_state == state && back_size == size && memcmp(back_sha, sha, 32) == 0;
+  uint16_t back;
+  if (!readPend(&back)) return false;
+  return back == nonce;
 }
 
-bool OtaUpdate::readPend(uint8_t* state, uint32_t* size, uint8_t sha[32]) {
+bool OtaUpdate::readPend(uint16_t* nonce) {
   if (_fs == nullptr || !_fs->exists(OTA_PEND_FILE)) return false;
   File f = fsOpenRead(_fs, OTA_PEND_FILE);
   if (!f) return false;
@@ -453,12 +416,9 @@ bool OtaUpdate::readPend(uint8_t* state, uint32_t* size, uint8_t sha[32]) {
   f.close();
   if (n != sizeof(rec)) return false;
   if (memcmp(rec, OTA_PEND_MAGIC, 4) != 0) return false;
-  if (rec[4] != OTA_PEND_VERSION) return false;
-  uint16_t stored = (uint16_t)rec[42] | ((uint16_t)rec[43] << 8);
+  uint16_t stored = (uint16_t)rec[6] | ((uint16_t)rec[7] << 8);
   if (crc16_ccitt(rec, OTA_PEND_SIZE - 2) != stored) return false;
-  *state = rec[5];
-  *size = le32(rec + 6);
-  memcpy(sha, rec + 10, 32);
+  *nonce = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
   return true;
 }
 
@@ -468,7 +428,7 @@ void OtaUpdate::deletePend() {
 
 void OtaUpdate::rollbackToPrevious(const char* why) {
   MESH_DEBUG_PRINTLN("ota: %s; rolling back", why);
-  writePendRecord(OTA_PEND_ROLLED, _health_size, _health_sha);   // best-effort marker
+  deletePend();                       // old image must not re-trigger a flip
   _health_pending = false;
   flipAndReboot(_io, _board);
 }
@@ -477,8 +437,8 @@ void OtaUpdate::rollbackToPrevious(const char* why) {
 
 void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
   if (_io == nullptr) {
-    snprintf(reply, reply_size, "running=%s sha=0000000000000000 state=unsupported size=0 off=0 err=0 rolledback=%d",
-             _version, _rolledback ? 1 : 0);
+    snprintf(reply, reply_size, "running=%s sha=0000000000000000 state=unsupported size=0 off=0 err=0",
+             _version);
     return;
   }
   if (!_running_sha_valid) {
@@ -492,48 +452,8 @@ void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
   char sha16[17];
   for (int i = 0; i < 8; i++) snprintf(sha16 + i * 2, 3, "%02x", _running_sha[i]);
   sha16[16] = 0;
-  snprintf(reply, reply_size, "running=%s sha=%s state=%s size=%lu off=%lu err=%u rolledback=%u",
-           _version, sha16, state_name, (unsigned long)_size, (unsigned long)_written,
-           (unsigned)_err, (unsigned)(_rolledback ? 1 : 0));
-}
-
-static bool parseFwVersion(const char* s, uint32_t* out) {
-  if (s == nullptr || *s == 0) return false;
-  if (*s == 'v') s++;
-  unsigned nums[3] = {0, 0, 0};
-  unsigned pre = 0;
-  int idx = 0;
-  unsigned acc = 0;
-  int digits = 0;
-  for (const char* q = s;; q++) {
-    char c = *q;
-    if (c >= '0' && c <= '9') {
-      if (idx > 3 || digits >= 3) return false;
-      acc = acc * 10 + (unsigned)(c - '0');
-      digits++;
-      continue;
-    }
-    if (c == '.' || c == '-' || c == 0) {
-      if (digits == 0 || acc > 255) return false;
-      if (c == '.') {
-        if (idx >= 2) return false;
-        nums[idx++] = acc;
-      } else if (c == '-') {
-        if (idx != 2) return false;   // pre-release only as MAJOR.MINOR.PATCH-pre
-        nums[2] = acc;
-        idx = 3;
-      } else {
-        if (idx == 3) pre = acc; else nums[idx] = acc;
-        break;
-      }
-      acc = 0;
-      digits = 0;
-      continue;
-    }
-    return false;
-  }
-  *out = ((uint32_t)nums[0] << 24) | ((uint32_t)nums[1] << 16) | ((uint32_t)nums[2] << 8) | pre;
-  return true;
+  snprintf(reply, reply_size, "running=%s sha=%s state=%s size=%lu off=%lu err=%u",
+           _version, sha16, state_name, (unsigned long)_size, (unsigned long)_written, (unsigned)_err);
 }
 
 bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const char* ver_tok, char* reply) {
@@ -541,8 +461,8 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     snprintf(reply, CLI_REPLY_MAX, "Err - OTA unsupported on this platform");
     return false;
   }
-  if (_state != State::Idle) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - staging in progress; abort it first");
+  if (_gate != nullptr && _gate->isSuspended()) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - battery gate active; staging refused");
     return false;
   }
   long size;
@@ -550,25 +470,25 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     snprintf(reply, CLI_REPLY_MAX, "Err - size must be 1..2147483647");
     return false;
   }
-  uint8_t sha[32];
-  if (sha_tok == nullptr || strlen(sha_tok) != 64 || !mesh::Utils::fromHex(sha, 32, sha_tok)) {
+  if (sha_tok == nullptr || strlen(sha_tok) != 64 || !mesh::Utils::fromHex(_pending.sha, 32, sha_tok)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - sha256 must be 64 hex chars");
     return false;
   }
-  uint32_t ignored_fw;
-  if (!parseFwVersion(ver_tok, &ignored_fw)) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - ver must be MAJOR[.MINOR[.PATCH][-pre]]");
+  if (ver_tok == nullptr || strlen(ver_tok) == 0 || strlen(ver_tok) > 63) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - ver must be 1..63 bytes");
     return false;
   }
-  if (!armSession((uint32_t)size, sha, nullptr, 0)) {
-    if (_err == OTA_ERR_BATTERY) {
-      snprintf(reply, CLI_REPLY_MAX, "Err - battery gate active; staging refused");
-    } else {
-      snprintf(reply, CLI_REPLY_MAX, "Err - cannot stage (slot unavailable?)");
-    }
+  if (_rng == nullptr) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - rng unavailable");
     return false;
   }
-  snprintf(reply, CLI_REPLY_MAX, "OK - staging armed (size=%ld)", size);
+
+  _pending.size = (uint32_t)size;
+  _rng->random(_pending.token, sizeof(_pending.token));
+  _pending.expires_at = millis() + OTA_PENDING_TTL_MS;
+  _pending.valid = true;
+  snprintf(reply, CLI_REPLY_MAX, "OK - staging armed (size=%ld) token=%02x%02x%02x%02x",
+           size, _pending.token[0], _pending.token[1], _pending.token[2], _pending.token[3]);
   return true;
 }
 
@@ -577,8 +497,8 @@ bool OtaUpdate::applyCommand(char* reply) {
     snprintf(reply, CLI_REPLY_MAX, "Err - no verified staging (see ota status)");
     return false;
   }
-  if (!writePendRecord(OTA_PEND_PENDING, _size, _expected_sha)) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - could not arm boot health record");
+  if (!writePend()) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - could not arm boot health marker");
     return false;
   }
   if (!flipAndReboot(_io, _board)) {
@@ -591,17 +511,13 @@ bool OtaUpdate::applyCommand(char* reply) {
 
 bool OtaUpdate::abortCommand(char* reply) {
   resetSession();
-  if (_rolledback) {
-    deletePend();
-    _rolledback = false;
-  }
+  clearPending();
   snprintf(reply, CLI_REPLY_MAX, "OK - aborted");
   return true;
 }
 
 bool OtaUpdate::rollbackCommand(char* reply) {
-  uint8_t zero[32] = {0};
-  writePendRecord(OTA_PEND_ROLLED, 0, zero);   // best-effort marker for the old image
+  deletePend();                       // no health check pending on the other image
   if (!flipAndReboot(_io, _board)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
     return false;
