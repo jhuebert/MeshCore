@@ -50,6 +50,7 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+#define REQ_TYPE_OTA                0x08     // OTA ops (admin only)
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -213,6 +214,19 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   // uint32_t now = getRTCClock()->getCurrentTimeUnique();
   // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
+
+  if (payload_len >= 2 && payload[0] == REQ_TYPE_OTA && sender->isAdmin()) {  // OTA ops
+    // The companion zero-pads the reply plaintext to a 16-byte block, so the
+    // frame carries its own length: [REQ_TYPE_OTA][frame_len][frame…]. Anything
+    // after frame_len bytes of frame is padding.
+    const uint8_t flen = payload[1];
+    if (payload_len < (size_t)2 + flen) return 0;   // truncated: no reply
+    uint8_t report[7];
+    size_t rlen = ota.onFrame(payload + 2, flen, report, sizeof(report));
+    if (rlen == 0) return 0;   // non-ask op (or nothing accepted): no response, like any unknown REQ
+    memcpy(&reply_data[4], report, rlen);
+    return 4 + (int)rlen;
+  }
 
   if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
     RepeaterStats stats;
@@ -449,11 +463,7 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   // only when the filter is enabled; with `filter off` nothing about the
   // receive path is spent on it (the value would never be read).
   const uint32_t filter_air_ms = filter.isEnabled() ? _radio->getEstAirtimeFor(packet->getRawLength()) : 0;
-  // OTA op packets (payload magic 'O','T') must never be dropped by a filter
-  // rule: a type=raw rule anywhere in the path would sever an update in
-  // transit. The battery gate and the stock checks still apply.
-  if (!otaIsOtaPacket(packet)
-      && filter.checkPacket(packet, millis(), recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
+  if (filter.checkPacket(packet, millis(), recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) return false;   // packet filter rules + advert rate limiter
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood()
       && mesh::isFloodHopLimitExceeded(packet, _prefs.flood_max, _prefs.flood_max_unscoped, _prefs.flood_max_advert)) {
@@ -987,13 +997,6 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   }
 }
 
-// OTA op packets (payload magic 'O','T') ride DIRECT raw-custom payloads;
-// anything that is not a valid OTA frame is inert. The node arms only via
-// OP_START, so a stray packet from a stranger configures nothing.
-void MyMesh::onRawDataRecv(mesh::Packet* packet) {
-  ota.onPacket(packet);
-}
-
 void MyMesh::sendNodeDiscoverReq() {
   uint8_t data[10];
   data[0] = CTL_TYPE_NODE_DISCOVER_REQ; // prefix_only=0
@@ -1177,22 +1180,18 @@ void MyMesh::mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& sta
 }
 #endif
 
-// OTA replies are originated here: zero-hop, or DIRECT along the return path
-// the app supplied in OP_START. A RAW_CUSTOM payload carries no sender
-// identity, so this is the only route back to the app.
-static bool otaSend(void* ctx, const uint8_t* payload, size_t len,
-                    const uint8_t* ret_path, uint8_t ret_path_len) {
+// The OTA transfer rides inside an admin client's REQ and its OP_REPORT comes
+// back inside the RESPONSE, both routed by stock mesh paths — see handleRequest().
+// This sender originates only the boot health probe: a zero-hop RAW_CUSTOM
+// OP_NOP whose transmission is the freshly-applied image's liveness check.
+static bool otaSend(void* ctx, const uint8_t* payload, size_t len) {
   MyMesh* m = (MyMesh*)ctx;
   mesh::Packet* pkt = m->obtainNewPacket();
   if (!pkt) return false;
   pkt->header = (PAYLOAD_TYPE_RAW_CUSTOM << PH_TYPE_SHIFT);
   pkt->payload_len = (uint16_t)len;
   memcpy(pkt->payload, payload, len);
-  if (ret_path_len != 0) {
-    m->sendDirect(pkt, ret_path, ret_path_len);
-  } else {
-    m->sendZeroHop(pkt, (uint32_t)0);
-  }
+  m->sendZeroHop(pkt, (uint32_t)0);
   return true;
 }
 

@@ -1,6 +1,8 @@
 // OtaUpdate.cpp — the LoRa OTA engine for the ESP32 simple_repeater firmware.
 // See OtaUpdate.h for the wire format, the arm/token contract, and the
-// boot-health marker. Fork-owned.
+// boot-health marker. Fork-owned. The ops ride inside an admin client's REQ
+// and the OP_REPORT comes back inside the RESPONSE, so intermediate nodes
+// only ever see ordinary request/response traffic.
 
 #include "OtaUpdate.h"
 
@@ -225,50 +227,43 @@ uint32_t OtaUpdate::ownTargetId() const {
 #endif
 }
 
-void OtaUpdate::onPacket(const mesh::Packet* pkt) {
-  if (!otaIsOtaPacket(pkt)) return;
-  const uint8_t* payload = pkt->payload;
-  const size_t n = pkt->payload_len;
+size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, size_t report_cap) {
+  if (frame == nullptr || n < 5) return 0;   // magic(2) + op(1) + crc(2); ops carry a seq
+  if (frame[0] != OTA_MAGIC0 || frame[1] != OTA_MAGIC1) return 0;
+  if (crc16_ccitt(frame, n - 2) != le16(frame + n - 2)) return 0;   // bad CRC: drop
 
-  uint16_t stored_crc = le16(payload + n - 2);
-  if (crc16_ccitt(payload, n - 2) != stored_crc) return;   // bad CRC: drop
+  const uint8_t op = frame[2];
 
-  const uint8_t op = payload[2];
+  if (_io == nullptr) return 0;   // not an ESP32 (or slot lookup failed): inert
 
-  if (_io == nullptr) return;   // not an ESP32 (or slot lookup failed): inert
-
-  if (op == OTA_OP_NOP || op == OTA_OP_REPORT) return;
+  if (op == OTA_OP_NOP || op == OTA_OP_REPORT) return 0;
 
   if (op == OTA_OP_ASK) {
-    if (!stagingArmed()) return;
-    const uint8_t* body = payload + 3;
-    const uint16_t body_len = (uint16_t)(n - 5);
-    if (body_len < 1) return;
-    const uint8_t ret_path_len = body[0];
-    if (!mesh::Packet::isValidPathLen(ret_path_len)) return;   // malformed ask: drop
-    const uint16_t path_bytes = (uint16_t)((ret_path_len & 63) * ((ret_path_len >> 6) + 1));
-    if (body_len != (uint16_t)(1 + path_bytes)) return;
-    sendReport(body + 1, ret_path_len);
-    return;
+    if (!stagingArmed()) return 0;
+    if (n != 5) return 0;   // OP_ASK carries no body
+    if (report_out == nullptr || report_cap < 7) return 0;
+    sendReport(report_out);
+    return 7;
   }
 
-  const uint16_t seq = le16(payload + 3);
-  const uint8_t* body = payload + 5;
+  const uint16_t seq = le16(frame + 3);
+  const uint8_t* body = frame + 5;
   const uint16_t body_len = (uint16_t)(n - OTA_FRAME_OVERHEAD);
 
   switch (op) {
     case OTA_OP_START:
-      if (seq != 0) return;          // OP_START is always seq 0
+      if (seq != 0) return 0;          // OP_START is always seq 0
       handleStart(body, body_len);
-      return;
+      return 0;
     default:
       break;
   }
-  if (!stagingArmed()) return;
-  if (seq != _expect) return;   // strictly in-order delivery; everything else is a gap or a dup
+  if (!stagingArmed()) return 0;
+  if (seq != _expect) return 0;   // strictly in-order delivery; everything else is a gap or a dup
 
   applyOp(body, body_len, op);
   if (_state == State::Staging) _expect++;   // Ready/Error need no watermark
+  return 0;
 }
 
 void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
@@ -352,19 +347,15 @@ bool OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
   return true;
 }
 
-void OtaUpdate::sendReport(const uint8_t* ret_path, uint8_t ret_path_len) {
-  uint8_t p[7];
-  p[0] = OTA_MAGIC0;
-  p[1] = OTA_MAGIC1;
-  p[2] = OTA_OP_REPORT;
-  p[3] = (uint8_t)(_expect & 0xFF);
-  p[4] = (uint8_t)(_expect >> 8);
-  uint16_t crc = crc16_ccitt(p, 5);
-  p[5] = (uint8_t)(crc & 0xFF);
-  p[6] = (uint8_t)(crc >> 8);
-  if (_send != nullptr) {
-    _send(_send_ctx, p, sizeof(p), ret_path, ret_path_len);
-  }
+void OtaUpdate::sendReport(uint8_t* out) {
+  out[0] = OTA_MAGIC0;
+  out[1] = OTA_MAGIC1;
+  out[2] = OTA_OP_REPORT;
+  out[3] = (uint8_t)(_expect & 0xFF);
+  out[4] = (uint8_t)(_expect >> 8);
+  uint16_t crc = crc16_ccitt(out, 5);
+  out[5] = (uint8_t)(crc & 0xFF);
+  out[6] = (uint8_t)(crc >> 8);
 }
 
 bool OtaUpdate::sendHealthProbe() {
@@ -373,7 +364,7 @@ bool OtaUpdate::sendHealthProbe() {
   uint16_t crc = crc16_ccitt(p, OTA_HEALTH_LEN - 2);
   p[5] = (uint8_t)(crc & 0xFF);
   p[6] = (uint8_t)(crc >> 8);
-  return _send != nullptr && _send(_send_ctx, p, sizeof(p), nullptr, 0);
+  return _send != nullptr && _send(_send_ctx, p, sizeof(p));
 }
 
 // ------------------------------------------------------------------ /ota_pend

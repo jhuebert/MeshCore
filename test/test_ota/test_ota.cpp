@@ -88,19 +88,12 @@ struct FakeSlotIo : OtaSlotIo {
 
 struct SentFrame {
   std::vector<uint8_t> payload;
-  uint8_t ret_path_len = 0;
-  std::vector<uint8_t> ret_path;
 };
 
-static bool captureSend(void* ctx, const uint8_t* payload, size_t len,
-                        const uint8_t* ret_path, uint8_t ret_path_len) {
+static bool captureSend(void* ctx, const uint8_t* payload, size_t len) {
   auto* vec = static_cast<std::vector<SentFrame>*>(ctx);
   SentFrame f;
   f.payload.assign(payload, payload + len);
-  f.ret_path_len = ret_path_len;
-  if (ret_path != nullptr && ret_path_len != 0) {
-    f.ret_path.assign(ret_path, ret_path + (ret_path_len & 63) * ((ret_path_len >> 6) + 1));
-  }
   vec->push_back(std::move(f));
   return true;
 }
@@ -117,6 +110,14 @@ static mesh::Packet makePacket(const std::vector<uint8_t>& payload) {
 static std::vector<uint8_t> frame(uint8_t op, uint16_t seq, const std::vector<uint8_t>& body) {
   std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, op, (uint8_t)(seq & 0xFF), (uint8_t)(seq >> 8)};
   p.insert(p.end(), body.begin(), body.end());
+  uint16_t crc = crc16_ccitt(p.data(), p.size());
+  p.push_back((uint8_t)(crc & 0xFF));
+  p.push_back((uint8_t)(crc >> 8));
+  return p;
+}
+
+static std::vector<uint8_t> askFrame() {
+  std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_ASK};
   uint16_t crc = crc16_ccitt(p.data(), p.size());
   p.push_back((uint8_t)(crc & 0xFF));
   p.push_back((uint8_t)(crc >> 8));
@@ -181,6 +182,16 @@ protected:
     ota.begin(&fs, &gate, &board, "test-fw-1.0.0", &rng);
   }
 
+  // Feed one frame to the engine, exactly as handleRequest() does from an
+  // admin client's REQ. Returns the OP_REPORT frame when the frame was an
+  // OP_ASK (7 bytes), else an empty vector.
+  std::vector<uint8_t> feed(const std::vector<uint8_t>& f) {
+    std::vector<uint8_t> report(7, 0);
+    size_t n = ota.onFrame(f.data(), f.size(), report.data(), report.size());
+    report.resize(n);
+    return report;
+  }
+
   static std::vector<uint8_t> testImage(size_t n = 520) {
     std::vector<uint8_t> img(n);
     for (size_t i = 0; i < n; i++) img[i] = (uint8_t)((i * 37 + 11) & 0xFF);
@@ -210,8 +221,8 @@ protected:
     auto token = armTokenOf(reply);
     token[0] ^= token_flip;   // flip a byte to model a stolen/damaged token
     auto body = makeStartBody((uint32_t)image.size(), sha, target, token.data());
-    auto pkt = makePacket(frame(OTA_OP_START, 0, body));
-    ota.onPacket(&pkt);
+    auto pkt = frame(OTA_OP_START, 0, body);
+    feed(pkt);
   }
 
   void sendLiteral(uint16_t seq, const std::vector<uint8_t>& data) {
@@ -219,8 +230,8 @@ protected:
     body[0] = (uint8_t)(data.size() & 0xFF);
     body[1] = (uint8_t)(data.size() >> 8);
     memcpy(body.data() + 2, data.data(), data.size());
-    auto pkt = makePacket(frame(OTA_OP_LITERAL, seq, body));
-    ota.onPacket(&pkt);
+    auto pkt = frame(OTA_OP_LITERAL, seq, body);
+    feed(pkt);
   }
 
   void sendCopy(uint16_t seq, uint32_t base_off, uint16_t len) {
@@ -228,29 +239,17 @@ protected:
     for (int i = 0; i < 4; i++) body[i] = (uint8_t)(base_off >> (8 * i));
     body[4] = (uint8_t)(len & 0xFF);
     body[5] = (uint8_t)(len >> 8);
-    auto pkt = makePacket(frame(OTA_OP_COPY, seq, body));
-    ota.onPacket(&pkt);
+    auto pkt = frame(OTA_OP_COPY, seq, body);
+    feed(pkt);
   }
 
   void sendEnd(uint16_t seq) {
-    auto pkt = makePacket(frame(OTA_OP_END, seq, {}));
-    ota.onPacket(&pkt);
+    auto pkt = frame(OTA_OP_END, seq, {});
+    feed(pkt);
   }
 
-  void sendAsk(uint8_t ret_path_len = 0, const uint8_t* ret_path = nullptr) {
-    std::vector<uint8_t> body;
-    body.push_back(ret_path_len);
-    if (ret_path_len != 0 && ret_path != nullptr) {
-      uint16_t path_bytes = (uint16_t)((ret_path_len & 63) * ((ret_path_len >> 6) + 1));
-      body.insert(body.end(), ret_path, ret_path + path_bytes);
-    }
-    std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_ASK};
-    p.insert(p.end(), body.begin(), body.end());
-    uint16_t crc = crc16_ccitt(p.data(), p.size());
-    p.push_back((uint8_t)(crc & 0xFF));
-    p.push_back((uint8_t)(crc >> 8));
-    auto pkt = makePacket(p);
-    ota.onPacket(&pkt);
+  std::vector<uint8_t> sendAsk() {
+    return feed(askFrame());
   }
 
   std::string statusLine() {
@@ -276,9 +275,9 @@ protected:
 TEST_F(OtaTest, RejectsBadCrc) {
   uint8_t sha[32] = {0};
   const uint8_t token[4] = {1, 2, 3, 4};
-  auto pkt = makePacket(frame(OTA_OP_START, 0, makeStartBody(4, sha, testTargetId(), token)));
-  pkt.payload[10] ^= 0x01;   // corrupt a body byte
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, makeStartBody(4, sha, testTargetId(), token));
+  pkt[10] ^= 0x01;   // corrupt a body byte
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
 }
 
@@ -287,15 +286,15 @@ TEST_F(OtaTest, RejectsBadMagic) {
   const uint8_t token[4] = {1, 2, 3, 4};
   auto p = frame(OTA_OP_START, 0, makeStartBody(4, sha, 0, token));
   p[0] = 'X';
-  auto pkt = makePacket(p);
-  ota.onPacket(&pkt);
+  auto pkt = p;
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
 }
 
 TEST_F(OtaTest, RejectsTruncatedFrame) {
   std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_START};
-  auto pkt = makePacket(p);
-  EXPECT_NO_FATAL_FAILURE(ota.onPacket(&pkt));
+  auto pkt = p;
+  EXPECT_NO_FATAL_FAILURE(feed(pkt));
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
 }
 
@@ -321,8 +320,8 @@ TEST_F(OtaTest, ArmWithoutPendingRejected) {
   mockSha256(image, sha);
   const uint8_t token[4] = {0x12, 0x34, 0x56, 0x78};   // never armed by an operator
   auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token);
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));   // no `ota stage` first
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);   // no `ota stage` first
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
 }
@@ -345,8 +344,8 @@ TEST_F(OtaTest, OverheardTokenCannotSubstituteImage) {
   uint8_t asha[32];
   mockSha256(attacker, asha);
   auto body = makeStartBody((uint32_t)attacker.size(), asha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));   // attacker with the overheard token
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);   // attacker with the overheard token
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
   arm(genuine);   // genuine flow still works on the same pending arm
@@ -359,22 +358,22 @@ TEST_F(OtaTest, ArmConsumesPendingArmStaleTokenIsUnusable) {
   mockSha256(image, sha);
   std::string reply = stage(image);   // one pending arm
   auto token = armTokenOf(reply);
-  auto pkt = makePacket(frame(OTA_OP_START, 0,
-      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data())));
-  ota.onPacket(&pkt);                  // consumed by this arm
+  auto pkt = frame(OTA_OP_START, 0,
+      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data()));
+  feed(pkt);                  // consumed by this arm
   ASSERT_EQ(ota.state(), OtaUpdate::State::Staging);
 
   // an exact replay is refused (busy); and the stale arm is not usable after an abort either
-  pkt = makePacket(frame(OTA_OP_START, 0,
-      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data())));
-  ota.onPacket(&pkt);
+  pkt = frame(OTA_OP_START, 0,
+      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data()));
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
 
   char r[160];
   ota.abortCommand(r);
-  pkt = makePacket(frame(OTA_OP_START, 0,
-      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data())));
-  ota.onPacket(&pkt);
+  pkt = frame(OTA_OP_START, 0,
+      makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data()));
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);   // stale token arms nothing
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
 }
@@ -387,8 +386,8 @@ TEST_F(OtaTest, PendingArmExpires) {
   auto token = armTokenOf(reply);
   g_mock_millis += OTA_PENDING_TTL_MS + 1;
   auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
 }
@@ -402,15 +401,15 @@ TEST_F(OtaTest, SecondStageReplacesFirstToken) {
   uint8_t sha2[32];
   mockSha256(image2, sha2);
   auto body = makeStartBody((uint32_t)image2.size(), sha2, testTargetId(), token_a.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));   // old token, new contract
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);   // old token, new contract
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
   // new token works
   auto token_b = armTokenOf(reply_b);
   body = makeStartBody((uint32_t)image2.size(), sha2, testTargetId(), token_b.data());
-  pkt = makePacket(frame(OTA_OP_START, 0, body));
-  ota.onPacket(&pkt);
+  pkt = frame(OTA_OP_START, 0, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
 }
 
@@ -423,8 +422,8 @@ TEST_F(OtaTest, AbortClearsPendingArm) {
   char r[160];
   EXPECT_TRUE(ota.abortCommand(r));
   auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=7"), std::string::npos);
 }
@@ -437,8 +436,8 @@ TEST_F(OtaTest, ArmWhileBatterySuspendedRefused) {
   auto token = armTokenOf(reply);
   suspendBattery();                   // gate engages before the app's OP_START arrives
   auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=2"), std::string::npos);
 }
@@ -481,8 +480,8 @@ TEST_F(OtaTest, RejectsOversizeImage) {
   EXPECT_TRUE(ota.stageCommand("3145728", sha_hex, "1.2.3", reply));   // 0x300000 > slot
   auto token = armTokenOf(reply);
   auto body = makeStartBody(0x300000, sha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 0, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 0, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=3"), std::string::npos);
 }
@@ -494,8 +493,8 @@ TEST_F(OtaTest, RejectsStartWithNonZeroSeq) {
   std::string reply = stage(image);
   auto token = armTokenOf(reply);
   auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data());
-  auto pkt = makePacket(frame(OTA_OP_START, 5, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_START, 5, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
 }
 
@@ -506,26 +505,29 @@ TEST_F(OtaTest, RejectsSecondStartWhileArmed) {
   EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
 }
 
-TEST_F(OtaTest, ArmThenAskCarriesReturnPathToReport) {
+TEST_F(OtaTest, AskGetsReportResponse) {
   auto image = testImage();
   arm(image);
   ASSERT_EQ(ota.state(), OtaUpdate::State::Staging);
-  const uint8_t ret_path[2] = {0xAA, 0xBB};   // one 2-byte hash, encoded 0x41
-  sendAsk(0x41, ret_path);
-  ASSERT_EQ(sent.size(), 1u);
-  EXPECT_EQ(sent[0].payload[2], OTA_OP_REPORT);
-  EXPECT_EQ(sent[0].ret_path_len, 0x41);
-  ASSERT_EQ(sent[0].ret_path.size(), 2u);
-  EXPECT_EQ(sent[0].ret_path[0], 0xAA);
-  EXPECT_EQ(sent[0].ret_path[1], 0xBB);
+  auto report = sendAsk();
+  ASSERT_EQ(report.size(), 7u);
+  EXPECT_EQ(report[0], OTA_MAGIC0);
+  EXPECT_EQ(report[1], OTA_MAGIC1);
+  EXPECT_EQ(report[2], OTA_OP_REPORT);
+  EXPECT_EQ(report[3] | (report[4] << 8), 1);               // next_expected
 }
 
-TEST_F(OtaTest, MalformedAskReturnPathGetsNoReply) {
+TEST_F(OtaTest, AskWithStrayBodyGetsNoReply) {
   auto image = testImage();
   arm(image);
   ASSERT_EQ(ota.state(), OtaUpdate::State::Staging);
-  sendAsk(0xC1, nullptr);   // hash size 4: invalid encoding
-  EXPECT_TRUE(sent.empty());
+  // OP_ASK carries no body since v2; a stray byte is not an ask.
+  std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_ASK, 0x00};
+  uint16_t crc = crc16_ccitt(p.data(), p.size());
+  p.push_back((uint8_t)(crc & 0xFF));
+  p.push_back((uint8_t)(crc >> 8));
+  auto report = feed(p);
+  EXPECT_TRUE(report.empty());
 }
 
 // ============================================================
@@ -559,11 +561,10 @@ TEST_F(OtaTest, GapReportedThenResentFromGap) {
   std::vector<uint8_t> part(image.begin(), image.begin() + 8);
   sendLiteral(1, part);
   sendLiteral(4, part);   // dropped: seq 2 and 3 never arrived
-  sendAsk();
-  ASSERT_EQ(sent.size(), 1u);
-  const auto& r = sent[0].payload;
-  EXPECT_EQ(r[2], OTA_OP_REPORT);
-  EXPECT_EQ(r[3] | (r[4] << 8), 2);               // next_expected
+  auto report = sendAsk();
+  ASSERT_EQ(report.size(), 7u);
+  EXPECT_EQ(report[2], OTA_OP_REPORT);
+  EXPECT_EQ(report[3] | (report[4] << 8), 2);               // next_expected
   sendLiteral(2, part);
   sendLiteral(3, part);
   sendLiteral(4, part);
@@ -580,8 +581,8 @@ TEST_F(OtaTest, DuplicateOpIsIgnored) {
 }
 
 TEST_F(OtaTest, AskWhenIdleGetsNoReply) {
-  sendAsk();
-  EXPECT_TRUE(sent.empty());
+  auto report = sendAsk();
+  EXPECT_TRUE(report.empty());
 }
 
 // ============================================================
@@ -626,8 +627,8 @@ TEST_F(OtaTest, LiteralWithTrailingJunkIsRejected) {
   arm(image);
   std::vector<uint8_t> body(2 + 4 + 1, 0);   // len says 4, buffer has 5
   body[0] = 4;
-  auto pkt = makePacket(frame(OTA_OP_LITERAL, 1, body));
-  ota.onPacket(&pkt);
+  auto pkt = frame(OTA_OP_LITERAL, 1, body);
+  feed(pkt);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
 }
 

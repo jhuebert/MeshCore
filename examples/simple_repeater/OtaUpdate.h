@@ -28,44 +28,52 @@
 // never flooded. SHA-256 gate on the staged slot is the only integrity
 // decision; the op stream itself is trustless once armed.
 //
-// Wire format (frozen in M0):
+// Wire format (v2): carried inside an admin client's REQ, answered by a
+// RESPONSE, so intermediate nodes only ever forward ordinary mesh traffic.
 //
-//   ch0   'O' 0x4F
-//   ch1   'T' 0x54
-//   ch2   op
-//   ch3   seq (u16, little endian) — op packets only: OP_START/OP_COPY/
-//             OP_LITERAL/OP_END. OP_ASK, OP_REPORT and OP_NOP carry no seq.
-//   ch4.. opcode-specific body
-//   last.. last-1
-//   crc16 (u16, LE) — CRC-16/CCITT-FALSE over everything before it
+//   REQ plaintext:    [tag(4)][REQ_TYPE_OTA (1)][frame_len(1)][OTA frame]
+//   RESPONSE plaintext (only for OP_ASK):  [tag(4)][OP_REPORT frame]
+// The plaintext is padded by the crypto layer to a 16-byte block, so the
+// OTA frame inside an OP_ASK request carries its own length and the padding
+// after it is ignored by the node; on the response side the OTA frame is
+// validated by its magic and CRC, and padding may follow it.
+//
+// The plaintext is padded by the crypto layer to a 16-byte block, so the
+// OTA frame inside carries its own length — the padding after it is ignored.
+//
+//   OTA frame:
+//     ch0   'O' 0x4F
+//     ch1   'T' 0x54
+//     ch2   op
+//     ch3   seq (u16, little endian) — op packets only: OP_START/OP_COPY/
+//               OP_LITERAL/OP_END. OP_ASK, OP_REPORT and OP_NOP carry no seq.
+//     ch4.. opcode-specific body
+//     last.. last-1
+//     crc16 (u16, LE) — CRC-16/CCITT-FALSE over everything before it
 //
 //   OP_START  0x01  size:u32 sha256[32] target:u32 token:u32
 //   OP_COPY   0x02  base_off:u32 len:u16          copy running-slot bytes into the staged image
 //   OP_LITERAL 0x03 len:u16 data[len]             write data into the staged image
 //   OP_END    0x04                              finish; SHA-256 the slot; if OK, ready
-//   OP_ASK    0x05  ret_path_len:u8 [ret_path]    request an OP_REPORT (after a window)
-//   OP_REPORT 0x06  next_expected:u16           (repeater → app)
+//   OP_ASK    0x05                              request an OP_REPORT (after a window)
+//   OP_REPORT 0x06  next_expected:u16           (repeater → app, inside RESPONSE)
 //   OP_NOP    0x00                              boot health probe; never answered
 //
-// Identical frames must still be delivered. OP_ASK carries no nonce, so every
-// ask in a transfer is byte-for-byte the same, and a re-sent op repeats the
-// bytes of the copy that went missing. The mesh duplicate filter would drop
-// both after the first copy in a boot — silently, with no error anywhere — so
-// MyMesh opts RAW_CUSTOM OTA frames out of it via allowRawDataDuplicate().
-// That is safe because the engine is idempotent by construction: an op applies
-// only when seq == next_expected, and an ask is a stateless query.
+// The tag the companion prepends to every request keeps each REQ's packet hash
+// unique, so a re-sent op is never swallowed by the duplicate filter — the
+// idempotency rule the raw-custom transport needed (and its
+// allowRawDataDuplicate() hook) is not required here. The inner CRC stays on
+// the OP_* frames: it costs two bytes and lets the engine reject a mangled
+// frame before touching flash, without trusting the carrier.
 //
 // Ops are strictly in order: an op applies only when seq == next_expected;
 // anything else is dropped. DIRECT routing delivers in order per path, so
 // this costs nothing on the wire and no reassembly buffer is needed. The
 // app's recovery from a lost op is "re-send from next_expected".
 //
-// ret_path_len / ret_path in OP_ASK carry the return itinerary for the
-// OP_REPORT being requested, in the repeater→app travel order (encoded
-// exactly like a packet's path_len byte). DIRECT paths are consumed hop by
-// hop as they travel, so the final hop cannot learn the reverse itinerary —
-// without it OP_REPORTs cannot cross a multi-hop path. The path travels
-// with each ask and is used once; nothing is stored. Empty (0) = zero hop.
+// The OP_REPORT comes back through the stock REQ reply routing (the client's
+// stored out_path, or a flood when none is known), exactly like a status
+// response — the ask carries no return itinerary and nothing is stored.
 //
 // /ota_pend is an 8-byte marker (magic "OTAP", a random nonce, CRC-16): its mere presence means an apply just booted and the boot health
 // check owes the board a verdict. Success deletes the marker; failure flips
@@ -92,7 +100,6 @@
 
 #include <Mesh.h>                    // mesh::Packet, mesh::MainBoard, mesh::RNG
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
-#include <Packet.h>                  // PAYLOAD_TYPE_RAW_CUSTOM
 #include "PersistUtil.h"             // crc16_ccitt (the wire CRC)
 
 // --- wire format ------------------------------------------------------------
@@ -127,20 +134,6 @@
 #define OTA_ERR_TOKEN      7        // OP_START with no/incompatible pending arm
 #define OTA_ERR_END        9        // esp_ota_end() failed after a clean verify
 
-// true iff the packet is a well-formed OTA frame: RAW_CUSTOM payload, OTA
-// magic, valid CRC. Used by the relay path (a fork filter rule must never
-// drop an update in transit — and only frames the node would itself accept
-// are exempt) and by the local receive path, on every platform.
-inline bool otaIsOtaPacket(const mesh::Packet* pkt) {
-  if (pkt == nullptr) return false;
-  if (pkt->getPayloadType() != PAYLOAD_TYPE_RAW_CUSTOM) return false;
-  const size_t n = pkt->payload_len;
-  if (n < 5) return false;   // magic(2) + op(1) + crc(2); ops carry a seq, ASK/REPORT/NOP do not
-  if (pkt->payload[0] != OTA_MAGIC0 || pkt->payload[1] != OTA_MAGIC1) return false;
-  const uint16_t stored = (uint16_t)pkt->payload[n - 2] | ((uint16_t)pkt->payload[n - 1] << 8);
-  return crc16_ccitt(pkt->payload, n - 2) == stored;
-}
-
 // The staging slot engine's only view of flash, so the session machine is
 // host-testable. The ESP32 implementation wraps esp_ota_*; host tests inject
 // a RAM-backed fake.
@@ -160,8 +153,9 @@ public:
   virtual bool setInactiveAsBoot() = 0;
 };
 
-typedef bool (*OtaSendFn)(void* ctx, const uint8_t* payload, size_t len,
-                          const uint8_t* ret_path, uint8_t ret_path_len);
+// Zero-hop transport for the boot health probe (PAYLOAD_TYPE_RAW_CUSTOM,
+// OP_NOP). The transfer itself never uses it — ops travel inside REQ/RESPONSE.
+typedef bool (*OtaSendFn)(void* ctx, const uint8_t* payload, size_t len);
 
 class BatteryGate;
 
@@ -175,15 +169,18 @@ public:
   // Wire the engine into the node: filesystem, the battery gate (staging is
   // refused while it is suspended), the board (apply/rollback reboot via
   // board->reboot()), and the RNG (arm tokens). `firmware_version` is
-  // FIRMWARE_VERSION (shown in `ota status`). The sender dispatches
-  // replies: zero-hop, or DIRECT along the return path from the armed
-  // OP_START.
+  // FIRMWARE_VERSION (shown in `ota status`). The sender dispatches the
+  // boot health probe: zero-hop only.
   void begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board, const char* firmware_version, mesh::RNG* rng);
   void setSender(OtaSendFn fn, void* ctx) { _send = fn; _send_ctx = ctx; }
 
-  // Receive entry: RAW_CUSTOM payloads with the OTA magic are validated and
-  // applied here; anything else is inert.
-  void onPacket(const mesh::Packet* pkt);
+  // Receive entry: feed one OTA frame (as carried inside an admin client's
+  // REQ, payload after REQ_TYPE_OTA). Applies the op; when the frame was an
+  // OP_ASK, writes the OP_REPORT frame into `report_out` and returns its
+  // length (7). Anything else — unknown magic/CRC, unsolicited ops, ASK while
+  // idle — returns 0 and is inert. The caller (handleRequest) puts the report
+  // into the RESPONSE the stock reply router delivers.
+  size_t onFrame(const uint8_t* frame, size_t len, uint8_t* report_out, size_t report_cap);
 
   // Boot health check (only engages right after an apply reboot) plus the
   // rollback deadline. Cheap once settled.
@@ -233,9 +230,8 @@ private:
   uint16_t _expect = 1;                     // next seq to apply (OP_START = 0)
   uint32_t _size = 0, _written = 0;
   uint8_t _expected_sha[32] = {0};
-
-  bool _running_sha_valid = false;
   uint8_t _running_sha[32] = {0};
+  bool _running_sha_valid = false;
 
   bool _health_pending = false;             // freshly-applied image booted
   bool _health_sent = false;                // health probe already dispatched
@@ -264,7 +260,7 @@ private:
   bool applyCopy(uint32_t base_off, uint16_t len);
   bool applyLiteral(const uint8_t* data, uint16_t len);
   uint32_t ownTargetId() const;
-  void sendReport(const uint8_t* ret_path, uint8_t ret_path_len);
+  void sendReport(uint8_t* out);
   bool sendHealthProbe();
   void rollbackToPrevious(const char* why);
   bool writePend();
