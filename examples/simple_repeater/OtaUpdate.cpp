@@ -306,7 +306,7 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
   q = putLe32(q, ownTargetId());
   q = putLe32(q, slot);
   q = putLe16(q, OTA_MAX_LITERAL);
-  q = putLe32(q, features);
+  putLe32(q, features);
   memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, strlen(_version) > 31 ? 31 : strlen(_version));
   if (_io != nullptr) {
     ensureRunningSha();

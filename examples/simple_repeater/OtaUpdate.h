@@ -157,6 +157,11 @@
 #define OTA_INFO_RUNNING_VER_OFF   15   // body offset of the 32-byte running version string
 #define OTA_INFO_RUNNING_SHA_OFF   47   // body offset of the 32-byte running SHA-256
 #define OTA_INFO_REPORT_LEN (3 + OTA_INFO_BODY + 2)
+// The report body is written field by field, so the fixed offsets above are
+// what keeps the frozen layout and the writer in step.
+static_assert(OTA_INFO_RUNNING_VER_OFF == 1 + 4 + 4 + 2 + 4, "OP_INFO_REPORT field order");
+static_assert(OTA_INFO_RUNNING_SHA_OFF == OTA_INFO_RUNNING_VER_OFF + 32, "OP_INFO_REPORT field order");
+static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT field order");
 // largest report frame the engine ever returns (OP_INFO_REPORT is the biggest)
 #define OTA_REPORT_MAX     OTA_INFO_REPORT_LEN
 
