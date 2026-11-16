@@ -83,7 +83,7 @@ public:
 #endif   // ESP32
 
 // SHA-256 over `size` bytes of one slot, read in 1 KB slices. Shared by the
-// OP_END verification and `ota status` (the app's delta base match).
+// OP_END verification and hashImage() (the app's delta base match).
 static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32]) {
   SHA256 sha;
   uint8_t buf[1024];
@@ -95,6 +95,50 @@ static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32])
     off += n;
   }
   sha.finalize(out, 32);
+  return true;
+}
+
+// One slot read, staged or running.
+static bool slotRead(OtaSlotIo* io, bool staged, uint32_t off, uint8_t* out, size_t len) {
+  return staged ? io->readStaged(off, out, len) : io->readSource(off, out, len);
+}
+
+// Length of the app image stored at the start of a slot: the ESP image header
+// (24 bytes: magic, segment count, ..., chip id, hash_appended) followed by
+// each segment header + payload, a checksum byte and 16-byte padding. This is
+// exactly what an update wrote — the .bin length — not the erase-filled
+// partition. Returns 0 when the bytes are not an ESP app image.
+static uint32_t slotImageLength(OtaSlotIo* io, bool staged) {
+  uint8_t h[24];
+  if (!slotRead(io, staged, 0, h, sizeof(h))) return 0;
+  if (h[0] != 0xE9 || h[1] < 1 || h[1] > 16) return 0;   // magic, segment count
+  uint32_t off = sizeof(h);
+  for (uint8_t i = 0; i < h[1]; i++) {
+    uint8_t seg[8];
+    if (!slotRead(io, staged, off, seg, sizeof(seg))) return 0;
+    uint32_t len = (uint32_t)seg[4] | ((uint32_t)seg[5] << 8) |
+                   ((uint32_t)seg[6] << 16) | ((uint32_t)seg[7] << 24);
+    off += 8 + len;
+    off = (off + 3) & ~3u;                               // payloads are 4-byte aligned
+    if (off >= io->sourceSize()) return 0;               // garbage: refuse
+  }
+  off += 1;                                              // trailing checksum byte
+  return (off + 15) & ~15u;                              // images are padded to 16
+}
+
+// SHA-256 of the app image in a slot, over exactly the bytes the update wrote.
+// esptool appends a SHA-256 of the image to every .bin by default; it is
+// included when it verifies against the computed hash, so this equals the hash
+// the app computes over its own image file (the delta base match). Returns
+// false when the slot does not hold a recognisable image.
+static bool hashImage(OtaSlotIo* io, bool staged, uint8_t out[32]) {
+  const uint32_t len = slotImageLength(io, staged);
+  if (len == 0) return false;
+  if (!hashSlot(io, staged, len, out)) return false;
+  uint8_t digest[32];
+  if (slotRead(io, staged, len, digest, sizeof(digest)) && memcmp(digest, out, 32) == 0) {
+    return hashSlot(io, staged, len + sizeof(digest), out);
+  }
   return true;
 }
 
@@ -254,11 +298,7 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
     memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, n);   // NUL-padded by memset
   }
   if (_io != nullptr) {
-    if (!_running_sha_valid) {
-      memset(_running_sha, 0, sizeof(_running_sha));
-      hashSlot(_io, /*staged=*/false, _io->sourceSize(), _running_sha);
-      _running_sha_valid = true;
-    }
+    ensureRunningSha();
     memcpy(&p[OTA_INFO_RUNNING_SHA_OFF], _running_sha, 32);
   }
 
@@ -573,17 +613,20 @@ void OtaUpdate::rollbackToPrevious(const char* why) {
 
 // --------------------------------------------------------------------- CLI
 
+void OtaUpdate::ensureRunningSha() {
+  if (_running_sha_valid) return;
+  _running_sha_valid = true;
+  memset(_running_sha, 0, sizeof(_running_sha));
+  if (_io != nullptr) hashImage(_io, /*staged=*/false, _running_sha);   // zeros: unknown
+}
+
 void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
   if (_io == nullptr) {
     snprintf(reply, reply_size, "running=%s sha=0000000000000000 state=unsupported size=0 off=0 err=0",
              _version);
     return;
   }
-  if (!_running_sha_valid) {
-    memset(_running_sha, 0, sizeof(_running_sha));
-    hashSlot(_io, /*staged=*/false, _io->sourceSize(), _running_sha);
-    _running_sha_valid = true;
-  }
+  ensureRunningSha();
   const char* state_name = _state == State::Staging ? "staging"
       : _state == State::Ready ? "ready"
       : _state == State::Error ? "error" : "idle";

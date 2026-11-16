@@ -67,8 +67,11 @@
 //     the wire version, the board's target id (before arming), the usable
 //     slot size, the largest accepted OP_LITERAL, and the feature mask
 //     (bit0 = OP_COPY delta, bit1 = apply/rollback), plus the RUNNING
-//     image's firmware version (32 bytes, NUL-padded) and full SHA-256 —
-//     which is what an app uses to pick a delta base by exact-image match.
+//     image's firmware version (32 bytes, NUL-padded) and its SHA-256 —
+//     taken over exactly the bytes the update wrote (image length from the
+//     ESP image header, appended digest included), so it equals the hash of
+//     the app's own .bin and is what the app uses to pick a delta base by
+//     exact-image match. All zeros means "cannot tell".
 //     New features are only ever added as new bits or new report fields
 //     appended at the end.
 //   - New ops get new op codes; existing ops never change meaning, field
@@ -279,6 +282,9 @@ private:
   uint16_t _health_nonce = 0;               // sha-free marker nonce
 
   bool stagingArmed() const { return _state == State::Staging || _state == State::Ready; }
+  // Compute _running_sha once per boot, on first use (the app's delta base
+  // match). Zeros when the platform cannot read the running image back.
+  void ensureRunningSha();
   // Build the OP_INFO_REPORT frame (magic..CRC) into `out`. Works in every
   // state — it is the negotiation handshake an app performs before arming.
   size_t buildInfoReport(uint8_t* out);

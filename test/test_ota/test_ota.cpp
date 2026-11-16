@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -560,11 +561,72 @@ TEST_F(OtaTest, InfoReportAnswersWhenIdle) {
   EXPECT_EQ(le32From(body + 5), 0x200000u);                       // FakeSlotIo slot size
   EXPECT_EQ(body[9] | (body[10] << 8), (uint16_t)OTA_MAX_LITERAL);
   EXPECT_EQ(le32From(body + 11), (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY));
-  // running slot is all zeroes in the fake
-  uint8_t expect_sha[32];
-  mockSha256(std::vector<uint8_t>(slot.source.begin(), slot.source.end()), expect_sha);
-  EXPECT_EQ(memcmp(body + OTA_INFO_RUNNING_SHA_OFF, expect_sha, 32), 0);
+  // The fake slot holds no ESP image, so the running sha is reported as
+  // unknown (all zeros) rather than as a hash of erase fill.
+  for (size_t k = 0; k < 32; k++) EXPECT_EQ(body[OTA_INFO_RUNNING_SHA_OFF + k], 0u);
   EXPECT_STREQ((const char*)(body + OTA_INFO_RUNNING_VER_OFF), "test-fw-1.0.0");
+}
+
+// A synthetic ESP app image: 24-byte header (magic, segment count, chip id,
+// hash_appended), one 400-byte segment, the checksum byte, padding to 16 and,
+// when `with_digest`, the appended SHA-256 that esptool writes by default.
+static std::vector<uint8_t> syntheticImage(bool with_digest, uint8_t fill = 0x5A) {
+  const size_t seg_len = 400;
+  std::vector<uint8_t> img(24 + 8 + seg_len, 0);
+  img[0] = 0xE9;
+  img[1] = 1;
+  img[0x0c] = 9;                          // chip id: ESP32-S3
+  img[0x17] = with_digest ? 1 : 0;         // hash_appended
+  img[24 + 4] = (uint8_t)(seg_len & 0xFF);
+  img[24 + 5] = (uint8_t)((seg_len >> 8) & 0xFF);
+  img[24 + 6] = (uint8_t)((seg_len >> 16) & 0xFF);
+  for (size_t k = 0; k < seg_len; k++) img[24 + 8 + k] = (uint8_t)(fill + k);
+  img.resize((img.size() + 1 + 15) & ~(size_t)15);   // + checksum, padded to 16
+  if (with_digest) {
+    uint8_t digest[32];
+    mockSha256(img, digest);
+    img.insert(img.end(), digest, digest + 32);
+  }
+  return img;
+}
+
+TEST_F(OtaTest, InfoReportHashesTheRunningImageBytes) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  uint8_t expect[32];
+  mockSha256(image, expect);   // the whole .bin, digest included
+  EXPECT_EQ(memcmp(report.data() + 3 + OTA_INFO_RUNNING_SHA_OFF, expect, 32), 0);
+}
+
+TEST_F(OtaTest, InfoReportHashesImageWithoutAppendedDigest) {
+  auto image = syntheticImage(/*with_digest=*/false);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  uint8_t expect[32];
+  mockSha256(image, expect);   // ends at the padded checksum
+  EXPECT_EQ(memcmp(report.data() + 3 + OTA_INFO_RUNNING_SHA_OFF, expect, 32), 0);
+}
+
+TEST_F(OtaTest, StatusShaMatchesTheInfoReport) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  char expect_sha16[17];
+  for (int k = 0; k < 8; k++)
+    snprintf(expect_sha16 + k * 2, 3, "%02x", report[3 + OTA_INFO_RUNNING_SHA_OFF + k]);
+  char reply[160];
+  ota.formatStatus(reply, sizeof(reply));
+  EXPECT_NE(strstr(reply, (std::string("sha=") + expect_sha16).c_str()), nullptr);
+}
+
+TEST_F(OtaTest, StatusShaIsZeroWhenTheSlotHoldsNoImage) {
+  char reply[160];
+  ota.formatStatus(reply, sizeof(reply));
+  EXPECT_NE(strstr(reply, "sha=0000000000000000"), nullptr);
 }
 
 TEST_F(OtaTest, InfoReportAnswersDuringStaging) {

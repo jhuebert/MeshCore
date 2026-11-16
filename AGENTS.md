@@ -67,7 +67,10 @@ should not need to explore beyond them before making a change.
   (`ota stage` + token), and the staged image boots only after a SHA-256
   gate; (3) `OP_INFO` is the capability handshake — answered in every state,
   and its report carries target id, slot size, max literal, feature bits, the
-  running firmware version and the full running-slot SHA-256; (4) the wire
+  running firmware version and the running image's SHA-256 (taken over exactly
+  the bytes an update wrote — image length from the ESP image header, appended
+  digest included — so it equals the hash of the app's own .bin and is the
+  delta-base identity; all zeros means "cannot tell"); (4) the wire
   contract is append-only frozen — new features add new op codes/report
   bits, never change existing ones.
 
