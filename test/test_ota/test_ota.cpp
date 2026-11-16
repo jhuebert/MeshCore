@@ -124,6 +124,17 @@ static std::vector<uint8_t> askFrame() {
   return p;
 }
 
+static std::vector<uint8_t> bodyFrame(uint8_t op, const std::vector<uint8_t>& body) {
+  std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, op};
+  p.insert(p.end(), body.begin(), body.end());
+  uint16_t crc = crc16_ccitt(p.data(), p.size());
+  p.push_back((uint8_t)(crc & 0xFF));
+  p.push_back((uint8_t)(crc >> 8));
+  return p;
+}
+
+static std::vector<uint8_t> infoFrame() { return bodyFrame(OTA_OP_INFO, {}); }
+
 static void mockSha256(const std::vector<uint8_t>& data, uint8_t out[32]) {
   SHA256 sha;
   sha.update(data.data(), data.size());
@@ -183,10 +194,10 @@ protected:
   }
 
   // Feed one frame to the engine, exactly as handleRequest() does from an
-  // admin client's REQ. Returns the OP_REPORT frame when the frame was an
-  // OP_ASK (7 bytes), else an empty vector.
+  // admin client's REQ. Returns the OP_REPORT/INFO_REPORT frame the op asks
+  // for (or an empty vector).
   std::vector<uint8_t> feed(const std::vector<uint8_t>& f) {
-    std::vector<uint8_t> report(7, 0);
+    std::vector<uint8_t> report(OTA_REPORT_MAX, 0);
     size_t n = ota.onFrame(f.data(), f.size(), report.data(), report.size());
     report.resize(n);
     return report;
@@ -521,13 +532,82 @@ TEST_F(OtaTest, AskWithStrayBodyGetsNoReply) {
   auto image = testImage();
   arm(image);
   ASSERT_EQ(ota.state(), OtaUpdate::State::Staging);
-  // OP_ASK carries no body since v2; a stray byte is not an ask.
+  // OP_ASK carries no body; a stray byte is not an ask.
   std::vector<uint8_t> p = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_ASK, 0x00};
   uint16_t crc = crc16_ccitt(p.data(), p.size());
   p.push_back((uint8_t)(crc & 0xFF));
   p.push_back((uint8_t)(crc >> 8));
   auto report = feed(p);
   EXPECT_TRUE(report.empty());
+}
+
+// ============================================================
+// OP_INFO — the negotiation handshake (answered in any state)
+// ============================================================
+
+TEST_F(OtaTest, InfoReportAnswersWhenIdle) {
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  EXPECT_EQ(report[0], OTA_MAGIC0);
+  EXPECT_EQ(report[1], OTA_MAGIC1);
+  EXPECT_EQ(report[2], OTA_OP_INFO_REPORT);
+  // frame CRC is valid
+  uint16_t stored = (uint16_t)report[report.size() - 2] | ((uint16_t)report[report.size() - 1] << 8);
+  EXPECT_EQ(crc16_ccitt(report.data(), report.size() - 2), stored);
+  const uint8_t* body = report.data() + 3;
+  EXPECT_EQ(body[0], OTA_WIRE_VERSION);
+  EXPECT_EQ(le32From(body + 1), testTargetId());
+  EXPECT_EQ(le32From(body + 5), 0x200000u);                       // FakeSlotIo slot size
+  EXPECT_EQ(body[9] | (body[10] << 8), (uint16_t)OTA_MAX_LITERAL);
+  EXPECT_EQ(le32From(body + 11), (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY));
+  // running slot is all zeroes in the fake
+  uint8_t expect_sha[32];
+  mockSha256(std::vector<uint8_t>(slot.source.begin(), slot.source.end()), expect_sha);
+  EXPECT_EQ(memcmp(body + OTA_INFO_RUNNING_SHA_OFF, expect_sha, 32), 0);
+  EXPECT_STREQ((const char*)(body + OTA_INFO_RUNNING_VER_OFF), "test-fw-1.0.0");
+}
+
+TEST_F(OtaTest, InfoReportAnswersDuringStaging) {
+  auto image = testImage();
+  arm(image);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Staging);
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  EXPECT_EQ(report[2], OTA_OP_INFO_REPORT);
+}
+
+TEST_F(OtaTest, InfoReportAnswersAfterStagingError) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, std::vector<uint8_t>(16, 0xFF));   // wrong bytes for the contract
+  sendEnd(2);                                       // sha mismatch → err=4
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Error);
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  EXPECT_EQ(report[2], OTA_OP_INFO_REPORT);
+}
+
+TEST_F(OtaTest, InfoReportToleratesStrayBody) {
+  auto report = feed(bodyFrame(OTA_OP_INFO, {0xDE, 0xAD, 0xBE, 0xEF}));
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  EXPECT_EQ(report[2], OTA_OP_INFO_REPORT);
+}
+
+TEST_F(OtaTest, InfoReportOnUnwiredEngineAnswersWithZeros) {
+  OtaUpdate fresh;   // never wired: no fs, slot io, rng, or firmware version
+  std::vector<uint8_t> f = infoFrame();
+  std::vector<uint8_t> report(OTA_REPORT_MAX, 0);
+  size_t n = fresh.onFrame(f.data(), f.size(), report.data(), report.size());
+  report.resize(n);
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  const uint8_t* body = report.data() + 3;
+  EXPECT_EQ(body[0], OTA_WIRE_VERSION);
+  EXPECT_EQ(le32From(body + 1), testTargetId());   // OTA_PIO_ENV is fixed at compile time
+  EXPECT_EQ(le32From(body + 5), 0u);    // no slot size without a slot io
+  EXPECT_EQ(le32From(body + 11), 0u);   // no features without flash
+  for (size_t i = OTA_INFO_RUNNING_VER_OFF; i < OTA_INFO_BODY; i++) {
+    EXPECT_EQ(body[i], 0u);             // running version and sha are zero
+  }
 }
 
 // ============================================================

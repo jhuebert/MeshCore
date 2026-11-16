@@ -221,7 +221,7 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
     // after frame_len bytes of frame is padding.
     const uint8_t flen = payload[1];
     if (payload_len < (size_t)2 + flen) return 0;   // truncated: no reply
-    uint8_t report[7];
+    uint8_t report[OTA_REPORT_MAX];
     size_t rlen = ota.onFrame(payload + 2, flen, report, sizeof(report));
     if (rlen == 0) return 0;   // non-ask op (or nothing accepted): no response, like any unknown REQ
     memcpy(&reply_data[4], report, rlen);

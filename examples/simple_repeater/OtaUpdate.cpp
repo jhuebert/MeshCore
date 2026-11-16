@@ -227,6 +227,51 @@ uint32_t OtaUpdate::ownTargetId() const {
 #endif
 }
 
+size_t OtaUpdate::buildInfoReport(uint8_t* out) {
+  uint32_t features = 0;
+  uint32_t slot = 0;
+  if (_io != nullptr) {
+    slot = _io->slotSize();
+    features |= OTA_FEAT_DELTA;   // OP_COPY is implemented everywhere with flash
+    features |= OTA_FEAT_APPLY;   // dual app slot (ESP32)
+  }
+
+  // OP_INFO_REPORT body: wire_ver(1) target(4) slot(4) max_literal(2) features(4)
+  //                      ver[32] sha256[32]
+  uint8_t p[OTA_INFO_BODY];
+  memset(p, 0, sizeof(p));
+  size_t i = 0;
+  p[i++] = OTA_WIRE_VERSION;
+  uint32_t target = ownTargetId();
+  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(target >> (8 * k));
+  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(slot >> (8 * k));
+  p[i++] = (uint8_t)(OTA_MAX_LITERAL & 0xFF);
+  p[i++] = (uint8_t)(OTA_MAX_LITERAL >> 8);
+  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(features >> (8 * k));
+  if (_version != nullptr) {
+    size_t n = strlen(_version);
+    if (n > 31) n = 31;
+    memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, n);   // NUL-padded by memset
+  }
+  if (_io != nullptr) {
+    if (!_running_sha_valid) {
+      memset(_running_sha, 0, sizeof(_running_sha));
+      hashSlot(_io, /*staged=*/false, _io->sourceSize(), _running_sha);
+      _running_sha_valid = true;
+    }
+    memcpy(&p[OTA_INFO_RUNNING_SHA_OFF], _running_sha, 32);
+  }
+
+  out[0] = OTA_MAGIC0;
+  out[1] = OTA_MAGIC1;
+  out[2] = OTA_OP_INFO_REPORT;
+  memcpy(out + 3, p, sizeof(p));
+  uint16_t crc = crc16_ccitt(out, 3 + sizeof(p));
+  out[3 + sizeof(p)] = (uint8_t)(crc & 0xFF);
+  out[3 + sizeof(p) + 1] = (uint8_t)(crc >> 8);
+  return 3 + sizeof(p) + 2;
+}
+
 size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, size_t report_cap) {
   if (frame == nullptr || n < 5) return 0;   // magic(2) + op(1) + crc(2); ops carry a seq
   if (frame[0] != OTA_MAGIC0 || frame[1] != OTA_MAGIC1) return 0;
@@ -234,9 +279,17 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
 
   const uint8_t op = frame[2];
 
+  // OP_INFO is the negotiation handshake: answered in every state, no arm
+  // required, tolerant of a body (for forward-compatible query extensions).
+  // It does not touch flash and does not create or consume a session.
+  if (op == OTA_OP_INFO) {
+    if (report_out == nullptr || report_cap < OTA_INFO_REPORT_LEN) return 0;
+    return buildInfoReport(report_out);
+  }
+
   if (_io == nullptr) return 0;   // not an ESP32 (or slot lookup failed): inert
 
-  if (op == OTA_OP_NOP || op == OTA_OP_REPORT) return 0;
+  if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT) return 0;
 
   if (op == OTA_OP_ASK) {
     if (!stagingArmed()) return 0;
