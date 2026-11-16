@@ -807,6 +807,121 @@ TEST_F(OtaTest, BootHealthProbeTimeoutRollsBack) {
   EXPECT_EQ(board2.reboots, 1);
 }
 
+// An image that hangs or crashes before loop() can never fail the probe, so
+// the attempt counter in the marker is what flips it back. Each boot of the
+// new image bumps it; past the limit the node rolls back without needing a
+// working radio.
+
+TEST_F(OtaTest, EarlyBootCheckCountsAttemptsWithoutRollingBackYet) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  char reply[160];
+  ASSERT_TRUE(ota.applyCommand(reply));
+  ASSERT_TRUE(fs.exists(OTA_PEND_FILE));
+
+  FakeSlotIo new_slot;
+  new_slot.source = slot.staged;
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&new_slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  fresh.earlyBootCheck(&fs, &board2);
+  EXPECT_EQ(board2.reboots, 0);        // first boot of a new image: let it run
+  EXPECT_TRUE(fs.exists(OTA_PEND_FILE));
+}
+
+TEST_F(OtaTest, EarlyBootCheckRollsBackAfterAttemptsExhausted) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  char reply[160];
+  ASSERT_TRUE(ota.applyCommand(reply));
+
+  FakeSlotIo new_slot;
+  new_slot.source = slot.staged;
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&new_slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  for (int i = 0; i < OTA_HEALTH_MAX_ATTEMPTS; i++) {
+    fresh.earlyBootCheck(&fs, &board2);         // a boot that crashed before the probe
+    EXPECT_EQ(board2.reboots, 0);
+  }
+  fresh.earlyBootCheck(&fs, &board2);           // one boot too many
+  EXPECT_EQ(board2.reboots, 1);
+  EXPECT_TRUE(slot.set_boot_called || new_slot.set_boot_called);
+  EXPECT_FALSE(fs.exists(OTA_PEND_FILE)); // the old image must not re-trigger
+}
+
+TEST_F(OtaTest, EarlyBootCheckIsInertWithoutAMarker) {
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  fresh.earlyBootCheck(&fs, &board2);
+  EXPECT_EQ(board2.reboots, 0);
+}
+
+TEST_F(OtaTest, LegacyMarkerWithoutAttemptsIsStillHonoured) {
+  // A node that applied an image with the first OTA firmware carries the
+  // 8-byte marker; it must still be counted, not treated as corrupt.
+  uint8_t rec[8];
+  memcpy(rec, "OTAP", 4);
+  rec[4] = 0x34;
+  rec[5] = 0x12;
+  uint16_t crc = crc16_ccitt(rec, 6);
+  rec[6] = (uint8_t)(crc & 0xFF);
+  rec[7] = (uint8_t)(crc >> 8);
+  // Write through the firmware's own path helper so the record lands exactly
+  // where readPend() looks for it.
+  fs.files[OTA_PEND_FILE] = std::vector<uint8_t>(rec, rec + sizeof(rec));
+
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  fresh.earlyBootCheck(&fs, &board2);
+  EXPECT_EQ(board2.reboots, 0);        // attempt 2 of 3: still allowed to run
+  EXPECT_TRUE(fs.exists(OTA_PEND_FILE));
+}
+
+// A freshly-applied image whose radio cannot start halts before loop(), so the
+// probe never runs. It must flip back on that first boot instead of stranding
+// the node until someone power-cycles it.
+TEST_F(OtaTest, RadioInitFailureOnAFreshImageRollsBackImmediately) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  char reply[160];
+  ASSERT_TRUE(ota.applyCommand(reply));
+
+  FakeSlotIo new_slot;
+  new_slot.source = slot.staged;
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&new_slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  fresh.earlyBootCheck(&fs, &board2);
+  EXPECT_EQ(board2.reboots, 0);        // counted, not yet a failure
+  EXPECT_TRUE(fresh.radioInitFailed());
+  EXPECT_EQ(board2.reboots, 1);        // flipped back without a power cycle
+  EXPECT_TRUE(new_slot.set_boot_called);
+  EXPECT_FALSE(fs.exists(OTA_PEND_FILE));
+}
+
+TEST_F(OtaTest, RadioInitFailureWithoutAFreshImageDoesNotRollBack) {
+  MockBoard board2;
+  OtaUpdate fresh;
+  fresh.setSlotIo(&slot);
+  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  EXPECT_FALSE(fresh.radioInitFailed());   // nothing owed: ordinary boot
+  EXPECT_EQ(board2.reboots, 0);
+}
+
 TEST_F(OtaTest, RollbackFromIdleFlipsPartitionAndReboots) {
   char reply[160];
   EXPECT_TRUE(ota.rollbackCommand(reply));

@@ -112,6 +112,7 @@
 #define OTA_FRAME_OVERHEAD (2 + 1 + 2 + 2)
 #define OTA_OP_START_MIN   (4 + 32 + 4 + 4)   // size + sha256 + target + token
 #define OTA_HEALTH_LEN     7         // NOP(3) nonce(2) crc(2)
+#define OTA_HEALTH_MAX_ATTEMPTS 3    // boots of a new image before it is rejected
 #define OTA_PENDING_TTL_MS 120000    // a pending arm lives two minutes
 #define OTA_PEND_FILE      "/ota_pend"
 
@@ -243,6 +244,17 @@ private:
   uint16_t _health_nonce = 0;               // sha-free marker nonce
 
   bool stagingArmed() const { return _state == State::Staging || _state == State::Ready; }
+public:
+  /// Boot-time verdict before the radio or mesh start: count this boot of a
+  /// freshly-applied image and roll back once the attempts run out. Covers the
+  /// images the probe cannot: ones that hang or crash before `loop()`.
+  void earlyBootCheck(FILESYSTEM* fs, mesh::MainBoard* board);
+
+  /// A freshly-applied image whose radio will not start is not healthy: roll
+  /// back now instead of halting. Returns true when a rollback was triggered.
+  bool radioInitFailed();
+
+private:
   void resetSession();                      // back to Idle
   void clearPending() { _pending.valid = false; }
   void abortStaging(uint8_t err);           // scrap the staged slot on failure
@@ -256,7 +268,8 @@ private:
   bool sendHealthProbe();
   void rollbackToPrevious(const char* why);
   bool writePend();
-  bool readPend(uint16_t* nonce);
+  bool readPend(uint16_t* nonce, uint8_t* attempts);
+  uint8_t bumpPendAttempts();
   void deletePend();
 };
 

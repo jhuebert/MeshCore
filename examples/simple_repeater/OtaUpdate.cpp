@@ -105,6 +105,16 @@ static bool flipAndReboot(OtaSlotIo* io, mesh::MainBoard* board) {
   return true;
 }
 
+// Console trace for boot verdicts. Host builds have no Serial; the native
+// suite asserts the same transitions directly, so this is a no-op there.
+static void otaLog(const char* line) {
+#if defined(ARDUINO)
+  Serial.println(line);
+#else
+  (void)line;
+#endif
+}
+
 // --------------------------------------------------------------- session
 
 OtaUpdate::OtaUpdate() = default;
@@ -122,7 +132,7 @@ void OtaUpdate::begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board,
 #endif
 
   uint16_t nonce;
-  if (readPend(&nonce)) {
+  if (readPend(&nonce, nullptr)) {
     // A freshly-applied image is booting: owe the board a verdict
     _health_pending = true;
     _health_nonce = nonce;
@@ -369,8 +379,11 @@ bool OtaUpdate::sendHealthProbe() {
 // ------------------------------------------------------------------ /ota_pend
 
 #define OTA_PEND_MAGIC   "OTAP"
-// magic(4) nonce(2) crc16(2)
-#define OTA_PEND_SIZE    8
+// magic(4) nonce(2) crc16(2)  — the original record, still read: a node that
+// already carries one must not lose its pending verdict.
+#define OTA_PEND_SIZE_V1 8
+// magic(4) attempts(1) nonce(2) crc16(2)
+#define OTA_PEND_SIZE    9
 
 bool OtaUpdate::writePend() {
   if (_fs == nullptr) return false;
@@ -381,11 +394,12 @@ bool OtaUpdate::writePend() {
 
   uint8_t rec[OTA_PEND_SIZE];
   memcpy(rec, OTA_PEND_MAGIC, 4);
-  rec[4] = nb[0];
-  rec[5] = nb[1];
+  rec[4] = 0;               // boot attempts used so far
+  rec[5] = nb[0];
+  rec[6] = nb[1];
   uint16_t crc = crc16_ccitt(rec, OTA_PEND_SIZE - 2);
-  rec[6] = (uint8_t)(crc & 0xFF);
-  rec[7] = (uint8_t)(crc >> 8);
+  rec[7] = (uint8_t)(crc & 0xFF);
+  rec[8] = (uint8_t)(crc >> 8);
 
   File f = fsOpenWrite(_fs, OTA_PEND_FILE);
   if (!f) return false;
@@ -395,22 +409,105 @@ bool OtaUpdate::writePend() {
   if (n != sizeof(rec)) { _fs->remove(OTA_PEND_FILE); return false; }
 
   uint16_t back;
-  if (!readPend(&back)) return false;
+  if (!readPend(&back, nullptr)) return false;
   return back == nonce;
 }
 
-bool OtaUpdate::readPend(uint16_t* nonce) {
+/// Read the marker. Accepts both record sizes so a node holding a v1 marker
+/// (written by the first OTA firmware) still gets its verdict; a v1 record is
+/// reported with attempts = 1, i.e. "this is the boot it was written for".
+bool OtaUpdate::readPend(uint16_t* nonce, uint8_t* attempts) {
   if (_fs == nullptr || !_fs->exists(OTA_PEND_FILE)) return false;
   File f = fsOpenRead(_fs, OTA_PEND_FILE);
   if (!f) return false;
   uint8_t rec[OTA_PEND_SIZE];
   size_t n = f.read(rec, sizeof(rec));
   f.close();
-  if (n != sizeof(rec)) return false;
   if (memcmp(rec, OTA_PEND_MAGIC, 4) != 0) return false;
-  uint16_t stored = (uint16_t)rec[6] | ((uint16_t)rec[7] << 8);
+  if (n == OTA_PEND_SIZE_V1) {                       // legacy: magic nonce crc
+    uint16_t stored = (uint16_t)rec[6] | ((uint16_t)rec[7] << 8);
+    if (crc16_ccitt(rec, OTA_PEND_SIZE_V1 - 2) != stored) return false;
+    if (nonce != nullptr) *nonce = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
+    if (attempts != nullptr) *attempts = 1;
+    return true;
+  }
+  if (n != OTA_PEND_SIZE) return false;
+  uint16_t stored = (uint16_t)rec[7] | ((uint16_t)rec[8] << 8);
   if (crc16_ccitt(rec, OTA_PEND_SIZE - 2) != stored) return false;
-  *nonce = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
+  if (nonce != nullptr) *nonce = (uint16_t)rec[5] | ((uint16_t)rec[6] << 8);
+  if (attempts != nullptr) *attempts = rec[4];
+  return true;
+}
+
+/// Record one more boot of the freshly-applied image. Returns the attempt
+/// number, or 0 when the marker is unreadable (nothing is owed then).
+uint8_t OtaUpdate::bumpPendAttempts() {
+  uint16_t nonce;
+  uint8_t attempts;
+  if (!readPend(&nonce, &attempts)) return 0;
+  attempts++;
+  uint8_t rec[OTA_PEND_SIZE];
+  memcpy(rec, OTA_PEND_MAGIC, 4);
+  rec[4] = attempts;
+  rec[5] = (uint8_t)(nonce & 0xFF);
+  rec[6] = (uint8_t)(nonce >> 8);
+  uint16_t crc = crc16_ccitt(rec, OTA_PEND_SIZE - 2);
+  rec[7] = (uint8_t)(crc & 0xFF);
+  rec[8] = (uint8_t)(crc >> 8);
+  File f = fsOpenWrite(_fs, OTA_PEND_FILE);
+  if (!f) {
+    otaLog("OTA boot verdict: marker rewrite failed");
+    return attempts;
+  }
+  size_t n = f.write(rec, sizeof(rec));
+  f.flush();
+  f.close();
+  if (n != sizeof(rec)) otaLog("OTA boot verdict: marker short write");
+  return attempts;
+}
+
+/// Boot-time verdict, called before the radio or the mesh are started.
+///
+/// The probe needs a working radio, so an image that hangs or crashes before
+/// `loop()` reaches the probe can never fail it — and because the marker
+/// persists, every boot would retry the same image, forever. Counting the
+/// attempts here (no radio, no mesh) turns that boot loop into a rollback
+/// after OTA_HEALTH_MAX_ATTEMPTS boots.
+void OtaUpdate::earlyBootCheck(FILESYSTEM* fs, mesh::MainBoard* board) {
+  if (fs == nullptr || board == nullptr) return;
+  if (_fs == nullptr) _fs = fs;
+  _board = board;
+#if defined(ESP32)
+  if (_io == nullptr) _io = new Esp32SlotIo();
+#endif
+  uint8_t attempts = bumpPendAttempts();
+  if (attempts == 0) return;                     // nothing owed
+  // Remember the verdict so a fatal start-up failure can act on it without
+  // waiting for loop(): begin() has not run yet.
+  uint16_t nonce;
+  if (readPend(&nonce, nullptr)) {
+    _health_pending = true;
+    _health_nonce = nonce;
+  }
+  // Visible on the console: a boot verdict is rare, and when a fresh image is
+  // being judged this is the only progress the operator can see.
+  {
+    char line[64];
+    snprintf(line, sizeof(line), "OTA boot verdict: attempt %u of %u",
+             (unsigned)attempts, (unsigned)OTA_HEALTH_MAX_ATTEMPTS);
+    otaLog(line);
+  }
+  if (attempts > OTA_HEALTH_MAX_ATTEMPTS) {
+    rollbackToPrevious("health attempts exhausted");
+  }
+}
+
+/// The radio did not initialise. On a freshly-applied image that is a failed
+/// verdict, so flip back now: `halt()` would strand the node until someone
+/// power-cycled it OTA_HEALTH_MAX_ATTEMPTS times.
+bool OtaUpdate::radioInitFailed() {
+  if (!_health_pending) return false;
+  rollbackToPrevious("radio init failed");
   return true;
 }
 
@@ -420,9 +517,14 @@ void OtaUpdate::deletePend() {
 
 void OtaUpdate::rollbackToPrevious(const char* why) {
   MESH_DEBUG_PRINTLN("ota: %s; rolling back", why);
+  {
+    char line[80];
+    snprintf(line, sizeof(line), "OTA rollback: %s", why);
+    otaLog(line);
+  }
   deletePend();                       // old image must not re-trigger a flip
   _health_pending = false;
-  flipAndReboot(_io, _board);
+  if (!flipAndReboot(_io, _board)) otaLog("OTA rollback: partition flip failed");
 }
 
 // --------------------------------------------------------------------- CLI

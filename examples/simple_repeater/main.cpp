@@ -60,29 +60,42 @@ void setup() {
   }
 #endif
 
+  FILESYSTEM* fs;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  InternalFS.begin();
+  fs = &InternalFS;
+#elif defined(ESP32)
+  SPIFFS.begin(true);
+  fs = &SPIFFS;
+#elif defined(RP2040_PLATFORM)
+  LittleFS.begin();
+  fs = &LittleFS;
+#else
+  #error "need to define filesystem"
+#endif
+
+  // Must run before radio_init(): if the radio configuration itself is broken,
+  // radio_init() halts setup and the health timeout in loop() is unreachable.
+  the_mesh.otaEarlyBootCheck(fs, &board);
+
   if (!radio_init()) {
     MESH_DEBUG_PRINTLN("Radio init failed!");
+    // A freshly-applied image that cannot start its radio has failed its
+    // verdict: flip back now rather than halt (which would need someone to
+    // power-cycle the node repeatedly).
+    the_mesh.otaRadioInitFailed();
     halt();
   }
 
   fast_rng.begin(radio_driver.getRngSeed());
 
-  FILESYSTEM* fs;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
-  InternalFS.begin();
-  fs = &InternalFS;
   IdentityStore store(InternalFS, "");
 #elif defined(ESP32)
-  SPIFFS.begin(true);
-  fs = &SPIFFS;
   IdentityStore store(SPIFFS, "/identity");
 #elif defined(RP2040_PLATFORM)
-  LittleFS.begin();
-  fs = &LittleFS;
   IdentityStore store(LittleFS, "/identity");
   store.begin();
-#else
-  #error "need to define filesystem"
 #endif
   if (!store.load("_main", the_mesh.self_id)) {
     MESH_DEBUG_PRINTLN("Generating new keypair");
