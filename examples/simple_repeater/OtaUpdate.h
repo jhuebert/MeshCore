@@ -1,8 +1,7 @@
 // OtaUpdate.h — LoRa OTA (over-the-air firmware update) for the ESP32
-// simple_repeater firmware (plans/2026-11-15-lora-ota-fork-firmware.md).
-// Personal fork feature; all fork-owned code lives in this file pair plus
-// minimal hook lines in MyMesh.{h,cpp} and the `ota` CLI branch in
-// handleCommand().
+// simple_repeater firmware. Personal fork feature; all fork-owned code lives
+// in this file pair plus minimal hook lines in MyMesh.{h,cpp} and the `ota`
+// CLI branch in handleCommand().
 //
 // The repeater is dumb; the phone app is smart. The app picks the target,
 // computes the delta (or full image), paces the transfer, and interprets
@@ -13,11 +12,17 @@
 //   1. Arming requires one operator action (serial or any authenticated
 //      remote admin on this node): `ota stage <size> <sha256-hex> <ver>`.
 //      It registers a single pending arm {size, sha256, token} in RAM,
-//      valid for 120 s, and replies with the token.
+//      valid for 120 s, and replies with the token. The version token is the
+//      operator's declaration of what is being staged: it is validated and
+//      kept out of the trust decision (the SHA-256 already pins the exact
+//      bytes), so it never has to be parsed on the node.
 //   2. OP_START is accepted only while a pending arm exists, unexpired,
 //      whose token AND {size, sha256} both match — a fully accepted arm
 //      consumes it. The armed contract binds the token to one exact image,
 //      so even an overheard token arms nothing but the genuine release.
+//      OP_START is also how a failed session is replaced: arming again (or
+//      `ota stage`) resets an Error session, so a retry never needs `ota
+//      abort` first. A Staging/Ready session is never disturbed.
 //   3. `ota apply` boots the verified image. A freshly applied image runs a
 //      boot health check (radio init + one zero-hop packet TX) and flips
 //      back automatically on failure.
@@ -97,20 +102,22 @@
 // stored out_path, or a flood when none is known), exactly like a status
 // response — the ask/info carries no return itinerary and nothing is stored.
 //
-// /ota_pend is an 8-byte marker (magic "OTAP", a random nonce, CRC-16): its mere presence means an apply just booted and the boot health
+// /ota_pend is a 9-byte marker (magic "OTAP", boots-so-far, a random nonce,
+// CRC-16): its mere presence means an apply just booted and the boot health
 // check owes the board a verdict. Success deletes the marker; failure flips
 // the boot partition back to the previous slot and reboots. The marker is
 // deleted on rollback too, so the old image never re-triggers a flip.
 //
 // CLI: "ota ..." commands, handled by otaCLI() (see OtaUpdate.cpp). `ota
-// status` is the app's progress feed; the line format is frozen in M0:
+// status` is the app's progress feed; the line format is frozen:
 //
 //   running=<ver> sha=<16hex> state=<idle|staging|ready|error> size=<n> off=<n> err=<code>
 //
-// - sha is the running slot's SHA-256, truncated to its first 8 bytes
+// - sha is the running image's SHA-256 (same value OP_INFO_REPORT carries),
+//   truncated to its first 8 bytes
 // - size/off are the staged contract's size and the write offset
 // - err is one of the OTA_ERR_* codes (0 = OK); state=error sticks until
-//   `ota abort` or a new OP_START
+//   `ota abort`, `ota stage` or a new OP_START
 // - state=unsupported on builds with no second app slot and on non-ESP32
 
 #ifndef _OTA_UPDATE_H
@@ -122,7 +129,6 @@
 
 #include <Mesh.h>                    // mesh::Packet, mesh::MainBoard, mesh::RNG
 #include <helpers/IdentityStore.h>   // FILESYSTEM typedef
-#include "PersistUtil.h"             // crc16_ccitt (the wire CRC)
 
 // --- wire format ------------------------------------------------------------
 #define OTA_OP_NOP        0x00
@@ -157,8 +163,11 @@
 // OTA frames carrying an op: magic(2) + op(1) + seq(2) + body + crc16(2).
 // ASK/REPORT/INFO*/NOP carry no seq.
 #define OTA_FRAME_OVERHEAD (2 + 1 + 2 + 2)
-// largest OP_LITERAL the node accepts (fits one MAX_PACKET_PAYLOAD op frame)
-#define OTA_MAX_LITERAL    (MAX_PACKET_PAYLOAD - OTA_FRAME_OVERHEAD - 2)
+// Two more bytes ride in front of the frame in the REQ (`REQ_TYPE_OTA` and
+// the frame-length byte), so this is the largest OP_LITERAL that can reach
+// the engine inside one MAX_PACKET_PAYLOAD datagram — the value OP_INFO_REPORT
+// advertises as `max_literal`.
+#define OTA_MAX_LITERAL    (MAX_PACKET_PAYLOAD - 2 - OTA_FRAME_OVERHEAD - 2)
 #define OTA_OP_START_MIN   (4 + 32 + 4 + 4)   // size + sha256 + target + token
 #define OTA_HEALTH_LEN     7         // NOP(3) nonce(2) crc(2)
 #define OTA_HEALTH_MAX_ATTEMPTS 3    // boots of a new image before it is rejected
@@ -174,7 +183,7 @@
 #define OTA_ERR_IO         5        // flash read/write/begin/end failed
 #define OTA_ERR_BOUNDS     6        // op out of bounds or past end of image
 #define OTA_ERR_TOKEN      7        // OP_START with no/incompatible pending arm
-#define OTA_ERR_END        9        // esp_ota_end() failed after a clean verify
+#define OTA_ERR_END        8        // esp_ota_end() failed after a clean verify
 
 // The staging slot engine's only view of flash, so the session machine is
 // host-testable. The ESP32 implementation wraps esp_ota_*; host tests inject
@@ -302,17 +311,19 @@ private:
   void resetSession();                      // back to Idle
   void clearPending() { _pending.valid = false; }
   void abortStaging(uint8_t err);           // scrap the staged slot on failure
-  bool armSession(uint32_t size, const uint8_t sha[32]);
+  void armSession(uint32_t size, const uint8_t sha[32]);
   void handleStart(const uint8_t* body, uint16_t body_len);
   void applyOp(const uint8_t* body, uint16_t body_len, uint8_t op);
-  bool applyCopy(uint32_t base_off, uint16_t len);
-  bool applyLiteral(const uint8_t* data, uint16_t len);
+  void applyCopy(uint32_t base_off, uint16_t len);
+  void applyLiteral(const uint8_t* data, uint16_t len);
   uint32_t ownTargetId() const;
   void sendReport(uint8_t* out);
   bool sendHealthProbe();
   void rollbackToPrevious(const char* why);
   bool writePend();
+  bool writePendRecord(uint8_t attempts, uint16_t nonce);
   bool readPend(uint16_t* nonce, uint8_t* attempts);
+  bool adoptPendVerdict();
   uint8_t bumpPendAttempts();
   void deletePend();
 };

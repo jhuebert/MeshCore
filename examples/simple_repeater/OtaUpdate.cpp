@@ -12,6 +12,7 @@
 
 #include "BatteryGate.h"
 #include "CliUtil.h"
+#include "PersistUtil.h"             // crc16_ccitt (the wire CRC)
 
 #if defined(ESP32)
 #include <esp_ota_ops.h>
@@ -22,6 +23,25 @@
 static uint16_t le16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static uint32_t le32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint8_t* putLe16(uint8_t* p, uint16_t v) {
+  p[0] = (uint8_t)v;
+  p[1] = (uint8_t)(v >> 8);
+  return p + 2;
+}
+static uint8_t* putLe32(uint8_t* p, uint32_t v) {
+  for (int k = 0; k < 4; k++) p[k] = (uint8_t)(v >> (8 * k));
+  return p + 4;
+}
+
+// Close an outgoing frame whose payload (magic..body) is already in `out`:
+// appends the CRC-16 and returns the total frame length. Every frame this
+// engine sends ends exactly this way.
+static size_t sealFrame(uint8_t* out, size_t payload_len) {
+  uint16_t crc = crc16_ccitt(out, payload_len);
+  out[payload_len] = (uint8_t)(crc & 0xFF);
+  out[payload_len + 1] = (uint8_t)(crc >> 8);
+  return payload_len + 2;
 }
 
 // ------------------------------------------------------------------ slot io
@@ -83,7 +103,7 @@ public:
 #endif   // ESP32
 
 // SHA-256 over `size` bytes of one slot, read in 1 KB slices. Shared by the
-// OP_END verification and hashImage() (the app's delta base match).
+// OP_END verification (staged) and hashRunningImage() (running).
 static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32]) {
   SHA256 sha;
   uint8_t buf[1024];
@@ -103,19 +123,19 @@ static bool slotRead(OtaSlotIo* io, bool staged, uint32_t off, uint8_t* out, siz
   return staged ? io->readStaged(off, out, len) : io->readSource(off, out, len);
 }
 
-// Length of the app image stored at the start of a slot: the ESP image header
+// Length of the app image in the *running* slot: the ESP image header
 // (24 bytes: magic, segment count, ..., chip id, hash_appended) followed by
 // each segment header + payload, a checksum byte and 16-byte padding. This is
 // exactly what an update wrote — the .bin length — not the erase-filled
 // partition. Returns 0 when the bytes are not an ESP app image.
-static uint32_t slotImageLength(OtaSlotIo* io, bool staged) {
+static uint32_t runningImageLength(OtaSlotIo* io) {
   uint8_t h[24];
-  if (!slotRead(io, staged, 0, h, sizeof(h))) return 0;
+  if (!slotRead(io, false, 0, h, sizeof(h))) return 0;
   if (h[0] != 0xE9 || h[1] < 1 || h[1] > 16) return 0;   // magic, segment count
   uint32_t off = sizeof(h);
   for (uint8_t i = 0; i < h[1]; i++) {
     uint8_t seg[8];
-    if (!slotRead(io, staged, off, seg, sizeof(seg))) return 0;
+    if (!slotRead(io, false, off, seg, sizeof(seg))) return 0;
     uint32_t len = (uint32_t)seg[4] | ((uint32_t)seg[5] << 8) |
                    ((uint32_t)seg[6] << 16) | ((uint32_t)seg[7] << 24);
     off += 8 + len;
@@ -126,18 +146,18 @@ static uint32_t slotImageLength(OtaSlotIo* io, bool staged) {
   return (off + 15) & ~15u;                              // images are padded to 16
 }
 
-// SHA-256 of the app image in a slot, over exactly the bytes the update wrote.
+// SHA-256 of the running app image, over exactly the bytes the update wrote.
 // esptool appends a SHA-256 of the image to every .bin by default; it is
 // included when it verifies against the computed hash, so this equals the hash
 // the app computes over its own image file (the delta base match). Returns
 // false when the slot does not hold a recognisable image.
-static bool hashImage(OtaSlotIo* io, bool staged, uint8_t out[32]) {
-  const uint32_t len = slotImageLength(io, staged);
+static bool hashRunningImage(OtaSlotIo* io, uint8_t out[32]) {
+  const uint32_t len = runningImageLength(io);
   if (len == 0) return false;
-  if (!hashSlot(io, staged, len, out)) return false;
+  if (!hashSlot(io, /*staged=*/false, len, out)) return false;
   uint8_t digest[32];
-  if (slotRead(io, staged, len, digest, sizeof(digest)) && memcmp(digest, out, 32) == 0) {
-    return hashSlot(io, staged, len + sizeof(digest), out);
+  if (slotRead(io, false, len, digest, sizeof(digest)) && memcmp(digest, out, 32) == 0) {
+    return hashSlot(io, /*staged=*/false, len + sizeof(digest), out);
   }
   return true;
 }
@@ -165,7 +185,6 @@ static void otaLog(const char* line) {
 
 OtaUpdate::OtaUpdate() = default;
 OtaUpdate::~OtaUpdate() { resetSession(); }
-
 void OtaUpdate::begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board, const char* firmware_version, mesh::RNG* rng) {
   _fs = fs;
   _gate = gate;
@@ -177,12 +196,18 @@ void OtaUpdate::begin(FILESYSTEM* fs, BatteryGate* gate, mesh::MainBoard* board,
   if (_io == nullptr) _io = new Esp32SlotIo();   // lives for the board's lifetime
 #endif
 
+  adoptPendVerdict();
+}
+
+// The marker means this boot of a freshly-applied image owes the board a
+// verdict. Adopted by both entry points (earlyBootCheck before the radio
+// starts, begin() for the paths that skip it).
+bool OtaUpdate::adoptPendVerdict() {
   uint16_t nonce;
-  if (readPend(&nonce, nullptr)) {
-    // A freshly-applied image is booting: owe the board a verdict
-    _health_pending = true;
-    _health_nonce = nonce;
-  }
+  if (!readPend(&nonce, nullptr)) return false;
+  _health_pending = true;
+  _health_nonce = nonce;
+  return true;
 }
 
 void OtaUpdate::loop() {
@@ -207,7 +232,10 @@ void OtaUpdate::loop() {
 void OtaUpdate::onTxResult(const mesh::Packet* pkt, bool ok) {
   if (!_health_pending || !_health_sent) return;
   if (pkt == nullptr || pkt->payload_len != OTA_HEALTH_LEN) return;
-  if (pkt->payload[0] != OTA_MAGIC0 || pkt->payload[1] != OTA_MAGIC1 || pkt->payload[2] != OTA_OP_NOP) return;
+  if (pkt->payload[0] != OTA_MAGIC0 || pkt->payload[1] != OTA_MAGIC1 ||
+      pkt->payload[2] != OTA_OP_NOP) {
+    return;
+  }
   if (le16(pkt->payload + 3) != _health_nonce) return;
   if (ok) {
     deletePend();
@@ -233,28 +261,17 @@ void OtaUpdate::abortStaging(uint8_t err) {
   _err = err;
 }
 
-bool OtaUpdate::armSession(uint32_t size, const uint8_t sha[32]) {
-  if (_state != State::Idle) return false;   // a busy session keeps its place
-  if (_io == nullptr) { _err = OTA_ERR_SLOT; return false; }
-  if (_gate != nullptr && _gate->isSuspended()) {
-    _err = OTA_ERR_BATTERY;
-    return false;
-  }
-  if (size == 0 || size > _io->slotSize()) {
-    _err = OTA_ERR_SLOT;
-    return false;
-  }
-  if (!_io->beginWrite(size)) {
-    _err = OTA_ERR_IO;
-    return false;
-  }
+void OtaUpdate::armSession(uint32_t size, const uint8_t sha[32]) {
+  if (_io == nullptr) { _err = OTA_ERR_SLOT; return; }
+  if (_gate != nullptr && _gate->isSuspended()) { _err = OTA_ERR_BATTERY; return; }
+  if (size == 0 || size > _io->slotSize()) { _err = OTA_ERR_SLOT; return; }
+  if (!_io->beginWrite(size)) { _err = OTA_ERR_IO; return; }
   _size = size;
   _written = 0;
   _expect = 1;
   memcpy(_expected_sha, sha, 32);
   _state = State::Staging;
   _err = OTA_ERR_NONE;
-  return true;
 }
 
 uint32_t OtaUpdate::ownTargetId() const {
@@ -284,19 +301,13 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
   //                      ver[32] sha256[32]
   uint8_t p[OTA_INFO_BODY];
   memset(p, 0, sizeof(p));
-  size_t i = 0;
-  p[i++] = OTA_WIRE_VERSION;
-  uint32_t target = ownTargetId();
-  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(target >> (8 * k));
-  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(slot >> (8 * k));
-  p[i++] = (uint8_t)(OTA_MAX_LITERAL & 0xFF);
-  p[i++] = (uint8_t)(OTA_MAX_LITERAL >> 8);
-  for (int k = 0; k < 4; k++) p[i++] = (uint8_t)(features >> (8 * k));
-  if (_version != nullptr) {
-    size_t n = strlen(_version);
-    if (n > 31) n = 31;
-    memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, n);   // NUL-padded by memset
-  }
+  uint8_t* q = p;
+  *q++ = OTA_WIRE_VERSION;
+  q = putLe32(q, ownTargetId());
+  q = putLe32(q, slot);
+  q = putLe16(q, OTA_MAX_LITERAL);
+  q = putLe32(q, features);
+  memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, strlen(_version) > 31 ? 31 : strlen(_version));
   if (_io != nullptr) {
     ensureRunningSha();
     memcpy(&p[OTA_INFO_RUNNING_SHA_OFF], _running_sha, 32);
@@ -306,10 +317,7 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
   out[1] = OTA_MAGIC1;
   out[2] = OTA_OP_INFO_REPORT;
   memcpy(out + 3, p, sizeof(p));
-  uint16_t crc = crc16_ccitt(out, 3 + sizeof(p));
-  out[3 + sizeof(p)] = (uint8_t)(crc & 0xFF);
-  out[3 + sizeof(p) + 1] = (uint8_t)(crc >> 8);
-  return 3 + sizeof(p) + 2;
+  return sealFrame(out, 3 + sizeof(p));
 }
 
 size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, size_t report_cap) {
@@ -339,6 +347,9 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
     return 7;
   }
 
+  // An op frame carries a seq word; anything shorter cannot be one and is
+  // dropped rather than read past its end.
+  if (n < OTA_FRAME_OVERHEAD) return 0;
   const uint16_t seq = le16(frame + 3);
   const uint8_t* body = frame + 5;
   const uint16_t body_len = (uint16_t)(n - OTA_FRAME_OVERHEAD);
@@ -351,22 +362,29 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
     default:
       break;
   }
-  if (!stagingArmed()) return 0;
+  // Only a live staging session takes ops: a verified (Ready) image is never
+  // written to again, so a stray op or a retransmitted OP_END is a no-op
+  // rather than something that could scrap a finished transfer.
+  if (_state != State::Staging) return 0;
   if (seq != _expect) return 0;   // strictly in-order delivery; everything else is a gap or a dup
 
   applyOp(body, body_len, op);
-  if (_state == State::Staging) _expect++;   // Ready/Error need no watermark
+  if (_state != State::Error) _expect++;   // Ready (OP_END) and Staging both advance
   return 0;
 }
 
 void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
+  // A busy session keeps its place: a stray OP_START never disturbs a
+  // transfer that is in progress or already verified.
+  if (_state == State::Staging || _state == State::Ready) return;
+  // From here the session is Idle or Error; a refusal records why and leaves
+  // the state alone (the operator sees `err=` until the next successful arm).
   if (len != OTA_OP_START_MIN) { _err = OTA_ERR_BOUNDS; return; }
   uint32_t size = le32(body);
   const uint8_t* sha = body + 4;
   uint32_t target_id = le32(body + 36);
   const uint8_t* token = body + 40;
   if (target_id != ownTargetId()) { _err = OTA_ERR_TARGET; return; }
-  if (_state != State::Idle) return;   // a busy session keeps its place
 
   // The armed contract decides: single-use, time-boxed, bound to {size, sha256}
   if (!_pending.valid) { _err = OTA_ERR_TOKEN; return; }
@@ -375,12 +393,13 @@ void OtaUpdate::handleStart(const uint8_t* body, uint16_t len) {
     _err = OTA_ERR_TOKEN;
     return;
   }
-  if (_pending.size != size || memcmp(_pending.sha, sha, 32) != 0 || memcmp(_pending.token, token, 4) != 0) {
+  if (_pending.size != size || memcmp(_pending.sha, sha, 32) != 0 ||
+      memcmp(_pending.token, token, 4) != 0) {
     _err = OTA_ERR_TOKEN;   // stranger: leave the pending arm intact
     return;
   }
   clearPending();           // consumed by this arm
-
+  resetSession();           // a failed (Error) session is replaced; Idle is a no-op
   armSession(size, sha);
 }
 
@@ -416,71 +435,70 @@ void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
   }
 }
 
-bool OtaUpdate::applyCopy(uint32_t base_off, uint16_t len) {
+void OtaUpdate::applyCopy(uint32_t base_off, uint16_t len) {
   if ((uint64_t)base_off + len > _io->sourceSize() || (uint64_t)_written + len > _size) {
     abortStaging(OTA_ERR_BOUNDS);
-    return false;
+    return;
   }
   uint8_t buf[256];
   uint32_t off = 0;
   while (off < len) {
     size_t n = (size_t)(len - off) < sizeof(buf) ? (size_t)(len - off) : sizeof(buf);
-    if (!_io->readSource(base_off + off, buf, n)) { abortStaging(OTA_ERR_IO); return false; }
-    if (!_io->append(buf, n)) { abortStaging(OTA_ERR_IO); return false; }
+    if (!_io->readSource(base_off + off, buf, n)) { abortStaging(OTA_ERR_IO); return; }
+    if (!_io->append(buf, n)) { abortStaging(OTA_ERR_IO); return; }
     off += (uint32_t)n;
   }
   _written += len;
-  return true;
 }
 
-bool OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
-  if ((uint64_t)_written + len > _size) { abortStaging(OTA_ERR_BOUNDS); return false; }
-  if (!_io->append(data, len)) { abortStaging(OTA_ERR_IO); return false; }
+void OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
+  if ((uint64_t)_written + len > _size) { abortStaging(OTA_ERR_BOUNDS); return; }
+  if (!_io->append(data, len)) { abortStaging(OTA_ERR_IO); return; }
   _written += len;
-  return true;
 }
 
 void OtaUpdate::sendReport(uint8_t* out) {
   out[0] = OTA_MAGIC0;
   out[1] = OTA_MAGIC1;
   out[2] = OTA_OP_REPORT;
-  out[3] = (uint8_t)(_expect & 0xFF);
-  out[4] = (uint8_t)(_expect >> 8);
-  uint16_t crc = crc16_ccitt(out, 5);
-  out[5] = (uint8_t)(crc & 0xFF);
-  out[6] = (uint8_t)(crc >> 8);
+  putLe16(out + 3, _expect);
+  sealFrame(out, 5);
 }
 
 bool OtaUpdate::sendHealthProbe() {
-  uint8_t p[OTA_HEALTH_LEN] = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_NOP,
-                               (uint8_t)(_health_nonce & 0xFF), (uint8_t)(_health_nonce >> 8)};
-  uint16_t crc = crc16_ccitt(p, OTA_HEALTH_LEN - 2);
-  p[5] = (uint8_t)(crc & 0xFF);
-  p[6] = (uint8_t)(crc >> 8);
+  uint8_t p[OTA_HEALTH_LEN] = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_NOP};
+  putLe16(p + 3, _health_nonce);
+  sealFrame(p, OTA_HEALTH_LEN - 2);
   return _send != nullptr && _send(_send_ctx, p, sizeof(p));
 }
 
 // ------------------------------------------------------------------ /ota_pend
 
 #define OTA_PEND_MAGIC   "OTAP"
-// magic(4) nonce(2) crc16(2)  — the original record, still read: a node that
-// already carries one must not lose its pending verdict.
-#define OTA_PEND_SIZE_V1 8
 // magic(4) attempts(1) nonce(2) crc16(2)
 #define OTA_PEND_SIZE    9
 
 bool OtaUpdate::writePend() {
-  if (_fs == nullptr) return false;
-  uint16_t nonce;
+  if (_fs == nullptr || _rng == nullptr) return false;   // no nonce, no marker
   uint8_t nb[2];
-  if (_rng != nullptr) _rng->random(nb, 2); else { nb[0] = (uint8_t)(millis() & 0xFF); nb[1] = (uint8_t)((millis() >> 8) & 0xFF); }
-  nonce = (uint16_t)nb[0] | ((uint16_t)nb[1] << 8);
+  _rng->random(nb, 2);
+  uint16_t nonce = (uint16_t)nb[0] | ((uint16_t)nb[1] << 8);
+  if (!writePendRecord(0 /* attempts */, nonce)) return false;
+  // Read the marker back before the reboot: a write that silently landed
+  // nothing is the one failure that would strand a fresh image with no
+  // verdict owed.
+  uint16_t back;
+  return readPend(&back, nullptr) && back == nonce;
+}
 
+// Write the whole marker record (magic, attempts, nonce, CRC). A short write
+// removes it: a torn marker is not a verdict.
+bool OtaUpdate::writePendRecord(uint8_t attempts, uint16_t nonce) {
   uint8_t rec[OTA_PEND_SIZE];
   memcpy(rec, OTA_PEND_MAGIC, 4);
-  rec[4] = 0;               // boot attempts used so far
-  rec[5] = nb[0];
-  rec[6] = nb[1];
+  rec[4] = attempts;
+  rec[5] = (uint8_t)(nonce & 0xFF);
+  rec[6] = (uint8_t)(nonce >> 8);
   uint16_t crc = crc16_ccitt(rec, OTA_PEND_SIZE - 2);
   rec[7] = (uint8_t)(crc & 0xFF);
   rec[8] = (uint8_t)(crc >> 8);
@@ -490,33 +508,23 @@ bool OtaUpdate::writePend() {
   size_t n = f.write(rec, sizeof(rec));
   f.flush();
   f.close();
-  if (n != sizeof(rec)) { _fs->remove(OTA_PEND_FILE); return false; }
-
-  uint16_t back;
-  if (!readPend(&back, nullptr)) return false;
-  return back == nonce;
+  if (n != sizeof(rec)) {
+    _fs->remove(OTA_PEND_FILE);
+    return false;
+  }
+  return true;
 }
 
-/// Read the marker. Accepts both record sizes so a node holding a v1 marker
-/// (written by the first OTA firmware) still gets its verdict; a v1 record is
-/// reported with attempts = 1, i.e. "this is the boot it was written for".
 bool OtaUpdate::readPend(uint16_t* nonce, uint8_t* attempts) {
   if (_fs == nullptr || !_fs->exists(OTA_PEND_FILE)) return false;
   File f = fsOpenRead(_fs, OTA_PEND_FILE);
   if (!f) return false;
   uint8_t rec[OTA_PEND_SIZE];
-  size_t n = f.read(rec, sizeof(rec));
+  const size_t n = f.read(rec, sizeof(rec));
   f.close();
-  if (memcmp(rec, OTA_PEND_MAGIC, 4) != 0) return false;
-  if (n == OTA_PEND_SIZE_V1) {                       // legacy: magic nonce crc
-    uint16_t stored = (uint16_t)rec[6] | ((uint16_t)rec[7] << 8);
-    if (crc16_ccitt(rec, OTA_PEND_SIZE_V1 - 2) != stored) return false;
-    if (nonce != nullptr) *nonce = (uint16_t)rec[4] | ((uint16_t)rec[5] << 8);
-    if (attempts != nullptr) *attempts = 1;
-    return true;
-  }
   if (n != OTA_PEND_SIZE) return false;
-  uint16_t stored = (uint16_t)rec[7] | ((uint16_t)rec[8] << 8);
+  if (memcmp(rec, OTA_PEND_MAGIC, 4) != 0) return false;
+  const uint16_t stored = (uint16_t)rec[7] | ((uint16_t)rec[8] << 8);
   if (crc16_ccitt(rec, OTA_PEND_SIZE - 2) != stored) return false;
   if (nonce != nullptr) *nonce = (uint16_t)rec[5] | ((uint16_t)rec[6] << 8);
   if (attempts != nullptr) *attempts = rec[4];
@@ -530,23 +538,7 @@ uint8_t OtaUpdate::bumpPendAttempts() {
   uint8_t attempts;
   if (!readPend(&nonce, &attempts)) return 0;
   attempts++;
-  uint8_t rec[OTA_PEND_SIZE];
-  memcpy(rec, OTA_PEND_MAGIC, 4);
-  rec[4] = attempts;
-  rec[5] = (uint8_t)(nonce & 0xFF);
-  rec[6] = (uint8_t)(nonce >> 8);
-  uint16_t crc = crc16_ccitt(rec, OTA_PEND_SIZE - 2);
-  rec[7] = (uint8_t)(crc & 0xFF);
-  rec[8] = (uint8_t)(crc >> 8);
-  File f = fsOpenWrite(_fs, OTA_PEND_FILE);
-  if (!f) {
-    otaLog("OTA boot verdict: marker rewrite failed");
-    return attempts;
-  }
-  size_t n = f.write(rec, sizeof(rec));
-  f.flush();
-  f.close();
-  if (n != sizeof(rec)) otaLog("OTA boot verdict: marker short write");
+  if (!writePendRecord(attempts, nonce)) otaLog("OTA boot verdict: marker rewrite failed");
   return attempts;
 }
 
@@ -568,11 +560,7 @@ void OtaUpdate::earlyBootCheck(FILESYSTEM* fs, mesh::MainBoard* board) {
   if (attempts == 0) return;                     // nothing owed
   // Remember the verdict so a fatal start-up failure can act on it without
   // waiting for loop(): begin() has not run yet.
-  uint16_t nonce;
-  if (readPend(&nonce, nullptr)) {
-    _health_pending = true;
-    _health_nonce = nonce;
-  }
+  adoptPendVerdict();
   // Visible on the console: a boot verdict is rare, and when a fresh image is
   // being judged this is the only progress the operator can see.
   {
@@ -617,7 +605,7 @@ void OtaUpdate::ensureRunningSha() {
   if (_running_sha_valid) return;
   _running_sha_valid = true;
   memset(_running_sha, 0, sizeof(_running_sha));
-  if (_io != nullptr) hashImage(_io, /*staged=*/false, _running_sha);   // zeros: unknown
+  if (_io != nullptr) hashRunningImage(_io, _running_sha);   // zeros: unknown
 }
 
 void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
@@ -651,7 +639,15 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     snprintf(reply, CLI_REPLY_MAX, "Err - size must be 1..2147483647");
     return false;
   }
-  if (sha_tok == nullptr || strlen(sha_tok) != 64 || !mesh::Utils::fromHex(_pending.sha, 32, sha_tok)) {
+  if ((uint32_t)size > _io->slotSize()) {
+    // Refuse here, where the operator can read why: an arm the slot can never
+    // hold would otherwise fail later as a silent OP_START refusal.
+    snprintf(reply, CLI_REPLY_MAX, "Err - size exceeds the %lu-byte slot",
+             (unsigned long)_io->slotSize());
+    return false;
+  }
+  uint8_t sha[32];
+  if (sha_tok == nullptr || strlen(sha_tok) != 64 || !mesh::Utils::fromHex(sha, 32, sha_tok)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - sha256 must be 64 hex chars");
     return false;
   }
@@ -665,9 +661,14 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
   }
 
   _pending.size = (uint32_t)size;
+  memcpy(_pending.sha, sha, sizeof(sha));
   _rng->random(_pending.token, sizeof(_pending.token));
   _pending.expires_at = millis() + OTA_PENDING_TTL_MS;
   _pending.valid = true;
+  // Arming a new image is the start of a new attempt: drop a failed session so
+  // the operator (and the app) never has to `ota abort` an old error away. A
+  // live transfer is left untouched.
+  if (_state == State::Error) resetSession();
   snprintf(reply, CLI_REPLY_MAX, "OK - staging armed (size=%ld) token=%02x%02x%02x%02x",
            size, _pending.token[0], _pending.token[1], _pending.token[2], _pending.token[3]);
   return true;
@@ -683,6 +684,7 @@ bool OtaUpdate::applyCommand(char* reply) {
     return false;
   }
   if (!flipAndReboot(_io, _board)) {
+    deletePend();   // nothing booted: the marker would only owe a phantom verdict
     snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
     return false;
   }
@@ -733,8 +735,17 @@ void otaCLI(OtaUpdate& ota, const char* sub, char* reply) {
     ota.stageCommand(size_tok, sha_tok, ver_tok, reply);
     return;
   }
-  if (strcmp(cmd, "apply") == 0) { if (!cliNoExtra(p, reply, OTA_USAGE)) return; ota.applyCommand(reply); return; }
-  if (strcmp(cmd, "abort") == 0) { if (!cliNoExtra(p, reply, OTA_USAGE)) return; ota.abortCommand(reply); return; }
-  if (strcmp(cmd, "rollback") == 0) { if (!cliNoExtra(p, reply, OTA_USAGE)) return; ota.rollbackCommand(reply); return; }
+  if (strcmp(cmd, "apply") == 0) {
+    if (cliNoExtra(p, reply, OTA_USAGE)) ota.applyCommand(reply);
+    return;
+  }
+  if (strcmp(cmd, "abort") == 0) {
+    if (cliNoExtra(p, reply, OTA_USAGE)) ota.abortCommand(reply);
+    return;
+  }
+  if (strcmp(cmd, "rollback") == 0) {
+    if (cliNoExtra(p, reply, OTA_USAGE)) ota.rollbackCommand(reply);
+    return;
+  }
   snprintf(reply, CLI_REPLY_MAX, "%s", OTA_USAGE);
 }

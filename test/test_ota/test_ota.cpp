@@ -43,6 +43,7 @@ struct FakeSlotIo : OtaSlotIo {
   std::vector<uint8_t> staged;   // image bytes written so far
   uint32_t image_size = 0;
   bool begin_ok = true, write_ok = true, end_ok = true, read_ok = true;
+  bool set_boot_ok = true;
   bool aborted = false, set_boot_called = false;
 
   FakeSlotIo() : source(0x200000, 0) {}
@@ -83,7 +84,7 @@ struct FakeSlotIo : OtaSlotIo {
   }
   bool setInactiveAsBoot() override {
     set_boot_called = true;
-    return true;
+    return set_boot_ok;
   }
 };
 
@@ -268,6 +269,26 @@ protected:
     char reply[192];
     ota.formatStatus(reply, sizeof(reply));
     return std::string(reply);
+  }
+
+  // Stage and apply [image] as the operator would: the image lands in
+  // slot.staged and the boot-health marker is left behind for the next boot.
+  // One literal covers it (the test images are tiny).
+  void applyImage(const std::vector<uint8_t>& image) {
+    arm(image);
+    sendLiteral(1, image);
+    sendEnd(2);
+    ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+    char reply[160];
+    ASSERT_TRUE(ota.applyCommand(reply));
+  }
+
+  // The reboot after an apply: a fresh engine over the same filesystem, whose
+  // running slot is exactly what the update wrote.
+  void bootFresh(OtaUpdate& fresh, FakeSlotIo& io, MockBoard& b) {
+    io.source = slot.staged;
+    fresh.setSlotIo(&io);
+    fresh.begin(&fs, &gate, &b, "test-fw-2.0.0", &rng);
   }
 
   // force the battery gate suspended: two low readings with a debounce gap
@@ -484,16 +505,27 @@ TEST_F(OtaTest, StageCliRejectsZeroSize) {
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
 }
 
-TEST_F(OtaTest, RejectsOversizeImage) {
+TEST_F(OtaTest, StageCliRefusesAnImageTheSlotCannotHold) {
+  char reply[160];
   uint8_t sha[32] = {0};
   char sha_hex[65];
   for (int i = 0; i < 32; i++) snprintf(sha_hex + i * 2, 3, "%02x", sha[i]);
-  char reply[160];
-  EXPECT_TRUE(ota.stageCommand("3145728", sha_hex, "1.2.3", reply));   // 0x300000 > slot
-  auto token = armTokenOf(reply);
-  auto body = makeStartBody(0x300000, sha, testTargetId(), token.data());
-  auto pkt = frame(OTA_OP_START, 0, body);
-  feed(pkt);
+  char size_str[24];
+  snprintf(size_str, sizeof size_str, "%lu", (unsigned long)slot.slot_size + 1);
+  EXPECT_FALSE(ota.stageCommand(size_str, sha_hex, "1.2.3", reply));
+  EXPECT_NE(std::string(reply).find("exceeds"), std::string::npos);
+}
+
+// The session is the last word on whether the slot can hold the image: an
+// armed size that no longer fits is refused at OP_START (err=3, slot).
+TEST_F(OtaTest, StartRefusesASizeTheSlotCannotHold) {
+  auto image = testImage(64);
+  auto token = armTokenOf(stage(image));
+  slot.slot_size = 32;                     // the slot cannot hold 64 bytes
+  uint8_t sha[32];
+  mockSha256(image, sha);
+  auto body = makeStartBody((uint32_t)image.size(), sha, testTargetId(), token.data());
+  feed(frame(OTA_OP_START, 0, body));
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_NE(statusLine().find("err=3"), std::string::npos);
 }
@@ -627,6 +659,16 @@ TEST_F(OtaTest, StatusShaIsZeroWhenTheSlotHoldsNoImage) {
   char reply[160];
   ota.formatStatus(reply, sizeof(reply));
   EXPECT_NE(strstr(reply, "sha=0000000000000000"), nullptr);
+}
+
+TEST_F(OtaTest, InfoReportAdvertisesTheReachableMaxLiteral) {
+  // The largest OP_LITERAL that fits one MAX_PACKET_PAYLOAD request: the REQ
+  // envelope (type + frame length), the op frame overhead and the literal's
+  // own length prefix all come out of the datagram.
+  EXPECT_EQ((size_t)OTA_MAX_LITERAL + 2 + OTA_FRAME_OVERHEAD + 2, (size_t)MAX_PACKET_PAYLOAD);
+  auto report = feed(infoFrame());
+  ASSERT_EQ(report.size(), OTA_INFO_REPORT_LEN);
+  EXPECT_EQ(report[3 + 9] | (report[3 + 10] << 8), (uint16_t)OTA_MAX_LITERAL);
 }
 
 TEST_F(OtaTest, InfoReportAnswersDuringStaging) {
@@ -840,7 +882,7 @@ TEST_F(OtaTest, EndWhenEndWriteFailsIsNotReady) {
   slot.end_ok = false;   // esp_ota_end() reports failure
   sendEnd(2);
   EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
-  EXPECT_NE(statusLine().find("err=9"), std::string::npos);
+  EXPECT_NE(statusLine().find("err=8"), std::string::npos);
 }
 
 TEST_F(OtaTest, FullImageEndToEndReady) {
@@ -859,7 +901,97 @@ TEST_F(OtaTest, FullImageEndToEndReady) {
 // APPLY / ROLLBACK — the boot health marker
 // ============================================================
 
-TEST_F(OtaTest, ApplyWhenNotReadyEnrefuses) {
+// A retransmitted OP_END (whose reply was lost on the way back) must leave a
+// verified session ready — not re-end it and scrap it.
+TEST_F(OtaTest, DuplicateEndKeepsSessionReady) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+  // The report the app resumes from must already say "nothing left to send",
+  // otherwise its recovery would resend OP_END and scrap the session.
+  auto report = sendAsk();
+  ASSERT_EQ(report.size(), 7u);
+  EXPECT_EQ(report[3] | (report[4] << 8), 3);  // END was seq 2
+  sendEnd(2);                                  // the app's retry of the same op
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Ready);
+  EXPECT_FALSE(slot.aborted);
+  char reply[160];
+  EXPECT_TRUE(ota.applyCommand(reply));        // still applyable
+}
+
+// Nothing may write to a verified image: a stray op after OP_END is a no-op.
+TEST_F(OtaTest, OpsAfterEndDoNotTouchTheVerifiedImage) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+  sendLiteral(3, std::vector<uint8_t>(4, 0xAA));   // next seq, after END
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Ready);
+  EXPECT_EQ(slot.staged, image);
+  EXPECT_FALSE(slot.aborted);
+}
+
+// A frame too short to carry a seq is dropped, not read past its end and not
+// treated as a malformed op that scraps the transfer.
+TEST_F(OtaTest, ShortOpFrameIsDroppedWithoutScrapping) {
+  auto image = testImage(16);
+  arm(image);
+  std::vector<uint8_t> short_frame = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_END};
+  uint16_t crc = crc16_ccitt(short_frame.data(), short_frame.size());
+  short_frame.push_back((uint8_t)(crc & 0xFF));
+  short_frame.push_back((uint8_t)(crc >> 8));
+  feed(short_frame);
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+  EXPECT_EQ(slot.staged.size(), 0u);
+}
+
+// A failed transfer must not need `ota abort` before the next attempt: a fresh
+// arm replaces it, and `ota stage` alone clears the stale error.
+TEST_F(OtaTest, ArmAfterAFailedSessionReplacesIt) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, std::vector<uint8_t>(16, 0xFF));   // wrong bytes
+  sendEnd(2);                                       // sha mismatch -> Error
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Error);
+
+  arm(image);                                       // re-arm + OP_START
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+  EXPECT_NE(statusLine().find("err=0"), std::string::npos);
+  sendLiteral(1, image);
+  sendEnd(2);
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Ready);
+}
+
+TEST_F(OtaTest, StageCommandClearsAFailedSession) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, std::vector<uint8_t>(16, 0xFF));
+  sendEnd(2);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Error);
+  stage(image);                                     // operator re-arms
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
+}
+
+// A failed boot-partition flip must not leave a marker behind: it would owe a
+// verdict on the next boot for an image that never booted.
+TEST_F(OtaTest, ApplyUnsetsTheMarkerWhenTheFlipFails) {
+  auto image = testImage(16);
+  arm(image);
+  sendLiteral(1, image);
+  sendEnd(2);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+  slot.set_boot_ok = false;
+
+  char reply[160];
+  EXPECT_FALSE(ota.applyCommand(reply));
+  EXPECT_FALSE(fs.exists(OTA_PEND_FILE));
+  EXPECT_EQ(board.reboots, 0);
+}
+
+TEST_F(OtaTest, ApplyWhenNotReadyIsRefused) {
   char reply[160];
   EXPECT_FALSE(ota.applyCommand(reply));
   EXPECT_EQ(board.reboots, 0);
@@ -881,18 +1013,11 @@ TEST_F(OtaTest, ApplyWritesPendingMarkerAndReboots) {
 
 TEST_F(OtaTest, BootHealthPassClearsMarker) {
   // freshly-applied boot: apply, then boot a fresh engine over the same fs
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
-  fresh.begin(&fs, &gate, &board, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board);
   std::vector<SentFrame> fresh_sent;
   fresh.setSender(captureSend, &fresh_sent);
   fresh.loop();   // verify + probe
@@ -905,20 +1030,13 @@ TEST_F(OtaTest, BootHealthPassClearsMarker) {
 }
 
 TEST_F(OtaTest, BootHealthProbeFailureRollsBack) {
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   MockBoard board2;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
   fresh.setSender(captureSend, &sent);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board2);
   fresh.loop();
   ASSERT_EQ(sent.size(), 1u);
   mesh::Packet health = makePacket(sent[0].payload);
@@ -928,19 +1046,12 @@ TEST_F(OtaTest, BootHealthProbeFailureRollsBack) {
 }
 
 TEST_F(OtaTest, BootHealthProbeTimeoutRollsBack) {
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   MockBoard board2;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board2);
   std::vector<SentFrame> fresh_sent;
   fresh.setSender(captureSend, &fresh_sent);
   fresh.loop();                       // probe dispatched, never completed
@@ -956,39 +1067,25 @@ TEST_F(OtaTest, BootHealthProbeTimeoutRollsBack) {
 // working radio.
 
 TEST_F(OtaTest, EarlyBootCheckCountsAttemptsWithoutRollingBackYet) {
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
   ASSERT_TRUE(fs.exists(OTA_PEND_FILE));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   MockBoard board2;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board2);
   fresh.earlyBootCheck(&fs, &board2);
   EXPECT_EQ(board2.reboots, 0);        // first boot of a new image: let it run
   EXPECT_TRUE(fs.exists(OTA_PEND_FILE));
 }
 
 TEST_F(OtaTest, EarlyBootCheckRollsBackAfterAttemptsExhausted) {
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   MockBoard board2;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board2);
   for (int i = 0; i < OTA_HEALTH_MAX_ATTEMPTS; i++) {
     fresh.earlyBootCheck(&fs, &board2);         // a boot that crashed before the probe
     EXPECT_EQ(board2.reboots, 0);
@@ -1008,46 +1105,16 @@ TEST_F(OtaTest, EarlyBootCheckIsInertWithoutAMarker) {
   EXPECT_EQ(board2.reboots, 0);
 }
 
-TEST_F(OtaTest, LegacyMarkerWithoutAttemptsIsStillHonoured) {
-  // A node that applied an image with the first OTA firmware carries the
-  // 8-byte marker; it must still be counted, not treated as corrupt.
-  uint8_t rec[8];
-  memcpy(rec, "OTAP", 4);
-  rec[4] = 0x34;
-  rec[5] = 0x12;
-  uint16_t crc = crc16_ccitt(rec, 6);
-  rec[6] = (uint8_t)(crc & 0xFF);
-  rec[7] = (uint8_t)(crc >> 8);
-  // Write through the firmware's own path helper so the record lands exactly
-  // where readPend() looks for it.
-  fs.files[OTA_PEND_FILE] = std::vector<uint8_t>(rec, rec + sizeof(rec));
-
-  MockBoard board2;
-  OtaUpdate fresh;
-  fresh.setSlotIo(&slot);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
-  fresh.earlyBootCheck(&fs, &board2);
-  EXPECT_EQ(board2.reboots, 0);        // attempt 2 of 3: still allowed to run
-  EXPECT_TRUE(fs.exists(OTA_PEND_FILE));
-}
-
 // A freshly-applied image whose radio cannot start halts before loop(), so the
 // probe never runs. It must flip back on that first boot instead of stranding
 // the node until someone power-cycles it.
 TEST_F(OtaTest, RadioInitFailureOnAFreshImageRollsBackImmediately) {
-  auto image = testImage(16);
-  arm(image);
-  sendLiteral(1, image);
-  sendEnd(2);
-  char reply[160];
-  ASSERT_TRUE(ota.applyCommand(reply));
+  applyImage(testImage(16));
 
   FakeSlotIo new_slot;
-  new_slot.source = slot.staged;
   MockBoard board2;
   OtaUpdate fresh;
-  fresh.setSlotIo(&new_slot);
-  fresh.begin(&fs, &gate, &board2, "test-fw-2.0.0", &rng);
+  bootFresh(fresh, new_slot, board2);
   fresh.earlyBootCheck(&fs, &board2);
   EXPECT_EQ(board2.reboots, 0);        // counted, not yet a failure
   EXPECT_TRUE(fresh.radioInitFailed());
