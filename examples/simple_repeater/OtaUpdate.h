@@ -47,6 +47,14 @@
 //   OP_REPORT 0x06  next_expected:u16           (repeater → app)
 //   OP_NOP    0x00                              boot health probe; never answered
 //
+// Identical frames must still be delivered. OP_ASK carries no nonce, so every
+// ask in a transfer is byte-for-byte the same, and a re-sent op repeats the
+// bytes of the copy that went missing. The mesh duplicate filter would drop
+// both after the first copy in a boot — silently, with no error anywhere — so
+// MyMesh opts RAW_CUSTOM OTA frames out of it via allowRawDataDuplicate().
+// That is safe because the engine is idempotent by construction: an op applies
+// only when seq == next_expected, and an ask is a stateless query.
+//
 // Ops are strictly in order: an op applies only when seq == next_expected;
 // anything else is dropped. DIRECT routing delivers in order per path, so
 // this costs nothing on the wire and no reassembly buffer is needed. The

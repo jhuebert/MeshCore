@@ -216,6 +216,15 @@ protected:
   void onControlDataRecv(mesh::Packet* packet) override;
   void onRawDataRecv(mesh::Packet* packet) override;
 
+  // OTA's op stream is idempotent by contract (ops drop unless seq ==
+  // next_expected, an ask is a stateless query), so an identical frame must
+  // still reach the engine: the transfer asks once per window and re-sends ops
+  // from next_expected, and both repeat bytes the duplicate filter would
+  // otherwise swallow after the first copy in a boot.
+  bool allowRawDataDuplicate(const mesh::Packet* packet) const override {
+    return otaIsOtaPacket(packet);
+  }
+
   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 
 public:
