@@ -112,23 +112,27 @@ message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
 
 ### 📲 LoRa OTA
 
-Over-the-air firmware updates for ESP32 repeaters: the update rides the
-existing mesh as zero-hop or explicit-path DIRECT packets (never flooded),
-the image is staged into the inactive A/B app slot and verified byte-for-byte
-against the armed contract's SHA-256 before anything is applied, and a
-freshly applied image must prove its radio at boot — on any failure it
-flips back to the previous firmware automatically. Arming requires one
-operator action: `ota stage` (authenticated) registers the exact image and
-returns a one-time token; the repeater arms only that contract. Unchanged
-bytes are sent as copy ops, so release-to-release updates are a fraction of
-a full image. The node side is a receive contract and a verifier; an
-Android app drives the transfer. Stock relays in the path need no changes.
+Over-the-air firmware updates for ESP32 repeaters: every op rides inside an
+ordinary encrypted admin REQ/RESPONSE datagram (direct along the companion's
+saved route, or flooded like any other request when it has none), so relays
+need no changes and nothing new crosses the mesh. The image is staged into
+the inactive A/B app slot and verified byte-for-byte against the armed
+contract's SHA-256 before anything is applied, and a freshly applied image
+must prove its radio at boot — on any failure it flips back to the previous
+firmware automatically. Arming requires one operator action: `ota stage`
+(authenticated) registers the exact image and returns a one-time token; the
+repeater arms only that contract. Unchanged bytes are sent as copy ops, so
+release-to-release updates are a fraction of a full image. The node side is
+a receive contract and a verifier; an Android app drives the transfer.
 `ota status` is the progress feed; `ota abort` discards a session,
-`ota rollback` flips back manually.
+`ota rollback` flips back manually. The app asks the node for its
+capabilities first (`OP_INFO`): wire version, board target id, slot size,
+`max_literal`, feature bits, the running version and the running image's
+hash, which is what selects a delta base exactly.
 
 Boards without a dual app partition and non-ESP32 builds report the feature
-unsupported. The OTA wire format and `ota status` layout are frozen in the
-M0 milestone of the plan.
+unsupported. The wire contract and the `ota status` line are frozen and
+append-only — `examples/simple_repeater/OtaUpdate.h` is the specification.
 
 ## Why run this instead of stock repeater firmware?
 

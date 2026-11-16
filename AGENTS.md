@@ -429,7 +429,10 @@ tests); the fleet's relay-side auth (the just-decrypted fleet packet's content
 hash) is not cleared after the receive bracket, so a later same-tag group
 packet pays one SHA-256 in the battery-gate exemption; in observer builds the
 worker task is always created (1 Hz idle, Wi-Fi off with no broker configured);
-and the fresh first boot writes `/filter_cfg` once (the Public provision).
+the fresh first boot writes `/filter_cfg` once (the Public provision); and the
+OTA engine is compiled into every repeater build, where its loop-path hook is a
+flag test and its per-TX hook compares one payload length (a node with no
+pending apply and no traffic on the wire does no OTA work).
 
 ## Behavior — principle of least surprise
 
