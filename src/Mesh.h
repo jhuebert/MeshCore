@@ -146,17 +146,6 @@ protected:
   virtual void onRawDataRecv(Packet* packet) { }
 
   /**
-   * \brief  Whether a repeat of an already-seen RAW_CUSTOM packet must still be
-   *         delivered to onRawDataRecv().
-   *
-   * The duplicate filter is right for application traffic, but a request/
-   * response protocol carried in RAW_CUSTOM can legitimately repeat the same
-   * bytes (an unchanged query, a re-sent op); suppressing those silently
-   * breaks it. Such a protocol owns its own idempotence, so it opts out here.
-  */
-  virtual bool allowRawDataDuplicate(const Packet* packet) const { return false; }
-
-  /**
    * \brief  Perform search of local DB of matching GroupChannels.
    * \param  channels  OUT - store matching channels in this array, up to max_matches
    * \returns  Number of channels with matching hash
