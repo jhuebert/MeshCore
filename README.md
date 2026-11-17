@@ -114,8 +114,8 @@ message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
 
 Over-the-air firmware updates for ESP32 repeaters: every op rides inside an
 ordinary encrypted admin REQ/RESPONSE datagram (direct along the companion's
-saved route, or flooded like any other request when it has none), so relays
-need no changes and nothing new crosses the mesh. The image is staged into
+saved route, or zero-hop on a private channel), so relays need no changes and
+nothing new crosses the mesh. The image is staged into
 the inactive A/B app slot and verified byte-for-byte against the armed
 contract's SHA-256 before anything is applied, and a freshly applied image
 must prove its radio at boot — on any failure it flips back to the previous
