@@ -61,7 +61,7 @@ should not need to explore beyond them before making a change.
   `lora-ota`; not merged to `repeater-filter` yet). The user manual, the
   Android/Linux app and the hardware bench live in the `MeshCoreOTA` repo
   (`jhuebert/MeshCoreOTA`); `OtaUpdate.h` is the authoritative spec of the
-  wire contract. Four rules the fork must not forget: (1) ops ride inside
+  wire contract. Five rules the fork must not forget: (1) ops ride inside
   ordinary encrypted REQ/RESPONSE datagrams (`REQ_TYPE_OTA`), never a new
   payload type; (2) the op stream is inert unless armed by an operator
   (`ota stage` + token), and the staged image boots only after a SHA-256
@@ -72,7 +72,9 @@ should not need to explore beyond them before making a change.
   digest included — so it equals the hash of the app's own .bin and is the
   delta-base identity; all zeros means "cannot tell"); (4) the wire
   contract is append-only frozen — new features add new op codes/report
-  bits, never change existing ones.
+  bits, never change existing ones; (5) `REQ_TYPE_OTA` is fork-private `0xA0`,
+  outside upstream's `0x01..0x09` REQ range (`0x08` is upstream's `subscribe`)
+  — the app's `reqTypeOta` constant changes with it.
 
 **When behavior changes, the matching guide section is updated in the same
 commit** — the guides are user-facing API documentation, not optional docs.

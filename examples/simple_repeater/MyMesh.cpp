@@ -50,7 +50,8 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
-#define REQ_TYPE_OTA                0x08     // OTA ops (admin only)
+// Fork-private: upstream's REQ types live in 0x01..0x09 (0x08 is 'subscribe').
+#define REQ_TYPE_OTA                0xA0     // OTA ops (admin only)
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
