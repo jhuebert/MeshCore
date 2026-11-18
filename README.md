@@ -126,9 +126,9 @@ for diagnostics.
 → Full guide: **[OTA.md](./OTA.md)**
 
 > **Partition change:** the 28 ESP32 repeaters still using `default.csv`, and
-> the other roles on those boards, need a full erase and merged reflash to gain
-> the OTA headroom. See
-> [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
+> the other roles on those boards, need a full erase and merged reflash for OTA
+> headroom — 20 move to `min_spiffs.csv`, 8 16 MB boards to `default_16MB.csv`.
+> See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
 > affected targets and the backup procedure.
 
 ## Why run this instead of stock repeater firmware?

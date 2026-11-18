@@ -12,18 +12,24 @@ in detail; this page is a short overview for repeater operators.
 ## Action required: ESP32 repeater partition change
 
 The first release with the larger OTA staging headroom moves the 28 ESP32
-repeater targets still using the 4 MB `default.csv` partition table to
-`min_spiffs.csv`. App slots grow from 1280 KiB to 1920 KiB, and SPIFFS shrinks
-from 1408 KiB to 128 KiB. Normal repeater config uses only around 10 KiB, so
-day-to-day behaviour is unchanged; a debug build with `MESH_PACKET_LOGGING`
-enabled fills the smaller filesystem much sooner.
+repeater targets still using the 4 MB `default.csv` partition table. App slots
+grow from 1280 KiB in both cases:
 
-This change **cannot be delivered over OTA**: SPIFFS moves from `0x290000` to
-`0x3D0000`, and the old region becomes part of `app1`. Upgrading one of these
-boards needs a **full erase and a flash of the merged image**. Existing identity
-and settings are lost unless you back them up first.
+| Board group | Table | App slots | SPIFFS |
+|---|---|---|---|
+| 4 MB boards (20 targets) | `min_spiffs.csv` | 1920 KiB | 128 KiB at `0x3D0000` |
+| 16 MB boards (8 targets) | `default_16MB.csv` | 6400 KiB | 3456 KiB at `0xC90000` |
+
+Both move SPIFFS away from `0x290000`, so this change **cannot be delivered over
+OTA**: upgrading needs a **full erase and a flash of the merged image**, and
+existing identity and settings are lost unless you back them up first. Normal
+repeater config uses only around 10 KiB, so day-to-day behaviour is unchanged;
+the `/packet_log` regression from the smaller filesystem applies only to debug
+builds with `MESH_PACKET_LOGGING` enabled on the 4 MB boards.
 
 ### Affected targets
+
+4 MB boards — `min_spiffs.csv`:
 
 ```text
 Generic_E22_sx1262_repeater
@@ -35,15 +41,6 @@ LilyGo_T3S3_sx1262_repeater
 LilyGo_T3S3_sx1262_repeater_bridge_espnow
 LilyGo_T3S3_sx1276_repeater
 LilyGo_T3S3_sx1276_repeater_bridge_espnow
-LilyGo_TBeam_1W_repeater
-LilyGo_TBeam_1W_repeater_bridge_espnow
-
-Station_G2_repeater
-Station_G2_repeater_bridge_espnow
-Station_G2_logging_repeater
-Station_G2_logging_repeater_bridge_espnow
-Station_G3_ESP32_repeater
-Station_G3_ESP32_logging_repeater
 
 Tenstar_C3_sx1262_repeater
 Tenstar_C3_sx1268_repeater
@@ -62,9 +59,25 @@ nibble_screen_connect_repeater_
 nibble_screen_connect_repeater_bridge_espnow_
 ```
 
+16 MB boards — `default_16MB.csv`:
+
+```text
+LilyGo_TBeam_1W_repeater
+LilyGo_TBeam_1W_repeater_bridge_espnow
+
+Station_G2_repeater
+Station_G2_repeater_bridge_espnow
+Station_G2_logging_repeater
+Station_G2_logging_repeater_bridge_espnow
+
+Station_G3_ESP32_repeater
+Station_G3_ESP32_logging_repeater
+```
+
 The other roles for these boards (companion radio, room server, KISS modem,
 terminal chat) share the base layout and need the same reflash. Observer builds
-keep their own partition tables, and all other boards are unaffected.
+have their own partition settings — the T-Beam 1W observer moved with its board
+so repeater and observer stay aligned — and all other boards are unaffected.
 
 ### Upgrading an affected board
 
