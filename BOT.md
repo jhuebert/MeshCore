@@ -1,22 +1,22 @@
 # Chat Bot
 
+**Think twice before enabling a bot.** Every reply costs airtime for everyone on
+the mesh, and most channels do not need one. If you do enable it, give the bot
+its own channel with no other bots on it — two responders to the same message
+just add noise.
+
 The chat bot is an opt-in `simple_repeater` feature that answers common `#test`
 chatter from the repeater itself. It needs no companion, no internet and no
 contact table: it uses only the path of the packet it just received. It is
 **off by default** — a node that has not enabled it behaves exactly like stock
 firmware.
 
-The reply is an ordinary flooded group text, so every receiver on the channel
-sees it. That is why there should be **one designated responder per channel**.
-Only one repeater should have the bot enabled on a given key.
-
 ## What it replies to
 
-Matching is case-insensitive and a leading `!` is ignored. Multi-word triggers
-are matched as *substrings*, so the common aliases used with meshcore-bot are
-caught without listing them all (`multitest`, `mtest`, `atest`, `testing 123`,
-`multipath`, … all work). Single-letter aliases (`t`, `p`, `m`, `h`) must be the
-whole message.
+Matching is case-insensitive. Multi-word triggers are matched as *substrings*,
+so common variants are caught without listing them all (`multitest`, `mtest`,
+`atest`, `testing 123`, `multipath`, … all work). Single-letter triggers
+(`t`, `p`, `m`, `h`) must be the whole message.
 
 | Message contains | Reply |
 |---|---|
@@ -24,9 +24,6 @@ whole message.
 | `ping` | mention line only |
 | `help` (or exactly `h`) | `Commands: ping, test` |
 | anything else | no reply |
-
-Note that `p` is a *path/test* trigger, not a ping alias. `ping` and `help` are
-checked first, so a mixed message like `ping test` gets the ping reply.
 
 Example replies, with `bot name TestBot` and a sender named Alice whose packet
 arrived over two 2-byte path hashes:
@@ -45,51 +42,18 @@ Commands: ping, test
 ```
 
 A direct (0-hop) request prints `direct` in place of path bytes. The path bytes
-are grouped by the *sender's* Path Hash Size setting — the same grouping ncbot
-uses — so a 1-byte-path sender gets `1A 2B 3C` and a 2-byte-path sender gets
-`1A2B 3C4D`.
+are grouped by the *sender's* Path Hash Size setting: a 1-byte-path sender gets
+`1A 2B 3C` and a 2-byte-path sender gets `1A2B 3C4D`.
 
 There is deliberately **no time, hop count or SNR** in the reply. The repeater's
 RTC is UTC (confusing on a local mesh), the hop count is just the number of path
 groups you can see, and the SNR is only the last leg of the route — not an
 end-to-end measurement.
 
-The reply is scoped like the request (a scoped request gets a scoped reply), is
-sent on the radio profile the request arrived on, and is delayed 1–3 s so it
-does not collide with the original packet's relay burst.
-
-## Bot etiquette
-
-Bots share the same limited airtime as everyone else. These guidelines from the
-local mesh keep it healthy:
-
-- ✅ **Be reactive, not proactive** — only respond when messaged; no unsolicited
-  broadcasts.
-- ✅ **Provide real utility** — make sure it helps the wider community, not just
-  a narrow case.
-- ✅ **Avoid duplicates** — watch the mesh for a few days first; don't repeat
-  what another bot does.
-- ✅ **One bot, one channel** — run in a channel named after the bot (e.g.
-  `#nmb`). `#test` is reserved and needs admin approval.
-- ✅ **Prefer direct messages** — DMs use routed paths and keep mesh-wide traffic
-  down.
-- 🚫 **No broadcast content** — don't post forecasts or updates unprompted;
-  it's noise for most of the state.
-- ⚠️ **Limit internet dependence** — the mesh matters most when the internet is
-  down. Prefer local data and fail gracefully.
-- ⚠️ **Consider backup power** — if it could matter in an outage, run it on
-  battery and solar.
-
-This bot is reactive by construction: no matching message, no transmission. It
-has no network, database or scheduled messages, so there are no unsolicited
-broadcasts to configure and nothing that depends on the internet.
-
-Replies are **flooded group texts, not DMs** — a repeater has no contact table,
-and DMs to it are the admin CLI surface. The "prefer direct messages" guideline
-therefore applies to other bots or services you run, not to this reply path.
-The "one bot, one channel" rule is supported directly by `bot chan #<name>`,
-which lets you name the channel after the bot. Using `#test` without admin
-approval is discouraged here too.
+The reply is scoped like any other reply from this repeater: it uses the
+incoming packet's region when that is known, otherwise the repeater's default
+region. It goes out on the radio profile the request arrived on, delayed 1–3 s
+so it does not collide with the original packet's relay burst.
 
 ## Setup
 
@@ -147,14 +111,13 @@ Err - psk must be 32 or 64 hex digits
 
 ## Rate limiting and persistence
 
-There is a single global gate: at most one reply every 5 seconds (`BOT_MIN_INTERVAL_MS`,
-a build flag). A second trigger inside that window gets silence. There are no
-per-user cooldowns, no hourly cap and no rate-limit messages. A reply is roughly
-50–80 bytes of text; the interval is the only bound on this node's airtime.
+There is a single global gate: at most one reply every 5 seconds. A second
+trigger inside that window gets silence. There are no per-user cooldowns, no
+hourly cap and no rate-limit messages.
 
-The config lives in `/bot_cfg` (magic `BOTC`, version 1, CRC-16, saved lazily a
-few seconds after an edit). The rate timer is RAM-only: a reboot clears it, so a
-trigger immediately after boot can be answered. No other state is persisted.
+The config is saved to `/bot_cfg` a few seconds after an edit. The rate timer is
+RAM-only: a reboot clears it, so a trigger immediately after boot can be
+answered. No other state is persisted.
 
 ## Interactions
 
@@ -177,20 +140,3 @@ One channel, fixed reply text, flooded replies only. No DMs, no contact-name
 lookups, no editable messages, no telemetry or weather commands, and no
 scheduled or unsolicited messages. Sender names are unauthenticated display
 labels — they are not identities.
-
-## Testing
-
-```
-pio test -e native_bot
-pio test -e native_bot_san
-```
-
-Firmware compile checks (persistence and hook changes touch every filesystem
-family):
-
-```
-bash build.sh build-firmware Xiao_S3_WIO_repeater
-bash build.sh build-firmware RAK_4631_repeater
-bash build.sh build-firmware PicoW_repeater
-bash build.sh build-firmware wio-e5_kiss_modem
-```

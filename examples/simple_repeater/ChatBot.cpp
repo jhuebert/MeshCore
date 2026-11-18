@@ -107,8 +107,8 @@ static void sanitizeSender(const char* in, char* out) {
   if (n == 0) strcpy(out, "anon");
 }
 
-// ncbot's getPathItems(): one hex group per hop, sized by the sender's path
-// hash size. An empty path is "direct".
+// One hex group per hop, sized by the sender's path hash size. An empty path
+// is "direct".
 static void appendPath(CliBuf& buf, const mesh::Packet* pkt) {
   uint8_t size = pkt->getPathHashSize();
   uint8_t bytes = pkt->getPathByteLen();
@@ -141,8 +141,6 @@ void ChatBot::onGroupData(const mesh::Packet* pkt, uint8_t type,
   if (!has_text || text[0] == 0) return;
 
   const char* p = text;
-  while (*p == ' ' || *p == '\t') p++;
-  if (*p == '!') p++;
   while (*p == ' ' || *p == '\t') p++;
   char lower[sizeof(text)];
   size_t i = 0;

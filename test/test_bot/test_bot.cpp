@@ -220,7 +220,7 @@ TEST_F(BotTest, AppendChannelByHashOffersOnlyWhenEnabledAndSet) {
 TEST_F(BotTest, UnifiedAliasesAllReachThePathReply) {
   arm();
   const char* triggers[] = { "test", "t", "path", "p", "m", "multitest", "mtest",
-                             "atest", "testing 123", "multipath", "mt", "!TEST",
+                             "atest", "testing 123", "multipath", "mt", "TEST",
                              "  test  " };
   const std::vector<uint8_t> path = { 0x1A, 0x2B, 0x3C, 0x4D };
   for (const char* tr : triggers) {
@@ -255,7 +255,8 @@ TEST_F(BotTest, HelpHasNoMentionLine) {
 
 TEST_F(BotTest, UnrelatedAndSingleLettersInsideWordsAreSilent) {
   arm();
-  const char* quiet[] = { "hello", "hi", "I saw a t earlier", "status time", "weather" };
+  const char* quiet[] = { "hello", "hi", "I saw a t earlier", "status time", "weather",
+                          "!t" };
   for (const char* q : quiet) {
     feed("Alice", q);
     EXPECT_EQ(sends, 0) << q;
