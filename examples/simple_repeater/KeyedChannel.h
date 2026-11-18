@@ -12,6 +12,7 @@
 #include <string.h>
 #include <Mesh.h>
 #include <Utils.h>
+#include "CliUtil.h"
 
 // A channel name has to survive a round trip through a rule's chan= list,
 // which is comma-separated and made of `key=value` tokens. ',', '=' and '"'
@@ -34,6 +35,30 @@ inline void deriveChannelKey(const char* name, uint8_t* secret, uint8_t* hash) {
   mesh::Utils::sha256(digest, sizeof(digest), (const uint8_t*)name, strlen(name));
   memcpy(secret, digest, 16);
   mesh::Utils::sha256(hash, 1, secret, 16);
+}
+
+// Resolve a user-supplied channel key spec into a padded secret, its length and
+// its 1-byte on-air hash. "#name" derives the PSK from the name (companion-app
+// convention); anything else must be 32 or 64 hex digits. The secret is ALWAYS
+// zero-padded to 32 bytes: core detects a 128-bit key by testing bytes 16..31
+// for zero (BaseChatMesh.cpp) and HMACs all 32 bytes, so a garbage tail makes
+// the channel match its hash but fail to decrypt. Zeroing before parsing keeps
+// that invariant in one place instead of relying on every caller to memset.
+inline bool parseChannelSpec(const char* spec, uint8_t* secret, uint8_t* len, uint8_t* hash) {
+  if (spec == NULL || secret == NULL || len == NULL || hash == NULL || spec[0] == 0) return false;
+  memset(secret, 0, PUB_KEY_SIZE);
+  if (spec[0] == '#') {
+    size_t n = strlen(spec);
+    if (n < 2 || n > 15 || !validChannelName(spec)) return false;
+    deriveChannelKey(spec, secret, hash);
+    *len = 16;
+  } else {
+    int n = 0;
+    if (!cliDecodePskHex(spec, secret, PUB_KEY_SIZE, &n)) return false;
+    *len = (uint8_t)n;
+    mesh::Utils::sha256(hash, 1, secret, n);
+  }
+  return true;
 }
 
 // Offer one key to core's candidate list. Only the `filled` prefix of dest is

@@ -138,6 +138,40 @@ TEST_F(BotTest, WrongChannelOrTypeIsIgnored) {
   EXPECT_EQ(sends, 1);
 }
 
+// Core decides a 16-byte key by checking that bytes 16..31 are zero, and HMACs
+// all 32 bytes (BaseChatMesh.cpp / Utils.cpp). A garbage tail makes the channel
+// match its hash but fail to decrypt. Poison the stack first so an uninitialised
+// tail cannot pass by luck on a fresh stack page.
+static void poisonStack() {
+  volatile uint8_t junk[128];
+  memset((void*)junk, 0xA5, sizeof(junk));
+}
+
+TEST_F(BotTest, ChannelSpecZeroPadsSixteenByteKeys) {
+  uint8_t secret[PUB_KEY_SIZE], len, hash;
+  memset(secret, 0xA5, sizeof(secret));
+  ASSERT_TRUE(parseChannelSpec("#bottest", secret, &len, &hash));
+  EXPECT_EQ(len, 16);
+  for (int i = 16; i < PUB_KEY_SIZE; i++) EXPECT_EQ(secret[i], 0) << i;
+
+  memset(secret, 0xA5, sizeof(secret));
+  ASSERT_TRUE(parseChannelSpec(HEX16, secret, &len, &hash));
+  EXPECT_EQ(len, 16);
+  for (int i = 16; i < PUB_KEY_SIZE; i++) EXPECT_EQ(secret[i], 0) << i;
+}
+
+TEST_F(BotTest, KeyOfferedToCoreIsZeroPadded) {
+  poisonStack();
+  ASSERT_TRUE(bot.setChannel("#bottest"));
+  bot.setEnabled(true);
+  uint8_t h[1] = { bot.getChanHash() };
+  mesh::GroupChannel dest[2];
+  memset(dest, 0xFF, sizeof(dest));   // core's candidate array is raw stack
+  ASSERT_EQ(bot.appendChannelByHash(h, dest, 2, 0), 1);
+  for (int i = 16; i < PUB_KEY_SIZE; i++) EXPECT_EQ(dest[0].secret[i], 0) << i;
+  for (int i = 16; i < PUB_KEY_SIZE; i++) EXPECT_EQ(bot.getPsk()[i], 0) << i;
+}
+
 // ---------------------------------------------------------------- channels
 
 TEST_F(BotTest, HashtagChannelMatchesFilterDerivation) {

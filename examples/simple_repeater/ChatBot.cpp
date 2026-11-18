@@ -51,22 +51,11 @@ void ChatBot::setName(const char* n) {
 
 bool ChatBot::setChannel(const char* value) {
   if (value == NULL || value[0] == 0) return false;
-  uint8_t key[32];
-  uint8_t len;
-  uint8_t hash;
-  if (value[0] == '#') {
-    size_t n = strlen(value);
-    if (n < 2 || n > 15 || !validChannelName(value)) return false;
-    deriveChannelKey(value, key, &hash);
-    len = 16;
-  } else {
-    int n = 0;
-    if (!cliDecodePskHex(value, key, sizeof(key), &n)) return false;
-    len = (uint8_t)n;
-    mesh::Utils::sha256(&hash, 1, key, len);
-  }
+  uint8_t key[PUB_KEY_SIZE];
+  uint8_t len, hash;
+  if (!parseChannelSpec(value, key, &len, &hash)) return false;
   if (len == psk_len && hash == chan_hash && memcmp(psk, key, sizeof(psk)) == 0) return true;
-  memcpy(psk, key, sizeof(psk));
+  memcpy(psk, key, sizeof(psk));   // parseChannelSpec zero-pads the 16-byte form
   psk_len = len;
   chan_hash = hash;
   save_flag.markDirty();
@@ -294,12 +283,11 @@ void botCLI(ChatBot& bot, const char* command, char* reply) {
   } else if (strcmp(verb, "chan") == 0) {
     char* arg = nextToken(&p);
     const char* usage = "Err - usage: chan #<name>|<psk-hex> | chan off";
+    if (!cliNoExtra(p, reply, usage)) return;
     if (arg == NULL || strcmp(arg, "off") == 0) {
-      if (!cliNoExtra(p, reply, usage)) return;
       bot.clearChannel();
       strcpy(reply, "OK - chan cleared");
     } else {
-      if (!cliNoExtra(p, reply, usage)) return;
       if (arg[0] == '#') {
         size_t n = strlen(arg);
         if (n < 2 || n > 15 || !validChannelName(arg)) {

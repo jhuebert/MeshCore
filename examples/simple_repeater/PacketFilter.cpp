@@ -181,18 +181,15 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   FilterChannel candidate;
   memset(&candidate, 0, sizeof(candidate));
 
-  if (psk_hex == NULL || psk_hex[0] == 0) {
-    if (name[0] != '#') return NULL;   // psk required for non-hash channels
-    deriveChannelKey(name, candidate.secret, &candidate.hash);
-    candidate.secret_len = 16;
-  } else {
-    // exactly 16 or 32 bytes of hex; anything else is refused before decoding
-    int len = 0;
-    if (!cliDecodePskHex(psk_hex, candidate.secret, sizeof(candidate.secret), &len)) return NULL;
-    candidate.secret_len = (uint8_t)len;
-  }
-
-  mesh::Utils::sha256(&candidate.hash, sizeof(candidate.hash), candidate.secret, candidate.secret_len);
+  // A '#'-name with no explicit key derives its PSK from the name; otherwise
+  // the key is the supplied hex. parseChannelSpec zero-pads the secret, and
+  // computes the hash for both forms.
+  const bool derive = (psk_hex == NULL || psk_hex[0] == 0);
+  if (derive && name[0] != '#') return NULL;   // psk required for non-hash channels
+  const char* spec = derive ? name : psk_hex;
+  uint8_t len = 0;
+  if (!parseChannelSpec(spec, candidate.secret, &len, &candidate.hash)) return NULL;
+  candidate.secret_len = len;
   StrHelper::strzcpy(candidate.name, name, FILTER_CHAN_NAME_LEN);
   channels[num_channels] = candidate;   // commit only once everything validated
   num_channels++;
