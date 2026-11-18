@@ -11,8 +11,8 @@ in detail; this page is a short overview for repeater operators.
 
 ## Action required: ESP32 repeater partition change
 
-The first release with the larger OTA staging headroom moves 28 four-megabyte
-ESP32 repeater targets from the `default.csv` partition table to
+The first release with the larger OTA staging headroom moves the 28 ESP32
+repeater targets still using the 4 MB `default.csv` partition table to
 `min_spiffs.csv`. App slots grow from 1280 KiB to 1920 KiB, and SPIFFS shrinks
 from 1408 KiB to 128 KiB. Normal repeater config uses only around 10 KiB, so
 day-to-day behaviour is unchanged; a debug build with `MESH_PACKET_LOGGING`
@@ -62,7 +62,9 @@ nibble_screen_connect_repeater_
 nibble_screen_connect_repeater_bridge_espnow_
 ```
 
-Observer builds and every other target are unaffected.
+The other roles for these boards (companion radio, room server, KISS modem,
+terminal chat) share the base layout and need the same reflash. Observer builds
+keep their own partition tables, and all other boards are unaffected.
 
 ### Upgrading an affected board
 
