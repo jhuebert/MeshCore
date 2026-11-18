@@ -50,6 +50,8 @@
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 #define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07     // FIRMWARE_VER_LEVEL >= 2
+// Fork-private: upstream's REQ types live in 0x01..0x09 (0x08 is 'subscribe').
+#define REQ_TYPE_OTA                0xA0     // OTA ops (admin only)
 
 #define RESP_SERVER_LOGIN_OK        0 // response to ANON_REQ
 
@@ -213,6 +215,19 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
   // uint32_t now = getRTCClock()->getCurrentTimeUnique();
   // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
   memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
+
+  if (payload_len >= 2 && payload[0] == REQ_TYPE_OTA && sender->isAdmin()) {  // OTA ops
+    // The companion zero-pads the reply plaintext to a 16-byte block, so the
+    // frame carries its own length: [REQ_TYPE_OTA][frame_len][frame…]. Anything
+    // after frame_len bytes of frame is padding.
+    const uint8_t flen = payload[1];
+    if (payload_len < (size_t)2 + flen) return 0;   // truncated: no reply
+    uint8_t report[OTA_REPORT_MAX];
+    size_t rlen = ota.onFrame(payload + 2, flen, report, sizeof(report));
+    if (rlen == 0) return 0;   // non-ask op (or nothing accepted): no response, like any unknown REQ
+    memcpy(&reply_data[4], report, rlen);
+    return 4 + (int)rlen;
+  }
 
   if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
     RepeaterStats stats;
@@ -584,6 +599,7 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
     bridge.sendPacket(pkt);
   }
 #endif
+  ota.onTxResult(pkt, true);
 
   if (_logging) {
     File f = openAppend(PACKET_LOG_FILE);
@@ -604,6 +620,7 @@ void MyMesh::logTx(mesh::Packet *pkt, int len) {
 }
 
 void MyMesh::logTxFail(mesh::Packet *pkt, int len) {
+  ota.onTxResult(pkt, false);
   if (_logging) {
     File f = openAppend(PACKET_LOG_FILE);
     if (f) {
@@ -1164,6 +1181,21 @@ void MyMesh::mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& sta
 }
 #endif
 
+// The OTA transfer rides inside an admin client's REQ and its OP_REPORT comes
+// back inside the RESPONSE, both routed by stock mesh paths — see handleRequest().
+// This sender originates only the boot health probe: a zero-hop RAW_CUSTOM
+// OP_NOP whose transmission is the freshly-applied image's liveness check.
+static bool otaSend(void* ctx, const uint8_t* payload, size_t len) {
+  MyMesh* m = (MyMesh*)ctx;
+  mesh::Packet* pkt = m->obtainNewPacket();
+  if (!pkt) return false;
+  pkt->header = (PAYLOAD_TYPE_RAW_CUSTOM << PH_TYPE_SHIFT);
+  pkt->payload_len = (uint16_t)len;
+  memcpy(pkt->payload, payload, len);
+  m->sendZeroHop(pkt, (uint32_t)0);
+  return true;
+}
+
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
@@ -1178,6 +1210,8 @@ void MyMesh::begin(FILESYSTEM *fs) {
   acl.load(_fs, self_id);
   filter.begin(fs);
   battGate.begin(fs);
+  ota.begin(fs, &battGate, &board, FIRMWARE_VERSION, getRNG());
+  ota.setSender(otaSend, this);
   fleet.setClock(fleetClock, this);
   fleet.setJitter(fleetJitter, this);
   fleet.setNameProvider(fleetNodeName, this);
@@ -1589,6 +1623,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
     // available so the operator can recover, and `get radio.rxps` is read-only.
     strcpy(reply, "Err - radio2 is on; set radio2 off first");
+  } else if (memcmp(command, "ota", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
+    const char* sub = command + 3;
+    while (*sub == ' ') sub++;
+    otaCLI(ota, sub, reply);
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it
     char now[32];
@@ -1623,6 +1661,8 @@ void MyMesh::loop() {
   // One sample per interval, not one per packet.
   battGate.loop(_fs, board);
   batteryAlerts(battGate, fleet);
+  // OTA boot health check (only active right after a freshly-applied boot)
+  ota.loop();
 
   mesh::Mesh::loop();
 

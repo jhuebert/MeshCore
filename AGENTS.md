@@ -57,6 +57,24 @@ should not need to explore beyond them before making a change.
   rules, the active/idle visit scheduler, the full CLI reference, feature
   interactions (RXPS, `extra.sf`, tempradio, filter, battery/fleet, powersaving)
   and tradeoffs.
+- LoRa OTA — the over-the-air firmware update for repeaters (branch
+  `lora-ota`; not merged to `repeater-filter` yet). The user manual, the
+  Android/Linux app and the hardware bench live in the `MeshCoreOTA` repo
+  (`jhuebert/MeshCoreOTA`); `OtaUpdate.h` is the authoritative spec of the
+  wire contract. Five rules the fork must not forget: (1) ops ride inside
+  ordinary encrypted REQ/RESPONSE datagrams (`REQ_TYPE_OTA`), never a new
+  payload type; (2) the op stream is inert unless armed by an operator
+  (`ota stage` + token), and the staged image boots only after a SHA-256
+  gate; (3) `OP_INFO` is the capability handshake — answered in every state,
+  and its report carries target id, slot size, max literal, feature bits, the
+  running firmware version and the running image's SHA-256 (taken over exactly
+  the bytes an update wrote — image length from the ESP image header, appended
+  digest included — so it equals the hash of the app's own .bin and is the
+  delta-base identity; all zeros means "cannot tell"); (4) the wire
+  contract is append-only frozen — new features add new op codes/report
+  bits, never change existing ones; (5) `REQ_TYPE_OTA` is fork-private `0xA0`,
+  outside upstream's `0x01..0x09` REQ range (`0x08` is upstream's `subscribe`)
+  — the app's `reqTypeOta` constant changes with it.
 
 **When behavior changes, the matching guide section is updated in the same
 commit** — the guides are user-facing API documentation, not optional docs.
@@ -105,6 +123,14 @@ commit** — the guides are user-facing API documentation, not optional docs.
   primary, the policy matrix, the active/idle visit scheduler, the deferred
   apply, and `radio2CLI`. `Radio2Device` is its only radio surface, so the
   native suite drives a fake; MyMesh supplies the adapter over `radio_driver`.
+- `OtaUpdate.h/.cpp` — the LoRa OTA engine: the `ota` CLI (`stage`, `status`,
+  `apply`, `abort`, `rollback`), the `/ota_pend` boot-health marker with its
+  attempt counter, the boot-time verdict (`earlyBootCheck`) that rolls back a
+  freshly-applied image after 3 bad boots, the ESP32 partition glue
+  (`Esp32SlotIo`) and the all-state `OP_INFO` negotiation handshake. Ops ride
+  inside admin REQ/RESPONSE datagrams (`REQ_TYPE_OTA`, dispatched by
+  `handleRequest`); the boot health probe is the one zero-hop RAW_CUSTOM
+  OP_NOP. The wire contract is frozen in the header; treat it as such.
 - `MyMesh.cpp/.h` — upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `logRx` (profile stamp + ack repeat
   detector), `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`,
@@ -405,7 +431,10 @@ tests); the fleet's relay-side auth (the just-decrypted fleet packet's content
 hash) is not cleared after the receive bracket, so a later same-tag group
 packet pays one SHA-256 in the battery-gate exemption; in observer builds the
 worker task is always created (1 Hz idle, Wi-Fi off with no broker configured);
-and the fresh first boot writes `/filter_cfg` once (the Public provision).
+the fresh first boot writes `/filter_cfg` once (the Public provision); and the
+OTA engine is compiled into every repeater build, where its loop-path hook is a
+flag test and its per-TX hook compares one payload length (a node with no
+pending apply and no traffic on the wire does no OTA work).
 
 ## Behavior — principle of least surprise
 
@@ -549,13 +578,14 @@ pio test -e native_fleet_noack      # the same, with FLEET_ACK_RETRY=0 (the off 
 pio test -e native_mesh_clock       # mesh clock sync
 pio test -e native_radio2           # second radio preset (policy/scheduler/persistence/CLI + core profile byte)
 pio test -e native_mqtt_observer    # observer config/format/policy
+pio test -e native_ota              # LoRa OTA engine (branch lora-ota)
 ```
 
 All green, and every touched line required — together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks

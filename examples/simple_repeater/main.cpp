@@ -60,8 +60,21 @@ void setup() {
   }
 #endif
 
+#if defined(ESP32)
+  // The OTA boot verdict has to run before radio_init(): a broken radio config
+  // halts setup, so a freshly-applied image that cannot start its radio would
+  // otherwise loop forever. The pending-apply marker lives in SPIFFS, which the
+  // identity store below mounts again (a second begin() is a no-op).
+  SPIFFS.begin(true);
+  the_mesh.otaEarlyBootCheck(&SPIFFS, &board);
+#endif
+
   if (!radio_init()) {
     MESH_DEBUG_PRINTLN("Radio init failed!");
+    // A freshly-applied image that cannot start its radio has failed its
+    // verdict: flip back now rather than halt (which would need someone to
+    // power-cycle the node repeatedly).
+    the_mesh.otaRadioInitFailed();
     halt();
   }
 
