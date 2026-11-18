@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds eight repeater-focused capabilities
+It tracks upstream `main` releases and adds nine repeater-focused capabilities
 on top of stock firmware. Everything else — supported boards, clients,
 protocols, build system — is identical to upstream;
 see the
@@ -130,6 +130,16 @@ for diagnostics.
 > headroom — 20 move to `min_spiffs.csv`, 8 16 MB boards to `default_16MB.csv`.
 > See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
 > affected targets and the backup procedure.
+
+### 🤖 Chat bot
+
+An opt-in responder that answers `test`/`ping`/`help` chatter on one keyed
+channel with the sender tagged and the path it arrived on — no companion, no
+internet, no contact table. **Most meshes do not need a bot:** every reply costs
+airtime for everyone, so enable it only with a reason, and then give it its own
+channel with no other bots on it. Off by default; no rebuild needed.
+
+→ Full guide: **[BOT.md](./BOT.md)**
 
 ## Why run this instead of stock repeater firmware?
 

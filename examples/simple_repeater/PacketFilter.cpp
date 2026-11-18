@@ -4,6 +4,7 @@
 #include "PacketFilter.h"
 #include "CliUtil.h"
 #include "AdvertRateLimiter.h"
+#include "KeyedChannel.h"
 #include <helpers/TxtDataHelpers.h>
 
 // The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
@@ -169,20 +170,6 @@ int FilterRules::indexOfChannel(const char* name) const {
   return -1;
 }
 
-// A channel name has to survive a round trip through a rule's chan= list,
-// which is comma-separated and made of `key=value` tokens. ',', '=' and '"'
-// therefore cannot be represented there, and a control character (a NUL above
-// all) would truncate the stored name. Ordinary spaces are fine: the value is
-// quoted where it is printed. Names already in the store are never re-validated
-// — an old config stays loadable and visible even if it predates this rule.
-static bool validChannelName(const char* name) {
-  for (const unsigned char* c = (const unsigned char*)name; *c; c++) {
-    if (*c < 0x20 || *c == 0x7f) return false;
-    if (*c == ',' || *c == '=' || *c == '"') return false;
-  }
-  return true;
-}
-
 FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   if (num_channels >= FILTER_MAX_CHANNELS) return NULL;
   if (name[0] == 0 || strlen(name) >= FILTER_CHAN_NAME_LEN) return NULL;
@@ -194,22 +181,15 @@ FilterChannel* FilterRules::addChannel(const char* name, const char* psk_hex) {
   FilterChannel candidate;
   memset(&candidate, 0, sizeof(candidate));
 
-  if (psk_hex == NULL || psk_hex[0] == 0) {
-    if (name[0] != '#') return NULL;   // psk required for non-hash channels
-    // hashtag channels are public-by-construction: secret = sha256(name)[0..15]
-    // (per the companion protocol)
-    uint8_t digest[32];
-    mesh::Utils::sha256(digest, sizeof(digest), (const uint8_t*)name, strlen(name));
-    memcpy(candidate.secret, digest, 16);
-    candidate.secret_len = 16;
-  } else {
-    // exactly 16 or 32 bytes of hex; anything else is refused before decoding
-    int len = 0;
-    if (!cliDecodePskHex(psk_hex, candidate.secret, sizeof(candidate.secret), &len)) return NULL;
-    candidate.secret_len = (uint8_t)len;
-  }
-
-  mesh::Utils::sha256(&candidate.hash, sizeof(candidate.hash), candidate.secret, candidate.secret_len);
+  // A '#'-name with no explicit key derives its PSK from the name; otherwise
+  // the key is the supplied hex. parseChannelSpec zero-pads the secret, and
+  // computes the hash for both forms.
+  const bool derive = (psk_hex == NULL || psk_hex[0] == 0);
+  if (derive && name[0] != '#') return NULL;   // psk required for non-hash channels
+  const char* spec = derive ? name : psk_hex;
+  uint8_t len = 0;
+  if (!parseChannelSpec(spec, candidate.secret, &len, &candidate.hash)) return NULL;
+  candidate.secret_len = len;
   StrHelper::strzcpy(candidate.name, name, FILTER_CHAN_NAME_LEN);
   channels[num_channels] = candidate;   // commit only once everything validated
   num_channels++;
@@ -240,18 +220,7 @@ int FilterRules::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel de
   int n = 0;
   for (int i = 0; i < num_channels && n < max_matches; i++) {
     if (channels[i].name[0] == 0) continue;   // null-key guard (same as BaseChatMesh)
-    if (channels[i].hash != hash[0]) continue;
-    // Aliases of one key share a tag; handing core the same secret twice would
-    // burn one of its few candidate slots and could hide a channel that would
-    // actually decrypt. Compare the padded secrets, not the names.
-    bool dup = false;
-    for (int j = 0; j < n; j++) {
-      if (memcmp(dest[j].secret, channels[i].secret, sizeof(channels[i].secret)) == 0) { dup = true; break; }
-    }
-    if (dup) continue;
-    dest[n].hash[0] = channels[i].hash;
-    memcpy(dest[n].secret, channels[i].secret, sizeof(dest[n].secret));
-    n++;
+    n += appendKeyedChannel(hash, channels[i].secret, channels[i].hash, dest, max_matches, n);
   }
   return n;
 }

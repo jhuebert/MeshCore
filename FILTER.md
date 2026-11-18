@@ -7,6 +7,9 @@ access to the repeater is required.
 
 > Maintained on the [jhuebert fork](https://github.com/jhuebert/MeshCore) — prebuilt
 > firmware is on the fork's Releases page (`filter-v*` tags).
+>
+> This repeater can also run an opt-in [chat bot](BOT.md) that answers `#test`
+> chatter on its own keyed channel.
 
 **Quick navigation:** [Quick start](#quick-start) ·
 [Common setups](#common-setups) ·
