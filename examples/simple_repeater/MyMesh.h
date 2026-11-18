@@ -39,6 +39,7 @@
 #include "PacketFilter.h"
 #include "BatteryGate.h"
 #include "FleetManager.h"
+#include "ChatBot.h"
 #include "MeshClockSync.h"
 #include "Radio2.h"
 #include "OtaUpdate.h"
@@ -125,6 +126,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FilterRules filter;
   BatteryGate battGate;
   FleetManager fleet;
+  ChatBot bot;
   MeshClockSync meshClock;
   OtaUpdate ota;
   Radio2DeviceImpl radio2_device;
@@ -251,6 +253,11 @@ public:
   // default flood scope when set (unscoped otherwise)
   void sendFleetReply(mesh::Packet* pkt) {
     sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  }
+
+  // chat bot reply: same scope as the request, jitter already chosen by the bot
+  void sendBotReply(mesh::Packet* pkt, uint32_t delay_ms) {
+    sendFloodReply(pkt, delay_ms, _prefs.path_hash_mode + 1);
   }
 
   // CommonCLICallbacks

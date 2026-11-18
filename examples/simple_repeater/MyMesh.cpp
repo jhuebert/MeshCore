@@ -496,10 +496,12 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
 }
 
 int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
-  // merge: the filter's keyed-channel store plus the fleet channel (the same
-  // PSK in both is skipped by the fleet side; any matching key decrypts)
+  // merge: the filter's store, the fleet channel and the bot channel. A key
+  // already offered by an earlier source is skipped, so a shared PSK costs no
+  // extra candidate slot; any matching key decrypts.
   int n = filter.searchChannelsByHash(hash, channels, max_matches);
   if (n < max_matches) n += fleet.appendChannelByHash(hash, channels, max_matches, n);
+  if (n < max_matches) n += bot.appendChannelByHash(hash, channels, max_matches, n);
   return n;
 }
 
@@ -518,9 +520,18 @@ void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::Gro
   if (battGate.isSuspended()) return;
 
   const uint32_t filter_air_ms = filter.isEnabled() ? _radio->getEstAirtimeFor(packet->getRawLength()) : 0;
-  if (filter.checkContent(packet, type, channel, data, len, recv_pkt_region, filter_air_ms) == FILTER_ACT_DROP) {
+  const bool filter_dropped =
+      filter.checkContent(packet, type, channel, data, len, recv_pkt_region, filter_air_ms)
+      == FILTER_ACT_DROP;
+  if (filter_dropped) {
     MESH_DEBUG_PRINTLN("filter: dropping group packet by content rule");
     packet->markDoNotRetransmit();
+  }
+
+  // Below the battery gate and after the filter verdict: a suspended node
+  // spends no airtime, and a channel the operator drops is not one to answer on.
+  if (!filter_dropped) {
+    bot.onGroupData(packet, type, channel, data, len, recv_pkt_region, getNodeName());
   }
 }
 
@@ -1159,6 +1170,34 @@ static bool fleetReplySend(void* ctx, const uint8_t* chan_secret, uint8_t chan_h
   return true;
 }
 
+// Chat bot replies are ordinary flooded group texts. MyMesh owns the timestamp
+// and the RNG; ChatBot owns the text and the channel secret.
+static bool botSend(void* ctx, const uint8_t* secret, uint8_t chan_hash, uint8_t radio_profile,
+                    uint32_t delay_ms, const char* text, size_t text_len) {
+  MyMesh* m = (MyMesh*)ctx;
+  mesh::GroupChannel chan;
+  memset(&chan, 0, sizeof(chan));
+  chan.hash[0] = chan_hash;
+  memcpy(chan.secret, secret, sizeof(chan.secret));
+  uint8_t msg[BOT_REPLY_BUF];
+  uint32_t ts = m->getRTCClock()->getCurrentTime();
+  memcpy(msg, &ts, 4);
+  msg[4] = 0;   // TXT_TYPE_PLAIN
+  if (text_len > BOT_TEXT_MAX) text_len = BOT_TEXT_MAX;
+  memcpy(msg + 5, text, text_len);
+  msg[5 + text_len] = 0;
+  mesh::Packet* pkt = m->createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, chan, msg, 5 + text_len);
+  if (!pkt) return false;
+  pkt->setTxProfile(radio_profile);
+  m->sendBotReply(pkt, delay_ms);
+  return true;
+}
+
+static uint32_t botJitter(void* ctx) {
+  MyMesh* m = (MyMesh*)ctx;
+  return m->getRNG()->nextInt(BOT_REPLY_DELAY_MIN_MS, BOT_REPLY_DELAY_MAX_MS);
+}
+
 // Announce battery-gate transitions on the fleet channel: one packet per
 // suspend/resume, as an ordinary "<name>: BATT ..." group text. sendAlert
 // enforces "fleet on + channel set", so no policy lives here.
@@ -1217,6 +1256,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   fleet.setNameProvider(fleetNodeName, this);
   fleet.setSender(fleetReplySend, this);
   fleet.begin(fs);
+  bot.begin(fs, this, botSend, botJitter);
   meshClock.setClockFn(meshClockSet, this);
   meshClock.begin(fs);
   // TODO: key_store.begin();
@@ -1606,6 +1646,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 5;
     while (*sub == ' ') sub++;
     fleetCLI(fleet, sub, reply);
+  } else if (memcmp(command, "bot", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
+    const char* sub = command + 3;
+    while (*sub == ' ') sub++;
+    botCLI(bot, sub, reply);
   } else if (memcmp(command, "radio2", 6) == 0 && (command[6] == 0 || command[6] == ' ')) {
     const char* sub = command + 6;
     while (*sub == ' ') sub++;
@@ -1712,6 +1756,7 @@ void MyMesh::loop() {
 
   // lazy dirty-flag save for the packet filter config
   filter.loop(_fs);
+  bot.loop(_fs);
 #ifdef WITH_MQTT_OBSERVER
   mqttObserver.setRadio(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   mqttObserver.loop();
