@@ -2,6 +2,7 @@
 
 #include "FleetManager.h"
 #include "CliUtil.h"
+#include "KeyedChannel.h"
 #include <helpers/TxtDataHelpers.h>   // TXT_TYPE_PLAIN
 
 #define FLEET_CFG_FILE "/fleet_cfg"
@@ -447,8 +448,7 @@ bool FleetManager::checkForward(const mesh::Packet* packet) {
 int FleetManager::appendChannelByHash(const uint8_t* hash, mesh::GroupChannel dest[],
                                       int max_matches, int filled) {
   if (!enabled || psk_len == 0) return 0;
-  if (chan_hash != hash[0]) return 0;
-  if (filled >= max_matches) {
+  if (chan_hash == hash[0] && filled >= max_matches) {
     // core offers at most max_matches candidate keys per on-air hash, and the
     // filter's channel store is offered first. When it filled them all, the
     // fleet channel is never tried: its traffic is not decrypted, so no script
@@ -457,15 +457,7 @@ int FleetManager::appendChannelByHash(const uint8_t* hash, mesh::GroupChannel de
     crowded_out++;
     return 0;
   }
-  // the filter store may hold the same PSK: handing core the same secret twice
-  // would burn one of its few candidate slots. Only the filled prefix of dest
-  // is initialised (core's caller passes raw stack), so only it is compared.
-  for (int i = 0; i < filled; i++) {
-    if (memcmp(dest[i].secret, psk, sizeof(psk)) == 0) return 0;
-  }
-  dest[filled].hash[0] = chan_hash;
-  memcpy(dest[filled].secret, psk, sizeof(dest[filled].secret));
-  return 1;
+  return appendKeyedChannel(hash, psk, chan_hash, dest, max_matches, filled);
 }
 
 // ---------------------------------------------------------------- persistence
