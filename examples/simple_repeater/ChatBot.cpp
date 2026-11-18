@@ -14,11 +14,12 @@ ChatBot::ChatBot() : ctx(NULL), send(NULL), jitter(NULL) {
 
 void ChatBot::resetToDefaults() {
   enabled = false;
-  name[0] = 0;
+  memset(name, 0, sizeof(name));   // the whole array is written to /bot_cfg
   memset(psk, 0, sizeof(psk));
   psk_len = 0;
   chan_hash = 0;
   last_reply_ms = 0;
+  has_replied = false;
   // ctx/send/jitter are wiring, not config state: a load() must not clear them
   save_flag.reset();
 }
@@ -142,7 +143,7 @@ void ChatBot::onGroupData(const mesh::Packet* pkt, uint8_t type,
   if (memcmp(psk, channel.secret, sizeof(psk)) != 0) return;  // hash collision guard
 
   const uint32_t now = millis();
-  if (last_reply_ms && (uint32_t)(now - last_reply_ms) < BOT_MIN_INTERVAL_MS) return;
+  if (has_replied && (uint32_t)(now - last_reply_ms) < BOT_MIN_INTERVAL_MS) return;
 
   char sender[24], text[24];
   bool has_text = false, has_sender = false;
@@ -180,7 +181,8 @@ void ChatBot::onGroupData(const mesh::Packet* pkt, uint8_t type,
 
   uint32_t delay = jitter ? jitter(ctx) : BOT_REPLY_DELAY_MIN_MS;
   if (!send(ctx, psk, chan_hash, pkt->getRxProfile(), delay, reply, reply_len)) return;
-  last_reply_ms = now;   // a suppressed send leaves no state behind
+  last_reply_ms = now;   // a failed send leaves no state behind
+  has_replied = true;
 }
 
 // ---------------------------------------------------------------- persistence
@@ -254,7 +256,9 @@ void ChatBot::load(FILESYSTEM* fs) {
 // ---------------------------------------------------------------- CLI
 
 void botCLI(ChatBot& bot, const char* command, char* reply) {
-  char scratch[64];
+  // "chan " + 64 hex digits is 69 bytes, so the scratch must hold at least
+  // that plus the quoting/whitespace cliPrepare() may hand us.
+  char scratch[96];
   if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
   char* p = scratch;
   char* verb = nextToken(&p);

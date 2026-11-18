@@ -358,6 +358,20 @@ TEST_F(BotTest, CliStatusOnOffNameAndChan) {
   EXPECT_EQ(cli("bot off"), "OK - bot off");
 }
 
+TEST_F(BotTest, CliAcceptsAFullLength32BytePsk) {
+  const char* hex64 = "000102030405060708090A0B0C0D0E0F"
+                      "101112131415161718191A1B1C1D1E1F";
+  std::string cmd = std::string("bot chan ") + hex64;
+  uint8_t key[32], h;
+  int key_len = 0;
+  ASSERT_TRUE(cliDecodePskHex(hex64, key, sizeof(key), &key_len));
+  mesh::Utils::sha256(&h, 1, key, 32);
+  char expected[24];
+  snprintf(expected, sizeof(expected), "OK - chan h=%02X", h);
+  EXPECT_EQ(cli(cmd.c_str()), expected);
+  EXPECT_EQ(bot.getPskLen(), 32);
+}
+
 TEST_F(BotTest, CliRejectsBothChanFormsAndBadValues) {
   std::string both = std::string("bot chan #bottest ") + HEX16;
   EXPECT_EQ(cli(both.c_str()), "Err - usage: chan #<name>|<psk-hex> | chan off");
@@ -368,6 +382,70 @@ TEST_F(BotTest, CliRejectsBothChanFormsAndBadValues) {
   EXPECT_EQ(cli("bot stats"), "Err - usage: on|off|name|chan");
   EXPECT_EQ(cli("bot tips reset"), "Err - usage: on|off|name|chan");
   EXPECT_EQ(cli("bot on junk"), "Err - usage: bot on|off");
+}
+
+TEST_F(BotTest, NonPlainTextWrongTypeAndShortPayloadAreIgnored) {
+  arm();
+  uint8_t data[64];
+  mesh::Packet pkt;
+  mesh::GroupChannel chan;
+  memset(&chan, 0, sizeof(chan));
+  chan.hash[0] = bot.getChanHash();
+  memcpy(chan.secret, bot.getPsk(), sizeof(chan.secret));
+
+  // too short for the 5-byte group-text header
+  bot.onGroupData(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, data, 4, NULL, "NodeName");
+  EXPECT_EQ(sends, 0);
+
+  memset(data, 0, sizeof(data));
+  data[4] = TXT_TYPE_CLI_DATA << 2;
+  memcpy(data + 5, "Alice: test", 12);
+  bot.onGroupData(&pkt, PAYLOAD_TYPE_GRP_TXT, chan, data, 17, NULL, "NodeName");
+  EXPECT_EQ(sends, 0);
+
+  data[4] = TXT_TYPE_PLAIN;
+  bot.onGroupData(&pkt, PAYLOAD_TYPE_GRP_DATA, chan, data, 17, NULL, "NodeName");
+  EXPECT_EQ(sends, 0);
+}
+
+TEST_F(BotTest, LongPskWorksAndOffKeepsTheChannel) {
+  const char* hex64 = "000102030405060708090A0B0C0D0E0F"
+                      "101112131415161718191A1B1C1D1E1F";
+  ASSERT_TRUE(bot.setChannel(hex64));
+  EXPECT_EQ(bot.getPskLen(), 32);
+  bot.setEnabled(true);
+  feed("Alice", "test");
+  ASSERT_EQ(sends, 1);
+  uint8_t expected_hash;
+  mesh::Utils::sha256(&expected_hash, 1, bot.getPsk(), 32);
+  EXPECT_EQ(bot.getChanHash(), expected_hash);
+
+  bot.setEnabled(false);
+  EXPECT_EQ(bot.getPskLen(), 32);   // off preserves the key
+  bot.setEnabled(true);             // one command to re-enable
+  g_mock_millis += BOT_MIN_INTERVAL_MS + 1;
+  feed("Alice", "test");
+  EXPECT_EQ(sends, 2);
+}
+
+TEST_F(BotTest, RecordBytesAreDeterministic) {
+  arm();
+  bot.setName("TestBot");
+  flushSave();
+  std::vector<uint8_t> first = fs.files[BOT_CFG_FILE];
+  ASSERT_EQ(first.size(), BOT_CFG_RECORD_BYTES);
+  fs.files.erase(BOT_CFG_FILE);
+  bot.save(&fs);   // write the same state again
+  EXPECT_EQ(fs.files[BOT_CFG_FILE], first);
+}
+
+TEST_F(BotTest, FirstReplyAtMillisZeroClosesTheGate) {
+  g_mock_millis = 0;
+  arm();
+  feed("Alice", "test");
+  ASSERT_EQ(sends, 1);
+  feed("Alice", "test");   // millis still 0: must be suppressed
+  EXPECT_EQ(sends, 1);
 }
 
 int main(int argc, char** argv) {

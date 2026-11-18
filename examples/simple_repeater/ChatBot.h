@@ -31,7 +31,8 @@ private:
   uint8_t psk[32];
   uint8_t psk_len;
   uint8_t chan_hash;
-  uint32_t last_reply_ms;   // wrap-safe millis() stamp of the last TX; 0 = none
+  uint32_t last_reply_ms;   // wrap-safe millis() stamp of the last successful TX
+  bool has_replied;         // a stamp of 0 is a valid time, so it needs its own flag
   void* ctx;
   SendFn send;
   JitterFn jitter;
