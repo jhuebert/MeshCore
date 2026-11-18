@@ -125,6 +125,11 @@ for diagnostics.
 
 → Full guide: **[OTA.md](./OTA.md)**
 
+> **Partition change:** 28 four-megabyte ESP32 repeater targets need a full
+> erase and merged reflash to gain the OTA headroom. See
+> [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
+> affected targets and the backup procedure.
+
 ## Why run this instead of stock repeater firmware?
 
 Stock repeaters forward everything they hear, until the battery dies. This

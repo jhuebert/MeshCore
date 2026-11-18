@@ -9,6 +9,76 @@ in detail; this page is a short overview for repeater operators.
 
 ---
 
+## Action required: ESP32 repeater partition change
+
+The first release with the larger OTA staging headroom moves 28 four-megabyte
+ESP32 repeater targets from the `default.csv` partition table to
+`min_spiffs.csv`. App slots grow from 1280 KiB to 1920 KiB, and SPIFFS shrinks
+from 1408 KiB to 128 KiB. Normal repeater config uses only around 10 KiB, so
+day-to-day behaviour is unchanged; a debug build with `MESH_PACKET_LOGGING`
+enabled fills the smaller filesystem much sooner.
+
+This change **cannot be delivered over OTA**: SPIFFS moves from `0x290000` to
+`0x3D0000`, and the old region becomes part of `app1`. Upgrading one of these
+boards needs a **full erase and a flash of the merged image**. Existing identity
+and settings are lost unless you back them up first.
+
+### Affected targets
+
+```text
+Generic_E22_sx1262_repeater
+Generic_E22_sx1262_repeater_bridge_espnow
+Generic_E22_sx1268_repeater
+Generic_E22_sx1268_repeater_bridge_espnow
+
+LilyGo_T3S3_sx1262_repeater
+LilyGo_T3S3_sx1262_repeater_bridge_espnow
+LilyGo_T3S3_sx1276_repeater
+LilyGo_T3S3_sx1276_repeater_bridge_espnow
+LilyGo_TBeam_1W_repeater
+LilyGo_TBeam_1W_repeater_bridge_espnow
+
+Station_G2_repeater
+Station_G2_repeater_bridge_espnow
+Station_G2_logging_repeater
+Station_G2_logging_repeater_bridge_espnow
+Station_G3_ESP32_repeater
+Station_G3_ESP32_logging_repeater
+
+Tenstar_C3_sx1262_repeater
+Tenstar_C3_sx1268_repeater
+
+ThinkNode_M2_Repeater
+ThinkNode_M2_Repeater_bridge_espnow
+ThinkNode_M5_Repeater
+ThinkNode_M5_Repeater_bridge_espnow
+
+Ebyte_EoRa-S3_Repeater
+Xiao_C3_repeater
+
+nibble_zero_connect_repeater_
+nibble_zero_connect_repeater_bridge_espnow_
+nibble_screen_connect_repeater_
+nibble_screen_connect_repeater_bridge_espnow_
+```
+
+Observer builds and every other target are unaffected.
+
+### Upgrading an affected board
+
+1. Back up the private key with `get prv.key` over the serial CLI, and record
+   your settings, channels, filter rules and fleet tags (there is no config
+   export yet).
+2. Fully erase the board and flash the **merged** image for this release — not
+   an app-only update.
+3. Restore the key with `set prv.key <hex>` and re-enter the prefs, channels,
+   rules and tags.
+4. Confirm the node keeps its identity and reconnects to the mesh, then check
+   `ota status` and run one stage → apply cycle.
+
+If the node comes back with a different identity, the key was not restored:
+reflash with the backed-up `prv.key` before letting it rejoin the mesh.
+
 ## What you need
 
 - A repeater running an OTA-enabled build of this fork on an ESP32 board with a
