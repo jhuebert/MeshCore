@@ -141,7 +141,8 @@ async def section_cli(a, b, rep):
     check("tempradio accepted", await rep.cmd("tempradio 910.525,62.5,7,5,1"),
           lambda s: s.startswith("OK"))
     await asyncio.sleep(1)
-    check("paused status", await rep.radio2(), "off; paused")
+    check("paused status", await rep.radio2(),
+          lambda s: "off; paused" in (s or "") and "preset=915.125,125,9,5" in (s or ""))
     check("off refused while paused", await rep.cmd("radio2 off"), lambda s: "tempradio active" in (s or ""))
     check("preset refused while paused",
           await rep.cmd("radio2 915.125,125,9,5"), lambda s: "tempradio active" in (s or ""))

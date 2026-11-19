@@ -547,7 +547,7 @@ TEST(Radio2Isolation, PausedDoesNotAdvertiseOnBoth) {
 
   char reply[CLI_REPLY_MAX];
   radio2CLI(r, false, false, "status", reply);
-  EXPECT_STREQ(reply, "off; paused");
+  EXPECT_STREQ(reply, "off; paused; preset=915,125,10,5");
 }
 
 TEST(Radio2Isolation, PausedSendsOnPrimary) {
@@ -848,7 +848,7 @@ TEST(Radio2Cli, StatusOff) {
   setPrimary(r);
   char reply[CLI_REPLY_MAX];
   radio2CLI(r, false, false, "", reply);
-  EXPECT_STREQ(reply, "off");
+  EXPECT_STREQ(reply, "off; preset=0,0,0,0");
 }
 
 TEST(Radio2Cli, SetPresetAndStatus) {

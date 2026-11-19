@@ -56,7 +56,7 @@ power behaviour. The preset and policy you save are simply remembered.
 
    ```text
    radio2 status
-   > on; at=primary; mode=active; split=80/20; nf=-117; sw=3; swf=0; rx=4/9; tx=1/6; both=0; bdrop=0; drop=0; abrt=0
+   > on; at=primary; mode=active; split=80/20; nf=-117; sw=3; swf=0; rx=4/9; tx=1/6; both=0; bdrop=0; drop=0; abrt=0; preset=915,125,10,5
    ```
 
 5. Pick what should cross:
@@ -173,7 +173,7 @@ outbound packet is queued. That lets a remote admin's reply go out on the old
 settings before the radio retunes. While waiting, status says:
 
 ```text
-> on; apply=pending; at=primary
+> on; apply=pending; at=primary; preset=915,125,10,5
 ```
 
 ### Policy commands
@@ -214,12 +214,13 @@ broadcast flood packet.
 A full status line looks like:
 
 ```text
-on; at=primary; mode=idle; split=39/61; nf=-117; sw=12; swf=0; rx=4/9; tx=1/6; both=0; bdrop=0; drop=0; abrt=0
+on; at=primary; mode=idle; split=39/61; nf=-117; sw=12; swf=0; rx=4/9; tx=1/6; both=0; bdrop=0; drop=0; abrt=0; preset=915,125,10,5
 ```
 
 | Field | Meaning |
 |---|---|
 | `on` / `off` | Whether radio2 is enabled. |
+| `preset=F,BW,SF,CR` | Configured secondary preset (frequency MHz, bandwidth kHz, spreading factor, coding rate). Present on every status line. |
 | `apply=pending` | The RF change is waiting for the deferred apply. |
 | `at=primary` / `at=radio2` | Which preset the radio is listening on right now. |
 | `mode=active` | The primary was heard in the last 30 seconds; primary gets priority. |
@@ -238,13 +239,13 @@ on; at=primary; mode=idle; split=39/61; nf=-117; sw=12; swf=0; rx=4/9; tx=1/6; b
 Other forms:
 
 ```text
-off
-off; conflict=radio.rxps
-off; conflict=extra.sf
-off; conflict=preset
-off; conflict=timing
-off; conflict=switch
-off; paused
+off; preset=915,125,10,5
+off; conflict=radio.rxps; preset=915,125,10,5
+off; conflict=extra.sf; preset=915,125,10,5
+off; conflict=preset; preset=915,125,10,5
+off; conflict=timing; preset=915,125,10,5
+off; conflict=switch; preset=915,125,10,5
+off; paused; preset=915,125,10,5
 ```
 
 `off; paused` means a temporary radio change is in progress; radio2 resumes

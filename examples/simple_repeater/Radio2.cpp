@@ -625,18 +625,24 @@ void Radio2::load(FILESYSTEM* fs) {
   "Err - usage: status|timing|<freq>,<bw>,<sf>,<cr>|off|policy [a] [b]|advert primary|both"
 
 static void radio2Status(Radio2& r, char* reply) {
+  const Radio2Profile& p = r.getSecondaryProfile();
+  char preset[40];
+  snprintf(preset, sizeof(preset), "%g,%g,%u,%u", p.freq, p.bw, (unsigned)p.sf,
+           (unsigned)p.cr);
   if (!r.isEnabled()) {
-    snprintf(reply, CLI_REPLY_MAX, "off");
+    snprintf(reply, CLI_REPLY_MAX, "off; preset=%s", preset);
     return;
   }
   if (!r.isScanning()) {
     if (r.hasPendingApply()) {
-      snprintf(reply, CLI_REPLY_MAX, "on; apply=pending; at=%s",
-               r.currentProfile() == RADIO_PROFILE_SECONDARY ? "radio2" : "primary");
+      snprintf(reply, CLI_REPLY_MAX, "on; apply=pending; at=%s; preset=%s",
+               r.currentProfile() == RADIO_PROFILE_SECONDARY ? "radio2" : "primary",
+               preset);
     } else if (r.isPaused()) {
-      snprintf(reply, CLI_REPLY_MAX, "off; paused");
+      snprintf(reply, CLI_REPLY_MAX, "off; paused; preset=%s", preset);
     } else {
-      snprintf(reply, CLI_REPLY_MAX, "off; conflict=%s", conflictName(r.conflict()));
+      snprintf(reply, CLI_REPLY_MAX, "off; conflict=%s; preset=%s",
+               conflictName(r.conflict()), preset);
     }
     return;
   }
@@ -667,6 +673,7 @@ static void radio2Status(Radio2& r, char* reply) {
   buf.add("; both=%lu; bdrop=%lu; drop=%lu; abrt=%lu", (unsigned long)r.getBoth(),
           (unsigned long)r.getBothDrop(), (unsigned long)r.getPolicyDrop(),
           (unsigned long)r.getAborts());
+  buf.add("; preset=%s", preset);
   cliCutReply(reply, CLI_REPLY_MAX, line);
 }
 
