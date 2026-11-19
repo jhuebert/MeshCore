@@ -152,6 +152,13 @@ static void frameHeader(uint8_t* out, uint8_t op) {
   out[2] = op;
 }
 
+// Every report is "magic + op + body + CRC"; finish one whose body is already
+// in out+3. Keeps the report builders to a single framing step.
+static size_t finishReport(uint8_t* out, uint8_t op, size_t body_len) {
+  frameHeader(out, op);
+  return sealFrame(out, 3 + body_len);
+}
+
 // ------------------------------------------------------------------ slot io
 
 #if defined(ESP32)
@@ -367,6 +374,7 @@ void OtaUpdate::resetSession() {
   _size = 0;
   _written = 0;
   _expect = 1;
+  _session_id = 0;
 }
 
 void OtaUpdate::abortStaging(uint8_t err) {
@@ -384,6 +392,11 @@ void OtaUpdate::armSession(uint32_t size, const uint8_t sha[32]) {
   _size = size;
   _written = 0;
   _expect = 1;
+  _session_id = 0;
+  if (_rng != nullptr) {
+    _rng->random((uint8_t*)&_session_id, sizeof(_session_id));
+    if (_session_id == 0) _session_id = 1;   // zero means "no session"
+  }
   memcpy(_expected_sha, sha, 32);
   _state = State::Staging;
   _err = OTA_ERR_NONE;
@@ -403,34 +416,47 @@ uint32_t OtaUpdate::ownTargetId() const {
 #endif
 }
 
-size_t OtaUpdate::buildInfoReport(uint8_t* out) {
-  uint32_t features = 0;
-  uint32_t slot = 0;
-  if (_io != nullptr) {
-    slot = _io->slotSize();
-    features |= OTA_FEAT_DELTA;   // OP_COPY is implemented everywhere with flash
-    features |= OTA_FEAT_APPLY;   // dual app slot (ESP32)
-    features |= OTA_FEAT_BLOCK_HASH;   // read-only running-image hash oracle
-  }
+uint32_t OtaUpdate::features() const {
+  if (_io == nullptr) return 0;
+  return OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH |
+         OTA_FEAT_STAGED_HASH | OTA_FEAT_STATUS | OTA_FEAT_PING;
+}
 
-  // OP_INFO_REPORT body: wire_ver(1) target(4) slot(4) max_literal(2) features(4)
-  //                      ver[32] sha256[32]. Written straight into the reply.
-  uint8_t* p = out + 3;
+// The frozen 79-byte body shared verbatim by INFO_REPORT and STATUS_REPORT.
+void OtaUpdate::writeIdentity(uint8_t* p, uint32_t feature_bits) {
   memset(p, 0, OTA_INFO_BODY);
   p[0] = OTA_WIRE_VERSION;
   putLe32(p + 1, ownTargetId());
-  putLe32(p + 5, slot);
+  putLe32(p + 5, _io != nullptr ? _io->slotSize() : 0);
   putLe16(p + 9, OTA_MAX_LITERAL);
-  putLe32(p + 11, features);
+  putLe32(p + 11, feature_bits);
   const size_t vlen = strlen(_version);
   memcpy(p + OTA_INFO_RUNNING_VER_OFF, _version, vlen > 31 ? 31 : vlen);
   if (_io != nullptr) {
     ensureRunningSha();
     memcpy(p + OTA_INFO_RUNNING_SHA_OFF, _running_sha, 32);
   }
+}
 
-  frameHeader(out, OTA_OP_INFO_REPORT);
-  return sealFrame(out, 3 + OTA_INFO_BODY);
+size_t OtaUpdate::buildInfoReport(uint8_t* out) {
+  writeIdentity(out + 3, features());
+  return finishReport(out, OTA_OP_INFO_REPORT, OTA_INFO_BODY);
+}
+
+size_t OtaUpdate::buildStatusReport(uint8_t* out) {
+  uint8_t* p = out + 3;
+  memset(p, 0, OTA_STATUS_BODY_FIXED);   // the TLV block is empty today
+  writeIdentity(p, features());
+  putLe32(p + OTA_STATUS_SESSION_OFF, _session_id);
+  p[OTA_STATUS_STATE_OFF] =
+      _io == nullptr ? OTA_STATE_UNSUPPORTED : (uint8_t)_state;
+  p[OTA_STATUS_ERR_OFF] = _err;
+  putLe32(p + OTA_STATUS_SIZE_OFF, _size);
+  putLe32(p + OTA_STATUS_WRITTEN_OFF, _written);
+  putLe16(p + OTA_STATUS_EXPECT_OFF, _expect);
+  p[OTA_STATUS_CODECS_OFF] = _io == nullptr ? 0 : OTA_CODEC_DEFLATE;
+  putLe16(p + OTA_STATUS_EXT_LEN_OFF, 0);
+  return finishReport(out, OTA_OP_STATUS_REPORT, OTA_STATUS_BODY_FIXED);
 }
 
 uint32_t OtaUpdate::ensureRunningLength() {
@@ -442,26 +468,31 @@ uint32_t OtaUpdate::ensureRunningLength() {
   return _running_len;
 }
 
-size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
+size_t OtaUpdate::buildHashReport(bool staged, uint8_t report_op,
+                                  const uint8_t* body, uint16_t body_len, uint8_t* out) {
   if (body == nullptr || body_len < 1 || out == nullptr) return 0;
   const uint8_t count = body[0];
   // Reject malformed queries before touching the reply buffer.
   if (count == 0 ? body_len != 1
-                 : count > OTA_HASH_MAX_RANGES || body_len != (uint16_t)(1 + 8 * count)) {
+                  : count > OTA_HASH_MAX_RANGES || body_len != (uint16_t)(1 + 8 * count)) {
     return 0;
   }
-  const uint32_t running_len = ensureRunningLength();
+  // Only bytes that exist can be hashed: the running image's length, or the
+  // staged slot's written prefix (the rest of the slot is erase-filled).
+  const uint32_t available = staged ? _written : ensureRunningLength();
   uint8_t* p = out + 3;
   memset(p, 0, OTA_HASH_RANGE_BODY(OTA_HASH_MAX_RANGES));
-  putLe32(p, running_len);
+  putLe32(p, available);
   p[4] = count;
 
   if (count == 0) {
     // Metadata query: fixed segment table (six slots, unused ones zero) plus
     // the whole-image hash. One round trip gives the app everything it needs
-    // to align segments and detect an identical image.
+    // to align segments and detect an identical image. Only the running image
+    // has a segment table; staged bytes are a prefix that may not hold a whole
+    // image header yet.
     uint8_t seg_count = 0;
-    if (_io != nullptr && running_len > 0) {
+    if (!staged && _io != nullptr && available > 0) {
       uint8_t h[24];
       if (slotRead(_io, false, 0, h, sizeof(h)) && h[0] == 0xE9 && h[1] >= 1 && h[1] <= 16) {
         uint32_t off = sizeof(h);
@@ -470,22 +501,31 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
           if (!slotRead(_io, false, off, seg, sizeof(seg))) break;
           const uint32_t len = le32(seg + 4);
           const uint32_t payload_off = off + 8;
-          if ((uint64_t)payload_off + len > running_len) break;
+          if ((uint64_t)payload_off + len > available) break;
           uint8_t* s = &p[6 + seg_count * 8];
           putLe32(s, payload_off);
           putLe32(s + 4, len);
           seg_count++;
           off = payload_off + len;
           off = (off + 3) & ~3u;
-          if (off >= running_len) break;
+          if (off >= available) break;
         }
       }
     }
     p[5] = seg_count;             // p[4] stays count == 0 (metadata marker)
-    ensureRunningSha();
-    memcpy(p + 6 + OTA_HASH_MAX_SEGS * 8, _running_sha, OTA_HASH_LEN);
-    frameHeader(out, OTA_OP_BLOCK_HASH_REPORT);
-    return sealFrame(out, 3 + OTA_HASH_META_BODY);
+    uint8_t* sha = p + 6 + OTA_HASH_MAX_SEGS * 8;
+    if (staged) {
+      // A zeroed hash means the staged bytes could not be read (or none yet).
+      uint8_t staged_hash[OTA_HASH_LEN] = {0};
+      if (_io != nullptr && available > 0 &&
+          hashSlot(_io, true, 0, available, staged_hash)) {
+        memcpy(sha, staged_hash, OTA_HASH_LEN);
+      }
+    } else {
+      ensureRunningSha();
+      memcpy(sha, _running_sha, OTA_HASH_LEN);
+    }
+    return finishReport(out, report_op, OTA_HASH_META_BODY);
   }
 
   for (uint8_t i = 0; i < count; i++) {
@@ -495,7 +535,7 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
     uint8_t* dst = &p[5 + i * (4 + 1 + OTA_HASH_LEN)];
     putLe32(dst, off);
     uint8_t status = 0;
-    if (_io == nullptr || running_len == 0) {
+    if (_io == nullptr || available == 0) {
       status = 3;                         // no readable image
     } else if ((off & (OTA_HASH_ALIGN - 1)) != 0 ||
                (len != 0 && ((len & (OTA_HASH_ALIGN - 1)) != 0 ||
@@ -503,17 +543,24 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
       status = 3;                         // alignment / length rejected
     } else {
       uint32_t n = len;
-      if (len == 0 && off <= running_len) n = running_len - off;
-      if (off > running_len || n > running_len - off) {
+      if (len == 0 && off <= available) n = available - off;
+      if (off > available || n > available - off) {
         status = 1;                       // out of bounds
-      } else if (!hashSlot(_io, false, off, n, dst + 5)) {
+      } else if (!hashSlot(_io, staged, off, n, dst + 5)) {
         status = 2;                       // flash read failed
       }
     }
     dst[4] = status;
   }
-  frameHeader(out, OTA_OP_BLOCK_HASH_REPORT);
-  return sealFrame(out, 3 + OTA_HASH_RANGE_BODY(count));
+  return finishReport(out, report_op, OTA_HASH_RANGE_BODY(count));
+}
+
+size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
+  return buildHashReport(false, OTA_OP_BLOCK_HASH_REPORT, body, body_len, out);
+}
+
+size_t OtaUpdate::buildStagedHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
+  return buildHashReport(true, OTA_OP_STAGED_HASH_REPORT, body, body_len, out);
 }
 
 size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
@@ -624,28 +671,45 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
 
   const uint8_t op = frame[2];
 
-  // OP_INFO is the negotiation handshake: answered in every state, no arm
-  // required, tolerant of a body (for forward-compatible query extensions).
-  // It does not touch flash and does not create or consume a session.
+  // OP_INFO/OP_STATUS/OP_PING are the read-only handshake and diagnostics:
+  // answered in every state, no arm required, tolerant of a body. None of them
+  // touches flash or the session.
   if (op == OTA_OP_INFO) {
     if (report_out == nullptr || report_cap < OTA_INFO_REPORT_LEN) return 0;
     return buildInfoReport(report_out);
   }
+  if (op == OTA_OP_STATUS) {
+    if (report_out == nullptr || report_cap < OTA_STATUS_REPORT_MAX) return 0;
+    return buildStatusReport(report_out);
+  }
+  if (op == OTA_OP_PING) {
+    const size_t body_len = n - 5;   // n >= 5 is guaranteed above; minus CRC
+    if (body_len < 1 || body_len > OTA_PING_MAX) return 0;
+    if (report_out == nullptr || report_cap < 3 + body_len + 2) return 0;
+    memcpy(report_out + 3, frame + 3, body_len);
+    return finishReport(report_out, OTA_OP_PING_REPORT, body_len);
+  }
 
   if (_io == nullptr) return 0;   // not an ESP32 (or slot lookup failed): inert
 
-  // Read-only diff oracle: answered in every state, like OP_INFO, and never
-  // touches the session or flash writes. Body is count + ranges (or just the
-  // count byte for the metadata query).
-  if (op == OTA_OP_BLOCK_HASH || op == OTA_OP_BLOCK_FIND) {
-    const size_t need = op == OTA_OP_BLOCK_HASH ? OTA_HASH_REPORT_MAX : OTA_FIND_REPORT_MAX;
-    if (report_out == nullptr || report_cap < need) return 0;
-    return op == OTA_OP_BLOCK_HASH
-        ? buildBlockHashReport(frame + 3, (uint16_t)(n - 5), report_out)
-        : buildFindReport(frame + 3, (uint16_t)(n - 5), report_out);
+  // Read-only hash oracles: answered in every state, never write flash. The
+  // two ops share one encoder and differ only in which slot they read.
+  if (op == OTA_OP_BLOCK_HASH || op == OTA_OP_STAGED_HASH) {
+    if (report_out == nullptr || report_cap < OTA_HASH_REPORT_MAX) return 0;
+    return op == OTA_OP_STAGED_HASH
+        ? buildStagedHashReport(frame + 3, (uint16_t)(n - 5), report_out)
+        : buildBlockHashReport(frame + 3, (uint16_t)(n - 5), report_out);
+  }
+  if (op == OTA_OP_BLOCK_FIND) {
+    if (report_out == nullptr || report_cap < OTA_FIND_REPORT_MAX) return 0;
+    return buildFindReport(frame + 3, (uint16_t)(n - 5), report_out);
   }
 
-  if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT) return 0;
+  // Ops that never arrive as a request, plus anything we do not implement:
+  // dropped silently so a future app can add ops without breaking this node.
+  if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT ||
+      op == OTA_OP_STAGED_HASH_REPORT || op == OTA_OP_STATUS_REPORT ||
+      op == OTA_OP_PING_REPORT) return 0;
 
   if (op == OTA_OP_ASK) {
     if (!stagingArmed()) return 0;
@@ -792,6 +856,12 @@ void OtaUpdate::applyLiteralZ(const uint8_t* body, uint16_t body_len) {
   const uint16_t comp_total = le16(body + 4);
   const uint8_t flags = body[6];
   const uint16_t dlen = body_len - 7;
+  // Codec 0 is raw DEFLATE, the only one implemented. A future app may propose
+  // another id; this firmware refuses it instead of mis-decoding the stream.
+  if (((flags & OTA_LZ_CODEC_MASK) >> OTA_LZ_CODEC_SHIFT) != 0) {
+    abortStaging(OTA_ERR_COMPRESS);
+    return;
+  }
   if (dlen == 0 || dlen > OTA_LZ_MAX_DATA) {
     abortStaging(OTA_ERR_BOUNDS);
     return;

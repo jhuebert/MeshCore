@@ -595,7 +595,8 @@ TEST_F(OtaTest, InfoReportAnswersWhenIdle) {
   EXPECT_EQ(le32From(body + 5), 0x200000u);                       // FakeSlotIo slot size
   EXPECT_EQ(body[9] | (body[10] << 8), (uint16_t)OTA_MAX_LITERAL);
   EXPECT_EQ(le32From(body + 11),
-            (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH));
+            (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH |
+                       OTA_FEAT_STAGED_HASH | OTA_FEAT_STATUS | OTA_FEAT_PING));
   // The fake slot holds no ESP image, so the running sha is reported as
   // unknown (all zeros) rather than as a hash of erase fill.
   for (size_t k = 0; k < 32; k++) EXPECT_EQ(body[OTA_INFO_RUNNING_SHA_OFF + k], 0u);
@@ -1527,6 +1528,134 @@ TEST_F(OtaTest, CorruptSegmentLengthReportsNoImageInsteadOfWrapping) {
   auto report = feed(bodyFrame(OTA_OP_BLOCK_HASH, {0}));
   ASSERT_EQ(report.size(), OTA_HASH_META_LEN);
   EXPECT_EQ(le32From(report.data() + 3), 0u);   // unreadable image
+}
+
+// ------------------------------------------------------- capability API (v1+)
+
+TEST_F(OtaTest, StatusReportAnswersWhenIdle) {
+  auto report = feed(bodyFrame(OTA_OP_STATUS, {}));
+  ASSERT_EQ(report.size(), OTA_STATUS_REPORT_LEN);
+  EXPECT_EQ(report[2], OTA_OP_STATUS_REPORT);
+  const uint8_t* b = report.data() + 3;
+  uint16_t stored = (uint16_t)b[OTA_STATUS_BODY_FIXED] |
+                    ((uint16_t)b[OTA_STATUS_BODY_FIXED + 1] << 8);
+  EXPECT_EQ(crc16_ccitt(report.data(), report.size() - 2), stored);
+  EXPECT_EQ(b[0], OTA_WIRE_VERSION);                       // identity block
+  EXPECT_EQ(le32From(b + 1), testTargetId());
+  EXPECT_EQ(le32From(b + 5), 0x200000u);
+  EXPECT_EQ(le32From(b + 11),
+            (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH |
+                       OTA_FEAT_STAGED_HASH | OTA_FEAT_STATUS | OTA_FEAT_PING));
+  EXPECT_STREQ((const char*)(b + OTA_INFO_RUNNING_VER_OFF), "test-fw-1.0.0");
+  EXPECT_EQ(le32From(b + OTA_STATUS_SESSION_OFF), 0u);     // no session yet
+  EXPECT_EQ(b[OTA_STATUS_STATE_OFF], OTA_STATE_IDLE);
+  EXPECT_EQ(b[OTA_STATUS_ERR_OFF], 0u);
+  EXPECT_EQ(le32From(b + OTA_STATUS_SIZE_OFF), 0u);
+  EXPECT_EQ(le32From(b + OTA_STATUS_WRITTEN_OFF), 0u);
+  EXPECT_EQ((uint16_t)(b[OTA_STATUS_EXPECT_OFF] | (b[OTA_STATUS_EXPECT_OFF + 1] << 8)), 1u);
+  EXPECT_EQ(b[OTA_STATUS_CODECS_OFF], OTA_CODEC_DEFLATE);
+  EXPECT_EQ((uint16_t)(b[OTA_STATUS_EXT_LEN_OFF] | (b[OTA_STATUS_EXT_LEN_OFF + 1] << 8)), 0u);
+}
+
+TEST_F(OtaTest, StatusSessionIdIdentifiesAnArmAndSurvivesProgress) {
+  auto image = testImage(16);
+  arm(image);
+  auto r1 = feed(bodyFrame(OTA_OP_STATUS, {}));
+  const uint8_t* b1 = r1.data() + 3;
+  const uint32_t session = le32From(b1 + OTA_STATUS_SESSION_OFF);
+  EXPECT_NE(session, 0u);
+  EXPECT_EQ(b1[OTA_STATUS_STATE_OFF], OTA_STATE_STAGING);
+  EXPECT_EQ(le32From(b1 + OTA_STATUS_SIZE_OFF), image.size());
+
+  std::vector<uint8_t> half(image.begin(), image.begin() + 8);
+  sendLiteral(1, half);
+  auto r2 = feed(bodyFrame(OTA_OP_STATUS, {}));
+  const uint8_t* b2 = r2.data() + 3;
+  EXPECT_EQ(le32From(b2 + OTA_STATUS_SESSION_OFF), session);  // same session
+  EXPECT_EQ(le32From(b2 + OTA_STATUS_WRITTEN_OFF), 8u);
+  EXPECT_EQ((uint16_t)(b2[OTA_STATUS_EXPECT_OFF] | (b2[OTA_STATUS_EXPECT_OFF + 1] << 8)), 2u);
+
+  // Abandoning the session clears it; a fresh arm mints a different id.
+  char reply[96];
+  ASSERT_TRUE(ota.abortCommand(reply));
+  auto r3 = feed(bodyFrame(OTA_OP_STATUS, {}));
+  EXPECT_EQ(le32From(r3.data() + 3 + OTA_STATUS_SESSION_OFF), 0u);
+  EXPECT_EQ(r3.data()[3 + OTA_STATUS_STATE_OFF], OTA_STATE_IDLE);
+  arm(image);
+  auto r4 = feed(bodyFrame(OTA_OP_STATUS, {}));
+  EXPECT_NE(le32From(r4.data() + 3 + OTA_STATUS_SESSION_OFF), session);
+}
+
+TEST_F(OtaTest, StagedHashHashesOnlyTheWrittenPrefixAndIsReadOnly) {
+  auto image = testImage(32);
+  arm(image);
+  auto empty = feed(bodyFrame(OTA_OP_STAGED_HASH, {0}));
+  ASSERT_EQ(empty.size(), OTA_HASH_META_LEN);
+  EXPECT_EQ(empty[2], OTA_OP_STAGED_HASH_REPORT);
+  EXPECT_EQ(le32From(empty.data() + 3), 0u);
+
+  std::vector<uint8_t> half(image.begin(), image.begin() + 16);
+  sendLiteral(1, half);
+  auto meta = feed(bodyFrame(OTA_OP_STAGED_HASH, {0}));
+  ASSERT_EQ(meta.size(), OTA_HASH_META_LEN);
+  EXPECT_EQ(le32From(meta.data() + 3), 16u);
+  EXPECT_EQ(meta[3 + 5], 0u);   // no segment table for a partial image
+  uint8_t whole[32];
+  mockSha256(half, whole);
+  EXPECT_EQ(memcmp(meta.data() + 3 + 6 + OTA_HASH_MAX_SEGS * 8, whole, 32), 0);
+
+  std::vector<uint8_t> q = {1, 0, 0, 0, 0, 8, 0, 0, 0};   // one 8-byte range
+  auto one = feed(bodyFrame(OTA_OP_STAGED_HASH, q));
+  ASSERT_EQ(one.size(), OTA_HASH_RANGE_LEN(1));
+  EXPECT_EQ(one[2], OTA_OP_STAGED_HASH_REPORT);
+  EXPECT_EQ(one[3 + 5 + 4], 0u);   // status ok
+  uint8_t part[32];
+  mockSha256(std::vector<uint8_t>(image.begin(), image.begin() + 8), part);
+  EXPECT_EQ(memcmp(one.data() + 3 + 5 + 5, part, 32), 0);
+
+  // Out-of-bounds and misaligned ranges are refused as on the running image.
+  std::vector<uint8_t> oob = {1, 16, 0, 0, 0, 8, 0, 0, 0};
+  EXPECT_EQ(feed(bodyFrame(OTA_OP_STAGED_HASH, oob))[3 + 5 + 4], 1u);
+  std::vector<uint8_t> bad = {1, 0, 0, 0, 0, 7, 0, 0, 0};
+  EXPECT_EQ(feed(bodyFrame(OTA_OP_STAGED_HASH, bad))[3 + 5 + 4], 3u);
+  EXPECT_FALSE(slot.aborted);
+  auto ask = sendAsk();
+  EXPECT_EQ(ask[3] | (ask[4] << 8), 2);   // session position untouched
+}
+
+TEST_F(OtaTest, PingEchoesThePayloadInAnyState) {
+  const std::vector<uint8_t> payload = {9, 8, 7, 6};
+  auto idle = feed(bodyFrame(OTA_OP_PING, payload));
+  ASSERT_EQ(idle.size(), 3 + payload.size() + 2);
+  EXPECT_EQ(idle[2], OTA_OP_PING_REPORT);
+  EXPECT_EQ(memcmp(idle.data() + 3, payload.data(), payload.size()), 0);
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
+
+  arm(testImage(16));
+  auto staging = feed(bodyFrame(OTA_OP_PING, payload));
+  EXPECT_EQ(staging, idle);
+  EXPECT_NE(statusLine().find("off=0"), std::string::npos);
+
+  // Over-long and empty probes are inert; an unwired engine still answers.
+  std::vector<uint8_t> big(OTA_PING_MAX + 1, 1);
+  EXPECT_TRUE(feed(bodyFrame(OTA_OP_PING, big)).empty());
+  EXPECT_TRUE(feed(bodyFrame(OTA_OP_PING, {})).empty());
+  OtaUpdate naked;
+  std::vector<uint8_t> answer(OTA_PING_REPORT_MAX, 0);
+  size_t n = naked.onFrame(bodyFrame(OTA_OP_PING, payload).data(),
+                           3 + payload.size() + 2, answer.data(), answer.size());
+  EXPECT_EQ(n, 3 + payload.size() + 2);
+}
+
+TEST_F(OtaTest, LiteralZRefusesAnUnknownCodec) {
+  auto image = testImage(16);
+  auto comp = rawDeflate(image);
+  ASSERT_LE(comp.size(), (size_t)OTA_LZ_MAX_DATA);
+  arm(image);
+  uint8_t flags = OTA_LZ_START | OTA_LZ_END | (1u << OTA_LZ_CODEC_SHIFT);
+  feed(frame(OTA_OP_LITERAL_Z, 1, literalZBody(image.size(), comp.size(), flags, comp)));
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
+  EXPECT_NE(statusLine().find("err=9"), std::string::npos);   // OTA_ERR_COMPRESS
 }
 
 int main(int argc, char **argv) {

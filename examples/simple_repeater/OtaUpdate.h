@@ -78,8 +78,22 @@
 //   OP_LITERAL_Z   0x0D orig_len:u32 comp_len:u16 flags:u8 data[comp_len]
 //                              raw DEFLATE stream (no gzip wrapper), split
 //                              across ops; flags bit0 starts a stream, bit1
-//                              ends it. Decompressed bytes are appended to the
+//                              ends it, bits 2..4 select the codec (0 = raw
+//                              DEFLATE). Decompressed bytes are appended to the
 //                              staged image like OP_LITERAL.
+//   OP_STAGED_HASH 0x0E count:u8 (offset:u32 len:u32)[count]
+//                              read-only hash of the staged slot's written
+//                              bytes (any state). Same request/report layout
+//                              as OP_BLOCK_HASH; count=0 hashes the staged
+//                              prefix and reports its length in the size field.
+//   OP_STAGED_HASH_REPORT 0x0F   same layout as OP_BLOCK_HASH_REPORT
+//   OP_STATUS      0x10          structured session/status/capability query
+//   OP_STATUS_REPORT 0x11        identity block + session id + progress +
+//                              codec mask + a length-prefixed TLV extension
+//                              block. Answered in every state, like OP_INFO.
+//   OP_PING        0x12 payload[1..16]  echo the payload back over the same
+//                              REQ/RESPONSE path (any state, read-only)
+//   OP_PING_REPORT 0x13 payload[...]
 //
 // Stability contract (this is what lets the format live for years):
 //   - Unknown ops and unknown OP_INFO bodies are dropped silently.
@@ -101,9 +115,19 @@
 //     writes flash or changes the session; it is a read-only diff oracle. The
 //     app still SHA-256s the *new* image at OP_END, so a wrong diff can waste
 //     airtime but can never boot a wrong image.
+//   - OP_INFO_REPORT is frozen byte-for-byte: an app that expects exactly 79
+//     body bytes must keep working. Everything added after this firmware ships
+//     goes into OP_STATUS_REPORT instead, whose trailing TLV block is the
+//     forward-compatibility point ([tag:u8][len:u8][value...], ext_len=0 today).
+//     OP_STATUS_REPORT repeats the identity block at the same offsets, so an
+//     app can share one decoder between the two reports.
+//   - The session id in OP_STATUS_REPORT is minted at OP_START and zeroed on
+//     reset. An app that survives a phone restart can tell from it whether the
+//     repeater also restarted: same id = the staged bytes are still there.
 //   - New ops get new op codes; existing ops never change meaning, field
 //     order or size. The CRC algorithm, the magic bytes and the SEQ rules
-//     are frozen.
+//     are frozen. A new op is always optional: nodes that do not implement it
+//     drop it silently, and apps must fall back when a feature bit is clear.
 //   - The `frame_len` byte in the REQ says the exact OTA frame length that
 //     follows; the node requires frame_len <= payload_len - 2 and ignores
 //     any trailing padding.
@@ -167,9 +191,19 @@
 #define OTA_OP_BLOCK_FIND 0x0B
 #define OTA_OP_BLOCK_FIND_REPORT 0x0C
 #define OTA_OP_LITERAL_Z 0x0D
+#define OTA_OP_STAGED_HASH 0x0E
+#define OTA_OP_STAGED_HASH_REPORT 0x0F
+#define OTA_OP_STATUS     0x10
+#define OTA_OP_STATUS_REPORT 0x11
+#define OTA_OP_PING       0x12
+#define OTA_OP_PING_REPORT 0x13
 #define OTA_LZ_MAX_DATA  120           // ≤ the companion's 176-byte frame
 #define OTA_LZ_START     0x01
 #define OTA_LZ_END       0x02
+// Bits 2..4 of OP_LITERAL_Z.flags carry a codec id; 0 is raw DEFLATE, which is
+// the only codec this firmware implements. Other ids are refused at staging.
+#define OTA_LZ_CODEC_SHIFT 2
+#define OTA_LZ_CODEC_MASK  0x1C
 
 #define OTA_MAGIC0     0x4F          // 'O'
 #define OTA_MAGIC1     0x54          // 'T'
@@ -178,10 +212,23 @@
 // previously-defined fields in the same positions.
 #define OTA_WIRE_VERSION   1
 
-// feature bits reported in OP_INFO_REPORT.features (rest reserved, must be 0)
+// feature bits reported in OP_INFO_REPORT.features and OP_STATUS_REPORT
+// (rest reserved, must be 0 so an old app ignores what it does not know)
 #define OTA_FEAT_DELTA     0x00000001   // OP_COPY is implemented
 #define OTA_FEAT_APPLY     0x00000002   // apply/rollback is implemented (dual app slot)
 #define OTA_FEAT_BLOCK_HASH 0x00000004  // OP_BLOCK_HASH is implemented
+#define OTA_FEAT_STAGED_HASH 0x00000008  // OP_STAGED_HASH is implemented
+#define OTA_FEAT_STATUS    0x00000010   // OP_STATUS_REPORT is implemented
+#define OTA_FEAT_PING      0x00000020   // OP_PING is implemented
+
+// OP_STATUS_REPORT.state values (same order as OtaUpdate::State).
+#define OTA_STATE_IDLE        0
+#define OTA_STATE_STAGING     1
+#define OTA_STATE_READY       2
+#define OTA_STATE_ERROR       3
+#define OTA_STATE_UNSUPPORTED 4
+// Bit in OP_STATUS_REPORT.codecs: raw DEFLATE via OP_LITERAL_Z.
+#define OTA_CODEC_DEFLATE  0x01
 
 // OP_INFO_REPORT body size (before the OTA frame envelope: magic + op + crc)
 #define OTA_INFO_BODY      79           // wire_ver(1) + target(4) + slot(4) + max_literal(2) + features(4) + ver[32] + running sha256[32]
@@ -193,6 +240,25 @@
 static_assert(OTA_INFO_RUNNING_VER_OFF == 1 + 4 + 4 + 2 + 4, "OP_INFO_REPORT field order");
 static_assert(OTA_INFO_RUNNING_SHA_OFF == OTA_INFO_RUNNING_VER_OFF + 32, "OP_INFO_REPORT field order");
 static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT field order");
+// OP_STATUS_REPORT: the frozen identity block above, then session/progress
+// fields and a reserved TLV block. Written as fixed offsets so a new field is
+// an append, never an insertion into the identity block.
+#define OTA_STATUS_SESSION_OFF   (OTA_INFO_BODY)
+#define OTA_STATUS_STATE_OFF     (OTA_STATUS_SESSION_OFF + 4)
+#define OTA_STATUS_ERR_OFF       (OTA_STATUS_STATE_OFF + 1)
+#define OTA_STATUS_SIZE_OFF      (OTA_STATUS_ERR_OFF + 1)
+#define OTA_STATUS_WRITTEN_OFF   (OTA_STATUS_SIZE_OFF + 4)
+#define OTA_STATUS_EXPECT_OFF    (OTA_STATUS_WRITTEN_OFF + 4)
+#define OTA_STATUS_CODECS_OFF    (OTA_STATUS_EXPECT_OFF + 2)
+#define OTA_STATUS_EXT_LEN_OFF   (OTA_STATUS_CODECS_OFF + 1)
+#define OTA_STATUS_BODY_FIXED    (OTA_STATUS_EXT_LEN_OFF + 2)
+#define OTA_STATUS_MAX_EXT       32
+#define OTA_STATUS_REPORT_LEN    (3 + OTA_STATUS_BODY_FIXED + 2)
+#define OTA_STATUS_REPORT_MAX    (3 + OTA_STATUS_BODY_FIXED + OTA_STATUS_MAX_EXT + 2)
+static_assert(OTA_STATUS_BODY_FIXED == 98, "OP_STATUS_REPORT field order");
+// OP_PING echoes at most this many bytes; its report is the payload + envelope.
+#define OTA_PING_MAX  16
+#define OTA_PING_REPORT_MAX (3 + OTA_PING_MAX + 2)
 // OP_BLOCK_HASH: one request may carry up to OTA_HASH_MAX_RANGES ranges; the
 // report echoes up to that many hashes. count=0 is the metadata query: it
 // returns the running image's size, its ESP segment table and its whole-image
@@ -213,8 +279,8 @@ static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT fi
 #define OTA_HASH_REPORT_MAX   (OTA_HASH_META_LEN > OTA_HASH_RANGE_LEN(OTA_HASH_MAX_RANGES) \
                                ? OTA_HASH_META_LEN : OTA_HASH_RANGE_LEN(OTA_HASH_MAX_RANGES))
 // largest report frame the engine ever returns
-#define OTA_REPORT_MAX     (OTA_INFO_REPORT_LEN > OTA_HASH_REPORT_MAX \
-                            ? OTA_INFO_REPORT_LEN : OTA_HASH_REPORT_MAX)
+#define OTA_REPORT_BASE ((OTA_INFO_REPORT_LEN > OTA_HASH_REPORT_MAX) ? OTA_INFO_REPORT_LEN : OTA_HASH_REPORT_MAX)
+#define OTA_REPORT_MAX ((OTA_REPORT_BASE > OTA_STATUS_REPORT_MAX) ? OTA_REPORT_BASE : OTA_STATUS_REPORT_MAX)
 
 // OTA frames carrying an op: magic(2) + op(1) + seq(2) + body + crc16(2).
 // ASK/REPORT/INFO*/NOP carry no seq.
@@ -337,6 +403,9 @@ private:
   uint8_t _err = OTA_ERR_NONE;
   PendingArm _pending;
   uint16_t _expect = 1;                     // next seq to apply (OP_START = 0)
+  // Random per-arm id reported by OP_STATUS: lets an app tell a phone restart
+  // (same session still staged) from a repeater restart (staged bytes orphaned).
+  uint32_t _session_id = 0;
   uint32_t _size = 0, _written = 0;
   uint8_t _expected_sha[32] = {0};
 
@@ -367,9 +436,19 @@ private:
   // Build the OP_INFO_REPORT frame (magic..CRC) into `out`. Works in every
   // state — it is the negotiation handshake an app performs before arming.
   size_t buildInfoReport(uint8_t* out);
-  // Build an OP_BLOCK_HASH_REPORT for a metadata query (count=0) or a range
-  // query. Read-only: never touches the session state or flash writes.
+  // The frozen 79-byte identity block shared by INFO_REPORT and STATUS_REPORT.
+  void writeIdentity(uint8_t* p, uint32_t feature_bits);
+  // Feature bits advertised by both reports (zero on platforms with no slot).
+  uint32_t features() const;
+  // Structured status/capability report. Also answered in every state.
+  size_t buildStatusReport(uint8_t* out);
+  // Build a running-image or staged-slot hash report with one shared encoder;
+  // the two ops differ only in which slot they read and which op they answer.
+  // Read-only: never touches the session state or flash writes.
+  size_t buildHashReport(bool staged, uint8_t report_op,
+                         const uint8_t* body, uint16_t body_len, uint8_t* out);
   size_t buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
+  size_t buildStagedHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
   // Locate 4-byte-aligned blocks of the running image by their 64-bit rolling
   // fingerprints. This recovers matches after an edit shifts every byte.
   size_t buildFindReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
