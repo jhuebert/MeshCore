@@ -547,9 +547,18 @@ size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_
   // and compare every fingerprint at each offset; this keeps a 12-block query
   // to one flash scan.
   static const uint64_t kPrime = 0x00000100000001B3ull;
+  // One esp_partition_read per 4-byte step costs ~60 ms/KB on ESP32 and made
+  // a 128 KB query miss the client's 10 s timeout. Refill a read-ahead buffer
+  // in bulk; the rolling window itself stays circular in RAM.
+  constexpr uint32_t kReadChunk = 1024;    // multiple of OTA_HASH_ALIGN
   uint8_t* buf = (uint8_t*)malloc(len);
-  if (buf == nullptr) return 0;
-  if (!slotRead(_io, false, start, buf, len)) { free(buf); return 0; }
+  uint8_t* ahead = (uint8_t*)malloc(kReadChunk);
+  if (buf == nullptr || ahead == nullptr) {
+    free(buf); free(ahead); return 0;
+  }
+  if (!slotRead(_io, false, start, buf, len)) {
+    free(buf); free(ahead); return 0;
+  }
   uint64_t h = 0;
   for (uint32_t i = 0; i < len; i++) h = h * kPrime + buf[i];
   uint64_t pow = 1, base = kPrime;
@@ -559,8 +568,11 @@ size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_
   }
 
   // Circular window: each step overwrites the four oldest bytes, so sliding
-  // costs four writes instead of shifting the whole block.
+  // costs four writes instead of shifting the whole block. Incoming bytes are
+  // served from the read-ahead buffer, refilled a chunk at a time.
   uint32_t head = 0;
+  uint32_t aheadPos = 0, aheadLen = 0;
+  uint32_t nextRead = start + len;
   for (uint32_t off = start; off + len <= end && remaining > 0;
        off += OTA_HASH_ALIGN) {
     for (uint8_t i = 0; i < count; i++) {
@@ -570,15 +582,27 @@ size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_
       if (++rec[0] == OTA_FIND_HITS_PER) remaining--;
     }
     if (remaining == 0 || off + OTA_HASH_ALIGN + len > end) break;
-    uint8_t in[OTA_HASH_ALIGN];
-    if (!slotRead(_io, false, off + len, in, sizeof(in))) break;
+    bool refilled = true;
     for (uint8_t k = 0; k < OTA_HASH_ALIGN; k++) {
-      h = (h - (uint64_t)buf[head] * pow) * kPrime + in[k];
-      buf[head] = in[k];
+      if (aheadPos == aheadLen) {
+        uint32_t avail = end - nextRead;
+        if (avail < OTA_HASH_ALIGN) { refilled = false; break; }
+        uint32_t want = avail > kReadChunk ? kReadChunk : avail;
+        if (!slotRead(_io, false, nextRead, ahead, want)) {
+          refilled = false; break;
+        }
+        aheadLen = want;
+        aheadPos = 0;
+        nextRead += want;
+      }
+      uint8_t b = ahead[aheadPos++];
+      h = (h - (uint64_t)buf[head] * pow) * kPrime + b;
+      buf[head] = b;
       if (++head == len) head = 0;
     }
+    if (!refilled) break;
   }
-  free(buf);
+  free(buf); free(ahead);
 
   uint8_t* w = out + 4;
   for (uint8_t i = 0; i < count; i++) {

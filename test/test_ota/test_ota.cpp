@@ -894,6 +894,42 @@ TEST_F(OtaTest, BlockFindRejectsBadRangesWithoutDisturbingStaging) {
   EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
 }
 
+TEST_F(OtaTest, BlockFindSpanningManyReadChunksFindsEveryFingerprint) {
+  // The bulk read-ahead refills every 1 KB; make the scan cross dozens of
+  // chunks so an off-by-one in the refill path cannot hide in a small image.
+  const uint32_t seg_len = 64 * 1024;
+  std::vector<uint8_t> img(24 + 8 + seg_len, 0);
+  img[0] = 0xE9;
+  img[1] = 1;
+  img[0x0c] = 9;
+  img[0x17] = 1;                            // hash_appended
+  img[24 + 4] = (uint8_t)(seg_len & 0xFF);
+  img[24 + 5] = (uint8_t)((seg_len >> 8) & 0xFF);
+  img[24 + 6] = (uint8_t)((seg_len >> 16) & 0xFF);
+  uint32_t rng = 0x12345678;
+  for (uint32_t k = 0; k < seg_len; k++) {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    img[24 + 8 + k] = (uint8_t)rng;
+  }
+  img.resize((img.size() + 1 + 15) & ~(size_t)15);
+  uint8_t digest[32];
+  mockSha256(img, digest);
+  img.insert(img.end(), digest, digest + 32);
+  std::copy(img.begin(), img.end(), slot.source.begin());
+
+  const uint32_t offsets[] = {0, 4096, 12288, 32768, 57344};
+  std::vector<uint64_t> wants;
+  for (auto o : offsets) wants.push_back(rollingTest(img, o, 32));
+  auto report = feed(findFrame(32, 0, (uint32_t)img.size(), wants));
+  ASSERT_FALSE(report.empty());
+  ASSERT_EQ(report[2], OTA_OP_BLOCK_FIND_REPORT);
+  for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+    auto hits = findHits(report, i);
+    EXPECT_TRUE(std::find(hits.begin(), hits.end(), (int)offsets[i]) != hits.end())
+        << "fingerprint at " << offsets[i] << " not found";
+  }
+}
+
 TEST_F(OtaTest, BlockHashWithoutAnImageReportsZeroSize) {
   // FakeSlotIo starts as erase fill, which is not an ESP app image.
   auto report = feed(hashFrame({}));
