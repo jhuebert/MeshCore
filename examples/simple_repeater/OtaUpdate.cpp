@@ -14,7 +14,7 @@
 // ROM (zero flash cost); native tests use the host's zlib. Both consume the
 // same raw DEFLATE bytes produced by the app.
 #if defined(ESP32)
-#include <esp_rom/miniz.h>
+#include <rom/miniz.h>
 struct ZInflater {
   tinfl_decompressor d;
   uint8_t* scratch;
@@ -54,7 +54,7 @@ static ZInflater* zInit() {
 
 static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
                   uint8_t* scratch, size_t scratch_cap, bool more,
-                  bool* done, ZEmit emit, void* ctx) {
+                  ZEmit emit, void* ctx) {
 #if defined(ESP32)
   size_t in_left = in_len;
   uint8_t* const base = scratch;
@@ -67,7 +67,7 @@ static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
     if (st < TINFL_STATUS_DONE) return false;
     const size_t produced = scratch_cap - out_left;
     if (produced > 0 && !emit(ctx, scratch, produced)) return false;
-    if (st == TINFL_STATUS_DONE) { z->done = true; *done = true; break; }
+    if (st == TINFL_STATUS_DONE) { z->done = true; break; }
     if (in_left == in_before && produced == 0) break;
   }
   return true;
@@ -81,7 +81,7 @@ static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
     if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) return false;
     const size_t produced = scratch_cap - z->s.avail_out;
     if (produced > 0 && !emit(ctx, scratch, produced)) return false;
-    if (rc == Z_STREAM_END) { z->done = true; *done = true; break; }
+    if (rc == Z_STREAM_END) { z->done = true; break; }
     if (z->s.avail_in == 0) break;
     if (produced == 0) break;
   }
@@ -110,6 +110,11 @@ static void zFree(ZInflater* z) {
 
 #define OTA_USAGE "Usage: ota [status|stage <size> <sha256> <ver>|apply|abort|rollback]"
 
+// All fixed CLI replies go through one snprintf call.
+static void cliSay(char* reply, const char* text) {
+  snprintf(reply, CLI_REPLY_MAX, "%s", text);
+}
+
 static uint16_t le16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
 static uint32_t le32(const uint8_t* p) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -132,6 +137,13 @@ static size_t sealFrame(uint8_t* out, size_t payload_len) {
   out[payload_len] = (uint8_t)(crc & 0xFF);
   out[payload_len + 1] = (uint8_t)(crc >> 8);
   return payload_len + 2;
+}
+
+// Start an outgoing frame: magic + op code, ready for its body and sealFrame().
+static void frameHeader(uint8_t* out, uint8_t op) {
+  out[0] = OTA_MAGIC0;
+  out[1] = OTA_MAGIC1;
+  out[2] = op;
 }
 
 // ------------------------------------------------------------------ slot io
@@ -394,26 +406,23 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
   }
 
   // OP_INFO_REPORT body: wire_ver(1) target(4) slot(4) max_literal(2) features(4)
-  //                      ver[32] sha256[32]
-  uint8_t p[OTA_INFO_BODY];
-  memset(p, 0, sizeof(p));
-  uint8_t* q = p;
-  *q++ = OTA_WIRE_VERSION;
-  q = putLe32(q, ownTargetId());
-  q = putLe32(q, slot);
-  q = putLe16(q, OTA_MAX_LITERAL);
-  putLe32(q, features);
-  memcpy(&p[OTA_INFO_RUNNING_VER_OFF], _version, strlen(_version) > 31 ? 31 : strlen(_version));
+  //                      ver[32] sha256[32]. Written straight into the reply.
+  uint8_t* p = out + 3;
+  memset(p, 0, OTA_INFO_BODY);
+  p[0] = OTA_WIRE_VERSION;
+  putLe32(p + 1, ownTargetId());
+  putLe32(p + 5, slot);
+  putLe16(p + 9, OTA_MAX_LITERAL);
+  putLe32(p + 11, features);
+  const size_t vlen = strlen(_version);
+  memcpy(p + OTA_INFO_RUNNING_VER_OFF, _version, vlen > 31 ? 31 : vlen);
   if (_io != nullptr) {
     ensureRunningSha();
-    memcpy(&p[OTA_INFO_RUNNING_SHA_OFF], _running_sha, 32);
+    memcpy(p + OTA_INFO_RUNNING_SHA_OFF, _running_sha, 32);
   }
 
-  out[0] = OTA_MAGIC0;
-  out[1] = OTA_MAGIC1;
-  out[2] = OTA_OP_INFO_REPORT;
-  memcpy(out + 3, p, sizeof(p));
-  return sealFrame(out, 3 + sizeof(p));
+  frameHeader(out, OTA_OP_INFO_REPORT);
+  return sealFrame(out, 3 + OTA_INFO_BODY);
 }
 
 uint32_t OtaUpdate::ensureRunningLength() {
@@ -428,9 +437,14 @@ uint32_t OtaUpdate::ensureRunningLength() {
 size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
   if (body == nullptr || body_len < 1 || out == nullptr) return 0;
   const uint8_t count = body[0];
+  // Reject malformed queries before touching the reply buffer.
+  if (count == 0 ? body_len != 1
+                 : count > OTA_HASH_MAX_RANGES || body_len != (uint16_t)(1 + 8 * count)) {
+    return 0;
+  }
   const uint32_t running_len = ensureRunningLength();
-  uint8_t p[OTA_HASH_RANGE_BODY(OTA_HASH_MAX_RANGES)];
-  memset(p, 0, sizeof(p));
+  uint8_t* p = out + 3;
+  memset(p, 0, OTA_HASH_RANGE_BODY(OTA_HASH_MAX_RANGES));
   putLe32(p, running_len);
   p[4] = count;
 
@@ -438,7 +452,6 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
     // Metadata query: fixed segment table (six slots, unused ones zero) plus
     // the whole-image hash. One round trip gives the app everything it needs
     // to align segments and detect an identical image.
-    if (body_len != 1) return 0;
     uint8_t seg_count = 0;
     if (_io != nullptr && running_len > 0) {
       uint8_t h[24];
@@ -462,15 +475,11 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
     }
     p[5] = seg_count;             // p[4] stays count == 0 (metadata marker)
     ensureRunningSha();
-    memcpy(&p[6 + OTA_HASH_MAX_SEGS * 8], _running_sha, OTA_HASH_LEN);
-    out[0] = OTA_MAGIC0;
-    out[1] = OTA_MAGIC1;
-    out[2] = OTA_OP_BLOCK_HASH_REPORT;
-    memcpy(out + 3, p, OTA_HASH_META_BODY);
+    memcpy(p + 6 + OTA_HASH_MAX_SEGS * 8, _running_sha, OTA_HASH_LEN);
+    frameHeader(out, OTA_OP_BLOCK_HASH_REPORT);
     return sealFrame(out, 3 + OTA_HASH_META_BODY);
   }
 
-  if (count > OTA_HASH_MAX_RANGES || body_len != (uint16_t)(1 + 8 * count)) return 0;
   for (uint8_t i = 0; i < count; i++) {
     const uint8_t* r = body + 1 + i * 8;
     const uint32_t off = le32(r);
@@ -495,10 +504,7 @@ size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, u
     }
     dst[4] = status;
   }
-  out[0] = OTA_MAGIC0;
-  out[1] = OTA_MAGIC1;
-  out[2] = OTA_OP_BLOCK_HASH_REPORT;
-  memcpy(out + 3, p, OTA_HASH_RANGE_BODY(count));
+  frameHeader(out, OTA_OP_BLOCK_HASH_REPORT);
   return sealFrame(out, 3 + OTA_HASH_RANGE_BODY(count));
 }
 
@@ -516,14 +522,18 @@ size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_
       start > end || end > running_len) return 0;
 
   uint64_t want[OTA_FIND_MAX_BLOCKS];
-  uint8_t hit_count[OTA_FIND_MAX_BLOCKS];
-  uint32_t hits[OTA_FIND_MAX_BLOCKS][OTA_FIND_HITS_PER];
   for (uint8_t i = 0; i < count; i++) {
     const uint8_t* p = body + 13 + i * 8;
     want[i] = (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
-    hit_count[i] = 0;
-    memset(hits[i], 0, sizeof(hits[i]));
   }
+
+  // Each block gets a fixed 1+hits*4 record in the reply buffer; the scan
+  // fills the offsets in place and a final pass compacts away unused slots.
+  // No separate hit-count, hit-offset or report buffers are needed.
+  constexpr size_t record = 1 + OTA_FIND_HITS_PER * 4;
+  uint8_t* slot = out + 4;
+  memset(slot, 0, count * record);
+  uint8_t remaining = count;
 
   // Same polynomial as the app's delta matcher. Slide once across the window
   // and compare every fingerprint at each offset; this keeps a 12-block query
@@ -534,44 +544,45 @@ size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_
   if (!slotRead(_io, false, start, buf, len)) { free(buf); return 0; }
   uint64_t h = 0;
   for (uint32_t i = 0; i < len; i++) h = h * kPrime + buf[i];
-  uint64_t pow = 1;
-  for (uint32_t i = 1; i < len; i++) pow *= kPrime;   // P^(len-1), mod 2^64
+  uint64_t pow = 1, base = kPrime;
+  for (uint32_t e = len - 1; e; e >>= 1) {   // P^(len-1), mod 2^64
+    if (e & 1) pow *= base;
+    base *= base;
+  }
 
-  uint8_t remaining = count;
+  // Circular window: each step overwrites the four oldest bytes, so sliding
+  // costs four writes instead of shifting the whole block.
+  uint32_t head = 0;
   for (uint32_t off = start; off + len <= end && remaining > 0;
        off += OTA_HASH_ALIGN) {
     for (uint8_t i = 0; i < count; i++) {
-      if (h != want[i] || hit_count[i] >= OTA_FIND_HITS_PER) continue;
-      hits[i][hit_count[i]++] = off;
-      if (hit_count[i] == OTA_FIND_HITS_PER) remaining--;
+      uint8_t* rec = slot + i * record;
+      if (h != want[i] || rec[0] >= OTA_FIND_HITS_PER) continue;
+      putLe32(rec + 1 + 4 * rec[0], off);
+      if (++rec[0] == OTA_FIND_HITS_PER) remaining--;
     }
     if (remaining == 0 || off + OTA_HASH_ALIGN + len > end) break;
     uint8_t in[OTA_HASH_ALIGN];
     if (!slotRead(_io, false, off + len, in, sizeof(in))) break;
     for (uint8_t k = 0; k < OTA_HASH_ALIGN; k++) {
-      h = (h - (uint64_t)buf[k] * pow) * kPrime + in[k];
+      h = (h - (uint64_t)buf[head] * pow) * kPrime + in[k];
+      buf[head] = in[k];
+      if (++head == len) head = 0;
     }
-    memmove(buf, buf + OTA_HASH_ALIGN, len - OTA_HASH_ALIGN);
-    memcpy(buf + len - OTA_HASH_ALIGN, in, OTA_HASH_ALIGN);
   }
   free(buf);
 
-  uint8_t p[1 + OTA_FIND_MAX_BLOCKS * (1 + OTA_FIND_HITS_PER * 4)];
-  memset(p, 0, sizeof(p));
-  size_t used = 0;
-  p[used++] = count;
+  uint8_t* w = out + 4;
   for (uint8_t i = 0; i < count; i++) {
-    p[used++] = hit_count[i];
-    for (uint8_t j = 0; j < hit_count[i]; j++) {
-      putLe32(p + used, hits[i][j]);
-      used += 4;
-    }
+    const uint8_t* r = slot + i * record;
+    const uint8_t hits = r[0];   // the memmove below can overwrite r[0]
+    *w++ = hits;
+    memmove(w, r + 1, 4 * hits);  // w never runs past r: in-place compaction
+    w += 4 * hits;
   }
-  out[0] = OTA_MAGIC0;
-  out[1] = OTA_MAGIC1;
-  out[2] = OTA_OP_BLOCK_FIND_REPORT;
-  memcpy(out + 3, p, used);
-  return sealFrame(out, 3 + used);
+  out[3] = count;
+  frameHeader(out, OTA_OP_BLOCK_FIND_REPORT);
+  return sealFrame(out, (size_t)(w - out));
 }
 
 size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, size_t report_cap) {
@@ -594,13 +605,12 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
   // Read-only diff oracle: answered in every state, like OP_INFO, and never
   // touches the session or flash writes. Body is count + ranges (or just the
   // count byte for the metadata query).
-  if (op == OTA_OP_BLOCK_HASH) {
-    if (report_out == nullptr || report_cap < OTA_HASH_REPORT_MAX) return 0;
-    return buildBlockHashReport(frame + 3, (uint16_t)(n - 5), report_out);
-  }
-  if (op == OTA_OP_BLOCK_FIND) {
-    if (report_out == nullptr || report_cap < OTA_FIND_REPORT_MAX) return 0;
-    return buildFindReport(frame + 3, (uint16_t)(n - 5), report_out);
+  if (op == OTA_OP_BLOCK_HASH || op == OTA_OP_BLOCK_FIND) {
+    const size_t need = op == OTA_OP_BLOCK_HASH ? OTA_HASH_REPORT_MAX : OTA_FIND_REPORT_MAX;
+    if (report_out == nullptr || report_cap < need) return 0;
+    return op == OTA_OP_BLOCK_HASH
+        ? buildBlockHashReport(frame + 3, (uint16_t)(n - 5), report_out)
+        : buildFindReport(frame + 3, (uint16_t)(n - 5), report_out);
   }
 
   if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT) return 0;
@@ -775,16 +785,15 @@ void OtaUpdate::applyLiteralZ(const uint8_t* body, uint16_t body_len) {
   if (dlen > _zin_comp_left) { abortStaging(OTA_ERR_BOUNDS); return; }
 
   auto* z = static_cast<ZInflater*>(_inflater);
-  bool done = z->done;
   if (!zFeed(z, body + 7, dlen, z->scratch, 32768,
              (flags & OTA_LZ_END) == 0 && dlen < _zin_comp_left,
-             &done, zEmit, this)) {
+             zEmit, this)) {
     abortStaging(OTA_ERR_COMPRESS);
     return;
   }
   _zin_comp_left -= dlen;
   if ((flags & OTA_LZ_END) != 0) {
-    if (!done || _zin_comp_left != 0 ||
+    if (!z->done || _zin_comp_left != 0 ||
         _written - _zin_stream_start != _zin_orig_total) {
       abortStaging(OTA_ERR_COMPRESS);
       return;
@@ -794,15 +803,14 @@ void OtaUpdate::applyLiteralZ(const uint8_t* body, uint16_t body_len) {
 }
 
 void OtaUpdate::sendReport(uint8_t* out) {
-  out[0] = OTA_MAGIC0;
-  out[1] = OTA_MAGIC1;
-  out[2] = OTA_OP_REPORT;
+  frameHeader(out, OTA_OP_REPORT);
   putLe16(out + 3, _expect);
   sealFrame(out, 5);
 }
 
 bool OtaUpdate::sendHealthProbe() {
-  uint8_t p[OTA_HEALTH_LEN] = {OTA_MAGIC0, OTA_MAGIC1, OTA_OP_NOP};
+  uint8_t p[OTA_HEALTH_LEN];
+  frameHeader(p, OTA_OP_NOP);
   putLe16(p + 3, _health_nonce);
   sealFrame(p, OTA_HEALTH_LEN - 2);
   return _send != nullptr && _send(_send_ctx, p, sizeof(p));
@@ -954,25 +962,26 @@ void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
   const char* state_name = _state == State::Staging ? "staging"
       : _state == State::Ready ? "ready"
       : _state == State::Error ? "error" : "idle";
-  char sha16[17];
-  for (int i = 0; i < 8; i++) snprintf(sha16 + i * 2, 3, "%02x", _running_sha[i]);
-  sha16[16] = 0;
-  snprintf(reply, reply_size, "running=%s sha=%s state=%s size=%lu off=%lu err=%u",
-           _version, sha16, state_name, (unsigned long)_size, (unsigned long)_written, (unsigned)_err);
+  snprintf(reply, reply_size,
+           "running=%s sha=%02x%02x%02x%02x%02x%02x%02x%02x"
+           " state=%s size=%lu off=%lu err=%u",
+           _version, _running_sha[0], _running_sha[1], _running_sha[2], _running_sha[3],
+           _running_sha[4], _running_sha[5], _running_sha[6], _running_sha[7],
+           state_name, (unsigned long)_size, (unsigned long)_written, (unsigned)_err);
 }
 
 bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const char* ver_tok, char* reply) {
   if (_io == nullptr) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - OTA unsupported on this platform");
+    cliSay(reply, "Err - OTA unsupported on this platform");
     return false;
   }
   if (_gate != nullptr && _gate->isSuspended()) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - battery gate active; staging refused");
+    cliSay(reply, "Err - battery gate active; staging refused");
     return false;
   }
   long size;
   if (!parseIntRange(size_tok, 1, 0x7FFFFFFFL, &size)) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - size must be 1..2147483647");
+    cliSay(reply, "Err - size must be 1..2147483647");
     return false;
   }
   if ((uint32_t)size > _io->slotSize()) {
@@ -984,15 +993,15 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
   }
   uint8_t sha[32];
   if (sha_tok == nullptr || strlen(sha_tok) != 64 || !mesh::Utils::fromHex(sha, 32, sha_tok)) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - sha256 must be 64 hex chars");
+    cliSay(reply, "Err - sha256 must be 64 hex chars");
     return false;
   }
   if (ver_tok == nullptr || strlen(ver_tok) == 0 || strlen(ver_tok) > 63) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - ver must be 1..63 bytes");
+    cliSay(reply, "Err - ver must be 1..63 bytes");
     return false;
   }
   if (_rng == nullptr) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - rng unavailable");
+    cliSay(reply, "Err - rng unavailable");
     return false;
   }
 
@@ -1012,36 +1021,36 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
 
 bool OtaUpdate::applyCommand(char* reply) {
   if (_state != State::Ready) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - no verified staging (see ota status)");
+    cliSay(reply, "Err - no verified staging (see ota status)");
     return false;
   }
   if (!writePend()) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - could not arm boot health marker");
+    cliSay(reply, "Err - could not arm boot health marker");
     return false;
   }
   if (!flipAndReboot(_io, _board)) {
     deletePend();   // nothing booted: the marker would only owe a phantom verdict
-    snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
+    cliSay(reply, "Err - could not set boot partition");
     return false;
   }
-  snprintf(reply, CLI_REPLY_MAX, "OK - applied; rebooting");
+  cliSay(reply, "OK - applied; rebooting");
   return true;
 }
 
 bool OtaUpdate::abortCommand(char* reply) {
   resetSession();
   clearPending();
-  snprintf(reply, CLI_REPLY_MAX, "OK - aborted");
+  cliSay(reply, "OK - aborted");
   return true;
 }
 
 bool OtaUpdate::rollbackCommand(char* reply) {
   deletePend();                       // no health check pending on the other image
   if (!flipAndReboot(_io, _board)) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - could not set boot partition");
+    cliSay(reply, "Err - could not set boot partition");
     return false;
   }
-  snprintf(reply, CLI_REPLY_MAX, "OK - rolling back; rebooting");
+  cliSay(reply, "OK - rolling back; rebooting");
   return true;
 }
 
@@ -1065,7 +1074,7 @@ void otaCLI(OtaUpdate& ota, const char* sub, char* reply) {
     char* sha_tok = nextToken(&p);
     char* ver_tok = nextToken(&p);
     if (size_tok == nullptr || sha_tok == nullptr || ver_tok == nullptr || nextToken(&p) != nullptr) {
-      snprintf(reply, CLI_REPLY_MAX, "%s", OTA_USAGE);
+      cliSay(reply, OTA_USAGE);
       return;
     }
     ota.stageCommand(size_tok, sha_tok, ver_tok, reply);
@@ -1083,5 +1092,5 @@ void otaCLI(OtaUpdate& ota, const char* sub, char* reply) {
     if (cliNoExtra(p, reply, OTA_USAGE)) ota.rollbackCommand(reply);
     return;
   }
-  snprintf(reply, CLI_REPLY_MAX, "%s", OTA_USAGE);
+  cliSay(reply, OTA_USAGE);
 }
