@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <zlib.h>
+
 #include <Arduino.h>      // g_mock_millis (NativeShim.h is force-included first)
 #include <SHA256.h>       // test mock (deterministic, non-cryptographic)
 #include <Utils.h>        // mesh::Utils::sha256 for expected digests (mock)
@@ -664,6 +666,91 @@ static uint8_t hashStatus(const std::vector<uint8_t>& report, size_t i) {
 
 static const uint8_t* hashDigest(const std::vector<uint8_t>& report, size_t i) {
   return report.data() + 3 + 5 + i * (4 + 1 + OTA_HASH_LEN) + 5;
+}
+
+static std::vector<uint8_t> rawDeflate(const std::vector<uint8_t>& data) {
+  z_stream z;
+  memset(&z, 0, sizeof(z));
+  deflateInit2(&z, 9, Z_DEFLATED, -15, 9, Z_DEFAULT_STRATEGY);
+  z.next_in = const_cast<Bytef*>(data.data());
+  z.avail_in = data.size();
+  std::vector<uint8_t> out(data.size() + 1024);
+  z.next_out = out.data();
+  z.avail_out = out.size();
+  deflate(&z, Z_FINISH);
+  size_t n = out.size() - z.avail_out;
+  deflateEnd(&z);
+  out.resize(n);
+  return out;
+}
+
+static std::vector<uint8_t> literalZBody(uint32_t orig_len, uint16_t comp_total,
+                                         uint8_t flags,
+                                         const std::vector<uint8_t>& chunk) {
+  std::vector<uint8_t> body;
+  for (int i = 0; i < 4; i++) body.push_back((uint8_t)(orig_len >> (8 * i)));
+  body.push_back((uint8_t)(comp_total & 0xFF));
+  body.push_back((uint8_t)(comp_total >> 8));
+  body.push_back(flags);
+  body.insert(body.end(), chunk.begin(), chunk.end());
+  return body;
+}
+
+TEST_F(OtaTest, CompressedLiteralOpsRebuildTheImage) {
+  // A pseudo-random image whose deflate stream is larger than one op frame.
+  std::vector<uint8_t> image(8192);
+  uint32_t x = 0x12345678;
+  for (size_t i = 0; i < image.size(); i++) {
+    x = x * 1664525u + 1013904223u;
+    image[i] = (uint8_t)(x >> 24);
+  }
+  auto comp = rawDeflate(image);
+  ASSERT_GT(comp.size(), (size_t)OTA_LZ_MAX_DATA);
+
+  uint16_t seq = 1;
+  size_t at = 0;
+  while (at < comp.size()) {
+    size_t n = comp.size() - at;
+    if (n > OTA_LZ_MAX_DATA) n = OTA_LZ_MAX_DATA;
+    uint8_t flags = (at == 0 ? OTA_LZ_START : 0) |
+                    (at + n == comp.size() ? OTA_LZ_END : 0);
+    std::vector<uint8_t> chunk(comp.begin() + at, comp.begin() + at + n);
+    feed(frame(OTA_OP_LITERAL_Z, seq++,
+               literalZBody(image.size(), comp.size(), flags, chunk)));
+    at += n;
+  }
+  // The ops above were sent without an arm; verify the framing is inert, then
+  // run the same stream inside a real staged session.
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
+
+  arm(image);
+  seq = 1;
+  at = 0;
+  while (at < comp.size()) {
+    size_t n = comp.size() - at;
+    if (n > OTA_LZ_MAX_DATA) n = OTA_LZ_MAX_DATA;
+    uint8_t flags = (at == 0 ? OTA_LZ_START : 0) |
+                    (at + n == comp.size() ? OTA_LZ_END : 0);
+    std::vector<uint8_t> chunk(comp.begin() + at, comp.begin() + at + n);
+    feed(frame(OTA_OP_LITERAL_Z, seq++,
+               literalZBody(image.size(), comp.size(), flags, chunk)));
+    at += n;
+  }
+  sendEnd(seq);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+  EXPECT_EQ(slot.staged, image);
+}
+
+TEST_F(OtaTest, CompressedLiteralStreamWithMissingEndFailsStaging) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  auto comp = rawDeflate(image);
+  arm(image);
+  std::vector<uint8_t> chunk(comp.begin(), comp.end());
+  feed(frame(OTA_OP_LITERAL_Z, 1,
+             literalZBody(image.size(), comp.size(), OTA_LZ_START, chunk)));
+  // No END flag and then OP_END: the unfinished stream must be refused.
+  sendEnd(2);
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
 }
 
 TEST_F(OtaTest, BlockHashMetadataReportsSizeSegmentsAndWholeHash) {

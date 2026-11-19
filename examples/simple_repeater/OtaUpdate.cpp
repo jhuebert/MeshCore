@@ -9,6 +9,95 @@
 #include <Arduino.h>
 #include <stdlib.h>
 #include <SHA256.h>
+
+// Streaming raw-DEFLATE decompressor. ESP32 uses the miniz implementation in
+// ROM (zero flash cost); native tests use the host's zlib. Both consume the
+// same raw DEFLATE bytes produced by the app.
+#if defined(ESP32)
+#include <esp_rom/miniz.h>
+struct ZInflater {
+  tinfl_decompressor d;
+  uint8_t* scratch;
+  bool done = false;
+};
+#else
+#include <zlib.h>
+struct ZInflater {
+  z_stream s;
+  uint8_t* scratch;
+  bool started = false;
+  bool done = false;
+};
+#endif
+
+typedef bool (*ZEmit)(void* ctx, const uint8_t* data, size_t len);
+
+static ZInflater* zInit() {
+  auto* z = new ZInflater();
+  if (z == nullptr) return nullptr;
+  // A DEFLATE window is up to 32 KB; both decoders need that much scratch.
+  z->scratch = (uint8_t*)malloc(32768);
+  if (z->scratch == nullptr) { delete z; return nullptr; }
+#if defined(ESP32)
+  tinfl_init(&z->d);
+#else
+  memset(&z->s, 0, sizeof(z->s));
+  if (inflateInit2(&z->s, -15) != Z_OK) {
+    free(z->scratch);
+    delete z;
+    return nullptr;
+  }
+  z->started = true;
+#endif
+  return z;
+}
+
+static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
+                  uint8_t* scratch, size_t scratch_cap, bool more,
+                  bool* done, ZEmit emit, void* ctx) {
+#if defined(ESP32)
+  size_t in_left = in_len;
+  uint8_t* const base = scratch;
+  const uint32_t flags = more ? TINFL_FLAG_HAS_MORE_INPUT : 0;
+  while (in_left > 0 && !z->done) {
+    size_t out_left = scratch_cap;
+    size_t in_before = in_left;
+    tinfl_status st = tinfl_decompress(&z->d, in + (in_len - in_left), &in_left,
+        base, base + scratch_cap, &out_left, flags);
+    if (st < TINFL_STATUS_DONE) return false;
+    const size_t produced = scratch_cap - out_left;
+    if (produced > 0 && !emit(ctx, scratch, produced)) return false;
+    if (st == TINFL_STATUS_DONE) { z->done = true; *done = true; break; }
+    if (in_left == in_before && produced == 0) break;
+  }
+  return true;
+#else
+  z->s.next_in = const_cast<Bytef*>(in);
+  z->s.avail_in = in_len;
+  while (!z->done) {
+    z->s.next_out = scratch;
+    z->s.avail_out = scratch_cap;
+    const int rc = inflate(&z->s, Z_NO_FLUSH);
+    if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) return false;
+    const size_t produced = scratch_cap - z->s.avail_out;
+    if (produced > 0 && !emit(ctx, scratch, produced)) return false;
+    if (rc == Z_STREAM_END) { z->done = true; *done = true; break; }
+    if (z->s.avail_in == 0) break;
+    if (produced == 0) break;
+  }
+  return true;
+#endif
+}
+
+static void zFree(ZInflater* z) {
+  if (z == nullptr) return;
+#if !defined(ESP32)
+  if (z->started) inflateEnd(&z->s);
+#endif
+  free(z->scratch);
+  delete z;
+}
+
 #include <Utils.h>
 
 #include "BatteryGate.h"
@@ -251,6 +340,7 @@ void OtaUpdate::onTxResult(const mesh::Packet* pkt, bool ok) {
 }
 
 void OtaUpdate::resetSession() {
+  closeInflater();
   if (_io != nullptr) _io->abortWrite();
   _state = State::Idle;
   _err = OTA_ERR_NONE;
@@ -586,13 +676,18 @@ void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
       applyCopy(le32(body), le16(body + 4));
       return;
     case OTA_OP_LITERAL: {
+      if (_inflater != nullptr) { abortStaging(OTA_ERR_COMPRESS); return; }
       if (body_len < 2) { abortStaging(OTA_ERR_BOUNDS); return; }
       uint16_t dlen = le16(body);
       if (body_len != (uint16_t)(2 + dlen)) { abortStaging(OTA_ERR_BOUNDS); return; }
       applyLiteral(body + 2, dlen);
       return;
     }
+    case OTA_OP_LITERAL_Z:
+      applyLiteralZ(body, body_len);
+      return;
     case OTA_OP_END:
+      if (_inflater != nullptr) { abortStaging(OTA_ERR_COMPRESS); return; }
       if (body_len != 0) { abortStaging(OTA_ERR_BOUNDS); return; }
       if (_written != _size) { abortStaging(OTA_ERR_BOUNDS); return; }
       {
@@ -631,6 +726,71 @@ void OtaUpdate::applyLiteral(const uint8_t* data, uint16_t len) {
   if ((uint64_t)_written + len > _size) { abortStaging(OTA_ERR_BOUNDS); return; }
   if (!_io->append(data, len)) { abortStaging(OTA_ERR_IO); return; }
   _written += len;
+}
+
+void OtaUpdate::closeInflater() {
+  zFree(static_cast<ZInflater*>(_inflater));
+  _inflater = nullptr;
+  _zin_comp_total = 0;
+  _zin_orig_total = 0;
+  _zin_comp_left = 0;
+}
+
+bool OtaUpdate::zEmit(void* ctx, const uint8_t* data, size_t len) {
+  auto* self = static_cast<OtaUpdate*>(ctx);
+  if ((uint64_t)self->_written + len > self->_size) return false;
+  if (!self->_io->append(data, len)) return false;
+  self->_written += len;
+  return true;
+}
+
+void OtaUpdate::applyLiteralZ(const uint8_t* body, uint16_t body_len) {
+  if (body_len < 8) { abortStaging(OTA_ERR_BOUNDS); return; }
+  const uint32_t orig_len = le32(body);
+  const uint16_t comp_total = le16(body + 4);
+  const uint8_t flags = body[6];
+  const uint16_t dlen = body_len - 7;
+  if (dlen == 0 || dlen > OTA_LZ_MAX_DATA) {
+    abortStaging(OTA_ERR_BOUNDS);
+    return;
+  }
+  if ((flags & OTA_LZ_START) != 0 && (uint64_t)_written + orig_len > _size) {
+    abortStaging(OTA_ERR_BOUNDS);
+    return;
+  }
+
+  if (flags & OTA_LZ_START) {
+    closeInflater();
+    _inflater = zInit();
+    if (_inflater == nullptr) { abortStaging(OTA_ERR_COMPRESS); return; }
+    _zin_comp_total = comp_total;
+    _zin_orig_total = orig_len;
+    _zin_comp_left = comp_total;
+    _zin_stream_start = _written;
+  } else if (_inflater == nullptr || comp_total != _zin_comp_total ||
+             orig_len != _zin_orig_total) {
+    abortStaging(OTA_ERR_COMPRESS);
+    return;
+  }
+  if (dlen > _zin_comp_left) { abortStaging(OTA_ERR_BOUNDS); return; }
+
+  auto* z = static_cast<ZInflater*>(_inflater);
+  bool done = z->done;
+  if (!zFeed(z, body + 7, dlen, z->scratch, 32768,
+             (flags & OTA_LZ_END) == 0 && dlen < _zin_comp_left,
+             &done, zEmit, this)) {
+    abortStaging(OTA_ERR_COMPRESS);
+    return;
+  }
+  _zin_comp_left -= dlen;
+  if ((flags & OTA_LZ_END) != 0) {
+    if (!done || _zin_comp_left != 0 ||
+        _written - _zin_stream_start != _zin_orig_total) {
+      abortStaging(OTA_ERR_COMPRESS);
+      return;
+    }
+    closeInflater();
+  }
 }
 
 void OtaUpdate::sendReport(uint8_t* out) {

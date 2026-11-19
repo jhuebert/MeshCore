@@ -75,6 +75,10 @@
 //     The node slides it once over the window, comparing all fingerprints.
 //   OP_BLOCK_FIND_REPORT 0x0C (hit_count:u8 offset:u32[hit_count])[count]
 //                              (at most OTA_FIND_HITS_PER offsets per block)
+//   OP_LITERAL_Z   0x0D orig_len:u32 comp_len:u16 flags:u8 data[comp_len]
+//                              gzip stream, split across ops; flags bit0 starts
+//                              a stream, bit1 ends it. Decompressed bytes are
+//                              appended to the staged image like OP_LITERAL.
 //
 // Stability contract (this is what lets the format live for years):
 //   - Unknown ops and unknown OP_INFO bodies are dropped silently.
@@ -161,6 +165,10 @@
 #define OTA_OP_BLOCK_HASH_REPORT 0x0A
 #define OTA_OP_BLOCK_FIND 0x0B
 #define OTA_OP_BLOCK_FIND_REPORT 0x0C
+#define OTA_OP_LITERAL_Z 0x0D
+#define OTA_LZ_MAX_DATA  120           // ≤ the companion's 176-byte frame
+#define OTA_LZ_START     0x01
+#define OTA_LZ_END       0x02
 
 #define OTA_MAGIC0     0x4F          // 'O'
 #define OTA_MAGIC1     0x54          // 'T'
@@ -233,6 +241,8 @@ static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT fi
 #define OTA_ERR_BOUNDS     6        // op out of bounds or past end of image
 #define OTA_ERR_TOKEN      7        // OP_START with no/incompatible pending arm
 #define OTA_ERR_END        8        // esp_ota_end() failed after a clean verify
+#define OTA_ERR_COMPRESS   9        // compressed literal stream failed
+
 
 // The staging slot engine's only view of flash, so the session machine is
 // host-testable. The ESP32 implementation wraps esp_ota_*; host tests inject
@@ -330,6 +340,14 @@ private:
   uint16_t _expect = 1;                     // next seq to apply (OP_START = 0)
   uint32_t _size = 0, _written = 0;
   uint8_t _expected_sha[32] = {0};
+
+  // Opaque streaming inflater for OP_LITERAL_Z (defined in OtaUpdate.cpp, so
+  // the header stays free of zlib/miniz includes).
+  void* _inflater = nullptr;
+  uint32_t _zin_comp_total = 0;         // full stream size, echoed by each op
+  uint32_t _zin_orig_total = 0;
+  uint32_t _zin_stream_start = 0;       // staged offset when the stream began
+  uint32_t _zin_comp_left = 0;          // compressed bytes still expected
   uint8_t _running_sha[32] = {0};
   bool _running_sha_valid = false;
   uint32_t _running_len = 0;                // image length (header + digest)
@@ -375,6 +393,9 @@ private:
   void applyOp(const uint8_t* body, uint16_t body_len, uint8_t op);
   void applyCopy(uint32_t base_off, uint16_t len);
   void applyLiteral(const uint8_t* data, uint16_t len);
+  void applyLiteralZ(const uint8_t* body, uint16_t body_len);
+  void closeInflater();                 // free the streaming decompressor
+  static bool zEmit(void* ctx, const uint8_t* data, size_t len);
   uint32_t ownTargetId() const;
   void sendReport(uint8_t* out);
   bool sendHealthProbe();
