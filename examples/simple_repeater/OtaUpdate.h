@@ -76,9 +76,10 @@
 //   OP_BLOCK_FIND_REPORT 0x0C (hit_count:u8 offset:u32[hit_count])[count]
 //                              (at most OTA_FIND_HITS_PER offsets per block)
 //   OP_LITERAL_Z   0x0D orig_len:u32 comp_len:u16 flags:u8 data[comp_len]
-//                              gzip stream, split across ops; flags bit0 starts
-//                              a stream, bit1 ends it. Decompressed bytes are
-//                              appended to the staged image like OP_LITERAL.
+//                              raw DEFLATE stream (no gzip wrapper), split
+//                              across ops; flags bit0 starts a stream, bit1
+//                              ends it. Decompressed bytes are appended to the
+//                              staged image like OP_LITERAL.
 //
 // Stability contract (this is what lets the format live for years):
 //   - Unknown ops and unknown OP_INFO bodies are dropped silently.
@@ -202,10 +203,8 @@ static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT fi
 #define OTA_HASH_MAX_SEGS     6
 #define OTA_HASH_MAX_RANGE    32768   // 32 x 1 KB flash reads per range
 #define OTA_HASH_ALIGN        4
-#define OTA_HASH_MAX_HITS     4
 #define OTA_FIND_MAX_BLOCKS   12
 #define OTA_FIND_HITS_PER     2
-#define OTA_FIND_BODY         (4 + 4 + 4 + 1 + OTA_FIND_MAX_BLOCKS * 8)
 #define OTA_FIND_REPORT_MAX   (3 + 1 + OTA_FIND_MAX_BLOCKS * (1 + OTA_FIND_HITS_PER * 4) + 2)
 #define OTA_HASH_META_BODY    (4 + 1 + 1 + OTA_HASH_MAX_SEGS * 8 + OTA_HASH_LEN)
 #define OTA_HASH_RANGE_BODY(n) (4 + 1 + (n) * (4 + 1 + OTA_HASH_LEN))
@@ -371,8 +370,8 @@ private:
   // Build an OP_BLOCK_HASH_REPORT for a metadata query (count=0) or a range
   // query. Read-only: never touches the session state or flash writes.
   size_t buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
-  // Locate a 4-byte-aligned block of the running image by its SHA-256. This
-  // is what recovers matches after an edit shifts every following byte.
+  // Locate 4-byte-aligned blocks of the running image by their 64-bit rolling
+  // fingerprints. This recovers matches after an edit shifts every byte.
   size_t buildFindReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
 public:
   /// Boot-time verdict before the radio or mesh start: count this boot of a

@@ -1481,6 +1481,18 @@ TEST_F(OtaTest, StatusLineIsBoundedAndComplete) {
   EXPECT_NE(strstr(reply, "state="), nullptr);
 }
 
+TEST_F(OtaTest, CorruptSegmentLengthReportsNoImageInsteadOfWrapping) {
+  auto image = syntheticImage(true);
+  image[24 + 4] = 0x00;
+  image[24 + 5] = 0x00;
+  image[24 + 6] = 0x00;
+  image[24 + 7] = 0xFF;   // declares a ~4 GB segment
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(bodyFrame(OTA_OP_BLOCK_HASH, {0}));
+  ASSERT_EQ(report.size(), OTA_HASH_META_LEN);
+  EXPECT_EQ(le32From(report.data() + 3), 0u);   // unreadable image
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -18,6 +18,7 @@
 struct ZInflater {
   tinfl_decompressor d;
   uint8_t* scratch;
+  size_t dict_ofs = 0;   // write position in the 32 KB wrapping dictionary
   bool done = false;
 };
 #else
@@ -56,20 +57,25 @@ static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
                   uint8_t* scratch, size_t scratch_cap, bool more,
                   ZEmit emit, void* ctx) {
 #if defined(ESP32)
-  size_t in_left = in_len;
+  size_t in_ofs = 0;
   uint8_t* const base = scratch;
   const uint32_t flags = more ? TINFL_FLAG_HAS_MORE_INPUT : 0;
-  while (in_left > 0 && !z->done) {
-    size_t out_left = scratch_cap;
-    size_t in_before = in_left;
-    tinfl_status st = tinfl_decompress(&z->d, in + (in_len - in_left), &in_left,
-        base, base + scratch_cap, &out_left, flags);
+  // miniz writes both size arguments back as bytes CONSUMED and bytes WRITTEN
+  // (unlike zlib's "left" counters). It also treats the output as a wrapping
+  // 32 KB dictionary, so write at the current offset and pass the space left.
+  tinfl_status st = TINFL_STATUS_NEEDS_MORE_INPUT;
+  do {
+    size_t chunk = in_len - in_ofs;
+    size_t out_left = scratch_cap - z->dict_ofs;
+    st = tinfl_decompress(&z->d, in + in_ofs, &chunk,
+        base, base + z->dict_ofs, &out_left, flags);
     if (st < TINFL_STATUS_DONE) return false;
-    const size_t produced = scratch_cap - out_left;
-    if (produced > 0 && !emit(ctx, scratch, produced)) return false;
+    in_ofs += chunk;
+    if (out_left > 0 && !emit(ctx, base + z->dict_ofs, out_left)) return false;
     if (st == TINFL_STATUS_DONE) { z->done = true; break; }
-    if (in_left == in_before && produced == 0) break;
-  }
+    z->dict_ofs = (z->dict_ofs + out_left) & (scratch_cap - 1);
+    if (chunk == 0 && out_left == 0) break;
+  } while (in_ofs < in_len || st == TINFL_STATUS_HAS_MORE_OUTPUT);
   return true;
 #else
   z->s.next_in = const_cast<Bytef*>(in);
@@ -241,6 +247,8 @@ static uint32_t runningImageLength(OtaSlotIo* io) {
     if (!slotRead(io, false, off, seg, sizeof(seg))) return 0;
     uint32_t len = (uint32_t)seg[4] | ((uint32_t)seg[5] << 8) |
                    ((uint32_t)seg[6] << 16) | ((uint32_t)seg[7] << 24);
+    // Reject before the addition: a corrupt header can declare a huge segment.
+    if ((uint64_t)off + 8 + len > io->sourceSize()) return 0;
     off += 8 + len;
     off = (off + 3) & ~3u;                               // payloads are 4-byte aligned
     if (off >= io->sourceSize()) return 0;               // garbage: refuse
