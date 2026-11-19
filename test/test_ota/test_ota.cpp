@@ -592,7 +592,8 @@ TEST_F(OtaTest, InfoReportAnswersWhenIdle) {
   EXPECT_EQ(le32From(body + 1), testTargetId());
   EXPECT_EQ(le32From(body + 5), 0x200000u);                       // FakeSlotIo slot size
   EXPECT_EQ(body[9] | (body[10] << 8), (uint16_t)OTA_MAX_LITERAL);
-  EXPECT_EQ(le32From(body + 11), (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY));
+  EXPECT_EQ(le32From(body + 11),
+            (uint32_t)(OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH));
   // The fake slot holds no ESP image, so the running sha is reported as
   // unknown (all zeros) rather than as a hash of erase fill.
   for (size_t k = 0; k < 32; k++) EXPECT_EQ(body[OTA_INFO_RUNNING_SHA_OFF + k], 0u);
@@ -640,6 +641,181 @@ TEST_F(OtaTest, InfoReportHashesImageWithoutAppendedDigest) {
   uint8_t expect[32];
   mockSha256(image, expect);   // ends at the padded checksum
   EXPECT_EQ(memcmp(report.data() + 3 + OTA_INFO_RUNNING_SHA_OFF, expect, 32), 0);
+}
+
+// ============================================================
+// OP_BLOCK_HASH — the read-only diff oracle
+// ============================================================
+
+static std::vector<uint8_t> hashFrame(
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  std::vector<uint8_t> body;
+  body.push_back((uint8_t)ranges.size());
+  for (const auto& r : ranges) {
+    for (int i = 0; i < 4; i++) body.push_back((uint8_t)(r.first >> (8 * i)));
+    for (int i = 0; i < 4; i++) body.push_back((uint8_t)(r.second >> (8 * i)));
+  }
+  return bodyFrame(OTA_OP_BLOCK_HASH, body);
+}
+
+static uint8_t hashStatus(const std::vector<uint8_t>& report, size_t i) {
+  return report[3 + 5 + i * (4 + 1 + OTA_HASH_LEN) + 4];
+}
+
+static const uint8_t* hashDigest(const std::vector<uint8_t>& report, size_t i) {
+  return report.data() + 3 + 5 + i * (4 + 1 + OTA_HASH_LEN) + 5;
+}
+
+TEST_F(OtaTest, BlockHashMetadataReportsSizeSegmentsAndWholeHash) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(hashFrame({}));
+  ASSERT_EQ(report.size(), OTA_HASH_META_LEN);
+  EXPECT_EQ(report[2], OTA_OP_BLOCK_HASH_REPORT);
+  const uint8_t* body = report.data() + 3;
+  EXPECT_EQ(le32From(body), (uint32_t)image.size());
+  EXPECT_EQ(body[4], 0u);                       // metadata marker
+  ASSERT_EQ(body[5], 1u);                       // one program segment
+  EXPECT_EQ(le32From(body + 6), 32u);           // payload starts after the header
+  EXPECT_EQ(le32From(body + 10), 400u);         // its length
+  uint8_t expect[32];
+  mockSha256(image, expect);
+  EXPECT_EQ(memcmp(body + 6 + OTA_HASH_MAX_SEGS * 8, expect, 32), 0);
+}
+
+TEST_F(OtaTest, BlockHashHashesRequestedRanges) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  // Four hash calculations in one call — the whole point of the batch.
+  auto report = feed(hashFrame({{0, 16}, {32, 400}, {0, 0}, {448, 32}}));
+  ASSERT_EQ(report.size(), OTA_HASH_RANGE_LEN(4));
+  for (int i = 0; i < 4; i++) {
+    EXPECT_EQ(hashStatus(report, i), 0u) << "range " << i;
+  }
+  const size_t lengths[4] = {16, 400, image.size(), 32};
+  const size_t offsets[4] = {0, 32, 0, 448};
+  for (int i = 0; i < 4; i++) {
+    uint8_t expect[32];
+    mockSha256(std::vector<uint8_t>(image.begin() + offsets[i],
+                                    image.begin() + offsets[i] + lengths[i]), expect);
+    EXPECT_EQ(memcmp(hashDigest(report, i), expect, 32), 0) << "range " << i;
+  }
+}
+
+TEST_F(OtaTest, BlockHashRejectsAliasedAndOversizedRanges) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto report = feed(hashFrame({{1, 16},        // misaligned
+                                {0, image.size() + 16},  // out of bounds
+                                {32, OTA_HASH_MAX_RANGE + 4},  // too long
+                                {image.size(), 0}}));    // empty tail: hashed
+  ASSERT_EQ(report.size(), OTA_HASH_RANGE_LEN(4));
+  EXPECT_EQ(hashStatus(report, 0), 3u);
+  EXPECT_EQ(hashStatus(report, 1), 1u);
+  EXPECT_EQ(hashStatus(report, 2), 3u);
+  EXPECT_EQ(hashStatus(report, 3), 0u);
+}
+
+TEST_F(OtaTest, BlockHashIsReadOnlyInEverySessionState) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  auto metadata = hashFrame({});
+  ASSERT_EQ(feed(metadata).size(), OTA_HASH_META_LEN);   // Idle
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Idle);
+
+  arm(image);
+  ASSERT_EQ(feed(metadata).size(), OTA_HASH_META_LEN);   // Staging
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+  EXPECT_EQ(slot.staged.size(), 0u);                     // no writes by the oracle
+
+  sendLiteral(1, image);
+  sendEnd(2);
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Ready);
+  ASSERT_EQ(feed(metadata).size(), OTA_HASH_META_LEN);   // Ready
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Ready);
+}
+
+TEST_F(OtaTest, BlockHashWorksAfterAFailedStaging) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  arm(image);
+  sendCopy(1, 0xFFFFFF00u, 16);                  // out of bounds → Error
+  ASSERT_EQ(ota.state(), OtaUpdate::State::Error);
+  ASSERT_EQ(feed(hashFrame({{0, 16}})).size(), OTA_HASH_RANGE_LEN(1));
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
+}
+
+static uint64_t rollingTest(const std::vector<uint8_t>& d, size_t at, size_t len) {
+  uint64_t h = 0;
+  for (size_t i = 0; i < len; i++) h = h * 0x00000100000001B3ull + d[at + i];
+  return h;
+}
+
+static std::vector<uint8_t> findFrame(uint32_t len, uint32_t start, uint32_t end,
+                                      const std::vector<uint64_t>& wants) {
+  std::vector<uint8_t> body;
+  for (int i = 0; i < 4; i++) body.push_back((uint8_t)(len >> (8 * i)));
+  for (int i = 0; i < 4; i++) body.push_back((uint8_t)(start >> (8 * i)));
+  for (int i = 0; i < 4; i++) body.push_back((uint8_t)(end >> (8 * i)));
+  body.push_back((uint8_t)wants.size());
+  for (auto w : wants) {
+    for (int i = 0; i < 8; i++) body.push_back((uint8_t)(w >> (8 * i)));
+  }
+  return bodyFrame(OTA_OP_BLOCK_FIND, body);
+}
+
+static std::vector<int> findHits(const std::vector<uint8_t>& report, size_t i) {
+  size_t at = 4;
+  for (size_t k = 0; k < i; k++) {
+    uint8_t n = report[at++];
+    at += n * 4;
+  }
+  std::vector<int> out;
+  uint8_t n = report[at++];
+  for (uint8_t k = 0; k < n; k++) {
+    out.push_back((int)le32From(report.data() + at));
+    at += 4;
+  }
+  return out;
+}
+
+TEST_F(OtaTest, BlockFindLocatesShiftedBlocksInOneScan) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  const uint64_t want = rollingTest(image, 32, 16);
+  const uint64_t bogus = want ^ 0x12345678ull;
+  auto report = feed(findFrame(16, 0, (uint32_t)image.size(),
+                               {bogus, want, want + 1}));
+  ASSERT_FALSE(report.empty());
+  ASSERT_EQ(report[2], OTA_OP_BLOCK_FIND_REPORT);
+  EXPECT_TRUE(findHits(report, 0).empty());
+  auto hits = findHits(report, 1);
+  ASSERT_FALSE(hits.empty());
+  EXPECT_TRUE(std::find(hits.begin(), hits.end(), 32) != hits.end());
+  EXPECT_TRUE(findHits(report, 2).empty());
+}
+
+TEST_F(OtaTest, BlockFindRejectsBadRangesWithoutDisturbingStaging) {
+  auto image = syntheticImage(/*with_digest=*/true);
+  std::copy(image.begin(), image.end(), slot.source.begin());
+  arm(image);
+  const uint64_t want = rollingTest(image, 32, 16);
+  // Misaligned start, end past the image, and zero length all produce no reply.
+  EXPECT_TRUE(feed(findFrame(16, 1, (uint32_t)image.size(), {want})).empty());
+  EXPECT_TRUE(feed(findFrame(16, 0, (uint32_t)image.size() + 4, {want})).empty());
+  EXPECT_TRUE(feed(findFrame(0, 0, (uint32_t)image.size(), {want})).empty());
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+}
+
+TEST_F(OtaTest, BlockHashWithoutAnImageReportsZeroSize) {
+  // FakeSlotIo starts as erase fill, which is not an ESP app image.
+  auto report = feed(hashFrame({}));
+  ASSERT_EQ(report.size(), OTA_HASH_META_LEN);
+  EXPECT_EQ(le32From(report.data() + 3), 0u);
+  EXPECT_EQ(report[3 + 5], 0u);                  // no segments
+  auto range = feed(hashFrame({{0, 16}}));
+  ASSERT_EQ(range.size(), OTA_HASH_RANGE_LEN(1));
+  EXPECT_EQ(hashStatus(range, 0), 3u);
 }
 
 TEST_F(OtaTest, StatusShaMatchesTheInfoReport) {

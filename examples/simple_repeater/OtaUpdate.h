@@ -61,6 +61,20 @@
 //   OP_INFO       0x07                              query node capabilities (any state)
 //   OP_INFO_REPORT 0x08 wire_ver:u8 target:u32 slot:u32 max_literal:u16 features:u32
 //                      ver[32] sha256[32]           (repeater → app, inside RESPONSE)
+//   OP_BLOCK_HASH 0x09 count:u8 (offset:u32 len:u32)[count]
+//                                                  hash running-image ranges (any state)
+//   OP_BLOCK_HASH_REPORT 0x0A running_size:u32 ...  (repeater → app, inside RESPONSE)
+//                          count=0: seg_count:u8 (off:u32 len:u32)[segs] sha256[32]
+//                          count>0: count:u8 (off:u32 status:u8 sha256[32])[count]
+//   OP_BLOCK_FIND 0x0B len:u32 start:u32 end:u32 count:u8 rolling64[count]:u64
+//                                                  find up to 12 blocks in one
+//                                                  window of the running image
+//                                                  (4-byte aligned offsets).
+//     rolling64 is the same polynomial hash the app's delta matcher uses:
+//       h = 0; for each byte: h = h*0x100000001B3 + byte   (mod 2^64)
+//     The node slides it once over the window, comparing all fingerprints.
+//   OP_BLOCK_FIND_REPORT 0x0C (hit_count:u8 offset:u32[hit_count])[count]
+//                              (at most OTA_FIND_HITS_PER offsets per block)
 //
 // Stability contract (this is what lets the format live for years):
 //   - Unknown ops and unknown OP_INFO bodies are dropped silently.
@@ -78,7 +92,10 @@
 //     the app's own .bin and is what the app uses to pick a delta base by
 //     exact-image match. All zeros means "cannot tell".
 //     New features are only ever added as new bits or new report fields
-//     appended at the end.
+//     appended at the end. OP_BLOCK_HASH is answered in every state and never
+//     writes flash or changes the session; it is a read-only diff oracle. The
+//     app still SHA-256s the *new* image at OP_END, so a wrong diff can waste
+//     airtime but can never boot a wrong image.
 //   - New ops get new op codes; existing ops never change meaning, field
 //     order or size. The CRC algorithm, the magic bytes and the SEQ rules
 //     are frozen.
@@ -140,6 +157,10 @@
 #define OTA_OP_REPORT     0x06
 #define OTA_OP_INFO       0x07
 #define OTA_OP_INFO_REPORT 0x08
+#define OTA_OP_BLOCK_HASH 0x09
+#define OTA_OP_BLOCK_HASH_REPORT 0x0A
+#define OTA_OP_BLOCK_FIND 0x0B
+#define OTA_OP_BLOCK_FIND_REPORT 0x0C
 
 #define OTA_MAGIC0     0x4F          // 'O'
 #define OTA_MAGIC1     0x54          // 'T'
@@ -151,6 +172,7 @@
 // feature bits reported in OP_INFO_REPORT.features (rest reserved, must be 0)
 #define OTA_FEAT_DELTA     0x00000001   // OP_COPY is implemented
 #define OTA_FEAT_APPLY     0x00000002   // apply/rollback is implemented (dual app slot)
+#define OTA_FEAT_BLOCK_HASH 0x00000004  // OP_BLOCK_HASH is implemented
 
 // OP_INFO_REPORT body size (before the OTA frame envelope: magic + op + crc)
 #define OTA_INFO_BODY      79           // wire_ver(1) + target(4) + slot(4) + max_literal(2) + features(4) + ver[32] + running sha256[32]
@@ -162,8 +184,30 @@
 static_assert(OTA_INFO_RUNNING_VER_OFF == 1 + 4 + 4 + 2 + 4, "OP_INFO_REPORT field order");
 static_assert(OTA_INFO_RUNNING_SHA_OFF == OTA_INFO_RUNNING_VER_OFF + 32, "OP_INFO_REPORT field order");
 static_assert(OTA_INFO_BODY == OTA_INFO_RUNNING_SHA_OFF + 32, "OP_INFO_REPORT field order");
-// largest report frame the engine ever returns (OP_INFO_REPORT is the biggest)
-#define OTA_REPORT_MAX     OTA_INFO_REPORT_LEN
+// OP_BLOCK_HASH: one request may carry up to OTA_HASH_MAX_RANGES ranges; the
+// report echoes up to that many hashes. count=0 is the metadata query: it
+// returns the running image's size, its ESP segment table and its whole-image
+// hash so the app can align segments and detect "already up to date" in one
+// round trip. Every range report also carries running_size.
+#define OTA_HASH_LEN          32
+#define OTA_HASH_MAX_RANGES   4
+#define OTA_HASH_MAX_SEGS     6
+#define OTA_HASH_MAX_RANGE    32768   // 32 x 1 KB flash reads per range
+#define OTA_HASH_ALIGN        4
+#define OTA_HASH_MAX_HITS     4
+#define OTA_FIND_MAX_BLOCKS   12
+#define OTA_FIND_HITS_PER     2
+#define OTA_FIND_BODY         (4 + 4 + 4 + 1 + OTA_FIND_MAX_BLOCKS * 8)
+#define OTA_FIND_REPORT_MAX   (3 + 1 + OTA_FIND_MAX_BLOCKS * (1 + OTA_FIND_HITS_PER * 4) + 2)
+#define OTA_HASH_META_BODY    (4 + 1 + 1 + OTA_HASH_MAX_SEGS * 8 + OTA_HASH_LEN)
+#define OTA_HASH_RANGE_BODY(n) (4 + 1 + (n) * (4 + 1 + OTA_HASH_LEN))
+#define OTA_HASH_META_LEN     (3 + OTA_HASH_META_BODY + 2)
+#define OTA_HASH_RANGE_LEN(n) (3 + OTA_HASH_RANGE_BODY(n) + 2)
+#define OTA_HASH_REPORT_MAX   (OTA_HASH_META_LEN > OTA_HASH_RANGE_LEN(OTA_HASH_MAX_RANGES) \
+                               ? OTA_HASH_META_LEN : OTA_HASH_RANGE_LEN(OTA_HASH_MAX_RANGES))
+// largest report frame the engine ever returns
+#define OTA_REPORT_MAX     (OTA_INFO_REPORT_LEN > OTA_HASH_REPORT_MAX \
+                            ? OTA_INFO_REPORT_LEN : OTA_HASH_REPORT_MAX)
 
 // OTA frames carrying an op: magic(2) + op(1) + seq(2) + body + crc16(2).
 // ASK/REPORT/INFO*/NOP carry no seq.
@@ -288,6 +332,8 @@ private:
   uint8_t _expected_sha[32] = {0};
   uint8_t _running_sha[32] = {0};
   bool _running_sha_valid = false;
+  uint32_t _running_len = 0;                // image length (header + digest)
+  bool _running_len_valid = false;
 
   bool _health_pending = false;             // freshly-applied image booted
   bool _health_sent = false;                // health probe already dispatched
@@ -296,12 +342,20 @@ private:
   uint16_t _health_nonce = 0;               // sha-free marker nonce
 
   bool stagingArmed() const { return _state == State::Staging || _state == State::Ready; }
-  // Compute _running_sha once per boot, on first use (the app's delta base
-  // match). Zeros when the platform cannot read the running image back.
+  // Compute _running_sha once per boot, on first use. Zeros when the platform
+  // cannot read the running image back.
   void ensureRunningSha();
+  // runningImageLength(), cached for the read-only hash oracle.
+  uint32_t ensureRunningLength();
   // Build the OP_INFO_REPORT frame (magic..CRC) into `out`. Works in every
   // state — it is the negotiation handshake an app performs before arming.
   size_t buildInfoReport(uint8_t* out);
+  // Build an OP_BLOCK_HASH_REPORT for a metadata query (count=0) or a range
+  // query. Read-only: never touches the session state or flash writes.
+  size_t buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
+  // Locate a 4-byte-aligned block of the running image by its SHA-256. This
+  // is what recovers matches after an edit shifts every following byte.
+  size_t buildFindReport(const uint8_t* body, uint16_t body_len, uint8_t* out);
 public:
   /// Boot-time verdict before the radio or mesh start: count this boot of a
   /// freshly-applied image and roll back once the attempts run out. Covers the

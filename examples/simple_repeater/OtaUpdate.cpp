@@ -7,6 +7,7 @@
 #include "OtaUpdate.h"
 
 #include <Arduino.h>
+#include <stdlib.h>
 #include <SHA256.h>
 #include <Utils.h>
 
@@ -104,12 +105,13 @@ public:
 
 // SHA-256 over `size` bytes of one slot, read in 1 KB slices. Shared by the
 // OP_END verification (staged) and hashRunningImage() (running).
-static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t size, uint8_t out[32]) {
+static bool hashSlot(OtaSlotIo* io, bool staged, uint32_t start, uint32_t size, uint8_t out[32]) {
   SHA256 sha;
   uint8_t buf[1024];
-  uint32_t off = 0;
-  while (off < size) {
-    size_t n = size - off < sizeof(buf) ? size - off : sizeof(buf);
+  uint32_t off = start;
+  const uint32_t end = start + size;
+  while (off < end) {
+    size_t n = end - off < sizeof(buf) ? end - off : sizeof(buf);
     if (staged ? !io->readStaged(off, buf, n) : !io->readSource(off, buf, n)) return false;
     sha.update(buf, n);
     off += n;
@@ -151,14 +153,17 @@ static uint32_t runningImageLength(OtaSlotIo* io) {
 // included when it verifies against the computed hash, so this equals the hash
 // the app computes over its own image file (the delta base match). Returns
 // false when the slot does not hold a recognisable image.
-static bool hashRunningImage(OtaSlotIo* io, uint8_t out[32]) {
+static bool hashRunningImage(OtaSlotIo* io, uint8_t out[32], uint32_t* hashed_len = nullptr) {
   const uint32_t len = runningImageLength(io);
   if (len == 0) return false;
-  if (!hashSlot(io, /*staged=*/false, len, out)) return false;
+  if (!hashSlot(io, /*staged=*/false, 0, len, out)) return false;
   uint8_t digest[32];
   if (slotRead(io, false, len, digest, sizeof(digest)) && memcmp(digest, out, 32) == 0) {
-    return hashSlot(io, /*staged=*/false, len + sizeof(digest), out);
+    if (!hashSlot(io, /*staged=*/false, 0, len + sizeof(digest), out)) return false;
+    if (hashed_len != nullptr) *hashed_len = len + sizeof(digest);
+    return true;
   }
+  if (hashed_len != nullptr) *hashed_len = len;
   return true;
 }
 
@@ -295,6 +300,7 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
     slot = _io->slotSize();
     features |= OTA_FEAT_DELTA;   // OP_COPY is implemented everywhere with flash
     features |= OTA_FEAT_APPLY;   // dual app slot (ESP32)
+    features |= OTA_FEAT_BLOCK_HASH;   // read-only running-image hash oracle
   }
 
   // OP_INFO_REPORT body: wire_ver(1) target(4) slot(4) max_literal(2) features(4)
@@ -320,6 +326,164 @@ size_t OtaUpdate::buildInfoReport(uint8_t* out) {
   return sealFrame(out, 3 + sizeof(p));
 }
 
+uint32_t OtaUpdate::ensureRunningLength() {
+  if (_running_len_valid) return _running_len;
+  _running_len_valid = true;
+  // The digest of the hashed bytes is the length the app sees in its .bin.
+  // ensureRunningSha() computes both in one pass over flash.
+  ensureRunningSha();
+  return _running_len;
+}
+
+size_t OtaUpdate::buildBlockHashReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
+  if (body == nullptr || body_len < 1 || out == nullptr) return 0;
+  const uint8_t count = body[0];
+  const uint32_t running_len = ensureRunningLength();
+  uint8_t p[OTA_HASH_RANGE_BODY(OTA_HASH_MAX_RANGES)];
+  memset(p, 0, sizeof(p));
+  putLe32(p, running_len);
+  p[4] = count;
+
+  if (count == 0) {
+    // Metadata query: fixed segment table (six slots, unused ones zero) plus
+    // the whole-image hash. One round trip gives the app everything it needs
+    // to align segments and detect an identical image.
+    if (body_len != 1) return 0;
+    uint8_t seg_count = 0;
+    if (_io != nullptr && running_len > 0) {
+      uint8_t h[24];
+      if (slotRead(_io, false, 0, h, sizeof(h)) && h[0] == 0xE9 && h[1] >= 1 && h[1] <= 16) {
+        uint32_t off = sizeof(h);
+        for (uint8_t i = 0; i < h[1] && seg_count < OTA_HASH_MAX_SEGS; i++) {
+          uint8_t seg[8];
+          if (!slotRead(_io, false, off, seg, sizeof(seg))) break;
+          const uint32_t len = le32(seg + 4);
+          const uint32_t payload_off = off + 8;
+          if ((uint64_t)payload_off + len > running_len) break;
+          uint8_t* s = &p[6 + seg_count * 8];
+          putLe32(s, payload_off);
+          putLe32(s + 4, len);
+          seg_count++;
+          off = payload_off + len;
+          off = (off + 3) & ~3u;
+          if (off >= running_len) break;
+        }
+      }
+    }
+    p[5] = seg_count;             // p[4] stays count == 0 (metadata marker)
+    ensureRunningSha();
+    memcpy(&p[6 + OTA_HASH_MAX_SEGS * 8], _running_sha, OTA_HASH_LEN);
+    out[0] = OTA_MAGIC0;
+    out[1] = OTA_MAGIC1;
+    out[2] = OTA_OP_BLOCK_HASH_REPORT;
+    memcpy(out + 3, p, OTA_HASH_META_BODY);
+    return sealFrame(out, 3 + OTA_HASH_META_BODY);
+  }
+
+  if (count > OTA_HASH_MAX_RANGES || body_len != (uint16_t)(1 + 8 * count)) return 0;
+  for (uint8_t i = 0; i < count; i++) {
+    const uint8_t* r = body + 1 + i * 8;
+    const uint32_t off = le32(r);
+    const uint32_t len = le32(r + 4);
+    uint8_t* dst = &p[5 + i * (4 + 1 + OTA_HASH_LEN)];
+    putLe32(dst, off);
+    uint8_t status = 0;
+    if (_io == nullptr || running_len == 0) {
+      status = 3;                         // no readable image
+    } else if ((off & (OTA_HASH_ALIGN - 1)) != 0 ||
+               (len != 0 && ((len & (OTA_HASH_ALIGN - 1)) != 0 ||
+                              len > OTA_HASH_MAX_RANGE))) {
+      status = 3;                         // alignment / length rejected
+    } else {
+      uint32_t n = len;
+      if (len == 0 && off <= running_len) n = running_len - off;
+      if (off > running_len || n > running_len - off) {
+        status = 1;                       // out of bounds
+      } else if (!hashSlot(_io, false, off, n, dst + 5)) {
+        status = 2;                       // flash read failed
+      }
+    }
+    dst[4] = status;
+  }
+  out[0] = OTA_MAGIC0;
+  out[1] = OTA_MAGIC1;
+  out[2] = OTA_OP_BLOCK_HASH_REPORT;
+  memcpy(out + 3, p, OTA_HASH_RANGE_BODY(count));
+  return sealFrame(out, 3 + OTA_HASH_RANGE_BODY(count));
+}
+
+size_t OtaUpdate::buildFindReport(const uint8_t* body, uint16_t body_len, uint8_t* out) {
+  if (body == nullptr || body_len < 13 || _io == nullptr) return 0;
+  const uint32_t len = le32(body);
+  const uint32_t start = le32(body + 4);
+  const uint32_t end = le32(body + 8);
+  const uint8_t count = body[12];
+  const uint32_t running_len = ensureRunningLength();
+  if (count == 0 || count > OTA_FIND_MAX_BLOCKS) return 0;
+  if (body_len < (uint16_t)(13 + 8 * count)) return 0;
+  if (len == 0 || len % OTA_HASH_ALIGN != 0 || len > OTA_HASH_MAX_RANGE ||
+      start % OTA_HASH_ALIGN != 0 || end % OTA_HASH_ALIGN != 0 ||
+      start > end || end > running_len) return 0;
+
+  uint64_t want[OTA_FIND_MAX_BLOCKS];
+  uint8_t hit_count[OTA_FIND_MAX_BLOCKS];
+  uint32_t hits[OTA_FIND_MAX_BLOCKS][OTA_FIND_HITS_PER];
+  for (uint8_t i = 0; i < count; i++) {
+    const uint8_t* p = body + 13 + i * 8;
+    want[i] = (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32);
+    hit_count[i] = 0;
+    memset(hits[i], 0, sizeof(hits[i]));
+  }
+
+  // Same polynomial as the app's delta matcher. Slide once across the window
+  // and compare every fingerprint at each offset; this keeps a 12-block query
+  // to one flash scan.
+  static const uint64_t kPrime = 0x00000100000001B3ull;
+  uint8_t* buf = (uint8_t*)malloc(len);
+  if (buf == nullptr) return 0;
+  if (!slotRead(_io, false, start, buf, len)) { free(buf); return 0; }
+  uint64_t h = 0;
+  for (uint32_t i = 0; i < len; i++) h = h * kPrime + buf[i];
+  uint64_t pow = 1;
+  for (uint32_t i = 1; i < len; i++) pow *= kPrime;   // P^(len-1), mod 2^64
+
+  uint8_t remaining = count;
+  for (uint32_t off = start; off + len <= end && remaining > 0;
+       off += OTA_HASH_ALIGN) {
+    for (uint8_t i = 0; i < count; i++) {
+      if (h != want[i] || hit_count[i] >= OTA_FIND_HITS_PER) continue;
+      hits[i][hit_count[i]++] = off;
+      if (hit_count[i] == OTA_FIND_HITS_PER) remaining--;
+    }
+    if (remaining == 0 || off + OTA_HASH_ALIGN + len > end) break;
+    uint8_t in[OTA_HASH_ALIGN];
+    if (!slotRead(_io, false, off + len, in, sizeof(in))) break;
+    for (uint8_t k = 0; k < OTA_HASH_ALIGN; k++) {
+      h = (h - (uint64_t)buf[k] * pow) * kPrime + in[k];
+    }
+    memmove(buf, buf + OTA_HASH_ALIGN, len - OTA_HASH_ALIGN);
+    memcpy(buf + len - OTA_HASH_ALIGN, in, OTA_HASH_ALIGN);
+  }
+  free(buf);
+
+  uint8_t p[1 + OTA_FIND_MAX_BLOCKS * (1 + OTA_FIND_HITS_PER * 4)];
+  memset(p, 0, sizeof(p));
+  size_t used = 0;
+  p[used++] = count;
+  for (uint8_t i = 0; i < count; i++) {
+    p[used++] = hit_count[i];
+    for (uint8_t j = 0; j < hit_count[i]; j++) {
+      putLe32(p + used, hits[i][j]);
+      used += 4;
+    }
+  }
+  out[0] = OTA_MAGIC0;
+  out[1] = OTA_MAGIC1;
+  out[2] = OTA_OP_BLOCK_FIND_REPORT;
+  memcpy(out + 3, p, used);
+  return sealFrame(out, 3 + used);
+}
+
 size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, size_t report_cap) {
   if (frame == nullptr || n < 5) return 0;   // magic(2) + op(1) + crc(2); ops carry a seq
   if (frame[0] != OTA_MAGIC0 || frame[1] != OTA_MAGIC1) return 0;
@@ -336,6 +500,18 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
   }
 
   if (_io == nullptr) return 0;   // not an ESP32 (or slot lookup failed): inert
+
+  // Read-only diff oracle: answered in every state, like OP_INFO, and never
+  // touches the session or flash writes. Body is count + ranges (or just the
+  // count byte for the metadata query).
+  if (op == OTA_OP_BLOCK_HASH) {
+    if (report_out == nullptr || report_cap < OTA_HASH_REPORT_MAX) return 0;
+    return buildBlockHashReport(frame + 3, (uint16_t)(n - 5), report_out);
+  }
+  if (op == OTA_OP_BLOCK_FIND) {
+    if (report_out == nullptr || report_cap < OTA_FIND_REPORT_MAX) return 0;
+    return buildFindReport(frame + 3, (uint16_t)(n - 5), report_out);
+  }
 
   if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT) return 0;
 
@@ -421,7 +597,7 @@ void OtaUpdate::applyOp(const uint8_t* body, uint16_t body_len, uint8_t op) {
       if (_written != _size) { abortStaging(OTA_ERR_BOUNDS); return; }
       {
         uint8_t sha[32];
-        if (!hashSlot(_io, /*staged=*/true, _size, sha) || memcmp(sha, _expected_sha, 32) != 0) {
+        if (!hashSlot(_io, /*staged=*/true, 0, _size, sha) || memcmp(sha, _expected_sha, 32) != 0) {
           abortStaging(OTA_ERR_SHA);
           return;
         }
@@ -605,7 +781,7 @@ void OtaUpdate::ensureRunningSha() {
   if (_running_sha_valid) return;
   _running_sha_valid = true;
   memset(_running_sha, 0, sizeof(_running_sha));
-  if (_io != nullptr) hashRunningImage(_io, _running_sha);   // zeros: unknown
+  if (_io != nullptr) hashRunningImage(_io, _running_sha, &_running_len);   // zeros: unknown
 }
 
 void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
