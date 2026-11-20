@@ -113,7 +113,7 @@ message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
 ### 📲 LoRa OTA
 
 ESP32 repeaters are updated over the mesh with the
-**[MeshCoreOTA](https://github.com/jhuebert/MeshCoreOTA)** app — the supported
+**[MeshCoreRepeaterManager](https://github.com/jhuebert/MeshCoreRepeaterManager)** app — the supported
 way to run an update. It talks to a stock companion over Bluetooth or TCP,
 stages the image in the inactive A/B slot, verifies it before applying, and
 boots it only when you confirm. If the new image cannot start its radio, the

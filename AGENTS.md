@@ -59,8 +59,8 @@ should not need to explore beyond them before making a change.
   and tradeoffs.
 - LoRa OTA — the over-the-air firmware update for repeaters (branch
   `lora-ota`; not merged to `repeater-filter` yet). The user manual, the
-  Android/Linux app and the hardware bench live in the `MeshCoreOTA` repo
-  (`jhuebert/MeshCoreOTA`); `OtaUpdate.h` is the authoritative spec of the
+  Android/Linux app and the hardware bench live in the `MeshCoreRepeaterManager` repo
+  (`jhuebert/MeshCoreRepeaterManager`); `OtaUpdate.h` is the authoritative spec of the
   wire contract. Five rules the fork must not forget: (1) ops ride inside
   ordinary encrypted REQ/RESPONSE datagrams (`REQ_TYPE_OTA`), never a new
   payload type; (2) the op stream is inert unless armed by an operator

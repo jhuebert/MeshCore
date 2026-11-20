@@ -1,10 +1,10 @@
 # LoRa OTA — User Guide
 
 Over-the-air updates are driven by the
-**[MeshCoreOTA](https://github.com/jhuebert/MeshCoreOTA)** app. The firmware
+**[MeshCoreRepeaterManager](https://github.com/jhuebert/MeshCoreRepeaterManager)** app. The firmware
 side only receives, verifies and applies an update — there is no need to
 assemble OTA operations by hand. The app's own
-[user guide](https://github.com/jhuebert/MeshCoreOTA#readme) covers the steps
+[user guide](https://github.com/jhuebert/MeshCoreRepeaterManager#readme) covers the steps
 in detail; this page is a short overview for repeater operators.
 
 ---
@@ -103,7 +103,7 @@ reflash with the backed-up `prv.key` before letting it rejoin the mesh.
   need custom firmware.
 - Admin access to the repeater. A blank password is enough when the companion
   is already approved as an administrator.
-- The app: **[MeshCoreOTA releases](https://github.com/jhuebert/MeshCoreOTA/releases)**.
+- The app: **[MeshCoreRepeaterManager releases](https://github.com/jhuebert/MeshCoreRepeaterManager/releases)**.
 
 ## Updating a repeater
 
