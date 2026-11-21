@@ -12,8 +12,10 @@
 
 // Streaming raw-DEFLATE decompressor. ESP32 uses the miniz implementation in
 // ROM (zero flash cost); native tests use the host's zlib. Both consume the
-// same raw DEFLATE bytes produced by the app.
+// same raw DEFLATE bytes produced by the app. Other firmware targets have no
+// OTA slot, so their OTA ops are inert and need no decompressor.
 #if defined(ESP32)
+#define OTA_HAS_INFLATER
 #include <rom/miniz.h>
 struct ZInflater {
   tinfl_decompressor d;
@@ -21,7 +23,8 @@ struct ZInflater {
   size_t dict_ofs = 0;   // write position in the 32 KB wrapping dictionary
   bool done = false;
 };
-#else
+#elif !defined(ARDUINO)
+#define OTA_HAS_INFLATER
 #include <zlib.h>
 struct ZInflater {
   z_stream s;
@@ -29,11 +32,17 @@ struct ZInflater {
   bool started = false;
   bool done = false;
 };
+#else
+struct ZInflater {
+  uint8_t* scratch = nullptr;   // unused: no inflater on this platform
+  bool done = false;
+};
 #endif
 
 typedef bool (*ZEmit)(void* ctx, const uint8_t* data, size_t len);
 
 static ZInflater* zInit() {
+#ifdef OTA_HAS_INFLATER
   auto* z = new ZInflater();
   if (z == nullptr) return nullptr;
   // A DEFLATE window is up to 32 KB; both decoders need that much scratch.
@@ -51,6 +60,9 @@ static ZInflater* zInit() {
   z->started = true;
 #endif
   return z;
+#else
+  return nullptr;   // no OTA slot on this platform
+#endif
 }
 
 static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
@@ -77,7 +89,7 @@ static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
     if (chunk == 0 && out_left == 0) break;
   } while (in_ofs < in_len || st == TINFL_STATUS_HAS_MORE_OUTPUT);
   return true;
-#else
+#elif defined(OTA_HAS_INFLATER)
   z->s.next_in = const_cast<Bytef*>(in);
   z->s.avail_in = in_len;
   while (!z->done) {
@@ -92,12 +104,16 @@ static bool zFeed(ZInflater* z, const uint8_t* in, size_t in_len,
     if (produced == 0) break;
   }
   return true;
+#else
+  (void)z; (void)in; (void)in_len; (void)scratch; (void)scratch_cap; (void)more;
+  (void)emit; (void)ctx;
+  return false;   // unreachable: no OTA slot on this platform
 #endif
 }
 
 static void zFree(ZInflater* z) {
   if (z == nullptr) return;
-#if !defined(ESP32)
+#if defined(OTA_HAS_INFLATER) && !defined(ESP32)
   if (z->started) inflateEnd(&z->s);
 #endif
   free(z->scratch);
