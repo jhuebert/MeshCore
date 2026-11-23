@@ -64,14 +64,16 @@ ham tx 22
 ham on
 ```
 
-`ham` should now report:
+`ham` should now report an active state like:
 
 ```
-on - call N0CALL, ham tx 22, set tx 7, tags 0, next ID 300s
+on - call N0CALL, ham tx 22, set tx 7, tags 0, next ID 0s
 ```
 
-The `next ID` value counts down from 10 minutes. A zero-hop advert carrying
-`N0CALL` goes out about 1.5 seconds after `ham on`.
+The `next ID` value counts down in seconds. It is 0 while the first ID is due,
+then about 598s once that advert has been queued (10 minutes less the 1.5 s
+send delay). A zero-hop advert carrying `N0CALL` goes out about 1.5 seconds
+after `ham on`.
 
 ## How it behaves
 
@@ -110,8 +112,9 @@ An unlisted hashtag is treated as encrypted and gets `set tx`.
 All commands take the `ham` prefix and are handled by the same dispatcher as
 `filter`, `battery`, `fleet` and `radio2`. Any `ham` command arriving over the
 mesh is accepted only from an admin client, via the core's `isAdmin()` check in
-`MyMesh::handleCommand()`. Serial and fleet-script commands run with serial
-privilege. Replies are bounded to 157 bytes.
+`MyMesh::onPeerDataRecv()`, which is the only mesh path into `handleCommand()`.
+Serial and fleet-script commands run with serial privilege. Replies are bounded
+to 157 bytes.
 
 Usage, printed for `ham help` and for an unknown or malformed command:
 
@@ -124,7 +127,7 @@ Err - usage: ham | ham on | ham off | ham callsign [CALL] | ham tx [N] | ham cha
 Reports the current state. Active:
 
 ```
-on - call N0CALL, ham tx 22, set tx 7, tags 2, next ID 300s
+on - call N0CALL, ham tx 22, set tx 7, tags 2, next ID 598s
 ```
 
 Off: `off - all packets use normal tx power`.
@@ -181,7 +184,7 @@ Err - channel list full (max 8); remove one first
 RAM-only counters since boot, plus the applied power and ID countdown:
 
 ```
-12 public, 34 private; applied 7 dBm; next ID 300s
+12 public, 34 private; applied 7 dBm; next ID 598s
 ```
 
 ## Interactions with other features

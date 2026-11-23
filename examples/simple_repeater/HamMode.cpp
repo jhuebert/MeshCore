@@ -25,6 +25,17 @@ static bool isWordChar(unsigned char c) {
          (c >= '0' && c <= '9');
 }
 
+// nextToken() keeps spaces inside double quotes and does not treat tabs as
+// separators, so a quoted or tabbed value must be rejected explicitly before
+// it is stored as a "one word" callsign or channel name.
+static bool isOneWord(const char* s) {
+  if (s == NULL || s[0] == 0) return false;
+  for (const char* p = s; *p; p++) {
+    if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') return false;
+  }
+  return true;
+}
+
 // A callsign identifies the station only when it stands alone in the node
 // name. A bare substring would let N0CALL activate on "N0CALLS".
 static bool containsCallWord(const char* name, const char* call) {
@@ -384,7 +395,7 @@ void hamCLI(HamMode& ham, const char* node_name, const char* command, char* repl
     } else {
       if (!cliNoExtra(p, reply, HAM_USAGE)) return;
       size_t n = strlen(tok);
-      if (n < 3 || n > HAM_CALLSIGN_MAX_LEN - 1) {
+      if (!isOneWord(tok) || n < 3 || n > HAM_CALLSIGN_MAX_LEN - 1) {
         snprintf(reply, CLI_REPLY_MAX, "Err - callsign must be one word, 3..15 chars");
         return;
       }
@@ -428,19 +439,19 @@ void hamCLI(HamMode& ham, const char* node_name, const char* command, char* repl
     bool add = strcmp(sub, "add") == 0;
     bool remove = strcmp(sub, "remove") == 0;
     if (!add && !remove) {
-      snprintf(reply, CLI_REPLY_MAX, "%s", HAM_USAGE);
+      if (cliNoExtra(p, reply, HAM_USAGE)) snprintf(reply, CLI_REPLY_MAX, "%s", HAM_USAGE);
       return;
     }
     char* tok = nextToken(&p);
-    if (tok == NULL || !cliNoExtra(p, reply, HAM_USAGE)) return;
+    if (tok == NULL) {
+      snprintf(reply, CLI_REPLY_MAX, "%s", HAM_USAGE);
+      return;
+    }
+    if (!cliNoExtra(p, reply, HAM_USAGE)) return;
 
     size_t tlen = strlen(tok);
-    bool one_word = tlen > 0;
-    for (size_t i = 0; i < tlen; i++) {
-      if (tok[i] == ' ' || tok[i] == '\t' || tok[i] == '\r' || tok[i] == '\n') one_word = false;
-    }
     size_t want = (tok[0] == '#') ? tlen : tlen + 1;
-    if (!one_word || want < 2 || want > HAM_TAG_MAX_LEN - 1) {
+    if (!isOneWord(tok) || want < 2 || want > HAM_TAG_MAX_LEN - 1) {
       snprintf(reply, CLI_REPLY_MAX,
                "Err - channel name must be one word, max 14 characters after #");
       return;

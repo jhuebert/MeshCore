@@ -288,6 +288,30 @@ TEST_F(HamTest, PublicUsesHamTxEncryptedUsesSetTx) {
   EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 10), 22);
 }
 
+TEST_F(HamTest, SetTxResyncsCacheAfterPublicTraffic) {
+  ham.setEnabled(true);
+  ham.setCallsign("N0CALL");
+  ham.setHamDbm(22);
+  uint8_t psk[16];
+  publicKey(psk);
+  mesh::Packet pub;
+  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, psk, "hello");
+  EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 7), 22);
+  ham.noteAppliedPower(22);   // radio now at ham power
+
+  // `set tx 10` writes the radio directly through CommonRadioPrefs, which
+  // bypasses MyMesh::setTxPower(). The CLI dispatch calls noteRadioPower() to
+  // resync the cache; without it the next public packet would stay at 10 dBm.
+  ham.noteRadioPower(10);
+  EXPECT_EQ(ham.getPrivateDbm(), 10);
+  EXPECT_EQ(ham.getAppliedDbm(), 10);
+  EXPECT_FALSE(ham.shouldApplyPower(10));   // encrypted: radio already there
+  EXPECT_TRUE(ham.shouldApplyPower(22));    // public: write ham power
+  mesh::Packet dm;
+  plainPacket(dm, PAYLOAD_TYPE_TXT_MSG);
+  EXPECT_EQ(ham.selectPower(&dm, "N0CALL Test", 10), 10);
+}
+
 TEST_F(HamTest, AppliedPowerCacheOnlyChangesOnClassChange) {
   EXPECT_EQ(ham.getAppliedDbm(), 7);
   EXPECT_TRUE(ham.shouldApplyPower(22));
@@ -321,6 +345,33 @@ TEST_F(HamTest, CliCallsignRules) {
   EXPECT_EQ(cli(ham, "N0CALL Test", "callsign ABCDEF1234567890", b),
             "Err - callsign must be one word, 3..15 chars");
   EXPECT_NE(cli(ham, "N0CALL Test", "callsign OK extra", b).find("usage"), std::string::npos);
+}
+
+TEST_F(HamTest, CliCallsignWarnsWhenNameExceedsAdvertBudget) {
+  CliReplyBuf b;
+  std::string r = cli(ham, "N0CALL A Very Long Node Name Over Twenty Three Bytes",
+                      "callsign N0CALL", b);
+  EXPECT_NE(r.find("OK - callsign set to N0CALL"), std::string::npos);
+  EXPECT_NE(r.find("warning"), std::string::npos);
+  EXPECT_NE(r.find("23 bytes"), std::string::npos);
+}
+
+TEST_F(HamTest, CliRejectsMalformedArguments) {
+  CliReplyBuf b;
+  // A missing mandatory argument must still produce a usage reply, not silence.
+  EXPECT_NE(cli(ham, "N0CALL Test", "channel add", b).find("usage"), std::string::npos);
+  EXPECT_NE(cli(ham, "N0CALL Test", "channel remove", b).find("usage"), std::string::npos);
+  EXPECT_NE(cli(ham, "N0CALL Test", "channel bogus extra", b).find("usage"), std::string::npos);
+
+  // Quoted and tabbed values are not one word, so they must be refused whole.
+  EXPECT_EQ(cli(ham, "N0CALL Test", "callsign \"N0 CALL\"", b),
+            "Err - callsign must be one word, 3..15 chars");
+  EXPECT_EQ(cli(ham, "N0CALL Test", "callsign N0\tCALL", b),
+            "Err - callsign must be one word, 3..15 chars");
+  EXPECT_STREQ(ham.getCallsign(), "");
+  EXPECT_EQ(cli(ham, "N0CALL Test", "channel add \"#two words\"", b),
+            "Err - channel name must be one word, max 14 characters after #");
+  EXPECT_EQ(ham.getTagCount(), 0);
 }
 
 TEST_F(HamTest, CliTxShowsAndSetsOnlyPublicPower) {

@@ -1696,6 +1696,13 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     const char* sub = command + 10;
     while (*sub == ' ') sub++;
     meshClockCLI(meshClock, now, sub, reply);
+  } else if (memcmp(command, "set tx ", 7) == 0) {
+    // CommonRadioPrefs writes the radio directly and only updates the prefs
+    // value, so this command never reaches MyMesh::setTxPower(). Sync ham's
+    // applied-power cache here, or the next public packet could be sent at the
+    // new private power.
+    _cli.handleCommand(sender_timestamp, command, reply);
+    ham.noteRadioPower(_prefs.tx_power_dbm);
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
