@@ -1,8 +1,8 @@
-# LoRa OTA — User Guide
+# LoRa OTA: User Guide
 
 Over-the-air updates are driven by the
 **[MeshCoreRepeaterManager](https://github.com/jhuebert/MeshCoreRepeaterManager)** app. The firmware
-side only receives, verifies and applies an update — there is no need to
+side only receives, verifies and applies an update. There is no need to
 assemble OTA operations by hand. The app's own
 [user guide](https://github.com/jhuebert/MeshCoreRepeaterManager#readme) covers the steps
 in detail; this page is a short overview for repeater operators.
@@ -29,7 +29,7 @@ builds with `MESH_PACKET_LOGGING` enabled on the 4 MB boards.
 
 ### Affected targets
 
-4 MB boards — `min_spiffs.csv`:
+4 MB boards (`min_spiffs.csv`):
 
 ```text
 Generic_E22_sx1262_repeater
@@ -59,7 +59,7 @@ nibble_screen_connect_repeater_
 nibble_screen_connect_repeater_bridge_espnow_
 ```
 
-16 MB boards — `default_16MB.csv`:
+16 MB boards (`default_16MB.csv`):
 
 ```text
 LilyGo_TBeam_1W_repeater
@@ -76,15 +76,15 @@ Station_G3_ESP32_logging_repeater
 
 The other roles for these boards (companion radio, room server, KISS modem,
 terminal chat) share the base layout and need the same reflash. Observer builds
-have their own partition settings — the T-Beam 1W observer moved with its board
-so repeater and observer stay aligned — and all other boards are unaffected.
+have their own partition settings (the T-Beam 1W observer moved with its board
+so repeater and observer stay aligned), and all other boards are unaffected.
 
 ### Upgrading an affected board
 
 1. Back up the private key with `get prv.key` over the serial CLI, and record
    your settings, channels, filter rules and fleet tags (there is no config
    export yet).
-2. Fully erase the board and flash the **merged** image for this release — not
+2. Fully erase the board and flash the **merged** image for this release, not
    an app-only update.
 3. Restore the key with `set prv.key <hex>` and re-enter the prefs, channels,
    rules and tags.
@@ -98,7 +98,7 @@ reflash with the backed-up `prv.key` before letting it rejoin the mesh.
 
 - A repeater running an OTA-enabled build of this fork on an ESP32 board with a
   dual app partition. Other boards report the feature as unsupported.
-- A stock MeshCore companion the app can reach — Bluetooth on Android, macOS
+- A stock MeshCore companion the app can reach: Bluetooth on Android, macOS
   or Linux, or over the network (TCP) on any platform. The companion does not
   need custom firmware.
 - Admin access to the repeater. A blank password is enough when the companion
@@ -110,7 +110,7 @@ reflash with the backed-up `prv.key` before letting it rejoin the mesh.
 1. Connect the app to the companion, pick the repeater and sign in.
 2. Choose a firmware version. The app picks the image for the repeater's board
    and downloads it; you can also import your own `.bin`.
-3. Choose where the transfer runs — the live mesh, a temporary private preset,
+3. Choose where the transfer runs: the live mesh, a temporary private preset,
    or the repeater's second preset. The app restores the radios afterwards.
 4. Review the plan, start the transfer, then confirm the update once the node
    reports that the image is staged and verified.

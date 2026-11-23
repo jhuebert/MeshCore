@@ -2,13 +2,13 @@
 
 **Think twice before enabling a bot.** Every reply costs airtime for everyone on
 the mesh, and most channels do not need one. If you do enable it, give the bot
-its own channel with no other bots on it — two responders to the same message
+its own channel with no other bots on it: two responders to the same message
 just add noise.
 
 The chat bot is an opt-in `simple_repeater` feature that answers common `#test`
 chatter from the repeater itself. It needs no companion, no internet and no
 contact table: it uses only the path of the packet it just received. It is
-**off by default** — a node that has not enabled it behaves exactly like stock
+**off by default**: a node that has not enabled it behaves exactly like stock
 firmware.
 
 ## What it replies to
@@ -47,7 +47,7 @@ are grouped by the *sender's* Path Hash Size setting: a 1-byte-path sender gets
 
 There is deliberately **no time, hop count or SNR** in the reply. The repeater's
 RTC is UTC (confusing on a local mesh), the hop count is just the number of path
-groups you can see, and the SNR is only the last leg of the route — not an
+groups you can see, and the SNR is only the last leg of the route, not an
 end-to-end measurement.
 
 The reply is scoped like any other reply from this repeater: it uses the
@@ -57,7 +57,7 @@ so it does not collide with the original packet's relay burst.
 
 ## Setup
 
-1. Set the channel — either a hashtag name (the PSK is derived from it exactly
+1. Set the channel: either a hashtag name (the PSK is derived from it exactly
    as `filter add chan=#name` derives it) or a raw key:
 
    ```
@@ -79,7 +79,7 @@ so it does not collide with the original packet's relay burst.
    ```
 
 `bot chan off` clears the key but keeps the name and the on/off setting. The
-channel name is not stored — the status line shows the 1-byte channel hash.
+channel name is not stored: the status line shows the 1-byte channel hash.
 
 ## CLI reference
 
@@ -121,17 +121,17 @@ answered. No other state is persisted.
 
 ## Interactions
 
-- **Battery gate** — while the repeater is suspended for low battery, the bot
+- **Battery gate**: while the repeater is suspended for low battery, the bot
   sends nothing.
-- **Packet filter** — a channel the filter drops by content rule is not one the
+- **Packet filter**: a channel the filter drops by content rule is not one the
   bot answers on.
-- **Fleet** — fleet scripts and acks are ordinary chat to the bot. Do not share
+- **Fleet**: fleet scripts and acks are ordinary chat to the bot. Do not share
   the fleet channel key with the bot: a fleet payload containing `test` or
   `path` can otherwise trigger a reply.
-- **radio2** — replies go out on the profile the request arrived on.
-- **MQTT observer** — replies are TX packets and appear in the feed like any
+- **radio2**: replies go out on the profile the request arrived on.
+- **MQTT observer**: replies are TX packets and appear in the feed like any
   other transmission.
-- **Powersaving** — no new wake source; the bot only reacts to a packet that
+- **Powersaving**: no new wake source; the bot only reacts to a packet that
   already woke the node.
 
 ## Limits
@@ -139,4 +139,4 @@ answered. No other state is persisted.
 One channel, fixed reply text, flooded replies only. No DMs, no contact-name
 lookups, no editable messages, no telemetry or weather commands, and no
 scheduled or unsolicited messages. Sender names are unauthenticated display
-labels — they are not identities.
+labels. They are not identities.

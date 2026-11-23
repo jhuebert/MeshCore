@@ -1,9 +1,9 @@
-# Repeater Fleet Management — User Guide
+# Repeater Fleet Management: User Guide
 
 Fleet management for the `simple_repeater` firmware. One PSK-backed channel,
 set once per repeater, turns into a remote administration bus: a group text
-message on that channel is executed as a small CLI script — deferred, and at
-most once per job — on every repeater whose **tags** the script targets. One
+message on that channel is executed as a small CLI script (deferred, and at
+most once per job) on every repeater whose **tags** the script targets. One
 broadcast message therefore configures a whole fleet (or any tagged subset of
 it), with no serial cable and no per-node logins.
 
@@ -28,20 +28,20 @@ set rxdelay 3
 
 is relayed like any group text (flood carries it to every repeater in range of
 the sender) and, on each member it targets, its lines run through the same
-command dispatcher as the serial console — `filter …`, `set …`, `battery …`,
+command dispatcher as the serial console: `filter …`, `set …`, `battery …`,
 `reboot`, everything an authenticated admin can type. Each executed line and
 its reply are logged to the serial console (`cli[<key>] <line>`), so an
 operator at the console sees exactly what ran.
 
 **Possession of the channel PSK is full admin access.** Anyone who can encrypt
-to the channel can run any CLI command on every fleet member — equivalent to
+to the channel can run any CLI command on every fleet member, equivalent to
 serial-console access. The trust boundary is the key, nothing else: the keyed
 channel's MAC must verify before the repeater even looks at the message, and
 that is the whole defense. See [Security model](#security-model).
 
 ## Quick start
 
-On each fleet repeater (over serial, or remote admin — see
+On each fleet repeater (over serial, or remote admin, see
 [FILTER.md](./FILTER.md#managing-the-repeater-remotely)):
 
 ```text
@@ -60,7 +60,7 @@ set path.hash.mode 1
 ```
 
 **One job = one message.** A job's commands are the *lines of a single group
-text* — write them with line breaks inside one message, not as several
+text*: write them with line breaks inside one message, not as several
 successive messages. Only a message's first line is checked for the `!id`
 marker, so a bare command sent on its own is treated as ordinary chat and does
 nothing. If you genuinely want two separate things, give each its own `!id`
@@ -79,7 +79,7 @@ the jobs and when.
 
 - `fleet chan set <psk>` takes exactly **16 or 32 bytes of hex**. The reply
   reports the derived on-air channel hash (`OK - fleet channel set h=XX (PSK
-  holder = admin)`) — never the PSK itself. The same PSK must be configured on
+  holder = admin)`), never the PSK itself. The same PSK must be configured on
   every companion you drive the fleet from.
 - `fleet chan clear` disables receipt and cancels every queued, sleeping and
   armed script (seen keys and counters survive). See [Kill switches](#kill-switches).
@@ -88,7 +88,7 @@ the jobs and when.
 - `fleet on` arms the hooks; `fleet off` idles them, cancels queued, sleeping
   and armed scripts, and preserves all config.
 - Config persists in `/fleet_cfg` across reboots. Pending acknowledgements,
-  armed `!at` scripts and the seen-key table are RAM-only — a reboot forgets
+  armed `!at` scripts and the seen-key table are RAM-only: a reboot forgets
   them.
 
 ### Tags: targeting by exact membership
@@ -103,13 +103,13 @@ directive:
 set name RIDGE-1
 ```
 
-Match rule — **exact set membership**: the script runs iff its tag list names
+Match rule is **exact set membership**: the script runs iff its tag list names
 one of the repeater's tags. No contains, no prefix, no wildcards, no
 negation: a tag either is set on the repeater or it is not. A literal `*` is
 just an invalid tag character.
 
 - **Absent `!tags` = broadcast**: the script runs on every fleet member.
-- Tag lists are exact — no whitespace around tags (`xiao, siteB` rejects).
+- Tag lists are exact: no whitespace around tags (`xiao, siteB` rejects).
 - `fleet tag add <tag>` / `del` / `list` / `clear` manage the set; duplicates
   no-op.
 
@@ -122,7 +122,7 @@ the tag after verification.
 
 ## Script format
 
-The script is the **text of an ordinary group text message** — companions that
+The script is the **text of an ordinary group text message**: companions that
 auto-prepend `name: ` work unchanged, since the script is everything after the
 first `": "`. Only **plain** group text (txt_type 0) can be a script; any other
 text type on the channel is ignored.
@@ -130,24 +130,24 @@ text type on the channel is ignored.
 **A job is exactly one message.** Every command in the job is a line of *that
 same message*; a job cannot be split across messages. Each message is checked
 for the `!id` marker independently, so `set txdelay 2` followed by a second
-message `set rxdelay 3` is two messages, neither of them a job — the commands
+message `set rxdelay 3` is two messages, neither of them a job: the commands
 must be sent together, one line each, in a single message.
 
 ```text
 !id <key>              # line 1, always
-[!tags t1,t2,...]      # the directive block — !tags, !ack and/or !at,
+[!tags t1,t2,...]      # the directive block: !tags, !ack and/or !at,
 [!ack [err]]           #   each at most once, in either order
 [!at <unix-ts>]        #   (lines 2..N; everything before the first command)
 <CLI command lines>    # may include "!delay <ms>" anywhere, any number of times
 ```
 
-- **Line 1 must be `!id <key>`** — the marker doubles as the job identity, so
+- **Line 1 must be `!id <key>`**: the marker doubles as the job identity, so
   no message can ever run un-deduplicated by accident. `<key>` is 1–32
   characters of letters, digits, `.`, `_`, `-` (e.g. `2026-06-12-preset2-cfg`).
   The key is a human-readable job name: it appears in the serial log, in
   `fleet seen <key>`, and in `fleet forget <key>`.
 - Directive block rules: `!tags`, `!ack` and `!at` are the known block
-  directives — each **at most once**, in either order. Any other `!` line in
+  directives: each **at most once**, in either order. Any other `!` line in
   the block refuses the **whole** script (fail-safe, not fail-open).
 - After the block, `!`-lines are only valid as `!delay <ms>`; any other
   unknown `!` line still refuses the whole script.
@@ -158,14 +158,14 @@ must be sent together, one line each, in a single message.
   convention FILTER.md uses).
 - A line longer than the serial CLI's own command buffer is skipped and
   counted (`badline` in `fleet`); the rest of the script still runs.
-- **Size reality:** one LoRa packet carries ~175 bytes of script — about 3–4
+- **Size reality:** one LoRa packet carries ~175 bytes of script, about 3–4
   short commands including the `!id` line. Bigger jobs are several messages
   with **distinct `!id` keys**, and their parts must be order-independent
   (flood arrival order is not guaranteed).
 
 ## Idempotency: at most once per key, per boot
 
-Each repeater remembers the job keys it has executed **in RAM only** — the
+Each repeater remembers the job keys it has executed **in RAM only**: the
 memory starts empty on every boot, like the advert cache. Within one boot a
 key executes at most once; a duplicate flood delivery or a deliberate re-send
 no-ops (but the message is still relayed). The key is marked the moment the
@@ -175,7 +175,7 @@ What this means in practice:
 
 - **Re-send freely while the fleet is up.** That is how you catch nodes that
   were offline or out of range; repeats are free.
-- `fleet seen <key>` answers "did this job run here?" — over a normal admin
+- `fleet seen <key>` answers "did this job run here?" over a normal admin
   session, one per repeater.
 - `fleet forget <key>` re-arms one key for a deliberate re-run; `fleet forget
   all` re-arms everything. A job that is still **queued, sleeping or armed** is
@@ -187,7 +187,7 @@ What this means in practice:
 - **After a reboot, keys are forgotten and a re-sent job runs again.** Scripts
   are therefore *re-runnable by convention*: commands that **set** state
   (`set …`, `filter add …`, `filter ratelimit …`, `battery …`) are safe to
-  repeat forever; index-based mutations (`filter del 3` — indices shift!) and
+  repeat forever; index-based mutations (`filter del 3`, indices shift!) and
   one-shot effects (`reboot`, `start ota`) belong in their own jobs, sent
   deliberately and only once.
 - A captured message replayed after a reboot re-runs. That residual exposure
@@ -198,35 +198,35 @@ What this means in practice:
 
 A script that carries `!ack` (or `!ack err`) in its directive block makes every
 repeater that runs it reply on the **same fleet channel** the script arrived on,
-as a plain group text with the **repeater's own name** as the sender —
+as a plain group text with the **repeater's own name** as the sender:
 companions and other fleet members see an ordinary `<repeater>: <text>`
 message.
 
-- `!ack` — reply always. The query case: `filter stats`, `battery`, version
+- `!ack`: reply always. The query case: `filter stats`, `battery`, version
   audits. Whoever replies is alive, so this doubles as a liveness roster.
-- `!ack err` — reply **only on error**; silence means success. The
+- `!ack err`: reply **only on error**; silence means success. The
   settings-job case: the cutover workflow stays quiet, failures speak up.
   This is the airtime-polite choice for large fleets.
-- No `!ack` — no reply.
+- No `!ack`: no reply.
 
-"Error" means the command's reply is a failure — the fork's own `Err - ...`
+"Error" means the command's reply is a failure: the fork's own `Err - ...`
 and the core's `Error`, `Error, ...`, `ERROR: ...`, `ERR: ...`, `error` and
 `Unknown command`. A typo'd core command (`set txdelayy 2`) replies
 `Unknown command`, and that is an error: the job did not do what it said.
 
 Reply content, always prefixed with the job key so replies are correlatable
 when several jobs are in flight. On air the body is `<key>`, then a newline,
-then the response — companions show the id and the response on separate lines:
+then the response, and companions show the id and the response on separate lines:
 
 - Single-command script → the command's **actual reply** (e.g.
   `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), cut to fit one packet.
 - Multi-command script → `<key> ran 5 ok`, or
-  `<key> ran 5; err: <first failing line's reply>` — the first error is the
+  `<key> ran 5; err: <first failing line's reply>`: the first error is the
   only useful detail in one packet. Replies are never split across packets.
 
 **A cut reply says so.** An acknowledgement carries as much reply as the
 packet has room for: the node name and the job key take their share of the
-datagram, and what is left is the reply — 97 bytes in the worst case (a
+datagram, and what is left is the reply: 97 bytes in the worst case (a
 31-character name and a 32-character key), more whenever either is shorter.
 A reply that does not fit is cut, and the cut is never silent, and never costs
 a whole rule: the reply is cut where it stops fitting, the text before the cut
@@ -238,7 +238,7 @@ case.
 
 **What the markers mean.** A `...` at the end of the reply means *the reply was
 cut here*; a `...` on a line of its own in a `filter list` reply is the
-filter's own page marker (see FILTER.md) and means the same thing — more
+filter's own page marker (see FILTER.md) and means the same thing: more
 follows. A `..` at the end of a line means *that line is incomplete*: the
 repeater's own listing abbreviated a rule too large for one line (FILTER.md
 marks those with `..`). The two say different things: `...` is the end of what
@@ -246,20 +246,20 @@ you got, `..` is that rule **not shown whole**.
 
 The way on from a cut reply is therefore the same in both cases:
 
-- `filter get <idx>` shows that rule whole (it is the rule's own index — the
+- `filter get <idx>` shows that rule whole (it is the rule's own index, the
   number before the `:` in the listing).
-- `filter list <idx+1>` shows the rules after it — send it as a new job; a
+- `filter list <idx+1>` shows the rules after it: send it as a new job; a
   listing that stopped at an abbreviated rule shows the same `..` again, so
   page on by index rather than by re-reading the same line.
 
 Protocol guarantees, by construction:
 
-1. Replies are `txt_type = 0x00` plain group texts — visible in the
+1. Replies are `txt_type = 0x00` plain group texts, visible in the
    companion's channel view.
 2. **Replies never parse as scripts**: reply text starts with the job key
    (charset `[A-Za-z0-9._-]`, never `!`), so it can never match the `!id `
    marker. Keep future reply formats key-prefixed for the same reason.
-3. Flood is the only reply route — group texts carry no pubkey, so a repeater
+3. Flood is the only reply route: group texts carry no pubkey, so a repeater
    cannot direct-reply to "alice" (sender-controlled text, not an identity).
    Every reply floods and is relayed by the fleet, using the repeater's
    configured path-hash size and its default region scope when one is set
@@ -272,27 +272,27 @@ near-simultaneous packets that all flood and are relayed, so the window has to
 be wide enough to spread them out: **rule of thumb ≈ 5 s per repeater**. A
 3-node fleet is fine at the default; a 10-node fleet wants ~50 s and a
 20-node fleet ~100 s. Widening costs only latency, while a
-too-narrow window costs collisions — when in doubt, widen. Set it per node, or
+too-narrow window costs collisions: when in doubt, widen. Set it per node, or
 fleet-wide from a script (`fleet reply 50`). Pending replies (2 slots) are
 RAM-only: a reboot wipes them, so a re-sent `!ack` job after a reboot re-runs
 *and* re-replies. A full reply store drops and counts the reply (`refused`); no
-reply cooldown in v1 — per-key dedupe already bounds each script to one reply.
+reply cooldown in v1: per-key dedupe already bounds each script to one reply.
 
 **Repeat confirmation and retry:** after a reply floods, the repeater listens
 for a neighbour repeating it. If none is heard within ~5 s, the reply is
-re-sent **once, byte-identically** — same frozen timestamp, same node name,
-same cut body, so the same on-air packet — and then the repeater stops.
+re-sent **once, byte-identically**: same frozen timestamp, same node name,
+same cut body, so the same on-air packet, and then the repeater stops.
 Because the copy is byte-identical, every node that already relayed the first
 attempt has it in its seen table and suppresses the copy at the mesh layer
 *before* any app or companion sees it: a retry can never appear as a duplicate
 message, and a healthy fleet still shows exactly one reply per node. (The
 node name and the room the reply body is cut to are frozen with the first
 attempt, so a `set name` job running in between cannot turn the copy into a
-different packet — that would show the reply twice.) "Heard a repeat" proves a
+different packet: that would show the reply twice.) "Heard a repeat" proves a
 repeater relayed the reply; it does **not** prove the operator's companion
-received it — there is no end-to-end ack for flood group text. Each such miss
+received it: there is no end-to-end ack for flood group text. Each such miss
 is counted as `rtx` on the status line; a climbing `rtx` means replies are not
-being repeated — likely no neighbouring repeater in range, or heavy loss. If
+being repeated: likely no neighbouring repeater in range, or heavy loss. If
 the packet pool refuses an initial send or retry, it is tried again after the
 configured backoff; `rtx` increments only when the retry is queued. A send the
 pool keeps refusing is given up on after a few attempts (build-time tunable,
@@ -340,27 +340,27 @@ reset
 A `!at` block directive schedules the whole script to execute when the node's
 RTC reaches the given unix epoch timestamp instead of immediately. This turns
 the fleet-wide `reset` cutover from a two-phase, wait-for-saturation dance into
-a single job every node runs **at the same instant** — no mesh-split risk — and
+a single job every node runs **at the same instant** (no mesh-split risk) and
 enables off-hours maintenance windows.
 
-- **`<unix-ts>` is unix epoch seconds — seconds since 1970-01-01 UTC**, as all
+- **`<unix-ts>` is unix epoch seconds (seconds since 1970-01-01 UTC)**, as all
   unix timestamps are. Unix time carries no timezone; repeater logs display
-  UTC (the `U` in log timestamps). Compute it with `date -u +%s` — "is this
+  UTC (the `U` in log timestamps). Compute it with `date -u +%s`: "is this
   UTC?" is the first question every user asks.
 - **Stale is refused**: a timestamp more than 300 s in the past is refused
-  (counted, key not marked) — a typo'd stale date must never run immediately,
+  (counted, key not marked): a typo'd stale date must never run immediately,
   since the damage it can do (a surprise `reset`) is exactly what scheduling is
   meant to control. Within the 300 s grace (clock skew, mesh transit delay) it
   executes immediately. A job whose key was already seen is a **duplicate**
-  (counted as `dup`), whatever its timestamp says — the job ran or was armed
+  (counted as `dup`), whatever its timestamp says: the job ran or was armed
   once, and a re-sent copy is a duplicate, not a stale refusal.
 - **Clock unset → refuse.** While the node's RTC is before 2025-01-01, `!at`
   scripts are refused and counted: executing at an unknown time is worse than
   not executing. The sync recipe below fixes this first.
 - Armed jobs live in a dedicated RAM-only store (2 entries; a full store
-  refuses new ones, counted, key not marked). **A reboot wipes them — re-send
+  refuses new ones, counted, key not marked). **A reboot wipes them: re-send
   the job.** Ordinary scripts keep flowing while a cutover is armed.
-- When the RTC passes the timestamp the script runs as normal — same
+- When the RTC passes the timestamp the script runs as normal: same
   deferral, same `!ack` behavior (the reply fires after execution, so a
   scheduled job's replies are themselves jittered and confirm *when* each node
   actually ran it).
@@ -369,17 +369,17 @@ enables off-hours maintenance windows.
 
 Repeater RTCs drift (no GPS = minutes to hours off), and scheduled cutovers
 executed by nodes with disagreeing clocks are *worse* than the two-phase
-pattern they replace — nodes would bounce at different moments, exactly the
+pattern they replace: nodes would bounce at different moments, exactly the
 mesh split scheduling exists to avoid. Sync first, using existing commands
 only:
 
-1. **Sync**: a fleet script running **`time <unix-ts>`** — re-send until every
+1. **Sync**: a fleet script running **`time <unix-ts>`**: re-send until every
    node has it (idempotent; `time` refuses to go backwards).
 
-   **`clock sync` does not work inside fleet scripts** — it syncs from the
-   message's sender timestamp, and scripts run with `sender_timestamp = 0` —
+   **`clock sync` does not work inside fleet scripts**: it syncs from the
+   message's sender timestamp, and scripts run with `sender_timestamp = 0`,
    so scripts must use `time` with an explicit epoch.
-2. **Verify**: a `!ack` query job running **`clock`** — every node replies with
+2. **Verify**: a `!ack` query job running **`clock`**: every node replies with
    its current time (minute resolution, UTC), so you can confirm agreement
    before trusting a scheduled job. Minute resolution cannot see a node that is
    a minute or so behind: an `!at` job fires when the node's own RTC reaches the
@@ -395,17 +395,17 @@ All commands begin with `fleet`.
 |---|---|
 | `fleet` | Status: `on, chan h=XX, tags 2/8; scripts ran:3 dup:1 noid:0 refused:0; pending 0/2; sched 0/2; seen 2/32; ackq 0/2 await 0 rtx 0; badline 0` |
 | `fleet on` / `fleet off` | Arm / idle the hooks (config preserved either way) |
-| `fleet chan set <psk-hex>` | Set/replace the one fleet channel (16 or 32 bytes hex) — `OK - fleet channel set h=XX (PSK holder = admin)` |
-| `fleet chan clear` | `OK - fleet channel cleared` — receipt stops, queued and armed scripts are cancelled, seen keys and counters kept |
+| `fleet chan set <psk-hex>` | Set/replace the one fleet channel (16 or 32 bytes hex): `OK - fleet channel set h=XX (PSK holder = admin)` |
+| `fleet chan clear` | `OK - fleet channel cleared`: receipt stops, queued and armed scripts are cancelled, seen keys and counters kept |
 | `fleet tag add <tag>` | `OK - tag xiao added (2/8)`; duplicates no-op `OK` |
 | `fleet tag del <tag>` | `OK - tag xiao deleted` / `Err - tag xiao not set` |
 | `fleet tag list` | `tags: xiao siteA` or `tags: (none) - broadcast scripts only` |
 | `fleet tag clear` | `OK - tags cleared` |
 | `fleet reply [<secs>]` | Query or set the `!ack` jitter window (1–600 s; default 15) |
 | `fleet seen` | How many job keys are remembered: `seen 2/32` |
-| `fleet seen <key>` | `OK - key <key> seen` / `Err - key <key> not seen` — did this job run here? |
-| `fleet forget <key>` | `OK - key forgotten` — re-arm one job for a deliberate re-run |
-| `fleet forget all` | `OK - seen table cleared` — re-arm everything |
+| `fleet seen <key>` | `OK - key <key> seen` / `Err - key <key> not seen`: did this job run here? |
+| `fleet forget <key>` | `OK - key forgotten`: re-arm one job for a deliberate re-run |
+| `fleet forget all` | `OK - seen table cleared`: re-arm everything |
 
 Counter meanings:
 
@@ -430,24 +430,24 @@ acknowledgement).
 The status line is one line, and it is cut to the CLI's reply bound like every
 other reply (a few bytes under 160). The counters are 32-bit, so a node that
 has run for a very long time can push the line past that; the cut is
-**marked**, never silent — the line ends with `...` and the operator knows the
+**marked**, never silent: the line ends with `...` and the operator knows the
 status is incomplete.
 
 ## Two-phase fleet changes (radio presets and other cutovers)
 
 A job that reboots a repeater on first receipt splits the mesh **before**
-stragglers got the new settings — repeaters still on the old frequency would
+stragglers got the new settings: repeaters still on the old frequency would
 be orphaned, and with them possibly your path back in. So cut over in two
 phases:
 
 ```text
-# phase 1 — saturate: re-send this over a period of time (each send catches
+# phase 1 (saturate): re-send this over a period of time (each send catches
 # more of the fleet; it no-ops on repeaters that already ran it, and
 # re-running it after a reboot is harmless because it only sets values)
 alice: !id 2026-06-12-preset2-cfg
 set radio 869.650,62.5,9,5
 
-# phase 2 — commit: one-line job, sent once, only after phase 1 has reached
+# phase 2 (commit): one-line job, sent once, only after phase 1 has reached
 # every node (check with `fleet seen` over a normal admin session)
 alice: !id 2026-06-12-preset2-go
 reboot
@@ -457,7 +457,7 @@ reboot
 works so cleanly: the settings job is idempotent and repeatable, and the
 commit job is a single reboot that only fires once everyone is ready.
 
-Rollback is just a new key — it runs everywhere, including repeaters that
+Rollback is just a new key, and it runs everywhere, including repeaters that
 already ran the first job:
 
 ```text
@@ -469,7 +469,7 @@ followed by its own `reboot` job once saturated.
 
 **When `!at` replaces this:** once the fleet's clocks are synced (the
 [sync → verify → schedule recipe](#the-sync--verify--schedule-recipe)), a
-cutover can be a single armed job — settings applied and `reboot` in one
+cutover can be a single armed job, settings applied and `reboot` in one
 script, every node executing at the same coordinated instant:
 
 ```text
@@ -484,7 +484,7 @@ the armed job after any node rebooted in between (armed jobs are RAM-only).
 
 ## Recipes
 
-Each recipe is one or more jobs on the fleet channel. `#` lines are comments —
+Each recipe is one or more jobs on the fleet channel. `#` lines are comments:
 don't send them.
 
 ### Radio preset switch
@@ -492,7 +492,7 @@ don't send them.
 The [two-phase pattern](#two-phase-fleet-changes-radio-presets-and-other-cutovers)
 above, or its [armed variant](#scheduled-execution-at-unix-ts) once clocks are
 synced. Keep your preset table (freq/bw/sf/cr values) in your own notes or a
-companion snippet — the repeater stores one active setting, and the job is
+companion snippet: the repeater stores one active setting, and the job is
 just the value plus a commit.
 
 ### Advert hygiene
@@ -509,7 +509,7 @@ Re-sendable forever; nodes that already ran it no-op.
 ### Fleet filter update
 
 Push a new policy to every repeater at once. First add the rule (re-sendable),
-then remove an old one by index — but only in a **separate job**, because
+then remove an old one by index, but only in a **separate job**, because
 indices shift after a delete:
 
 ```text
@@ -523,7 +523,7 @@ filter del 2
 If you are not sure of the index, don't guess: run `filter list` with `!ack`
 and read the replies, or over a normal admin session per node, then send del
 jobs addressed to the cohorts whose layout you know. A mis-addressed `del`
-deletes the wrong rule — prefer `filter disable <idx>` first, watch the mesh
+deletes the wrong rule: prefer `filter disable <idx>` first, watch the mesh
 for a day, then delete.
 
 ### Node renaming and location refresh
@@ -541,16 +541,16 @@ All set-state commands: safe to re-send, safe to re-run after a reboot.
 ### Channel rotation (PSK response)
 
 Suspect the fleet key leaked? Set a fresh channel and verify the new path
-works, then retire the old one — but note the asymmetry with the filter's
+works, then retire the old one, but note the asymmetry with the filter's
 channel store: **`fleet chan set` is a one-channel config**, so the rotation
 is a single step, not an add-then-retire. Roll the new key out by direct admin
 per node (or a script sent over the *old* channel that ends with
-`fleet chan set <new-psk>` — it must be the last line of its job, and the
+`fleet chan set <new-psk>`: it must be the last line of its job, and the
 operator should keep the old channel configured in the companion until every
 node has rotated). `fleet seen` over the old channel tells you which nodes
 already rotated: they stop seeing jobs there.
 
-While you work, the old key still opens the channel — speed matters. In the
+While you work, the old key still opens the channel: speed matters. In the
 meantime `fleet off` (over a normal admin session, per node) closes the door.
 
 ### Emergency quiet mode
@@ -563,14 +563,14 @@ alice: !id 2026-06-16-quiet
 filter off
 ```
 
-Recovery is the same shape (`filter on`) — or per-node over normal admin.
+Recovery is the same shape (`filter on`), or per-node over normal admin.
 For a harder stop, `set repeat off` in its own job; recovering needs an
 explicit `set repeat on` job, which is itself re-sendable.
 
 ### Canary rollout
 
 Tag a few repeaters `canary` and send `!tags canary` jobs first; widen the tag
-(`fleet tag add canary` — which is itself a broadcast script) after
+(`fleet tag add canary`, which is itself a broadcast script) after
 verification. Cohorts by board/site/role work the same way; `!tags all` with
 an `all` tag on every node is the convention for fleet-wide jobs.
 
@@ -585,8 +585,8 @@ alice: !id 2026-06-17-rooftags
 fleet tag add roof
 ```
 
-The obvious footgun — a script that runs `fleet chan clear` on the whole
-fleet — is the same class as deleting the filter rule that delivered it:
+The obvious footgun (a script that runs `fleet chan clear` on the whole
+fleet) is the same class as deleting the filter rule that delivered it:
 documented here, not special-cased in code. Don't.
 
 ## Status, logs and troubleshooting
@@ -607,15 +607,15 @@ cli[2026-06-12-preset2-cfg] set radio 869.650,62.5,9,5
 | Some nodes ran it, some didn't | `refused` counter on the stragglers | Their pending queue was full (a third job arrived before the first drained); re-send the job |
 | Script targets nobody | `fleet tag list` on the nodes | Tag typo (exact matching: `xiao ` ≠ `xiao`); or all nodes lack the tag and `!tags` was present |
 | No `!ack` reply arrived | `ackq` on the node; window too long? | Reply still jittering (up to `reply window` s); store was full (`refused`); or the channel changed between receipt and send |
-| `rtx` climbing | Neighbouring repeaters in range? | Replies are not being heard repeated — likely no neighbouring repeater, or heavy loss; each miss is one extra byte-identical resend (never a duplicate, since nodes that already relayed suppress the copy) |
-| `dup` climbing, nothing changed | — | Normal: re-sends and duplicate flood deliveries |
+| `rtx` climbing | Neighbouring repeaters in range? | Replies are not being heard repeated: likely no neighbouring repeater, or heavy loss; each miss is one extra byte-identical resend (never a duplicate, since nodes that already relayed suppress the copy) |
+| `dup` climbing, nothing changed | - | Normal: re-sends and duplicate flood deliveries |
 | Job ran twice | seen-ring wrap | 33+ distinct jobs this boot evicted the key; re-send deliberately via `forget` semantics |
-| Lines missing from a run | `badline` counter | Lines over the CLI's length limit were skipped — split the job |
-| Reply ends with `...` | — | The reply did not fit one packet and was cut there; the text before the marker is everything that fitted. Page on with `filter list <idx+1>` (the first rule after the last complete one) |
-| Reply line ends in `..` | — | That rule is not shown whole: the repeater's listing abbreviated a rule too large for one line (see FILTER.md). `filter get <idx>` shows the rule whole |
-| Whole script refused, `refused` up | — | Unknown `!` directive, bad key characters, or a malformed `!tags`/`!ack`/`!at`/`!delay`; check the exact text |
-| `!at` job never fired | `sched` count; `clock` reply per node | Clock not synced (below the 2025 floor → refused), or the RTC is past it and it fired already; or a reboot wiped the armed job — re-send |
-| `!at` refused, `refused` up | — | Timestamp > 300 s in the past (stale), RTC unset, or the scheduled store was full |
+| Lines missing from a run | `badline` counter | Lines over the CLI's length limit were skipped: split the job |
+| Reply ends with `...` | - | The reply did not fit one packet and was cut there; the text before the marker is everything that fitted. Page on with `filter list <idx+1>` (the first rule after the last complete one) |
+| Reply line ends in `..` | - | That rule is not shown whole: the repeater's listing abbreviated a rule too large for one line (see FILTER.md). `filter get <idx>` shows the rule whole |
+| Whole script refused, `refused` up | - | Unknown `!` directive, bad key characters, or a malformed `!tags`/`!ack`/`!at`/`!delay`; check the exact text |
+| `!at` job never fired | `sched` count; `clock` reply per node | Clock not synced (below the 2025 floor → refused), or the RTC is past it and it fired already; or a reboot wiped the armed job: re-send |
+| `!at` refused, `refused` up | - | Timestamp > 300 s in the past (stale), RTC unset, or the scheduled store was full |
 | Nothing on the fleet channel is ever decrypted | `crowded` counter on the node | Core tries at most **4** candidate keys per on-air channel hash, and the packet filter's channel store is offered first. If the filter's store holds 4 *different* keys on the fleet channel's hash, the fleet key is never tried: the fleet channel goes deaf. The `crowded` counter counts the packets that were never offered to it. Fix it by removing a filter channel (`filter chan del <name>`) that shares the hash, or by using a different fleet PSK |
 
 ### Kill switches
@@ -630,7 +630,7 @@ nothing after that. `fleet forget <key>` re-arms one job. `filter off` does not 
 
 ## Battery supersession
 
-**Fleet management works when the battery is low** — a node in trouble is
+**Fleet management works when the battery is low**: a node in trouble is
 exactly the node you need to reach. All three of the battery gate's reach are
 exempt for the fleet channel:
 
@@ -639,7 +639,7 @@ exempt for the fleet channel:
   counted as a battery drop. (The exemption is exactly the packet the repeater
   has just MAC-verified under the fleet key. The one-byte channel hash only
   narrows the search, so other channels that share it stay gated.)
-- **Acknowledgements**: replies are sent regardless of gate state — the
+- **Acknowledgements**: replies are sent regardless of gate state: the
   operator chose `!ack`, and it is the operator's call whether to spend
   battery on a response. A battery report from a *low* node is the most
   valuable one.
@@ -660,10 +660,10 @@ so it can't be orphaned from a fleet cutover by its own battery state.
 
 - **PSK possession = admin.** The channel key is the credential; its MAC gate
   is the only thing between the world and your scripts. Holders of the key are
-  equals — there is no per-sender distinction, and tags are not authentication.
+  equals: there is no per-sender distinction, and tags are not authentication.
 - **Replay:** a captured message re-sent while the repeater is up no-ops
   (seen table) and is still relayed. After a reboot the table is empty and the
-  replay re-runs — bounded by the re-runnable-scripts convention. If
+  replay re-runs, bounded by the re-runnable-scripts convention. If
   cross-reboot replay protection matters to you, keep one-shot jobs out of the
   channel and do them over direct admin.
 - **Leak response:** treat every fleet member as compromised, rotate the PSK
@@ -679,7 +679,7 @@ so it can't be orphaned from a fleet cutover by its own battery state.
 | Limit | Value |
 |---|---|
 | Script per message | ~175 bytes of script (`!id` line included) |
-| Pending scripts | 2 — a third before the queue drains is refused, but **not** marked seen; a re-send reaches it |
+| Pending scripts | 2: a third before the queue drains is refused, but **not** marked seen; a re-send reaches it |
 | Armed `!at` scripts | 2 (RAM-only; a reboot wipes them) |
 | Pending acknowledgements | 2 (RAM-only; a full store drops and counts) |
 | `!ack` reply window | 1–600 s; default 15 s (~5 s per repeater) |
@@ -689,13 +689,13 @@ so it can't be orphaned from a fleet cutover by its own battery state.
 | Tags | up to 8 on a repeater; up to 8 per `!tags` list; 1–16 chars each |
 | `!delay` | 1–300000 ms per pause; a sleeping script holds its queue slot |
 | Command lines | up to the serial CLI's buffer (~160 bytes); longer lines are skipped |
-| Reply content | up to 97 bytes of room per acknowledgement in the worst case (a 31-character node name and a 32-character job key); a shorter name or key buys more. About 93 bytes of that are reply text — the cut marker takes 3. A reply that does not fit is cut where it stops fitting and ends with `...`; the text before it is kept as it was |
+| Reply content | up to 97 bytes of room per acknowledgement in the worst case (a 31-character node name and a 32-character job key); a shorter name or key buys more. About 93 bytes of that are reply text: the cut marker takes 3. A reply that does not fit is cut where it stops fitting and ends with `...`; the text before it is kept as it was |
 
 - Execution is **deferred**: a queued script runs in the main loop, outside the
   packet handling that queued it, so scripts may safely contain `filter …` and
   `fleet …` commands that mutate config.
 - All script state is RAM-only. Job keys, queue, armed jobs and counters reset
-  on reboot — the channel, tags and reply window persist in `/fleet_cfg`; the
+  on reboot: the channel, tags and reply window persist in `/fleet_cfg`; the
   script machinery does not.
 - `filter stats reset` does not touch the fleet counters; they reset only on
   reboot.

@@ -1,9 +1,9 @@
-# Repeater Power Profile — User Guide
+# Repeater Power Profile: User Guide
 
 Three knobs that cut an idle repeater's current by an order of magnitude:
 **light sleep** (`powersaving`), the radio's **receive duty cycle**
 (`radio.rxps`) and the **CPU clock** (`cpu.freq`). All three are runtime
-settings — persisted, tunable over the CLI, no rebuild required.
+settings: persisted, tunable over the CLI, no rebuild required.
 
 Measured on a Seeed XIAO ESP32-S3 + Wio-SX1262 (SF7 / 62.5 kHz, US preset,
 bench PSU, WiFi off):
@@ -15,7 +15,7 @@ bench PSU, WiFi off):
 | + `radio.rxps` level 6 (73 % RX duty, 16-symbol profile) | 4 mA |
 | + `cpu.freq 80` | 4 mA idle (3.75 mA on a DMM), 32 mA awake |
 
-The CPU knob does not show at idle — the CPU is asleep almost all the time —
+The CPU knob does not show at idle (the CPU is asleep almost all the time)
 but it cuts every awake window roughly in half (54 → 32 mA in the two-minute
 window after boot, and during any packet work).
 
@@ -26,7 +26,7 @@ Only one of the three knobs is this fork's own work, and the credit matters:
 - **`powersaving` (light sleep)** is **upstream MeshCore**
   ([meshcore-dev/MeshCore](https://github.com/meshcore-dev/MeshCore)) and is
   used here unchanged.
-- **`radio.rxps` (the receive duty cycle)** comes from **EasySkyMesh** —
+- **`radio.rxps` (the receive duty cycle)** comes from **EasySkyMesh**:
   [IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore), branch
   `PowerSaving-v18` (the source behind the EasySkyMesh PowerSaving18 release,
   by Kevin Le). The policy, level ladder, preamble guard, CLI and radio-wrapper
@@ -54,15 +54,15 @@ two costs that dominate idle:
   time spent listening when nothing is on air).
 
 Each knob is independent and each can be reverted with one command. The
-defaults reproduce the pre-power-feature behaviour exactly — light sleep off,
+defaults reproduce the pre-power-feature behaviour exactly: light sleep off,
 RX duty cycle off (continuous RX), CPU at the board's compiled clock
-(`ESP32_CPU_FREQ` where a variant sets it, otherwise 240 MHz) — so an existing
+(`ESP32_CPU_FREQ` where a variant sets it, otherwise 240 MHz). An existing
 installation sees no change until it opts in. `set radio.rxps on` and
 `powersaving on` are one command each; `cpu.freq 0` restores the board default.
 
 ## Behaviour
 
-### Light sleep — `powersaving`
+### Light sleep: `powersaving`
 
 With `powersaving on`, the node enters ESP32 light sleep whenever it has no
 pending work. The first sleep waits **2 minutes** after boot; afterwards the
@@ -71,7 +71,7 @@ loop sleeps in **30 s** chunks and wakes earlier on two events:
 - a LoRa packet (the radio's IRQ line is a GPIO wake source), and
 - any scheduled job that comes due.
 
-The radio stays in RX while the MCU sleeps, so packets are not missed — the
+The radio stays in RX while the MCU sleeps, so packets are not missed: the
 chip wakes on the preamble/first IRQ and the message is read normally. On
 NRF52 boards the same setting uses the platform's low-power path instead.
 
@@ -79,12 +79,12 @@ NRF52 boards the same setting uses the platform's low-power path instead.
 clock. A reboot re-reads the setting; the sleep itself starts again 2 minutes
 after boot.
 
-### RX duty cycle — `radio.rxps`
+### RX duty cycle: `radio.rxps`
 
 The SX126x, LLCC68 and LR11x0 radios can listen in **duty-cycled windows**:
 the radio wakes for a short window, looks for a preamble, and sleeps if there
 is none. Once a preamble is detected the chip stays awake for the whole packet,
-so a window only has to be shorter than the sender's preamble — the rest of the
+so a window only has to be shorter than the sender's preamble. The rest of the
 time is free.
 
 The setting is expressed as a **level**, and a level is a promise about the
@@ -125,7 +125,7 @@ remain visible while RXPS is off: the TCXO start-up delay is 1.6 ms
 reports the CAD-busy count. Neither changes the receive/sleep state or the
 on-air protocol.
 
-### CPU frequency — `cpu.freq`
+### CPU frequency: `cpu.freq`
 
 `set cpu.freq <mhz>` caps the CPU clock while the node is awake. Supported
 values are **40, 80, 160 and 240**; `0` restores the frequency the board booted
@@ -135,7 +135,7 @@ setting is applied immediately and again at boot.
 
 Repeater work is I/O-bound: packet handling is dominated by SPI and airtime,
 and the filter's pattern matcher is bounded by a **step budget**, not a time
-budget — at 80 MHz the pathological worst case grows from about 1 ms to about
+budget: at 80 MHz the pathological worst case grows from about 1 ms to about
 3 ms against packets that hold the channel for hundreds of milliseconds. WiFi
 on the ESP32-S3 needs at least 80 MHz, so 80 is the useful floor for observer
 builds.
@@ -154,8 +154,8 @@ the new bus clock; USB CDC consoles are unaffected.
 | `set radio.rxps on` (or `conservative`) | Level 3, 16-symbol profile |
 | `set radio.rxps balanced` | Level 6, 16-symbol profile |
 | `set radio.rxps max` | Level 8 (guarded floor), 16-symbol profile |
-| `set radio.rxps overdrive` | Level 9 — lossless but outside the datasheet timer condition |
-| `set radio.rxps riskyWorkingMax` | Level 10 — measured working edge, drops ~2 % |
+| `set radio.rxps overdrive` | Level 9: lossless but outside the datasheet timer condition |
+| `set radio.rxps riskyWorkingMax` | Level 10: measured working edge, drops ~2 % |
 | `set radio.rxps level <1-10>` | Pick a level directly |
 | `set radio.rxps level <1-10> preamble <16\|32>` | Pick a level and the preamble profile |
 | `set radio.rxps max preamble <16\|32>` | Preset with an explicit profile |
@@ -212,9 +212,9 @@ periods it was calculated with.
 
 | Situation | Setting |
 |---|---|
-| Battery/solar node, mixed network | `balanced` (level 6) — the default |
+| Battery/solar node, mixed network | `balanced` (level 6), the default |
 | Best battery life, mixed network, can accept a rare miss | `max` (level 8) |
-| Whole network on 32-symbol preambles (SF ≤ 8) | `set radio.rxps level 6 preamble 32` — much cheaper than the 16-symbol default |
+| Whole network on 32-symbol preambles (SF ≤ 8) | `set radio.rxps level 6 preamble 32`, much cheaper than the 16-symbol default |
 | Need every packet, radio must never sleep | `off` |
 
 Measured delivery at level 6 on a 0-hop path: **8/8** direct CLI round trips

@@ -1,8 +1,8 @@
-# Second Radio Preset (radio2) — User Guide
+# Second Radio Preset (radio2): User Guide
 
 Give a repeater a second LoRa preset. The same transceiver time-shares between
 the normal preset (`radio`) and the new one (`radio2`), so the node can hear two
-networks — but only one at a time. The primary preset is protected; the second
+networks, but only one at a time. The primary preset is protected; the second
 one is a bonus.
 
 **Off by default.** With `radio2` off, the repeater behaves like stock
@@ -20,8 +20,8 @@ power behaviour. The preset and policy you save are simply remembered.
 - **Broadcast flood only.** Adverts, group text and group data heard as flood
   traffic can be repeated on the other preset. Direct messages, ACKs, path
   returns and traces never cross.
-- **Replies follow the request.** A reply — CLI, ACK, path return, control
-  response, fleet acknowledgement — goes back out on the preset the request
+- **Replies follow the request.** A reply (CLI, ACK, path return, control
+  response, fleet acknowledgement) goes back out on the preset the request
   arrived on.
 - **Useful for:**
   - joining two nearby communities that use different radio presets;
@@ -29,7 +29,7 @@ power behaviour. The preset and policy you save are simply remembered.
   - listening to a second preset without giving up the primary network.
 - **Not a second receiver.** It cannot hear both presets at once. A packet on
   the secondary preset can be missed while the radio is listening on the
-  primary — that is the price of one transceiver.
+  primary: that is the price of one transceiver.
 
 ## Quick start
 
@@ -50,7 +50,7 @@ power behaviour. The preset and policy you save are simply remembered.
    ```
 
    The four values are **frequency MHz, bandwidth kHz, spreading factor,
-   coding rate** — the same order as `set radio`.
+   coding rate**, the same order as `set radio`.
 
 4. Wait a couple of seconds, then check it is running:
 
@@ -413,7 +413,7 @@ not repeated back into its origin. This is usually the cleanest bridge.
 radio2 policy both both
 ```
 
-Each packet is repeated on both presets — one copy stays in the origin network,
+Each packet is repeated on both presets: one copy stays in the origin network,
 one crosses. This doubles the traffic and the airtime. Use it only when the
 origin network genuinely needs the local repeat.
 

@@ -1,7 +1,7 @@
-# Mesh Clock Sync — User Guide
+# Mesh Clock Sync: User Guide
 
 Give a repeater a plausible UTC from the adverts it already hears, so features
-that need a clock — most importantly fleet `!at` scheduling — work on a node with
+that need a clock, most importantly fleet `!at` scheduling, work on a node with
 no GPS, no NTP and no battery-backed RTC.
 
 **Off by default.** Enabling it changes nothing else; disabling it changes
@@ -29,10 +29,10 @@ When mesh clock sync is **on**, each distinct source contributes **one vote** pe
 When the batch fills, the repeater takes the **median** of the sources' predicted
 "now" and counts how many sources agree with it:
 
-- **too few agree** — nothing happens; the batch is dropped and a new one starts.
-- **the median is close to the node's own clock** (within 60 s) — nothing happens;
+- **too few agree**: nothing happens; the batch is dropped and a new one starts.
+- **the median is close to the node's own clock** (within 60 s): nothing happens;
   the node is already in sync.
-- **enough sources agree and the clock differs** — the RTC is stepped **once** to
+- **enough sources agree and the clock differs**: the RTC is stepped **once** to
   the median, and a new batch starts.
 
 The median is deliberately robust: a minority of sources with a wrong clock
@@ -64,19 +64,19 @@ collected over hours and its samples still cluster within seconds.
 | `clock mesh` | Status: `off slots=<s>/<a> tol=<t>/<d> now=<iso-time>`, or `on samples=<n>/<cap> last=<result> slots=<s>/<a> tol=<t>/<d> now=<iso-time>` |
 | `clock mesh on` | Enable |
 | `clock mesh off` | Disable |
-| `clock mesh slots <slots> <min-agree>` | Set the batch size and the quorum — both values are required and applied as a pair; persists |
-| `clock mesh tolerance <tolerance-s> <min-diff-s>` | Set the inlier window and the deadband — both values are required and applied as a pair; persists |
+| `clock mesh slots <slots> <min-agree>` | Set the batch size and the quorum: both values are required and applied as a pair; persists |
+| `clock mesh tolerance <tolerance-s> <min-diff-s>` | Set the inlier window and the deadband: both values are required and applied as a pair; persists |
 
 `slots` is the distinct-sources-per-batch figure the batch fills at (the
 compile-time `MESHCLOCK_SLOTS`, 33, is both the shipped default and the upper
 bound; the valid runtime range is `3..33`). `min-agree` is the agreeing sources
 the batch needs before the RTC is stepped (`2..slots`). `tolerance` is how
 close a source must be to the median to count as an inlier (`1..65535`
-seconds — zero is refused: it would deadlock consensus outright). `min-diff`
+seconds, zero is refused: it would deadlock consensus outright). `min-diff`
 is the deadband: a median this close to the node's clock is left alone
 (`0..65535` seconds; zero means the clock always steps). Both pairs are
 validated independently: a bad pair is rejected as a whole, nothing is
-applied, and the batch already in flight is dropped when a setting changes —
+applied, and the batch already in flight is dropped when a setting changes:
 samples gathered under old rules never decide under new ones. An even `slots`
 value is allowed; the median is then the upper-middle value.
 
@@ -89,7 +89,7 @@ OK - mesh clock tolerance 300/120
 ```
 
 Like the other fork CLIs (`filter`, `battery`, `fleet`), the command is refused
-whole — nothing is enabled or disabled — when it is too long for the CLI's
+whole (nothing is enabled or disabled) when it is too long for the CLI's
 buffer (`Err - command too long`) or carries an odd number of double quotes
 (`Err - unbalanced quotes`); an unexpected extra word answers
 `Err - clock mesh takes on|off|slots|tolerance`.
@@ -103,7 +103,7 @@ The status `last=` field is one of:
 | `in-sync(N s)` | median was close to the node clock; nothing changed |
 | `no-consensus` | not enough sources agreed; batch dropped |
 
-`last=` is status only — it is **not** persisted, so a reboot reports `idle`.
+`last=` is status only: it is **not** persisted, so a reboot reports `idle`.
 
 `now=` is the node's current RTC time as an ISO 8601 UTC timestamp
 (`YYYY-MM-DDTHH:MM:SSZ`), e.g. `2026-11-01T14:05:00Z`; the trailing `Z` means
@@ -141,7 +141,7 @@ reboot always starts a fresh, empty batch. A `clock mesh` command is written to
 flash about **3 seconds** later, staged the same way as the other configs
 (scratch file, read back and checked, previous config kept as a backup, then
 swapped in). Records written by the original format (v1: the enabled flag
-only) are still read — the flag carries over, the knobs take the defaults
+only) are still read: the flag carries over, the knobs take the defaults
 above, and the v1 bytes are kept as the backup of the migration save.
 
 ## Defaults
@@ -155,7 +155,7 @@ above, and the v1 bytes are kept as the backup of the migration save.
 
 The defaults are also the compile-time fallback; `MESHCLOCK_SLOTS` doubles as
 the runtime upper bound (the sample array is sized for it). Sites can override
-them at build time (e.g. in `platformio.local.ini`), or — without rebuilding —
+them at build time (e.g. in `platformio.local.ini`), or, without rebuilding,
 set them at runtime with `clock mesh slots` and `clock mesh tolerance`; the
 runtime values persist. Sparse meshes may never hear 33 distinct sources: lower
 the batch and quorum to fit what the mesh actually hears (e.g. `clock mesh
