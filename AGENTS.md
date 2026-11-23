@@ -82,8 +82,11 @@ should not need to explore beyond them before making a change.
   outside upstream's `0x01..0x09` REQ range (`0x08` is upstream's `subscribe`);
   the app's `reqTypeOta` constant changes with it.
 
-**When behavior changes, the matching guide section is updated in the same
-commit**. The guides are user-facing API documentation, not optional docs.
+**New top-level features need two docs in the same commit:** a paragraph in
+`README.md` describing the feature, and a dedicated, user-focused guide (like
+`FILTER.md`, `FLEET.md`, `RADIO2.md`) covering setup, behavior, the CLI and
+limits. **When behavior changes, the matching guide section is updated in the
+same commit**. The guides are user-facing API documentation, not optional docs.
 
 **Code (`examples/simple_repeater/`):**
 - `PacketFilter.h/.cpp`: rule model, evaluation (`checkPacket` packet-level,
@@ -393,18 +396,34 @@ conflicting, not before.
   no drive-by refactors, no renames, no reformatting of untouched lines, no
   dependency upgrades folded into an unrelated change. Re-read the final diff
   and confirm every touched line is required and nothing else changed.
+- **Keep the upstream diff small.** Prefer fork-owned files. When a hook in an
+  upstream file is unavoidable, keep it to a handful of lines (see *Fork-owned
+  vs upstream code* above), so upstream syncs stay cheap and the fork remains
+  easy to rebase.
 - **DRY.** Shared logic gets one authoritative home, and nothing re-implements
   it. Precedents: the CLI tokenizer and reply writer in `CliUtil.h`; the match
   gates + hit/airtime commit in `FilterRules::decideMatch()`. If you find
   yourself copying a block from a sibling function, factor it instead.
 - **Deslop as you go.** Code you touch must end up cleaner than you found it
   where slop is in reach: duplicated logic factored, unbounded writes bounded,
-  dead state removed, twin branches merged. But don't deslop code you aren't
-  otherwise touching: that's churn, not cleanliness.
-- **Simplicity and maintainability.** The simplest code that is correct;
-  obvious beats clever; write what the project's maintainers would have
-  written, not what an agent would. Comments explain *why* (invariants,
-  protocol quirks, on-air format constraints), not what.
+  dead state removed, twin branches merged. Remove unimplemented stubs, dead
+  code and anything unnecessary before calling the change done. But don't
+  deslop code you aren't otherwise touching: that's churn, not cleanliness.
+- **Simplicity.** The simplest code that is correct; obvious beats clever;
+  write what the project's maintainers would have written, not what an agent
+  would. Prefer the less clever option when it is easier to reason about and
+  verify. Comments explain *why* (invariants, protocol quirks, on-air format
+  constraints), not what.
+- **Maintainability.** This fork is maintained long term. Choose solutions
+  that stay workable and flexible so later features are easy to add and we do
+  not design ourselves into a corner.
+- **Minimize flash usage.** Targets have tight flash budgets (the STM32WLE5
+  repeaters no longer fit). Share code instead of duplicating it, reuse
+  existing helpers, and avoid heavy dependencies for small gains.
+- **Minimize RAM usage.** Targets have limited RAM and small stacks. Bound
+  buffers and queues, keep per-feature state small, and avoid large stack
+  frames and heap churn (see the stack constraint under *Tests &
+  verification*).
 - **No em dashes anywhere.** In this file, fork docs, code comments, commit
   messages, CLI help and replies, and any other user-facing text, use a short
   sentence, a colon or a comma instead. Do not introduce an em dash; replace
