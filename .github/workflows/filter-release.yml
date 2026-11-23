@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.version.outputs.skip }}
-      branch: ${{ steps.version.outputs.branch }}
+      prev_tag: ${{ steps.version.outputs.prev_tag }}
       release_tag: ${{ steps.version.outputs.release_tag }}
       release_title: ${{ steps.version.outputs.release_title }}
       firmware_version: ${{ steps.version.outputs.firmware_version }}
@@ -208,7 +208,7 @@ jobs:
             }
 
             core.setOutput('skip', String(skip));
-            core.setOutput('branch', branch);
+            core.setOutput('prev_tag', prevTag);
             core.setOutput('release_tag', releaseTag);
             core.setOutput('release_title', releaseTitle);
             core.setOutput('firmware_version', firmwareVersion);
@@ -224,6 +224,72 @@ jobs:
       contents: write
     steps:
 
+      - name: Clone Repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.version.outputs.source_sha }}
+          # stable notes collect dev releases since the previous stable tag, so
+          # the full history is needed here
+          fetch-depth: 0
+
+      # dev uses the pending notes file as its body verbatim
+      - name: Prepare dev release notes
+        if: inputs.channel == 'dev'
+        env:
+          PREV_TAG: ${{ needs.version.outputs.prev_tag }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+        run: |
+          if [[ -n $PREV_TAG ]] && git diff --quiet "$PREV_TAG" HEAD -- RELEASE_NOTES.md; then
+            echo "::warning::RELEASE_NOTES.md is unchanged since $PREV_TAG; notes may be stale"
+          fi
+          { cat RELEASE_NOTES.md
+            printf '\n\nBuilt from commit `%s`.\n' "$SOURCE_SHA"
+          } > "$RUNNER_TEMP/release-body.md"
+
+      # a stable release spans several dev builds and may not come from a
+      # promotion, so collect the notes of every dev release in its range
+      - name: Aggregate stable release notes
+        if: inputs.channel == 'stable'
+        uses: actions/github-script@v8
+        env:
+          PREV_TAG: ${{ needs.version.outputs.prev_tag }}
+          SOURCE_SHA: ${{ needs.version.outputs.source_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { spawnSync } = require('child_process');
+            const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
+            const gitOk = (...args) => git(...args).status === 0;
+            const footer = `\n\nBuilt from commit \`${process.env.SOURCE_SHA}\`.`;
+
+            // an explicit stable notes file wins when one is present
+            if (fs.existsSync('RELEASE_NOTES_STABLE.md')) {
+              fs.writeFileSync(`${process.env.RUNNER_TEMP}/release-body.md`,
+                fs.readFileSync('RELEASE_NOTES_STABLE.md', 'utf8').trimEnd() + footer + '\n');
+              return;
+            }
+
+            const prev = process.env.PREV_TAG;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner, repo: context.repo.repo, per_page: 100,
+            });
+            const notes = releases
+              .filter((r) => r.prerelease && /^filter-v[\d.]+-dev\.\d+$/.test(r.tag_name))
+              .filter((r) => !prev || gitOk('merge-base', '--is-ancestor', prev, r.target_commitish))
+              .filter((r) => gitOk('merge-base', '--is-ancestor', r.target_commitish, process.env.SOURCE_SHA))
+              .sort((a, b) => a.created_at.localeCompare(b.created_at))
+              // drop each dev release's commit footer; the old placeholder
+              // body carried no notes at all
+              .map((r) => (r.body || '').trim().replace(/\n*Built from commit `[0-9a-f]+`\.$/, ''))
+              .filter(Boolean);
+            let body = notes.join('\n\n');
+            if (!body) {
+              // no dev release notes in range: fall back to the commit list
+              const range = prev ? `${prev}..${process.env.SOURCE_SHA}` : process.env.SOURCE_SHA;
+              body = git('log', '--oneline', range).stdout.trim();
+            }
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/release-body.md`, body + footer + '\n');
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
@@ -232,7 +298,6 @@ jobs:
           # dev releases are pre-releases; the stable release is the repo's latest
           prerelease: ${{ inputs.channel != 'stable' }}
           make_latest: ${{ inputs.channel == 'stable' && 'true' || 'false' }}
-          # release notes are written by hand after the release is created
+          body_path: ${{ runner.temp }}/release-body.md
           # firmware assets are built and uploaded locally (scripts/local-release-build.sh)
-          body: "Built from commit `${{ needs.version.outputs.source_sha }}`."
           target_commitish: ${{ needs.version.outputs.source_sha }}

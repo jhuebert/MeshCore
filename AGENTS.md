@@ -259,6 +259,13 @@ shut down). The build job prints the tail of a failed target's log, prunes a
 failed target's build tree, and retries the failed set once with two workers
 (`--retry-failed`) after the main pass, so runner-resource flakes do not leave
 assets missing; a deterministic failure simply fails again.
+`RELEASE_NOTES.md` holds the pending release notes and `filter-release.yml` uses
+it verbatim as the body of every dev release. A stable release collects the
+bodies of the dev releases since the previous stable one, so it needs no
+separate notes file; a `RELEASE_NOTES_STABLE.md` on the stable branch overrides
+that collection when curated stable notes are wanted. Update the pending file
+as changes land, since the gate cuts a release only when code (not docs)
+changed.
 `sync-upstream.yml` merges upstream `main` into `repeater-filter-stable`
 (channel=stable) or `repeater-filter-stable` into `repeater-filter` (dev);
 `promote-stable.yml` fast-forwards `repeater-filter-stable` to
