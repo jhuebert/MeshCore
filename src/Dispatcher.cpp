@@ -331,7 +331,7 @@ void Dispatcher::checkSend() {
 
       uint32_t max_airtime = _radio->getEstAirtimeFor(len)*3/2;
       outbound_start = _ms->getMillis();
-      bool success = _radio->startSendRaw(raw, len);
+      bool success = onBeforeTransmit(outbound) && _radio->startSendRaw(raw, len);
       if (!success) {
         MESH_DEBUG_PRINTLN("%s Dispatcher::loop(): ERROR: send start failed!", getLogDateTime());
 

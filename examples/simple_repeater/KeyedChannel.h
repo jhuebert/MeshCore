@@ -28,6 +28,10 @@ inline bool validChannelName(const char* name) {
   return true;
 }
 
+// The well-known MeshCore Public channel PSK (16 bytes); sha256()[0] is 0x11.
+// Both the filter and ham mode need it, so it lives here once.
+#define MESHCORE_PUBLIC_PSK_HEX "8b3387e9c5cdea6ac9e5edbaa115cd72"
+
 // Derive a hashtag channel's 16-byte secret and its 1-byte on-air hash from
 // the name (including the leading '#'), per the companion protocol.
 inline void deriveChannelKey(const char* name, uint8_t* secret, uint8_t* hash) {

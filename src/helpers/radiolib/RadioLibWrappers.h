@@ -27,6 +27,7 @@ protected:
   float _last_rssi, _last_snr;
   bool _last_metrics_valid;
   bool _cad_enabled;
+  bool _tx_power_ok = false;
   uint16_t _num_floor_samples;
   int32_t _floor_sample_sum;
   uint8_t _preamble_sf;
@@ -144,6 +145,7 @@ public:
   virtual void setParams(float freq, float bw, uint8_t sf, uint8_t cr) = 0;
   uint32_t getRngSeed();
   void setTxPower(int8_t dbm);
+  bool lastTxPowerOk() const { return _tx_power_ok; }
 
   virtual float getCurrentRSSI() =0;
   virtual uint8_t getSpreadingFactor() const { return LORA_SF; }

@@ -196,6 +196,29 @@ TEST(DispatcherProfiles, SelectsBeforeAirtimeAndCad) {
   d.loop();   // complete and release the outbound packet
 }
 
+TEST(DispatcherTransmit, RejectedPreparationDoesNotStartRadioAndReleasesPacket) {
+  struct RejectPower : TestDispatcher {
+    using TestDispatcher::TestDispatcher;
+    bool failed = false;
+    bool onBeforeTransmit(mesh::Packet*) override { return false; }
+    void logTxFail(mesh::Packet*, int) override { failed = true; }
+  };
+  OrderRadio radio;
+  FixedClock clock;
+  StaticPoolPacketManager mgr(1);
+  RejectPower d(radio, clock, mgr);
+  d.begin();
+  clock.now = 2;
+  auto pkt = d.obtainNewPacket();
+  ASSERT_NE(pkt, nullptr);
+  pkt->header = (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT;
+  d.sendPacket(pkt, 1, 0);
+  d.loop();
+  EXPECT_TRUE(d.failed);
+  EXPECT_FALSE(radio.started);
+  EXPECT_EQ(mgr.getFreeCount(), 1);
+}
+
 TEST(DispatcherProfiles, SelectFailureLeavesPacketQueued) {
   OrderRadio radio;
   FixedClock clock;
