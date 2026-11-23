@@ -3,17 +3,11 @@ name: Promote Stable
 # manual only: moves repeater-filter-stable to repeater-filter's tip without
 # syncing upstream or cutting a release. The fork dev branch is based on
 # stable, so the promotion is a fast-forward: if stable is not an ancestor of
-# dev the run fails and leaves stable untouched (merge stable into dev — run
-# sync-upstream.yml with channel=dev — then re-run this). Use Filter Release
+# dev the run fails and leaves stable untouched (merge stable into dev: run
+# sync-upstream.yml with channel=dev, then re-run this). Use Filter Release
 # (channel: stable) afterwards to tag the promoted revision.
 on:
   workflow_dispatch:
-    inputs:
-      skip_gate:
-        description: Move stable even if the native test gate fails (deliberate override)
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -47,8 +41,6 @@ jobs:
       - name: Promote repeater-filter-stable
         id: promote
         uses: actions/github-script@v8
-        env:
-          SKIP_GATE: ${{ inputs.skip_gate }}
         with:
           script: |
             const { spawnSync } = require('child_process');
@@ -69,7 +61,7 @@ jobs:
             // stable no longer an ancestor of dev, breaking this invariant.
             if (git('merge-base', '--is-ancestor', stableBefore, devSha).status !== 0) {
               core.setFailed('repeater-filter-stable is not an ancestor of repeater-filter '
-                + '(stable gained commits the dev branch does not have — typically an upstream '
+                + '(stable gained commits the dev branch does not have, typically an upstream '
                 + 'main sync). Run sync-upstream.yml with channel=dev to merge stable into dev, '
                 + 'then re-run this workflow. Stable is unchanged.');
               return;
@@ -83,35 +75,31 @@ jobs:
             // ---- quality gate: never publish something that does not pass ----
             // Test the exact tree stable is about to point at.
             run('checkout', '-B', 'promote-gate', devSha);
-            if (process.env.SKIP_GATE !== 'true') {
-              const onPath = (cmd) => (process.env.PATH || '').split(':')
-                .some((dir) => fs.existsSync(path.join(dir, cmd)));
-              if (!process.env.PIO && !onPath('pio')) {
-                core.setFailed('pio is not available; cannot run the gate (or set skip_gate)');
-                return;
-              }
-              const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
-                '-e', 'native_packet_filter', '-e', 'native_battery_gate',
-                '-e', 'native_ham_mode', '-e', 'native_fleet',
-                '-e', 'native_fleet_noack', '-e', 'native_mesh_clock',
-                '-e', 'native_rx_power_saving', '-e', 'native_radio2',
-                '-e', 'native_mqtt_observer', '-e', 'native_ota'],
-                { stdio: 'inherit' });
-              if (gate.status !== 0) {
-                core.setFailed('native test gate failed; stable is unchanged');
-                return;
-              }
-              // the fork's own build-tooling tests (the target catalog and the
-              // build.sh environment list): nothing else runs them
-              const tooling = spawnSync('python3',
-                ['-m', 'unittest', 'discover', '-s', 'scripts/tests'],
-                { stdio: 'inherit' });
-              if (tooling.status !== 0) {
-                core.setFailed('build tooling test gate failed; stable is unchanged');
-                return;
-              }
-            } else {
-              core.warning('skip_gate set: publishing without the native test gate');
+            const onPath = (cmd) => (process.env.PATH || '').split(':')
+              .some((dir) => fs.existsSync(path.join(dir, cmd)));
+            if (!process.env.PIO && !onPath('pio')) {
+              core.setFailed('pio is not available; cannot run the gate');
+              return;
+            }
+            const gate = spawnSync('pio', ['test', '-e', 'native', '-e', 'native_kiss_modem',
+              '-e', 'native_packet_filter', '-e', 'native_battery_gate',
+              '-e', 'native_ham_mode', '-e', 'native_fleet',
+              '-e', 'native_fleet_noack', '-e', 'native_mesh_clock',
+              '-e', 'native_rx_power_saving', '-e', 'native_radio2',
+              '-e', 'native_mqtt_observer', '-e', 'native_ota'],
+              { stdio: 'inherit' });
+            if (gate.status !== 0) {
+              core.setFailed('native test gate failed; stable is unchanged');
+              return;
+            }
+            // the fork's own build-tooling tests (the target catalog and the
+            // build.sh environment list): nothing else runs them
+            const tooling = spawnSync('python3',
+              ['-m', 'unittest', 'discover', '-s', 'scripts/tests'],
+              { stdio: 'inherit' });
+            if (tooling.status !== 0) {
+              core.setFailed('build tooling test gate failed; stable is unchanged');
+              return;
             }
 
             // ---- publish: a non-fast-forward rejection is the correct outcome

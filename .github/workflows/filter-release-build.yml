@@ -1,7 +1,7 @@
 name: Filter Release Build
 
 # Builds one filter release's firmware assets on a single runner by invoking
-# scripts/local-release-build.sh — the same script, flags and code path used
+# scripts/local-release-build.sh: the same script, flags and code path used
 # locally. No matrix: the script drives its own build pool, and keeping a
 # release in one job is the point (the old per-target fan-out is what got
 # Actions shut down).
@@ -25,11 +25,6 @@ on:
         required: false
         type: string
         default: ""
-      no_upload:
-        description: Build and collect the artifacts only — do not upload them to the release
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write # gh release upload --clobber
@@ -94,7 +89,6 @@ jobs:
           RELEASE: ${{ inputs.release }}
           JOBS: ${{ inputs.jobs }}
           FILTER: ${{ inputs.filter }}
-          NO_UPLOAD: ${{ inputs.no_upload }}
         run: |
           # a target that does not build is reported by the script and is
           # visible as a missing asset on the release, but it must not fail the
@@ -102,7 +96,6 @@ jobs:
           # just the targets that failed.
           args=(--prune --jobs "$JOBS" --allow-build-failures)
           [[ -n $FILTER ]] && args+=(--filter "$FILTER")
-          [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
           bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
 
       # The build pool is as wide as the runner's cores, so a target can fail
@@ -116,7 +109,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE: ${{ inputs.release }}
-          NO_UPLOAD: ${{ inputs.no_upload }}
         run: |
           shopt -s nullglob
           failed=("$HOME"/.cache/meshcore-release-build/*/.state/failed/*)
@@ -127,13 +119,4 @@ jobs:
           fi
           echo "retrying ${#failed[@]} failed target(s) with 2 workers"
           args=(--prune --jobs 2 --allow-build-failures --retry-failed)
-          [[ $NO_UPLOAD == true ]] && args+=(--no-upload)
           bash scripts/local-release-build.sh "${args[@]}" "$RELEASE"
-
-      # without the upload the runner's artifacts vanish with it
-      - name: Upload built artifacts
-        if: inputs.no_upload
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-assets
-          path: ~/.cache/meshcore-release-build/*/out

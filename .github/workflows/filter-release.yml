@@ -8,16 +8,6 @@ on:
         required: false
         type: string
         default: dev
-      branch:
-        description: Branch to release (defaults to the channel's branch)
-        required: false
-        type: string
-        default: ""
-      force_build:
-        description: Create the release even if nothing changed since the last one of this channel
-        required: false
-        type: boolean
-        default: false
   workflow_dispatch:
     inputs:
       channel:
@@ -28,16 +18,6 @@ on:
         options:
           - dev
           - stable
-      branch:
-        description: Branch to release (defaults to the channel's branch)
-        required: false
-        type: string
-        default: ""
-      force_build:
-        description: Create the release even if nothing changed since the last one of this channel
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -63,9 +43,8 @@ jobs:
       - name: Clone Repo
         uses: actions/checkout@v6
         with:
-          # empty branch input = the channel's own branch
-          # the ref is an expression evaluated by Actions, never shell text
-          ref: ${{ inputs.branch != '' && inputs.branch || (inputs.channel == 'stable' && 'repeater-filter-stable' || 'repeater-filter') }}
+          # each channel is released from its own branch
+          ref: ${{ inputs.channel == 'stable' && 'repeater-filter-stable' || 'repeater-filter' }}
           fetch-depth: 0
 
       - name: Derive Version
@@ -73,8 +52,6 @@ jobs:
         uses: actions/github-script@v8
         env:
           CHANNEL: ${{ inputs.channel }}
-          FORCE_BUILD: ${{ inputs.force_build }}
-          BRANCH_INPUT: ${{ inputs.branch }}
         with:
           script: |
             const { spawnSync } = require('child_process');
@@ -96,16 +73,9 @@ jobs:
               return;
             }
 
-            let branch = 'repeater-filter';
             // both channels are based on upstream main; used to count only
             // fork commits for the stable release decision
-            let baseRef = 'origin/main';
-            if (channel === 'stable') {
-              branch = 'repeater-filter-stable';
-            }
-            // via env, not an Actions expression: input text must never become
-            // shell syntax
-            if (process.env.BRANCH_INPUT) branch = process.env.BRANCH_INPUT;
+            const baseRef = 'origin/main';
 
             // upstream base version, X.Y.Z only. Both channels are main-based,
             // so upstream tags on the main merge commit are reachable; prefer
@@ -166,20 +136,11 @@ jobs:
 
             // ---- gate: should this channel build at all? ----
             let skip = true;
-            let range = 'HEAD';
-            if (process.env.FORCE_BUILD === 'true') {
-              skip = false;
-              // forced builds still list changes since the previous release,
-              // when there is one to compare against
-              if (prevTag) range = `${prevTag}..HEAD`;
-            } else if (!prevTag) {
-              // first release of this channel under the new scheme
-              range = 'HEAD';
-            } else {
+            const range = prevTag ? `${prevTag}..HEAD` : 'HEAD';
+            if (prevTag) {
               // upstream base changed -> build to carry the new base
               const prevBase = (prevTag.match(/v\d+\.\d+\.\d+/) || [])[0] || '';
               if (prevBase && prevBase !== upstreamVersion) skip = false;
-              range = `${prevTag}..HEAD`;
             }
 
             if (skip) {
