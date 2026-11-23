@@ -75,8 +75,8 @@ The node sends its callsign in a zero-hop advert at least every 10 minutes.
 Packets themselves are unchanged, so stock nodes and apps are unaffected.
 Off by default: with ham mode off the node behaves like stock firmware.
 
-Adapted from NebraskaMesh/MeshCore-Ham by KF0WXX for the Nebraska Mesh
-community; see the Acknowledgements in HAM.md.
+Adapted from [NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham)
+by KF0WXX for the Nebraska Mesh community; see the Acknowledgements in HAM.md.
 
 → Full guide, including the classification table, setup and the legal notes:
 **[HAM.md](./HAM.md)**

@@ -184,6 +184,21 @@ TEST_F(HamTest, GroupOnPrivatePskIsPrivate) {
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_ENCRYPTED);
 }
 
+TEST_F(HamTest, FleetAckUsesPrivatePower) {
+  // Fleet ACKs are not PAYLOAD_TYPE_ACK: MyMesh builds them as GRP_TXT on the
+  // fleet channel's private PSK. That key is not in the ham list, so even an
+  // active node must send them at `set tx`.
+  ham.setEnabled(true);
+  ham.setCallsign("N0CALL");
+  ham.setHamDbm(22);
+  uint8_t secret[16];
+  memset(secret, 0x5A, sizeof(secret));
+  mesh::Packet ack;
+  makeGroup(ack, PAYLOAD_TYPE_GRP_TXT, secret, "jobkey\nok");
+  EXPECT_EQ(ham.classify(&ack), HAM_TX_ENCRYPTED);
+  EXPECT_EQ(ham.selectPower(&ack, "N0CALL Test", 7), 7);
+}
+
 TEST_F(HamTest, HashMatchWithoutMacIsNotEnough) {
   uint8_t psk[16];
   publicKey(psk);

@@ -45,10 +45,12 @@ differs. With ham mode off, no power switching happens at all.
   that. The call sign is the node name, so set the name to include it.
 - Part 15 devices are limited to 1 W (30 dBm) conducted output, with a
   dB-for-dB reduction above 6 dBi of antenna gain (47 CFR 15.247(b)(3)-(4)).
-  On boards with a power amplifier, the `set tx` number is often a drive level,
-  not measured output. Station G2 and G3 use a `LORA_TX_POWER` of 7 dBm to drive
-  the PA. Measure your real output on your hardware and choose both powers
-  yourself. This fork enforces no ceiling and claims no compliance.
+  A high-gain antenna can push radiated power over that limit on any board,
+  not just an amplified one. On boards with a power amplifier, the `set tx`
+  number is often a drive level rather than measured output; Station G2 and G3
+  use a `LORA_TX_POWER` of 7 dBm to drive the PA. Measure your real output with
+  your actual antenna and choose both powers yourself. This fork enforces no
+  ceiling and claims no compliance.
 
 ## Quick start
 
@@ -196,9 +198,10 @@ RAM-only counters since boot, plus the applied power and ID countdown:
 - **Battery gate:** independent. Ham ID adverts still fire while forwarding is
   suspended, so disable ham mode on battery-critical nodes if you do not want
   that RF activity.
-- **Fleet:** fleet datagrams use private PSKs and get `set tx`. Fleet ACKs are
-  ACK packets with no message content, so they are public and get `ham tx`.
-  They obscure nothing.
+- **Fleet:** fleet traffic and its acknowledgements are group texts encrypted
+  with the fleet channel's private PSK. Ham classification checks group traffic
+  against the Public channel and your listed hashtag channels, so neither fleet
+  datagrams nor fleet ACKs match and both use `set tx`.
 - **Observer:** capture happens before forwarding policy and only TX power
   changes, so there is no schema change.
 - **OTA:** update operations ride inside requests and responses, so they are
@@ -229,8 +232,10 @@ must re-enter its settings here.
 - A hashtag message still uses private power: the name must be listed with
   `ham channel add`, match exactly including case, and the sender must use the
   same channel key.
-- Amplified board reports look low: `set tx` and `ham tx` are drive levels on
-  boards like G2 and G3. Measure conducted output; the numbers are not watts.
+- Reported power looks low, or the link seems too strong: on amplified boards
+  like G2 and G3 the numbers are PA drive levels, not measured watts. On any
+  board a high-gain antenna raises radiated power. Measure conducted output with
+  the real antenna and check the antenna-gain rule before choosing either power.
 - To verify: check that `ham` says `on`, watch for a zero-hop advert after
   activation, send one public and one direct message, and confirm `ham stats`
   increments both counters.
@@ -238,8 +243,11 @@ must re-enter its settings here.
 ## Acknowledgements
 
 This feature adapts the ham capability built and published by **KF0WXX and the
-Nebraska Mesh community** in `NebraskaMesh/MeshCore-Ham` (MIT licensed), whose
-original implementation is commit `6e716038`. The public/private classification
+Nebraska Mesh community** in
+[NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham)
+(MIT licensed), whose original implementation is
+[commit `6e716038`](https://github.com/NebraskaMesh/MeshCore-Ham/commit/6e716038).
+The public/private classification
 model and its fail-safe rule, the hardcoded Public key and hashtag derivation,
 the activation gate, the per-packet TX power hook, the command names and the
 public/private counters all come from that work. This fork rewrites it into the
