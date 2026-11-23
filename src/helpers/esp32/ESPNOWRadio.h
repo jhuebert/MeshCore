@@ -5,6 +5,7 @@
 class ESPNOWRadio : public mesh::Radio {
 protected:
   uint32_t n_recv, n_sent, n_recv_errors;
+  bool _tx_power_ok = false;
 
 public:
   ESPNOWRadio() { n_recv = n_sent = n_recv_errors = 0; }
@@ -43,6 +44,7 @@ public:
 
   uint32_t intID();
   void setTxPower(uint8_t dbm);
+  bool lastTxPowerOk() const { return _tx_power_ok; }
 };
 
 #if ESPNOW_DEBUG_LOGGING && ARDUINO

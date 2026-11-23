@@ -59,7 +59,7 @@ uint32_t ESPNOWRadio::getRngSeed() {
 }
 
 void ESPNOWRadio::setTxPower(uint8_t dbm) {
-  esp_wifi_set_max_tx_power(dbm * 4);
+  _tx_power_ok = esp_wifi_set_max_tx_power(dbm * 4) == ESP_OK;
 }
 
 uint32_t ESPNOWRadio::intID() {

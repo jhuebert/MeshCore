@@ -1292,7 +1292,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   powerApplyRadioProfile(_prefs);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
-  ham.noteRadioPower(_prefs.tx_power_dbm);
+  ham.noteRadioPower(_prefs.tx_power_dbm, radio_driver.lastTxPowerOk());
 
   radio2.setPrimary(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio2.start(_prefs.rxps.enabled, _prefs.extra_sf[0] != 0);
@@ -1421,15 +1421,11 @@ void MyMesh::dumpLogFile() {
 
 void MyMesh::setTxPower(int8_t power_dbm) {
   radio_driver.setTxPower(power_dbm);
-  ham.noteRadioPower(power_dbm);
+  ham.noteRadioPower(power_dbm, radio_driver.lastTxPowerOk());
 }
 
-void MyMesh::onBeforeTransmit(mesh::Packet* pkt) {
-  int8_t dbm = ham.selectPower(pkt, _prefs.node_name, _prefs.tx_power_dbm);
-  if (ham.shouldApplyPower(dbm)) {
-    radio_driver.setTxPower(dbm);
-    ham.noteAppliedPower(dbm);
-  }
+bool MyMesh::onBeforeTransmit(mesh::Packet* pkt) {
+  return ham.prepareTransmit(radio_driver, pkt, hamAdvertName(), _prefs.tx_power_dbm);
 }
 
 bool MyMesh::setRxBoostedGain(bool enable) {
@@ -1659,7 +1655,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   } else if (memcmp(command, "ham", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
     const char* sub = command + 3;
     while (*sub == ' ') sub++;
-    hamCLI(ham, _prefs.node_name, sub, reply);
+    hamCLI(ham, hamAdvertName(), sub, reply);
   } else if (memcmp(command, "fleet", 5) == 0 && (command[5] == ' ' || command[5] == 0)) {
     const char* sub = command + 5;
     while (*sub == ' ') sub++;
@@ -1702,7 +1698,7 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     // applied-power cache here, or the next public packet could be sent at the
     // new private power.
     _cli.handleCommand(sender_timestamp, command, reply);
-    ham.noteRadioPower(_prefs.tx_power_dbm);
+    ham.noteRadioPower(_prefs.tx_power_dbm, radio_driver.lastTxPowerOk());
   } else{
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
@@ -1747,7 +1743,7 @@ void MyMesh::loop() {
   // Watches the active-state transition (arming the ID timer) and flushes a
   // pending config save. Runs before the advert branches so the ID decision
   // below sees this pass's state.
-  ham.loop(millis(), _fs, _prefs.node_name);
+  ham.loop(millis(), _fs, hamAdvertName());
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     sendSelfAdvertisement(0, true);
@@ -1758,7 +1754,7 @@ void MyMesh::loop() {
     sendSelfAdvertisement(0, false);
 
     updateAdvertTimer(); // schedule next local advert
-  } else if (ham.isActive(_prefs.node_name) && ham.idDue(millis())) {
+  } else if (ham.idDue(millis())) {
     // A station ID is an ordinary zero-hop advert. The ID timer is independent
     // of the normal advert schedule, which is left untouched.
     sendSelfAdvertisement(HAM_ID_SEND_DELAY_MS, false);

@@ -133,6 +133,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   Radio2DeviceImpl radio2_device;
   Radio2 radio2;
   HamMode ham;
+  HamAdvertName hamAdvertName() const {
+    return HamAdvertName(_prefs.node_name, _prefs.advert_loc_policy != ADVERT_LOC_NONE);
+  }
   bool rx_forward_allowed = true;
 #ifdef WITH_MQTT_OBSERVER
   MQTTObserver mqttObserver;
@@ -187,7 +190,7 @@ protected:
   void logTxFail(mesh::Packet* pkt, int len) override;
   // Pick public or private TX power for this one physical transmit. The radio2
   // profile has already been selected by the dispatcher at this point.
-  void onBeforeTransmit(mesh::Packet* pkt) override;
+  bool onBeforeTransmit(mesh::Packet* pkt) override;
   int calcRxDelay(float score, uint32_t air_time) const override;
 
   uint32_t getRetransmitDelay(const mesh::Packet* packet) override;

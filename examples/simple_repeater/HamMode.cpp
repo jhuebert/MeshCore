@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <Utils.h>
+#include <helpers/UTF8Helpers.h>
 
 #include "CliUtil.h"
 #include "KeyedChannel.h"
@@ -31,20 +32,21 @@ static bool isWordChar(unsigned char c) {
 static bool isOneWord(const char* s) {
   if (s == NULL || s[0] == 0) return false;
   for (const char* p = s; *p; p++) {
-    if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') return false;
+    if (isspace((unsigned char)*p)) return false;
   }
   return true;
 }
 
 // A callsign identifies the station only when it stands alone in the node
 // name. A bare substring would let N0CALL activate on "N0CALLS".
-static bool containsCallWord(const char* name, const char* call) {
+static bool containsCallWord(HamAdvertName advert, const char* call) {
+  const char* name = advert.text;
   size_t n = strlen(call);
-  size_t m = strlen(name);
+  size_t m = mesh::validUtf8PrefixLength(name, advert.budget);
   if (n == 0 || n > m) return false;
   for (size_t p = 0; p + n <= m; p++) {
     if (p > 0 && isWordChar((unsigned char)name[p - 1])) continue;
-    if (p + n < m && isWordChar((unsigned char)name[p + n])) continue;
+    if (isWordChar((unsigned char)name[p + n])) continue;
     size_t i = 0;
     while (i < n && tolower((unsigned char)name[p + i]) ==
                     tolower((unsigned char)call[i])) i++;
@@ -68,6 +70,7 @@ void HamMode::resetToDefaults() {
   cfg.callsign[0] = 0;
   private_dbm = HAM_TX_POWER;
   applied_dbm = HAM_TX_POWER;
+  power_known = restore_power = false;
   n_public = 0;
   n_private = 0;
   next_id_at = 0;
@@ -92,14 +95,14 @@ void HamMode::rebuildKeys() {
 
 // ---------------------------------------------------------------- gate
 
-const char* HamMode::inactiveReason(const char* node_name) const {
+const char* HamMode::inactiveReason(HamAdvertName node_name) const {
   if (!cfg.enabled) return "disabled";
   if (cfg.callsign[0] == 0) return "no callsign";
   if (!containsCallWord(node_name, cfg.callsign)) return "name lacks callsign";
   return NULL;
 }
 
-bool HamMode::isActive(const char* node_name) const {
+bool HamMode::isActive(HamAdvertName node_name) const {
   return inactiveReason(node_name) == NULL;
 }
 
@@ -153,9 +156,12 @@ HamTxClass HamMode::classify(const mesh::Packet* pkt) const {
   }
 }
 
-int8_t HamMode::selectPower(const mesh::Packet* pkt, const char* node_name,
+int8_t HamMode::selectPower(const mesh::Packet* pkt, HamAdvertName node_name,
                             int8_t default_dbm) {
-  if (!isActive(node_name)) return default_dbm;
+  return isActive(node_name) ? activePower(pkt, default_dbm) : default_dbm;
+}
+
+int8_t HamMode::activePower(const mesh::Packet* pkt, int8_t default_dbm) {
   if (classify(pkt) == HAM_TX_PUBLIC) {
     n_public++;
     return cfg.ham_dbm;
@@ -164,9 +170,13 @@ int8_t HamMode::selectPower(const mesh::Packet* pkt, const char* node_name,
   return default_dbm;
 }
 
-void HamMode::noteRadioPower(int8_t dbm) {
+void HamMode::noteRadioPower(int8_t dbm, bool ok) {
   private_dbm = dbm;
-  applied_dbm = dbm;
+  power_known = ok;
+  if (ok) {
+    applied_dbm = dbm;
+    restore_power = false;
+  }
 }
 
 // ---------------------------------------------------------------- station ID
@@ -174,32 +184,32 @@ void HamMode::noteRadioPower(int8_t dbm) {
 void HamMode::noteAdvertOnAir(uint32_t now) {
   if (!was_active) return;
   // The send is delayed by HAM_ID_SEND_DELAY_MS, so arm short by that much to
-  // keep the on-air gap at or under the 10-minute identification limit.
+  // allow for that delay when scheduling the next ID.
   next_id_at = now + HAM_ID_INTERVAL_MS - HAM_ID_SEND_DELAY_MS;
 }
 
 bool HamMode::idDue(uint32_t now) const {
   // Unsigned subtraction gives the right answer across a millis() wrap for any
   // deadline within the 10-minute window.
-  return was_active && next_id_at != 0 &&
+  return was_active &&
          (uint32_t)(now - next_id_at) < 0x80000000UL;
 }
 
 uint32_t HamMode::secondsToId(uint32_t now) const {
-  if (!was_active || next_id_at == 0) return 0;
+  if (!was_active) return 0;
   uint32_t remaining = (uint32_t)(next_id_at - now);
   if (remaining > HAM_ID_INTERVAL_MS) return 0;   // past due
   return remaining / 1000UL;
 }
 
-void HamMode::loop(uint32_t now, FILESYSTEM* fs, const char* node_name) {
+void HamMode::loop(uint32_t now, FILESYSTEM* fs, HamAdvertName node_name) {
   if (save_flag.due()) save(fs);
 
   // Activation is a transition, not a command: `ham on`, a stored config at
   // boot, and `set name` after the callsign was set all take the same path.
   bool active = isActive(node_name);
   if (active && !was_active) {
-    next_id_at = now;   // immediately due: ID before any ham-power traffic
+    next_id_at = now;   // schedule an ID on this pass
   } else if (!active && was_active) {
     next_id_at = 0;
   }
@@ -269,12 +279,13 @@ static bool hamValidateRecord(const HamCfgRecord& rec) {
   if (rec.version != HAM_CFG_VERSION) return false;
   if (rec.enabled > 1) return false;
   if (rec.ham_dbm < -9 || rec.ham_dbm > 30) return false;
-  if (boundedLen(rec.callsign, HAM_CALLSIGN_MAX_LEN) >= HAM_CALLSIGN_MAX_LEN) return false;
+  size_t len = boundedLen(rec.callsign, HAM_CALLSIGN_MAX_LEN);
+  if (len && (len < 3 || len == HAM_CALLSIGN_MAX_LEN || !isOneWord(rec.callsign))) return false;
   for (int i = 0; i < HAM_MAX_TAGS; i++) {
     if (!rec.tags[i][0]) continue;
     if (rec.tags[i][0] != '#') return false;
     size_t n = boundedLen(rec.tags[i], HAM_TAG_MAX_LEN);
-    if (n < 2 || n > HAM_TAG_MAX_LEN - 1) return false;
+    if (n < 2 || n >= HAM_TAG_MAX_LEN || !isOneWord(rec.tags[i])) return false;
   }
   return true;
 }
@@ -351,7 +362,7 @@ static void cliListChannels(HamMode& ham, char* reply) {
   }
 }
 
-static void cliStatus(HamMode& ham, const char* node_name, uint32_t now, char* reply) {
+static void cliStatus(HamMode& ham, HamAdvertName node_name, uint32_t now, char* reply) {
   CliBuf buf(reply, CLI_REPLY_MAX);
   if (!ham.isEnabled()) {
     buf.addStr("off - all packets use normal tx power");
@@ -366,7 +377,7 @@ static void cliStatus(HamMode& ham, const char* node_name, uint32_t now, char* r
   }
 }
 
-void hamCLI(HamMode& ham, const char* node_name, const char* command, char* reply) {
+void hamCLI(HamMode& ham, HamAdvertName node_name, const char* command, char* reply) {
   char scratch[MAX_PACKET_PAYLOAD + 1];
   if (!cliPrepare(command, scratch, sizeof(scratch), reply)) return;
   char* p = scratch;
@@ -407,7 +418,7 @@ void hamCLI(HamMode& ham, const char* node_name, const char* command, char* repl
       buf.add("OK - callsign set to %s", up);
       // With lat/lon the advert name budget is 23 bytes. Warn when the live
       // name is over that, whatever the current position setting.
-      if (strlen(node_name) > 23) {
+      if (strlen(node_name.text) > 23) {
         buf.addStr("; warning: name over 23 bytes may be cut from adverts with lat/lon");
       }
     }
@@ -482,9 +493,11 @@ void hamCLI(HamMode& ham, const char* node_name, const char* command, char* repl
   } else if (strcmp(cmd, "stats") == 0) {
     if (!cliNoExtra(p, reply, HAM_USAGE)) return;
     CliBuf buf(reply, CLI_REPLY_MAX);
-    buf.add("%lu public, %lu private; applied %d dBm; next ID %lus",
-            (unsigned long)ham.getPublicCount(), (unsigned long)ham.getPrivateCount(),
-            ham.getAppliedDbm(), (unsigned long)ham.secondsToId(millis()));
+    buf.add("%lu public, %lu private; applied ",
+            (unsigned long)ham.getPublicCount(), (unsigned long)ham.getPrivateCount());
+    if (ham.powerKnown()) buf.add("%d dBm", ham.getAppliedDbm());
+    else buf.addStr("unknown");
+    buf.add("; next ID %lus", (unsigned long)ham.secondsToId(millis()));
   } else {
     snprintf(reply, CLI_REPLY_MAX, "%s", HAM_USAGE);
   }

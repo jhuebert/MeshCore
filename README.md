@@ -71,7 +71,8 @@ For licensed operators who want more range on traffic anyone can read. With
 ham mode on, publicly readable traffic (the Public channel, the #hashtag
 channels you list, adverts, ACKs and traces) goes out at the power you set
 with `ham tx`, while encrypted traffic keeps using the normal `set tx` power.
-The node sends its callsign in a zero-hop advert at least every 10 minutes.
+The node schedules a zero-hop callsign advert if it has not scheduled a local
+advert in the last 10 minutes. Actual air time depends on the radio and queue.
 Packets themselves are unchanged, so stock nodes and apps are unaffected.
 Off by default: with ham mode off the node behaves like stock firmware.
 
@@ -177,7 +178,7 @@ fork is for operators who want policy and resilience at the node:
   filter policy, rollouts and rollbacks.
 - **Licensed amateur operators**: send publicly readable traffic at amateur
   power while encrypted traffic stays at unlicensed power, with the callsign
-  identified automatically at least every 10 minutes.
+  included in adverts on a 10-minute ID timer.
 
 ## Getting the firmware
 

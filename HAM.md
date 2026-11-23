@@ -16,8 +16,9 @@ There are two transmit powers:
   only while ham mode is active.
 
 A packet is publicly readable only when this firmware can positively identify
-it as such. Everything else is treated as encrypted and gets `set tx`. This
-fail-safe rule means a mistake can never send private traffic at amateur power.
+it as such. Everything else gets `set tx`. Group classification uses the
+protocol's one-byte channel hash and two-byte MAC. Both must match, but
+these short fields cannot rule out a collision.
 
 | Public (uses `ham tx`) | Encrypted (uses `set tx`) |
 |---|---|
@@ -40,9 +41,9 @@ differs. With ham mode off, no power switching happens at all.
   (47 CFR 97.113(a)(4)). Ham mode therefore gives higher power only to
   traffic anyone can read. Encrypted traffic always stays at `set tx`.
 - FCC 97.119(a) requires your call sign to be transmitted at least every
-  10 minutes during a communication. This firmware sends your call sign in a
-  zero-hop advert when ham mode activates and at least every 10 minutes after
-  that. The call sign is the node name, so set the name to include it.
+  10 minutes during a communication. This firmware schedules an ID on
+  activation and on a 10-minute timer. The call sign travels in the node name.
+  Check it on a receiver: the scheduler cannot guarantee when a packet airs.
 - Part 15 devices are limited to 1 W (30 dBm) conducted output, with a
   dB-for-dB reduction above 6 dBi of antenna gain (47 CFR 15.247(b)(3)-(4)).
   A high-gain antenna can push radiated power over that limit on any board,
@@ -54,7 +55,9 @@ differs. With ham mode off, no power switching happens at all.
 
 ## Quick start
 
-From a fresh install, over serial or as an admin over the mesh:
+Run these commands over serial or as an admin over the mesh. The powers
+are examples: substitute drive levels appropriate for your board and
+antenna. In particular, 22 dBm exceeds the Station G2's 19 dBm maximum drive.
 
 ```
 ham callsign N0CALL
@@ -72,8 +75,7 @@ on - call N0CALL, ham tx 22, set tx 7, tags 0, next ID 0s
 
 The `next ID` value counts down in seconds. It is 0 while the first ID is due,
 then about 598s once that advert has been queued (10 minutes less the 1.5 s
-send delay). A zero-hop advert carrying `N0CALL` goes out about 1.5 seconds
-after `ham on`.
+send delay). The first ID is eligible for transmission after that delay.
 
 ## How it behaves
 
@@ -82,7 +84,9 @@ after `ham on`.
 live node name. Whole word means the characters around it are not letters or
 digits, so `N0CALL` matches `N0CALL Test` but not `N0CALLS Test`. Matching is
 case insensitive. `set name` takes effect immediately because the current name
-is checked on every use.
+is checked on every use. The whole callsign must fit in the transmitted UTF-8
+name: 31 bytes without position, 23 with position. Put the callsign first if
+the full name contains it but `ham` reports `waiting`.
 
 **Three status words.** `ham` reports `on` when active, `off` when ham mode is
 disabled, or `waiting` when it is enabled but not yet gated on. `waiting`
@@ -93,12 +97,15 @@ include. While off or waiting, every packet uses `set tx`.
 encrypted packets use the live `set tx`. Changing `set tx` immediately changes
 the power of encrypted traffic, even while ham mode is on; public traffic keeps
 using `ham tx`. The radio is only reprogrammed when the chosen power actually
-changes, which avoids needless duty-cycle churn when RXPS is armed.
+changes, which avoids needless duty-cycle churn when RXPS is armed. If the
+radio rejects a power switch, that packet is dropped. The next send must
+successfully set power, even if you disabled ham mode after the failure.
 
-**Station ID.** Activation arms a timer immediately: the first ID advert
-reaches the air about 1.5 seconds later. Every advert that reaches the air,
-including the ID advert itself, scheduled adverts and `advert.zerohop`, pushes
-the timer out another 10 minutes. The normal advert schedule is untouched. The
+**Station ID.** Activation makes the first ID due immediately. Creating a local
+advert, including a scheduled advert or `advert.zerohop`, restarts the timer.
+This happens before transmission: other queued traffic can go first, a busy
+radio can delay the ID, and a failed transmission can leave a gap longer than
+10 minutes. Relaying someone else's advert does not restart the timer. The
 ID is an ordinary signed zero-hop advert with your callsign in the name, so it
 feeds mesh clock sync like any other advert.
 
@@ -181,7 +188,10 @@ Err - channel list full (max 8); remove one first
 
 ### `ham stats`
 
-RAM-only counters since boot, plus the applied power and ID countdown:
+RAM-only counts of packets classified for transmission since boot, plus the
+last driver-confirmed power setting (`unknown` after a failed power write)
+and ID countdown. These are attempts, not confirmed transmissions; the power
+setting is not a measurement of radiated power.
 
 ```
 12 public, 34 private; applied 7 dBm; next ID 598s
@@ -215,8 +225,9 @@ RAM-only counters since boot, plus the applied power and ID countdown:
 ## Persistence and defaults
 
 Settings live in `/ham_cfg`, a fixed 152-byte record plus a 2-byte CRC-16,
-written with a staged save that keeps a `.bak` copy. A missing, corrupt,
-overlong or wrong-version record leaves every default in place: ham mode off,
+written with a staged save that keeps a `.bak` copy. If the main record is
+missing or invalid, a valid backup can restore its settings, including `on`.
+Without a usable record the defaults are: ham mode off,
 no callsign, `ham tx` at the board's `LORA_TX_POWER`, and no tags. Counters and
 the ID timer are RAM-only and reset on boot.
 
@@ -255,14 +266,13 @@ model and its fail-safe rule, the hardcoded Public key and hashtag derivation,
 the activation gate, the per-packet TX power hook, the command names and the
 public/private counters all come from that work. This fork rewrites it into the
 repeater-filter architecture with fork-owned files, CRC-protected settings,
-native tests, whole-word callsign validation and a timer-driven station ID that
-closes the source fork's 10-minute compliance gap. The original contribution
-stands behind all of it.
+native tests, whole-word callsign validation and a timer-driven station ID.
 
 ## For developers
 
 The feature is `examples/simple_repeater/HamMode.h/.cpp` plus `HamModeConfig.h`.
-Its only upstream edit is the virtual `Dispatcher::onBeforeTransmit()` hook.
+The `Dispatcher::onBeforeTransmit()` hook can veto a transmit if the radio
+driver reports that the power switch failed.
 Behavior is pinned by the `test/test_ham_mode/` native suite (`native_ham_mode`
 and `native_ham_mode_san`). See the code map in AGENTS.md for the other fork
 features and their guides.

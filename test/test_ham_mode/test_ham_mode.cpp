@@ -23,23 +23,14 @@ static void publicKey(uint8_t out[16]) {
   ASSERT_TRUE(mesh::Utils::fromHex(out, 16, MESHCORE_PUBLIC_PSK_HEX));
 }
 
-// Build a group datagram the way Mesh::createGroupDatagram() does: a 1-byte
-// channel hash followed by MAC(2) plus AES ciphertext. Real crypto is linked
-// in this env, so a MAC check is a genuine proof of channel membership.
-static void makeGroup(mesh::Packet& pkt, uint8_t type, const uint8_t secret[16],
-                      const char* text) {
+// Independent wire fixtures: channel hash, HMAC-SHA256 prefix, AES-128-ECB
+// ciphertext. The shared native AES stub does not write an encrypted block.
+static const char PUBLIC_HELLO[] = "11e6878045e59184851776e1afe5da9ca76f9b";
+static void makeGroup(mesh::Packet& pkt, uint8_t type, const char* hex) {
   memset(&pkt, 0, sizeof(pkt));
   pkt.header = (uint8_t)(type << PH_TYPE_SHIFT);
-  uint8_t key[PUB_KEY_SIZE];
-  memset(key, 0, sizeof(key));
-  memcpy(key, secret, 16);
-  uint8_t enc[MAX_PACKET_PAYLOAD];
-  int n = mesh::Utils::encryptThenMAC(key, enc, (const uint8_t*)text, (int)strlen(text));
-  uint8_t hash;
-  mesh::Utils::sha256(&hash, 1, key, 16);
-  pkt.payload[0] = hash;
-  memcpy(&pkt.payload[1], enc, n);
-  pkt.payload_len = (uint16_t)(1 + n);
+  pkt.payload_len = strlen(hex) / 2;
+  ASSERT_TRUE(mesh::Utils::fromHex(pkt.payload, pkt.payload_len, hex));
 }
 
 static void plainPacket(mesh::Packet& pkt, uint8_t type) {
@@ -88,7 +79,7 @@ protected:
   void SetUp() override {
     g_mock_millis = 0;
     ham.load(&fs);           // no file: disabled defaults
-    ham.noteRadioPower(7);   // stand in for `set tx 7`
+    ham.noteRadioPower(7, true);   // stand in for `set tx 7`
   }
 };
 
@@ -149,38 +140,30 @@ TEST_F(HamTest, OnlyMultipartAckIsPublic) {
 }
 
 TEST_F(HamTest, GroupOnPublicIsPublic) {
-  uint8_t psk[16];
-  publicKey(psk);
   mesh::Packet pkt;
-  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, psk, "hello");
+  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, PUBLIC_HELLO);
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_PUBLIC);
-  makeGroup(pkt, PAYLOAD_TYPE_GRP_DATA, psk, "data");
+  makeGroup(pkt, PAYLOAD_TYPE_GRP_DATA, PUBLIC_HELLO);
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_PUBLIC);
 }
 
 TEST_F(HamTest, GroupOnListedTagIsPublic) {
-  uint8_t secret[16], hash;
-  deriveChannelKey("#test", secret, &hash);
   ASSERT_TRUE(ham.addTag("#test"));
   mesh::Packet pkt;
-  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, secret, "tagged");
+  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, "d9bed6a701b632727a6cfbac453cf1e90ce7bb");
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_PUBLIC);
 }
 
 TEST_F(HamTest, GroupOnUnlistedTagIsPrivate) {
-  uint8_t secret[16], hash;
-  deriveChannelKey("#other", secret, &hash);
   ham.addTag("#test");
   mesh::Packet pkt;
-  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, secret, "unlisted");
+  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, "15adad728c558cba643041c902735368c65d46");
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_ENCRYPTED);
 }
 
 TEST_F(HamTest, GroupOnPrivatePskIsPrivate) {
-  uint8_t secret[16];
-  memset(secret, 0x42, sizeof(secret));
   mesh::Packet pkt;
-  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, secret, "private");
+  makeGroup(pkt, PAYLOAD_TYPE_GRP_TXT, "9013c11a84d77efa71c62379230415f2f3f10c");
   EXPECT_EQ(ham.classify(&pkt), HAM_TX_ENCRYPTED);
 }
 
@@ -191,10 +174,8 @@ TEST_F(HamTest, FleetAckUsesPrivatePower) {
   ham.setEnabled(true);
   ham.setCallsign("N0CALL");
   ham.setHamDbm(22);
-  uint8_t secret[16];
-  memset(secret, 0x5A, sizeof(secret));
   mesh::Packet ack;
-  makeGroup(ack, PAYLOAD_TYPE_GRP_TXT, secret, "jobkey\nok");
+  makeGroup(ack, PAYLOAD_TYPE_GRP_TXT, "1c8503429e455100bcd914fb7328737a8395c1");
   EXPECT_EQ(ham.classify(&ack), HAM_TX_ENCRYPTED);
   EXPECT_EQ(ham.selectPower(&ack, "N0CALL Test", 7), 7);
 }
@@ -253,13 +234,21 @@ TEST_F(HamTest, NameChangeAfterCallsign) {
   EXPECT_TRUE(ham.isActive("N0CALL Node"));     // the live name is passed in
 }
 
+TEST_F(HamTest, CallsignMustFitOnAirAndBeAWholeWordInTheLiveName) {
+  ham.setEnabled(true);
+  ham.setCallsign("N0CALL");
+  const char* name = "12345678901234567 N0CALL";
+  EXPECT_TRUE(ham.isActive(HamAdvertName(name, false)));
+  EXPECT_FALSE(ham.isActive(HamAdvertName(name, true)));  // last byte is cut
+  EXPECT_TRUE(ham.isActive(HamAdvertName("1234567890123456 N0CALL", true)));
+  EXPECT_FALSE(ham.isActive(HamAdvertName("1234567890123456 N0CALLS", true)));
+}
+
 // ============================================================ power selection
 
 TEST_F(HamTest, DisabledReturnsSetTxForEveryClass) {
-  uint8_t psk[16];
-  publicKey(psk);
   mesh::Packet pub;
-  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, psk, "hello");
+  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, PUBLIC_HELLO);
   mesh::Packet ack;
   plainPacket(ack, PAYLOAD_TYPE_ACK);
   EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 7), 7);
@@ -272,10 +261,8 @@ TEST_F(HamTest, PublicUsesHamTxEncryptedUsesSetTx) {
   ham.setEnabled(true);
   ham.setCallsign("N0CALL");
   ham.setHamDbm(22);
-  uint8_t psk[16];
-  publicKey(psk);
   mesh::Packet pub;
-  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, psk, "hello");
+  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, PUBLIC_HELLO);
   mesh::Packet dm;
   plainPacket(dm, PAYLOAD_TYPE_TXT_MSG);
   EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 7), 22);
@@ -283,41 +270,64 @@ TEST_F(HamTest, PublicUsesHamTxEncryptedUsesSetTx) {
   EXPECT_EQ(ham.getPublicCount(), 1u);
   EXPECT_EQ(ham.getPrivateCount(), 1u);
   // Changing `set tx` takes effect immediately for encrypted traffic.
-  ham.noteRadioPower(10);
+  ham.noteRadioPower(10, true);
   EXPECT_EQ(ham.selectPower(&dm, "N0CALL Test", 10), 10);
   EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 10), 22);
 }
+
+struct PowerRadio {
+  std::vector<int> writes;
+  bool ok = true;
+  void setTxPower(int8_t dbm) { writes.push_back(dbm); }
+  bool lastTxPowerOk() const { return ok; }
+};
 
 TEST_F(HamTest, SetTxResyncsCacheAfterPublicTraffic) {
   ham.setEnabled(true);
   ham.setCallsign("N0CALL");
   ham.setHamDbm(22);
-  uint8_t psk[16];
-  publicKey(psk);
+  PowerRadio radio;
   mesh::Packet pub;
-  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, psk, "hello");
-  EXPECT_EQ(ham.selectPower(&pub, "N0CALL Test", 7), 22);
-  ham.noteAppliedPower(22);   // radio now at ham power
+  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, PUBLIC_HELLO);
+  EXPECT_TRUE(ham.prepareTransmit(radio, &pub, "N0CALL Test", 7));
 
   // `set tx 10` writes the radio directly through CommonRadioPrefs, which
   // bypasses MyMesh::setTxPower(). The CLI dispatch calls noteRadioPower() to
   // resync the cache; without it the next public packet would stay at 10 dBm.
-  ham.noteRadioPower(10);
+  ham.noteRadioPower(10, true);
   EXPECT_EQ(ham.getPrivateDbm(), 10);
   EXPECT_EQ(ham.getAppliedDbm(), 10);
-  EXPECT_FALSE(ham.shouldApplyPower(10));   // encrypted: radio already there
-  EXPECT_TRUE(ham.shouldApplyPower(22));    // public: write ham power
   mesh::Packet dm;
   plainPacket(dm, PAYLOAD_TYPE_TXT_MSG);
-  EXPECT_EQ(ham.selectPower(&dm, "N0CALL Test", 10), 10);
+  EXPECT_TRUE(ham.prepareTransmit(radio, &dm, "N0CALL Test", 10));
+  EXPECT_TRUE(ham.prepareTransmit(radio, &pub, "N0CALL Test", 10));
+  EXPECT_TRUE(ham.prepareTransmit(radio, &pub, "N0CALL Test", 10));
+  EXPECT_EQ(radio.writes, (std::vector<int>{22, 22}));
 }
 
-TEST_F(HamTest, AppliedPowerCacheOnlyChangesOnClassChange) {
-  EXPECT_EQ(ham.getAppliedDbm(), 7);
-  EXPECT_TRUE(ham.shouldApplyPower(22));
-  ham.noteAppliedPower(22);
-  EXPECT_FALSE(ham.shouldApplyPower(22));
-  EXPECT_TRUE(ham.shouldApplyPower(7));
+TEST_F(HamTest, FailedPrivatePowerBlocksSendEvenAfterDisable) {
+  PowerRadio radio;
+  mesh::Packet pub, dm;
+  makeGroup(pub, PAYLOAD_TYPE_GRP_TXT, PUBLIC_HELLO);
+  plainPacket(dm, PAYLOAD_TYPE_TXT_MSG);
+  ham.noteRadioPower(7, false);
+  EXPECT_TRUE(ham.prepareTransmit(radio, &dm, "N0CALL", 7));  // stock off path
+  ham.setEnabled(true);
+  ham.setCallsign("N0CALL");
+  ham.setHamDbm(22);
+  ASSERT_TRUE(ham.prepareTransmit(radio, &pub, "N0CALL", 7));
+  radio.ok = false;
+  ham.noteRadioPower(10, false);  // rejected `set tx`
+  EXPECT_FALSE(ham.prepareTransmit(radio, &dm, "N0CALL", 10));
+  ham.setEnabled(false);
+  EXPECT_FALSE(ham.prepareTransmit(radio, &dm, "N0CALL", 10));
+  EXPECT_FALSE(ham.powerKnown());
+  CliReplyBuf reply;
+  EXPECT_NE(cli(ham, "N0CALL", "stats", reply).find("applied unknown"), std::string::npos);
+  radio.ok = true;
+  EXPECT_TRUE(ham.prepareTransmit(radio, &dm, "N0CALL", 10));
+  EXPECT_TRUE(ham.prepareTransmit(radio, &dm, "N0CALL", 10));
+  EXPECT_EQ(radio.writes, (std::vector<int>{22, 10, 10, 10}));
 }
 
 // ============================================================ CLI
@@ -495,6 +505,22 @@ TEST_F(HamTest, LazySaveTiming) {
   EXPECT_TRUE(fs.exists(HAM_CFG_FILE));
 }
 
+TEST_F(HamTest, InvalidStoredCallsignCannotActivate) {
+  HamCfgRecord rec = defaultRecord();
+  rec.enabled = 1;
+  strcpy(rec.callsign, "N0 CALL");
+  writeRecord(fs, HAM_CFG_FILE, rec);
+  ham.load(&fs);
+  EXPECT_FALSE(ham.isActive("N0 CALL"));
+  EXPECT_FALSE(ham.isEnabled());
+
+  strcpy(rec.callsign, "N0CALL");
+  strcpy(rec.tags[0], "#two words");
+  writeRecord(fs, HAM_CFG_FILE, rec);
+  ham.load(&fs);
+  EXPECT_FALSE(ham.isEnabled());
+}
+
 TEST_F(HamTest, RecoversFromBackup) {
   HamCfgRecord rec = defaultRecord();
   rec.enabled = 1;
@@ -577,6 +603,18 @@ TEST_F(HamTest, MillisWrapIsHandled) {
   EXPECT_TRUE(ham.idDue(next));
   EXPECT_EQ(ham.secondsToId(g_mock_millis),
             (HAM_ID_INTERVAL_MS - HAM_ID_SEND_DELAY_MS) / 1000);
+}
+
+TEST_F(HamTest, ZeroIsAValidActiveDeadline) {
+  ham.setEnabled(true);
+  ham.setCallsign("N0CALL");
+  ham.loop(0, &fs, "N0CALL");
+  EXPECT_TRUE(ham.idDue(0));
+  uint32_t now = uint32_t(0) - uint32_t(HAM_ID_INTERVAL_MS - HAM_ID_SEND_DELAY_MS);
+  ham.noteAdvertOnAir(now);
+  EXPECT_GT(ham.secondsToId(now), 0u);
+  EXPECT_FALSE(ham.idDue(UINT32_MAX));
+  EXPECT_TRUE(ham.idDue(0));
 }
 
 int main(int argc, char** argv) {

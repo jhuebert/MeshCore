@@ -71,7 +71,7 @@ void RadioLibWrapper::setTxPower(int8_t dbm) {
 
   idle();
 #endif
-  _radio->setOutputPower(dbm);
+  _tx_power_ok = _radio->setOutputPower(dbm) == RADIOLIB_ERR_NONE;
 }
 
 void RadioLibWrapper::idle() {
