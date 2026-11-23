@@ -7,8 +7,6 @@
 #include "KeyedChannel.h"
 #include <helpers/TxtDataHelpers.h>
 
-// The well-known Public channel PSK (16 bytes); its sha256()[0] air hash is 0x11.
-#define FILTER_PUBLIC_PSK_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 #define FILTER_CFG_FILE        "/filter_cfg"
 #define FILTER_CFG_VERSION     7   // v7: all payload types typeable (type_mask_hi
                                    // joins the record), capacity growth (32 rules /
@@ -73,7 +71,7 @@ void FilterRules::begin(FILESYSTEM* fs) {
 
   // pre-provision the well-known Public channel on a fresh node
   if (fresh && findChannel("Public") == NULL) {
-    addChannel("Public", FILTER_PUBLIC_PSK_HEX);
+    addChannel("Public", MESHCORE_PUBLIC_PSK_HEX);
   }
 }
 

@@ -1,7 +1,7 @@
 # MeshCore — Repeater Firmware with a Remote-Configurable Packet Filter
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds nine repeater-focused capabilities
+It tracks upstream `main` releases and adds ten repeater-focused capabilities
 on top of stock firmware. Everything else — supported boards, clients,
 protocols, build system — is identical to upstream;
 see the
@@ -64,6 +64,22 @@ like stock firmware.
 
 → Full guide, including the policy recipes, CLI reference and tradeoffs:
 **[RADIO2.md](./RADIO2.md)**
+
+### 📢 Ham mode (licensed amateur operators)
+
+For licensed operators who want more range on traffic anyone can read. With
+ham mode on, publicly readable traffic (the Public channel, the #hashtag
+channels you list, adverts, ACKs and traces) goes out at the power you set
+with `ham tx`, while encrypted traffic keeps using the normal `set tx` power.
+The node sends its callsign in a zero-hop advert at least every 10 minutes.
+Packets themselves are unchanged, so stock nodes and apps are unaffected.
+Off by default: with ham mode off the node behaves like stock firmware.
+
+Adapted from NebraskaMesh/MeshCore-Ham by KF0WXX for the Nebraska Mesh
+community; see the Acknowledgements in HAM.md.
+
+→ Full guide, including the classification table, setup and the legal notes:
+**[HAM.md](./HAM.md)**
 
 ### 🕒 Mesh clock sync
 
@@ -159,6 +175,9 @@ fork is for operators who want policy and resilience at the node:
   set of towers) and push settings to all of them with one broadcast message
   instead of one admin session each: radio preset cutovers, advert hygiene,
   filter policy, rollouts and rollbacks.
+- **Licensed amateur operators**: send publicly readable traffic at amateur
+  power while encrypted traffic stays at unlicensed power, with the callsign
+  identified automatically at least every 10 minutes.
 
 ## Getting the firmware
 
@@ -177,6 +196,7 @@ Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI,
 [FLEET.md](./FLEET.md) if you are running a fleet,
 [POWER.md](./POWER.md) if the node runs on solar or battery,
-[RADIO2.md](./RADIO2.md) if it should listen on a second preset, or
+[RADIO2.md](./RADIO2.md) if it should listen on a second preset,
+[HAM.md](./HAM.md) if you are a licensed operator using dual TX power, or
 [MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
 Observer builds ship in the same releases as the plain repeater firmware.

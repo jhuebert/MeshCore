@@ -57,6 +57,12 @@ should not need to explore beyond them before making a change.
   rules, the active/idle visit scheduler, the full CLI reference, feature
   interactions (RXPS, `extra.sf`, tempradio, filter, battery/fleet, powersaving)
   and tradeoffs.
+- `HAM.md`: ham mode user manual: the Part 97 / Part 15 power split, the
+  public/private classification table, the callsign gate and the 10-minute
+  station-ID timer, the `ham` CLI, persistence in `/ham_cfg`, the deliberate
+  decoupling from the filter, the credit to NebraskaMesh/MeshCore-Ham, and
+  the operator's responsibility for power levels and identification. First
+  stop for any ham-mode question.
 - LoRa OTA: the over-the-air firmware update for repeaters (branch
   `lora-ota`; not merged to `repeater-filter` yet). The user manual, the
   Android/Linux app and the hardware bench live in the `MeshCoreRepeaterManager` repo
@@ -123,6 +129,11 @@ commit**. The guides are user-facing API documentation, not optional docs.
   primary, the policy matrix, the active/idle visit scheduler, the deferred
   apply, and `radio2CLI`. `Radio2Device` is its only radio surface, so the
   native suite drives a fake; MyMesh supplies the adapter over `radio_driver`.
+- `HamMode.h/.cpp`, `HamModeConfig.h`: ham mode: per-packet public/private TX
+  power selection, the 10-minute station-ID advert timer, the `ham` CLI and
+  the `/ham_cfg` record (v1, magic "HAMC", CRC-16). Uses `CliUtil.h` and
+  `PersistUtil.h`. The one upstream hook is `Dispatcher::onBeforeTransmit()`.
+  Kept fully decoupled from the filter.
 - `OtaUpdate.h/.cpp`: the LoRa OTA engine: the `ota` CLI (`stage`, `status`,
   `apply`, `abort`, `rollback`), the `/ota_pend` boot-health marker with its
   attempt counter, the boot-time verdict (`earlyBootCheck`) that rolls back a
@@ -197,7 +208,9 @@ reached through the same entry points a user or the firmware would:
 upgrades, CLI surface, TinyRegex, PatternMatch), `test/test_fleet/` (runner
 grammar, tag targeting, acknowledgements, scheduling, persistence, CLI surface,
 the battery exemption contract), `test/test_battery_gate/` (suspension
-behavior, persistence, CLI), `test/test_mesh_clock/` (sample collection, quorum
+behavior, persistence, CLI), `test/test_ham_mode/` (classification, callsign
+gate, station-ID timing, CLI and persistence), `test/test_mesh_clock/` (sample
+collection, quorum
 decision, persistence, CLI), `test/test_rx_power_saving/` (the duty-cycle
 level ladders and preamble guard, timer-condition validation, config
 normalisation, presets/raw parsing and the `get radio.rxps` report),
@@ -211,12 +224,14 @@ status/packet/raw JSON schema). Test-only shims:
 `FilterTestHelpers.h`, `CliReplyHelper.h`.
 
 **Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` / `-e native_fleet` / `-e native_fleet_noack` (the fleet
+native_battery_gate` / `-e native_ham_mode` / `-e native_fleet` /
+`-e native_fleet_noack` (the fleet
 suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
 other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e
 native_radio2` / `-e native_mqtt_observer`
 (host-native, no hardware), plus `-e
-native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_fleet_san` /
+native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_ham_mode_san` /
+`-e native_fleet_san` /
 `-e native_mesh_clock_san` / `-e native_rx_power_saving_san` / `-e
 native_radio2_san` / `-e
 native_mqtt_observer_san` for ASan+UBSan;
@@ -577,6 +592,7 @@ FILTER.md:
 ```
 pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + persistence
 pio test -e native_battery_gate     # battery gate
+pio test -e native_ham_mode         # ham mode (classification, gate, ID, CLI, persistence)
 pio test -e native_fleet            # fleet manager + runner + CLI + persistence
 pio test -e native_fleet_noack      # the same, with FLEET_ACK_RETRY=0 (the off switch)
 pio test -e native_mesh_clock       # mesh clock sync
@@ -589,7 +605,7 @@ All green, and every touched line required, together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_ham_mode -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks
