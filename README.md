@@ -148,6 +148,17 @@ for diagnostics.
 > See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
 > affected targets and the backup procedure.
 
+### 🌐 Online OTA (observer builds)
+
+Observer repeaters can update straight from a GitHub release over WiFi. Set
+the version and the expected SHA-256 with `ota fetch ver` and `ota fetch sha`,
+then `ota fetch start` downloads the board's image in the background; `ota
+status` shows progress and `ota apply` reboots into the verified image. No
+manifest, GitHub API call or phone is needed, and the usual SHA-256 gate and
+rollback still apply.
+
+→ Full guide: **[ONLINE_OTA.md](./ONLINE_OTA.md)**
+
 ### 🤖 Chat bot
 
 An opt-in responder that answers `test`/`ping`/`help` chatter on one keyed
@@ -198,6 +209,7 @@ Flash as you would stock firmware, then follow
 [FLEET.md](./FLEET.md) if you are running a fleet,
 [POWER.md](./POWER.md) if the node runs on solar or battery,
 [RADIO2.md](./RADIO2.md) if it should listen on a second preset,
-[HAM.md](./HAM.md) if you are a licensed operator using dual TX power, or
-[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
+[HAM.md](./HAM.md) if you are a licensed operator using dual TX power,
+[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build, or
+[ONLINE_OTA.md](./ONLINE_OTA.md) to update one over WiFi.
 Observer builds ship in the same releases as the plain repeater firmware.
