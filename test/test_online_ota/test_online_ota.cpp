@@ -199,7 +199,7 @@ TEST(OnlineOtaPolicyTest, ParsesShaWithOptionalPrefix) {
 TEST(OnlineOtaPolicyTest, BuildsAssetUrlFromVersionAndEnv) {
   char url[ONLINE_OTA_MAX_URL];
   ASSERT_TRUE(buildAssetUrl(kVersion, kEnv, url, sizeof(url)));
-  EXPECT_STREQ(url, ONLINE_OTA_BASE_URL "filter-v1.18.0-dev.11/"
+  EXPECT_STREQ(url, ONLINE_OTA_BASE_URL "v1.18.0-dev.11/"
                     "Xiao_S3_WIO_repeater_observer-v1.18.0-dev.11.bin");
 }
 

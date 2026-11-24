@@ -32,7 +32,7 @@ class ReleasePruneTest(unittest.TestCase):
                     "WORKER_PLATFORM": "RP2040_PLATFORM",
                     "WORKER_PRUNE": "1" if prune else "0",
                     "RELEASE_SHA": "0" * 40,
-                    "FIRMWARE_VERSION": "v1.0.0-filter",
+                    "FIRMWARE_VERSION": "v1.0.0",
                 },
                 check=True, capture_output=True, text=True,
             )

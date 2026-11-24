@@ -24,7 +24,7 @@ board's PlatformIO environment name. Firmware knows its own `OTA_PIO_ENV`, so
 it builds the download URL from the version token alone:
 
 ```text
-https://github.com/jhuebert/MeshCore/releases/download/filter-v<version>/<own-env>-v<version>.bin
+https://github.com/jhuebert/MeshCore/releases/download/v<version>/<own-env>-v<version>.bin
 ```
 
 There is no manifest, no GitHub API call and no JSON in firmware. The digest
@@ -83,7 +83,7 @@ Nothing is persisted: a reboot drops the values and the job.
 
 ### Version syntax
 
-The version token selects the release tag `filter-v<version>`. One leading
+The version token selects the release tag `v<version>`. One leading
 `v` or `V` and a trailing `-filter-<sha>` are stripped, so a version copied out
 of `ota status` works:
 

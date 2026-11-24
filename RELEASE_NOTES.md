@@ -1,3 +1,9 @@
+- **Release naming changed.** Tags are now `v<version>` instead of
+  `filter-v<version>`, release titles say `Firmware <version>`, and the
+  firmware version string is the same sha-free `v<version>`. Existing release
+  tags and asset names were renamed in place, so asset URLs from older
+  announcements no longer work. Old tag refs remain as aliases, and branch
+  names are unchanged.
 - **Online OTA for repeater observer builds.** `ota fetch ver <version>`,
   `ota fetch sha <digest>` and `ota fetch start` download a release over HTTPS,
   stage it with the existing SHA-256 gate, and `ota apply` reboots into it with

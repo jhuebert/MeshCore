@@ -154,8 +154,8 @@ same commit**. The guides are user-facing API documentation, not optional docs.
   `finishLocalStage`/`cancelLocalStage`) used by the online download and the
   appended `0x40` feature bit. Frozen replies and report layouts are unchanged.
 - `OnlineOtaPolicy.h`: pure, Arduino-free version normalization, SHA-256 token
-  parsing and release URL construction. The tag prefix (`filter-v`) is one
-  macro here, pending the planned rename away from "filter" naming.
+  parsing and release URL construction. The release tag prefix (`v`) is one
+  macro here.
 - `OnlineOtaCore.h/.cpp`: RAM-only async download state machine (wifi, clock,
   asset, verify, ready, error) driven one bounded step per `loop()`. Three CLI
   steps (ver, sha, start) store inputs before any network work. No persistence.
@@ -260,7 +260,7 @@ native_radio2_san` / `-e
 native_mqtt_observer_san` / `-e native_ota_san` / `-e native_online_ota_san`
 for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list`;
-`build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
+`build.sh` uses bash arrays, so `sh` is not a contract), the fork's flash
 target being `Xiao_S3_WIO_repeater` (observer builds add
 `Xiao_S3_WIO_repeater_observer`). **Compile-check every filesystem
 family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
@@ -283,11 +283,12 @@ shut down). The build job prints the tail of a failed target's log, prunes a
 failed target's build tree, and retries the failed set once with two workers
 (`--retry-failed`) after the main pass, so runner-resource flakes do not leave
 assets missing; a deterministic failure simply fails again.
-App images are uploaded as `<env>-v<version>.bin`, without the short commit
-sha; the firmware's own version string still carries it. `scripts/rename-ota-assets.py`
-renames existing assets in place through the GitHub API. The planned rename
-away from the `filter` prefix is a separate migration; the tag prefix is one
-macro in `OnlineOtaPolicy.h`.
+App images are uploaded as `<env>-v<version>.bin` and the firmware version
+string is the same sha-free `v<version>`. Release tags use the `v` prefix;
+branch names and the workflow file name keep `filter` for now.
+`scripts/rename-ota-assets.py` and `scripts/rename-ota-tags.py` renamed existing
+assets and releases in place through the GitHub API, keeping the old tag refs
+as aliases. `OnlineOtaPolicy.h` holds the single tag-prefix macro.
 `RELEASE_NOTES.md` holds the pending release notes and `filter-release.yml` uses
 it verbatim as the body of every dev release. A stable release collects the
 bodies of the dev releases since the previous stable one, so it needs no

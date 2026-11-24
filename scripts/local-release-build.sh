@@ -54,13 +54,12 @@
 #   5. Uploads each target's artifacts as soon as it finishes (a small capped
 #      pool of gh release upload --clobber runs beside the build pool).
 #
-# Environment parity with the releases CI cuts: FIRMWARE_VERSION = <tag minus
-# the "filter-" prefix> + "-filter" (exactly what filter-release.yml's version
-# job derived), PLATFORMIO_BUILD_FLAGS starts with -fstack-usage, and build.sh's
-# "-<short-sha>" suffix comes from the release's pinned commit. Uploaded app
-# images are named <env>-v<version>.bin without the sha; the firmware version
-# string still carries it. Artifacts land in <build-dir>/<tag>/out/ as well as
-# on the release, so a failed upload never loses a build.
+# Environment parity with the releases CI cuts: FIRMWARE_VERSION is the tag
+# itself (v<version>, no commit sha, exactly what filter-release.yml's version
+# job derives) and PLATFORMIO_BUILD_FLAGS starts with -fstack-usage. Uploaded
+# app images are named <env>-v<version>.bin. Artifacts land in
+# <build-dir>/<tag>/out/ as well as on the release, so a failed upload never
+# loses a build.
 #
 # Build environment isolation: PlatformIO runs from a dedicated venv (not your
 # system Python packages), and every compiler/toolchain comes from the
@@ -175,19 +174,17 @@ if [[ ${1:-} == __worker ]]; then
   target=$2
   cd "$WORKER_DIR"
 
-  short_sha=${RELEASE_SHA:0:7}            # build.sh uses `git rev-parse --short HEAD`
-  firmware_version_string="${FIRMWARE_VERSION}-${short_sha}"
+  firmware_version_string="${FIRMWARE_VERSION}"
   firmware_build_date=$(LC_ALL=C date '+%d-%b-%Y')   # %b is locale-dependent; CI runs C.UTF-8
 
   # flags release firmware has always been built with: stack usage metadata
   # (codegen unchanged, consumed by the stack gate below) + version string
   export PLATFORMIO_BUILD_FLAGS="-fstack-usage -DFIRMWARE_BUILD_DATE='\"${firmware_build_date}\"' -DFIRMWARE_VERSION='\"${firmware_version_string}\"'"
 
-  # Release assets are named <env>-v<version>.bin. The firmware's own version
-  # string keeps the short commit sha; the asset name does not, so the node can
-  # build the download URL from its version token and its own environment.
-  asset_version="${FIRMWARE_VERSION%-filter}"
-  file_base="${target}-${asset_version}"
+  # Release assets are named <env>-v<version>.bin. The firmware version string
+  # is the same sha-free v<version>, so the node can build the download URL
+  # from its version token and its own environment.
+  file_base="${target}-${FIRMWARE_VERSION}"
   mkdir -p out
 
   platform=${WORKER_PLATFORM:-}   # passed by the orchestrator's precomputed map
@@ -358,10 +355,10 @@ git -C "$REPO_ROOT" fetch --quiet "$remote" "refs/tags/$tag:refs/tags/$tag" --no
 git -C "$REPO_ROOT" cat-file -e "$release_sha^{commit}" \
   || die "commit $release_sha not present after fetching tag $tag"
 
-# workflow's version job: displayVersion = tag minus "filter-" prefix,
-# firmwareVersion = displayVersion + "-filter" (build.sh appends -<sha>)
-firmware_version="${tag#filter-}-filter"
-[[ $firmware_version == "$tag" ]] && die "tag '$tag' does not start with 'filter-' — not a filter release?"
+# workflow's version job: displayVersion = tag minus the "v" prefix,
+# firmwareVersion = the tag itself (no commit sha)
+firmware_version="${tag#v}"
+[[ $firmware_version == "$tag" ]] && die "tag '$tag' does not start with 'v' — not a release tag?"
 info "source: $release_sha"
 info "FIRMWARE_VERSION: $firmware_version"
 

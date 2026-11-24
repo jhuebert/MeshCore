@@ -202,8 +202,8 @@ Two channels:
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|
-| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `filter-v*-dev.N` |
-| stable | `repeater-filter-stable` | upstream `main` releases | `filter-v*` |
+| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `v*-dev.N` |
+| stable | `repeater-filter-stable` | upstream `main` releases | `v*` |
 
 Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI,

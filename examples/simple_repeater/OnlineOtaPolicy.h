@@ -24,9 +24,8 @@
 #define ONLINE_OTA_MAX_ENV     64
 #define ONLINE_OTA_MAX_URL     320
 #define ONLINE_OTA_BASE_URL "https://github.com/jhuebert/MeshCore/releases/download/"
-// The fork's release tag prefix. Kept here so the planned rename away from
-// "filter" is one edit.
-#define ONLINE_OTA_TAG_PREFIX "filter-v"
+// The fork's release tag prefix.
+#define ONLINE_OTA_TAG_PREFIX "v"
 
 namespace OnlineOtaPolicy {
 

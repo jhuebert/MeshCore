@@ -99,39 +99,37 @@ jobs:
 
             let releaseTag, displayVersion, releaseTitle, firmwareVersion, prevTag;
             if (channel === 'stable') {
-              // previous stable tag = latest filter-v* tag under the new scheme,
-              // skipping dev-suffixed and old date-scheme tags
-              prevTag = tags('filter-v*')
+              // previous stable tag = latest v* tag, skipping dev-suffixed
+              // and old date-scheme tags
+              prevTag = tags('v*')
                 .find((t) => !t.includes('-dev.') && !/-20\d{6}-/.test(t)) || '';
-              // tag: filter-v<base>, or -rN when that base was already released
+              // tag: v<base>, or -rN when that base was already released
               let rnSuffix = '';
-              if (gitOk('rev-parse', '-q', '--verify', `refs/tags/filter-${upstreamVersion}`)) {
+              if (gitOk('rev-parse', '-q', '--verify', `refs/tags/v${upstreamVersion}`)) {
                 let n = 1;
-                while (gitOk('rev-parse', '-q', '--verify', `refs/tags/filter-${upstreamVersion}-r${n}`)) n += 1;
+                while (gitOk('rev-parse', '-q', '--verify', `refs/tags/v${upstreamVersion}-r${n}`)) n += 1;
                 rnSuffix = `-r${n}`;
               }
-              releaseTag = `filter-${upstreamVersion}${rnSuffix}`;
+              releaseTag = `v${upstreamVersion}${rnSuffix}`;
               displayVersion = `${upstreamVersion}${rnSuffix}`;
-              releaseTitle = `Filter Firmware ${displayVersion} (stable)`;
-              // build.sh appends -<short sha> itself
-              firmwareVersion = `${upstreamVersion}-filter`;
+              releaseTitle = `Firmware ${displayVersion} (stable)`;
+              firmwareVersion = releaseTag;
             } else {
-              // previous dev tag = latest filter-*-dev.* tag (new scheme only).
+              // previous dev tag = latest v*-dev.* tag.
               // Scoped to the channel's own tags, so an unrelated stable release
               // cannot mask a dev change (or vice versa).
-              prevTag = tags('filter-*-dev.*')[0] || '';
+              prevTag = tags('v*-dev.*')[0] || '';
               // counter = highest existing suffix for this base + 1: the first
               // sorted tag carries it. Counting the tags (count + 1) collides
               // when one was deleted or a gap exists, and a duplicate tag fails
               // the release.
-              const highestDev = tags(`filter-${upstreamVersion}-dev.*`)[0] || '';
+              const highestDev = tags(`v${upstreamVersion}-dev.*`)[0] || '';
               const m = highestDev.match(/\.(\d+)$/);
               const n = (m ? parseInt(m[1], 10) : 0) + 1;
-              releaseTag = `filter-${upstreamVersion}-dev.${n}`;
+              releaseTag = `v${upstreamVersion}-dev.${n}`;
               displayVersion = `${upstreamVersion}-dev.${n}`;
-              releaseTitle = `Filter Firmware ${displayVersion}`;
-              // build.sh appends -<short sha> itself
-              firmwareVersion = `${upstreamVersion}-dev.${n}-filter`;
+              releaseTitle = `Firmware ${displayVersion}`;
+              firmwareVersion = releaseTag;
             }
 
             // ---- gate: should this channel build at all? ----
@@ -235,7 +233,7 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo, per_page: 100,
             });
             const notes = releases
-              .filter((r) => r.prerelease && /^filter-v[\d.]+-dev\.\d+$/.test(r.tag_name))
+              .filter((r) => r.prerelease && /^v[\d.]+-dev\.\d+$/.test(r.tag_name))
               .filter((r) => !prev || gitOk('merge-base', '--is-ancestor', prev, r.target_commitish))
               .filter((r) => gitOk('merge-base', '--is-ancestor', r.target_commitish, process.env.SOURCE_SHA))
               .sort((a, b) => a.created_at.localeCompare(b.created_at))
