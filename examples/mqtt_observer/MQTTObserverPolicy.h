@@ -33,12 +33,10 @@ inline bool parseSlot(const char* command, const char* operation, size_t max_slo
 }  // namespace MQTTObserverCommandPolicy
 
 // The station link normally belongs to a broker slot: with no ready slot the
-// worker powers Wi-Fi down and leaves it down. `start ota` needs the station on
-// its own, so it arms this hold — the worker then brings the station up (and
-// keeps it up) with no broker involved, which is what lets the update page be
-// served on the LAN address instead of the setup hotspot. The hold is RAM-only
-// by design: the reboot that ends an OTA session returns the node to its idle
-// Wi-Fi-off state.
+// worker powers Wi-Fi down and leaves it down. A consumer can request it on its
+// own: `start ota` needs the station for the web uploader, and `ota fetch start`
+// needs it for a release download. The request is RAM-only: setting the version
+// or digest does not request WiFi, and a reboot returns to Wi-Fi-off.
 namespace MQTTObserverOtaStationPolicy {
 
 // How long `start ota` waits for the station to associate before leaving the
@@ -46,8 +44,17 @@ namespace MQTTObserverOtaStationPolicy {
 // a few seconds is normal.
 static const uint32_t kAssociateTimeoutMs = 10000;
 
+inline bool isOnlineFetchCommand(const char* command) {
+  return command != nullptr && strcmp(command, "ota fetch start") == 0;
+}
+
 inline bool isOtaCommand(const char* command) {
-  return command != nullptr && strcmp(command, "start ota") == 0;
+  return (command != nullptr && strcmp(command, "start ota") == 0) ||
+         isOnlineFetchCommand(command);
+}
+
+inline bool stationWanted(bool ready_broker, bool request, bool have_credentials) {
+  return ready_broker || (request && have_credentials);
 }
 
 inline bool wantsStation(bool have_credentials, bool station_up) {

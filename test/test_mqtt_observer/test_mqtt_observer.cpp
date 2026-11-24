@@ -1001,6 +1001,21 @@ TEST(MQTTObserverOtaStationPolicy, ArmsOnlyForStartOtaWithCredentialsAndNoLink) 
   EXPECT_FALSE(keepStation(false, true));
 }
 
+TEST(MQTTObserverOtaStationPolicy, OnlyTheStartVerbRequestsTheStation) {
+  using namespace MQTTObserverOtaStationPolicy;
+  EXPECT_TRUE(isOtaCommand("ota fetch start"));
+  EXPECT_TRUE(isOnlineFetchCommand("ota fetch start"));
+  EXPECT_FALSE(isOnlineFetchCommand("ota fetch ver 1.18.0-dev.11"));
+  EXPECT_FALSE(isOnlineFetchCommand("ota fetch sha sha256:abc"));
+  EXPECT_FALSE(isOnlineFetchCommand("ota fetch start now"));
+  EXPECT_FALSE(isOnlineFetchCommand(nullptr));
+
+  EXPECT_TRUE(stationWanted(true, false, false));   // a ready broker wins
+  EXPECT_TRUE(stationWanted(false, true, true));
+  EXPECT_FALSE(stationWanted(false, true, false));
+  EXPECT_FALSE(stationWanted(false, false, true));
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

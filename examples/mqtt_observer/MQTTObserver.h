@@ -111,7 +111,7 @@ class MQTTObserver {
   BrokerRuntime _brokers[MQTT_OBSERVER_MAX_BROKERS];
   bool _wifi_started;
   std::atomic<bool> _recover_requested;   // reset the Wi-Fi station and reconnect
-  std::atomic<bool> _ota_station_hold;    // `start ota` armed the station with no broker
+  std::atomic<bool> _station_request;     // a consumer requested the station with no broker
   uint32_t _queue_disconnected_since;
   uint32_t _last_ntp_request;
   char _device_id[2 * PUB_KEY_SIZE + 1];
@@ -129,7 +129,6 @@ class MQTTObserver {
   void copyConfig(MQTTObserverConfig& config);
   bool ready(const MQTTObserverConfig& config, size_t slot) const;
   bool hasEnabledBrokerLocked() const;   // caller holds _config_mux
-  bool hasConnectHeadroom(bool secure) const;
   bool configureClient(size_t slot, const MQTTObserverConfig& config);
   bool createJwt(size_t slot, const MQTTObserverBrokerConfig& config, uint32_t& expires_at);
   bool publishEvent(const Event& event, const MQTTObserverConfig& config);
@@ -160,6 +159,12 @@ public:
   void loop();
   void setRadio(float freq, float bw, uint8_t sf, uint8_t cr);
   bool needsAwake() const;
+  // The PSRAM-aware heap gate, shared with the online OTA HTTPS client.
+  bool hasConnectHeadroom(bool secure) const;
+  // Request (or release) the station for a consumer with no broker.
+  void requestStation(bool want) {
+    _station_request.store(want, std::memory_order_relaxed);
+  }
   void stageRaw(float snr, float rssi, const uint8_t raw[], int len);
   void capture(mesh::Packet* packet, float score);
   void captureTx(mesh::Packet* packet);

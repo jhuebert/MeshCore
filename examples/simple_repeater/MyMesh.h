@@ -46,6 +46,8 @@
 #include "OtaUpdate.h"
 #ifdef WITH_MQTT_OBSERVER
 #include "../mqtt_observer/MQTTObserver.h"
+#include "OnlineOtaCore.h"
+#include "OnlineOtaNet.h"
 #endif
 
 #ifdef WITH_BRIDGE
@@ -139,6 +141,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool rx_forward_allowed = true;
 #ifdef WITH_MQTT_OBSERVER
   MQTTObserver mqttObserver;
+  OnlineOtaNetEsp32 onlineOtaNet;
+  OnlineOtaCore onlineOta;
   // supplies the observer's status-message stats from live node state
   static void mqttStatusStats(void* context, MQTTObserverFormat::StatusStats& stats);
 #endif
