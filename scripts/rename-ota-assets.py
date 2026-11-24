@@ -13,7 +13,9 @@ import re
 import subprocess
 import sys
 
-ASSET_RE = re.compile(r"-filter-[0-9a-f]{7,}")
+# Some older releases carry the sha twice (filter-<8 hex>-<7 hex>); strip the
+# whole suffix so the remaining name is just <env>-v<version> plus its extension.
+ASSET_RE = re.compile(r"-filter-[0-9a-f]{7,}(?:-[0-9a-f]{7,})?")
 
 
 def gh(*args):

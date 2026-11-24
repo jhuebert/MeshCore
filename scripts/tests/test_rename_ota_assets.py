@@ -27,6 +27,7 @@ class RenameTest(unittest.TestCase):
                 {"id": 3, "name": "Xiao_S3_WIO_repeater-v1.18.0-dev.11.bin"},
                 {"id": 4, "name": "wio-e5-v1.18.0-dev.11-filter-10d4da2.uf2"},
                 {"id": 5, "name": "SHA256SUMS.txt"},
+                {"id": 6, "name": "t1000e_repeater-v1.17.1-filter-e7e9188c-e7e9188.zip"},
             ],
         }]
         (self.dir / "releases.json").write_text(json.dumps(releases), encoding="utf-8")
@@ -69,13 +70,14 @@ class RenameTest(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         patches = (self.dir / "patches.log").read_text(encoding="utf-8")
-        self.assertEqual(len(patches.splitlines()), 3)
+        self.assertEqual(len(patches.splitlines()), 4)
         self.assertIn("name=Xiao_S3_WIO_repeater-v1.18.0-dev.11.bin", patches)
         self.assertIn("name=Xiao_S3_WIO_repeater-v1.18.0-dev.11-merged.bin", patches)
         self.assertIn("name=wio-e5-v1.18.0-dev.11.uf2", patches)
+        self.assertIn("name=t1000e_repeater-v1.17.1.zip", patches)
         self.assertNotIn("SHA256SUMS", patches)
         self.run_script()
-        self.assertEqual(len((self.dir / "patches.log").read_text().splitlines()), 3)
+        self.assertEqual(len((self.dir / "patches.log").read_text().splitlines()), 4)
 
     def test_limit(self):
         result = self.run_script("--limit", "1")
