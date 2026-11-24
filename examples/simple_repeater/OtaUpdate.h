@@ -220,6 +220,16 @@
 #define OTA_FEAT_STAGED_HASH 0x00000008  // OP_STAGED_HASH is implemented
 #define OTA_FEAT_STATUS    0x00000010   // OP_STATUS_REPORT is implemented
 #define OTA_FEAT_PING      0x00000020   // OP_PING is implemented
+#define OTA_FEAT_ONLINE_FETCH 0x00000040 // local staging from a release download
+
+// Online OTA is observer-only firmware. The local staging API itself is
+// Arduino-free and host-tested; the advertised bit follows the real build.
+#if defined(ESP32) && defined(WITH_MQTT_OBSERVER)
+#define OTA_HAS_ONLINE_FETCH 1
+#endif
+
+// One reply string for the whole CLI, shared by the LoRa and online verbs.
+#define OTA_USAGE "Usage: ota [status|net|fetch <ver|sha|start>|stage <size> <sha256> <ver>|apply|abort|rollback]"
 
 // OP_STATUS_REPORT.state values (same order as OtaUpdate::State).
 #define OTA_STATE_IDLE        0
@@ -371,6 +381,18 @@ public:
   bool abortCommand(char* reply);
   bool rollbackCommand(char* reply);
 
+  // Local staging for the online download. It feeds the same session and the
+  // same SHA-256 gate as a LoRa transfer, so apply and rollback are shared.
+  bool beginLocalStage(uint32_t size, const uint8_t sha[32], const char* ver, char* reply);
+  bool appendLocalStage(const uint8_t* data, size_t len);
+  bool finishLocalStage(char* reply);
+  void cancelLocalStage();
+  void noteOnlineError(uint8_t err, char* reply);
+  bool localStageActive() const { return _local_source; }
+  bool batterySuspended() const;
+  uint8_t errorCode() const { return _err; }
+  uint32_t slotSize() const { return _io != nullptr ? _io->slotSize() : 0; }
+
   State state() const { return _state; }
 
   // Test-only: inject a RAM-backed slot instead of the ESP32 partitions.
@@ -421,6 +443,8 @@ private:
   uint32_t _running_len = 0;                // image length (header + digest)
   bool _running_len_valid = false;
 
+  bool _local_source = false;               // this session came from an online download
+
   bool _health_pending = false;             // freshly-applied image booted
   bool _health_sent = false;                // health probe already dispatched
   bool _health_checked = false;             // boot pump settled
@@ -467,6 +491,7 @@ private:
   void clearPending() { _pending.valid = false; }
   void abortStaging(uint8_t err);           // scrap the staged slot on failure
   void armSession(uint32_t size, const uint8_t sha[32]);
+  bool checkStageRequest(uint32_t size, const uint8_t sha[32], const char* ver, char* reply);
   void handleStart(const uint8_t* body, uint16_t body_len);
   void applyOp(const uint8_t* body, uint16_t body_len, uint8_t op);
   void applyCopy(uint32_t base_off, uint16_t len);

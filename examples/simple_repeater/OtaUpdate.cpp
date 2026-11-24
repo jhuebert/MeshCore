@@ -130,8 +130,6 @@ static void zFree(ZInflater* z) {
 #include <esp_ota_ops.h>
 #endif
 
-#define OTA_USAGE "Usage: ota [status|stage <size> <sha256> <ver>|apply|abort|rollback]"
-
 // All fixed CLI replies go through one snprintf call.
 static void cliSay(char* reply, const char* text) {
   snprintf(reply, CLI_REPLY_MAX, "%s", text);
@@ -391,6 +389,7 @@ void OtaUpdate::resetSession() {
   _written = 0;
   _expect = 1;
   _session_id = 0;
+  _local_source = false;
 }
 
 void OtaUpdate::abortStaging(uint8_t err) {
@@ -418,6 +417,10 @@ void OtaUpdate::armSession(uint32_t size, const uint8_t sha[32]) {
   _err = OTA_ERR_NONE;
 }
 
+bool OtaUpdate::batterySuspended() const {
+  return _gate != nullptr && _gate->isSuspended();
+}
+
 uint32_t OtaUpdate::ownTargetId() const {
 #if defined(OTA_PIO_ENV)
   static uint32_t id = 0;
@@ -434,8 +437,12 @@ uint32_t OtaUpdate::ownTargetId() const {
 
 uint32_t OtaUpdate::features() const {
   if (_io == nullptr) return 0;
-  return OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH |
-         OTA_FEAT_STAGED_HASH | OTA_FEAT_STATUS | OTA_FEAT_PING;
+  uint32_t bits = OTA_FEAT_DELTA | OTA_FEAT_APPLY | OTA_FEAT_BLOCK_HASH |
+                  OTA_FEAT_STAGED_HASH | OTA_FEAT_STATUS | OTA_FEAT_PING;
+#ifdef OTA_HAS_ONLINE_FETCH
+  bits |= OTA_FEAT_ONLINE_FETCH;
+#endif
+  return bits;
 }
 
 // The frozen 79-byte body shared verbatim by INFO_REPORT and STATUS_REPORT.
@@ -726,6 +733,10 @@ size_t OtaUpdate::onFrame(const uint8_t* frame, size_t n, uint8_t* report_out, s
   if (op == OTA_OP_NOP || op == OTA_OP_REPORT || op == OTA_OP_INFO_REPORT ||
       op == OTA_OP_STAGED_HASH_REPORT || op == OTA_OP_STATUS_REPORT ||
       op == OTA_OP_PING_REPORT) return 0;
+
+  // A local download owns this session. Refuse every stream op, including
+  // OP_START, so a pending LoRa arm cannot overwrite the image being written.
+  if (_local_source) return 0;
 
   if (op == OTA_OP_ASK) {
     if (!stagingArmed()) return 0;
@@ -1088,7 +1099,9 @@ void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
            state_name, (unsigned long)_size, (unsigned long)_written, (unsigned)_err);
 }
 
-bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const char* ver_tok, char* reply) {
+// The contract both staging sources must satisfy, kept in one place.
+bool OtaUpdate::checkStageRequest(uint32_t size, const uint8_t sha[32],
+                                  const char* ver, char* reply) {
   if (_io == nullptr) {
     cliSay(reply, "Err - OTA unsupported on this platform");
     return false;
@@ -1097,16 +1110,30 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     cliSay(reply, "Err - battery gate active; staging refused");
     return false;
   }
-  long size;
-  if (!parseIntRange(size_tok, 1, 0x7FFFFFFFL, &size)) {
+  if (size == 0 || size > 0x7FFFFFFFu) {
     cliSay(reply, "Err - size must be 1..2147483647");
     return false;
   }
-  if ((uint32_t)size > _io->slotSize()) {
-    // Refuse here, where the operator can read why: an arm the slot can never
-    // hold would otherwise fail later as a silent OP_START refusal.
+  if (size > _io->slotSize()) {
     snprintf(reply, CLI_REPLY_MAX, "Err - size exceeds the %lu-byte slot",
              (unsigned long)_io->slotSize());
+    return false;
+  }
+  if (sha == nullptr) {
+    cliSay(reply, "Err - sha256 must be 64 hex chars");
+    return false;
+  }
+  if (ver == nullptr || ver[0] == 0 || strlen(ver) > 63) {
+    cliSay(reply, "Err - ver must be 1..63 bytes");
+    return false;
+  }
+  return true;
+}
+
+bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const char* ver_tok, char* reply) {
+  long size;
+  if (!parseIntRange(size_tok, 1, 0x7FFFFFFFL, &size)) {
+    cliSay(reply, "Err - size must be 1..2147483647");
     return false;
   }
   uint8_t sha[32];
@@ -1114,12 +1141,13 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     cliSay(reply, "Err - sha256 must be 64 hex chars");
     return false;
   }
-  if (ver_tok == nullptr || strlen(ver_tok) == 0 || strlen(ver_tok) > 63) {
-    cliSay(reply, "Err - ver must be 1..63 bytes");
-    return false;
-  }
+  if (!checkStageRequest((uint32_t)size, sha, ver_tok, reply)) return false;
   if (_rng == nullptr) {
     cliSay(reply, "Err - rng unavailable");
+    return false;
+  }
+  if (_local_source) {
+    cliSay(reply, "Err - online fetch active; abort first");
     return false;
   }
 
@@ -1135,6 +1163,67 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
   snprintf(reply, CLI_REPLY_MAX, "OK - staging armed (size=%ld) token=%02x%02x%02x%02x",
            size, _pending.token[0], _pending.token[1], _pending.token[2], _pending.token[3]);
   return true;
+}
+
+bool OtaUpdate::beginLocalStage(uint32_t size, const uint8_t sha[32],
+                                const char* ver, char* reply) {
+  if (_local_source) {
+    cliSay(reply, "Err - online fetch already active");
+    return false;
+  }
+  if (_state == State::Staging || _state == State::Ready) {
+    cliSay(reply, "Err - staging busy; abort first");
+    return false;
+  }
+  if (!checkStageRequest(size, sha, ver, reply)) return false;
+  if (_state == State::Error) resetSession();
+  armSession(size, sha);
+  if (_state != State::Staging) return false;   // armSession recorded the reason
+  _local_source = true;
+  if (reply != nullptr) {
+    snprintf(reply, CLI_REPLY_MAX, "OK - online stage armed (size=%lu)", (unsigned long)size);
+  }
+  return true;
+}
+
+bool OtaUpdate::appendLocalStage(const uint8_t* data, size_t len) {
+  if (!_local_source || _state != State::Staging) return false;
+  if (len == 0) return true;
+  if ((uint64_t)_written + len > _size) { abortStaging(OTA_ERR_BOUNDS); return false; }
+  if (!_io->append(data, len)) { abortStaging(OTA_ERR_IO); return false; }
+  _written += (uint32_t)len;
+  return true;
+}
+
+bool OtaUpdate::finishLocalStage(char* reply) {
+  if (!_local_source || _state != State::Staging) return false;
+  if (_written != _size) { abortStaging(OTA_ERR_BOUNDS); return false; }
+  uint8_t digest[32];
+  if (!hashSlot(_io, /*staged=*/true, 0, _size, digest) ||
+      memcmp(digest, _expected_sha, 32) != 0) {
+    abortStaging(OTA_ERR_SHA);
+    return false;
+  }
+  if (!_io->endWrite()) { abortStaging(OTA_ERR_END); return false; }
+  _state = State::Ready;
+  if (reply != nullptr) {
+    snprintf(reply, CLI_REPLY_MAX, "OK - online image staged (size=%lu)", (unsigned long)_size);
+  }
+  return true;
+}
+
+void OtaUpdate::cancelLocalStage() {
+  if (!_local_source) return;
+  resetSession();
+}
+
+void OtaUpdate::noteOnlineError(uint8_t err, char* reply) {
+  resetSession();
+  _state = State::Error;
+  _err = err;
+  if (reply != nullptr) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - online OTA error %u", (unsigned)err);
+  }
 }
 
 bool OtaUpdate::applyCommand(char* reply) {
@@ -1156,6 +1245,7 @@ bool OtaUpdate::applyCommand(char* reply) {
 }
 
 bool OtaUpdate::abortCommand(char* reply) {
+  cancelLocalStage();
   resetSession();
   clearPending();
   cliSay(reply, "OK - aborted");
