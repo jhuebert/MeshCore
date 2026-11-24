@@ -128,7 +128,6 @@ build_firmware() {
   ENV_PLATFORM=($(get_platform_for_env $1))
 
   # get git commit sha
-  COMMIT_HASH=$(git rev-parse --short HEAD)
 
   # set firmware build date
   FIRMWARE_BUILD_DATE=$(date '+%d-%b-%Y')
@@ -139,12 +138,8 @@ build_firmware() {
     exit 1
   fi
 
-  # set firmware version string
-  # e.g: v1.0.0-abcdef
-  FIRMWARE_VERSION_STRING="${FIRMWARE_VERSION}-${COMMIT_HASH}"
-
-  # craft filename
-  # e.g: RAK_4631_Repeater-v1.0.0-SHA
+  # firmware version and asset name carry the same sha-free v<version>
+  FIRMWARE_VERSION_STRING="${FIRMWARE_VERSION}"
   FIRMWARE_FILENAME="$1-${FIRMWARE_VERSION_STRING}"
 
   # add firmware version info to end of existing platformio build flags in environment vars

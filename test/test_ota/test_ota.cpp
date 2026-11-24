@@ -1658,6 +1658,110 @@ TEST_F(OtaTest, LiteralZRefusesAnUnknownCodec) {
   EXPECT_NE(statusLine().find("err=9"), std::string::npos);   // OTA_ERR_COMPRESS
 }
 
+// LOCAL (ONLINE) STAGING: the same session, a second source
+
+static bool beginLocal(OtaUpdate& ota, const std::vector<uint8_t>& image) {
+  uint8_t sha[32];
+  mockSha256(image, sha);
+  char reply[160];
+  return ota.beginLocalStage((uint32_t)image.size(), sha, "1.2.3", reply);
+}
+
+TEST_F(OtaTest, LocalStageWritesAndVerifiesTheWholeImage) {
+  auto image = testImage(64);
+  ASSERT_TRUE(beginLocal(ota, image));
+  EXPECT_TRUE(ota.localStageActive());
+  ASSERT_TRUE(ota.appendLocalStage(image.data(), image.size()));
+  char reply[160];
+  ASSERT_TRUE(ota.finishLocalStage(reply));
+  EXPECT_STREQ(reply, "OK - online image staged (size=64)");
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Ready);
+  EXPECT_EQ(slot.staged, image);
+  ASSERT_TRUE(ota.applyCommand(reply));   // the shared apply still works
+  EXPECT_STREQ(reply, "OK - applied; rebooting");
+}
+
+TEST_F(OtaTest, LocalStageShaMismatchIsRejected) {
+  auto image = testImage(16);
+  uint8_t wrong[32] = {0};
+  char reply[160];
+  ASSERT_TRUE(ota.beginLocalStage(image.size(), wrong, "1.2.3", reply));
+  ASSERT_TRUE(ota.appendLocalStage(image.data(), image.size()));
+  EXPECT_FALSE(ota.finishLocalStage(reply));
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
+  EXPECT_NE(statusLine().find("err=4"), std::string::npos);
+  EXPECT_TRUE(slot.aborted);
+  EXPECT_FALSE(ota.localStageActive());
+}
+
+TEST_F(OtaTest, LocalStageBoundsWriteAndEndFailuresAbort) {
+  auto image = testImage(16);
+  ASSERT_TRUE(beginLocal(ota, image));
+  EXPECT_FALSE(ota.appendLocalStage(image.data(), image.size() + 1));
+  EXPECT_NE(statusLine().find("err=6"), std::string::npos);
+
+  slot.write_ok = false;
+  ASSERT_TRUE(beginLocal(ota, image));
+  EXPECT_FALSE(ota.appendLocalStage(image.data(), image.size()));
+  EXPECT_NE(statusLine().find("err=5"), std::string::npos);
+
+  slot.write_ok = true;
+  slot.end_ok = false;
+  ASSERT_TRUE(beginLocal(ota, image));
+  ASSERT_TRUE(ota.appendLocalStage(image.data(), image.size()));
+  char reply[160];
+  EXPECT_FALSE(ota.finishLocalStage(reply));
+  EXPECT_NE(statusLine().find("err=8"), std::string::npos);
+}
+
+TEST_F(OtaTest, LocalStageAbortCancelsTheFetchAndLoraOpsAreExcluded) {
+  auto image = testImage(16);
+  ASSERT_TRUE(beginLocal(ota, image));
+  ota.appendLocalStage(image.data(), 8);
+  char reply[160];
+  ASSERT_TRUE(ota.abortCommand(reply));
+  EXPECT_STREQ(reply, "OK - aborted");
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
+  EXPECT_FALSE(ota.localStageActive());
+
+  // Arm a real LoRa transfer first, then start a local one. The valid token
+  // must still be unable to take over the session.
+  std::string arm_reply = stage(image);
+  ASSERT_NE(arm_reply.find("token="), std::string::npos);
+  auto token = armTokenOf(arm_reply);
+  ASSERT_TRUE(beginLocal(ota, image));
+  feed(infoFrame());   // read-only handshake stays available
+  uint8_t sha[32];
+  mockSha256(image, sha);
+  auto body = makeStartBody(image.size(), sha, testTargetId(), token.data());
+  feed(frame(OTA_OP_START, 0, body));
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+  EXPECT_TRUE(ota.localStageActive());
+}
+
+TEST_F(OtaTest, OnlineGuardsTolerateANullReplyAndRecordAnError) {
+  auto image = testImage(16);
+  ASSERT_TRUE(beginLocal(ota, image));
+  // The online core passes nullptr; guarded refusals must not crash and must
+  // leave a real error code for ota status.
+  EXPECT_FALSE(ota.beginLocalStage(image.size(), image.data(), "1.2.3", nullptr));
+  EXPECT_NE(statusLine().find("err=6"), std::string::npos);
+  EXPECT_TRUE(ota.appendLocalStage(image.data(), 0));   // zero-length append is inert
+  ota.cancelLocalStage();
+  EXPECT_FALSE(ota.appendLocalStage(image.data(), image.size()));
+  EXPECT_NE(statusLine().find("err=6"), std::string::npos);
+}
+
+TEST_F(OtaTest, OnlineErrorSetsTheFrozenStatusLineAndIsReArmable) {
+  char reply[160];
+  ota.noteOnlineError(15, reply);
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Error);
+  EXPECT_NE(statusLine().find("state=error"), std::string::npos);
+  EXPECT_NE(statusLine().find("err=15"), std::string::npos);
+  EXPECT_TRUE(beginLocal(ota, testImage(8)));
+  EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

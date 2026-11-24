@@ -1252,6 +1252,16 @@ void MyMesh::begin(FILESYSTEM *fs) {
   battGate.begin(fs);
   ota.begin(fs, &battGate, &board, FIRMWARE_VERSION, getRNG());
   ota.setSender(otaSend, this);
+#ifdef WITH_MQTT_OBSERVER
+  onlineOtaNet.begin(&mqttObserver);
+  onlineOta.begin(&onlineOtaNet, &ota,
+ #if defined(OTA_PIO_ENV)
+                  OTA_PIO_ENV,
+ #else
+                  "",
+ #endif
+                  ota.slotSize());
+#endif
   fleet.setClock(fleetClock, this);
   fleet.setJitter(fleetJitter, this);
   fleet.setNameProvider(fleetNodeName, this);
@@ -1681,9 +1691,27 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     // radio.rxps and radio2 are mutually exclusive; turning RXPS off stays
     // available so the operator can recover, and `get radio.rxps` is read-only.
     strcpy(reply, "Err - radio2 is on; set radio2 off first");
+#ifndef WITH_MQTT_OBSERVER
+  } else if ((memcmp(command, "ota fetch", 9) == 0 &&
+              (command[9] == ' ' || command[9] == 0)) ||
+             strcmp(command, "ota net") == 0) {
+    strcpy(reply, "Err - unsupported");
+#endif
+#ifdef WITH_MQTT_OBSERVER
+  } else if ((memcmp(command, "ota fetch", 9) == 0 &&
+              (command[9] == ' ' || command[9] == 0)) ||
+             strcmp(command, "ota net") == 0) {
+    const char* sub = command + 3;
+    while (*sub == ' ') sub++;
+    onlineOtaCLI(onlineOta, sub, reply);
+#endif
   } else if (memcmp(command, "ota", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
     const char* sub = command + 3;
     while (*sub == ' ') sub++;
+#ifdef WITH_MQTT_OBSERVER
+    // The frozen reply comes from otaCLI; the online job must be dropped too.
+    if (strcmp(sub, "abort") == 0) onlineOta.abort();
+#endif
     otaCLI(ota, sub, reply);
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it
@@ -1728,6 +1756,9 @@ void MyMesh::loop() {
   batteryAlerts(battGate, fleet);
   // OTA boot health check (only active right after a freshly-applied boot)
   ota.loop();
+#ifdef WITH_MQTT_OBSERVER
+  onlineOta.loop();   // one bounded step of a release download, or inert
+#endif
 
   mesh::Mesh::loop();
 
@@ -1819,6 +1850,7 @@ bool MyMesh::hasPendingWork() const {
 #endif
 #ifdef WITH_MQTT_OBSERVER
   if (mqttObserver.needsAwake()) return true;
+  if (onlineOta.needsAwake()) return true;
 #endif
   return _mgr->getOutboundTotal() > 0;
 }

@@ -1,9 +1,10 @@
-# MeshCore: Repeater Firmware with a Remote-Configurable Packet Filter
+# MeshCore: Remote-Configurable Repeater Firmware
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds ten repeater-focused capabilities
-on top of stock firmware. Everything else (supported boards, clients,
-protocols, build system) is identical to upstream;
+It tracks upstream `main` releases and adds repeater management, power,
+radio, fleet and update capabilities on top of stock firmware. The packet
+filter is one of them, not the fork's identity. Everything else (supported
+boards, clients, protocols, build system) is identical to upstream;
 see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
 general project, hardware support, and getting-started guide.
@@ -148,6 +149,17 @@ for diagnostics.
 > See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
 > affected targets and the backup procedure.
 
+### 🌐 Online OTA (observer builds)
+
+Observer repeaters can update straight from a GitHub release over WiFi. Set
+the version and the expected SHA-256 with `ota fetch ver` and `ota fetch sha`,
+then `ota fetch start` downloads the board's image in the background; `ota
+status` shows progress and `ota apply` reboots into the verified image. No
+manifest, GitHub API call or phone is needed, and the usual SHA-256 gate and
+rollback still apply.
+
+→ Full guide: **[ONLINE_OTA.md](./ONLINE_OTA.md)**
+
 ### 🤖 Chat bot
 
 An opt-in responder that answers `test`/`ping`/`help` chatter on one keyed
@@ -190,14 +202,15 @@ Two channels:
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|
-| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `filter-v*-dev.N` |
-| stable | `repeater-filter-stable` | upstream `main` releases | `filter-v*` |
+| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `v*-dev.N` |
+| stable | `repeater-filter-stable` | upstream `main` releases | `v*` |
 
 Flash as you would stock firmware, then follow
 [FILTER.md](./FILTER.md) to set your first rules over the CLI,
 [FLEET.md](./FLEET.md) if you are running a fleet,
 [POWER.md](./POWER.md) if the node runs on solar or battery,
 [RADIO2.md](./RADIO2.md) if it should listen on a second preset,
-[HAM.md](./HAM.md) if you are a licensed operator using dual TX power, or
-[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build.
+[HAM.md](./HAM.md) if you are a licensed operator using dual TX power,
+[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build, or
+[ONLINE_OTA.md](./ONLINE_OTA.md) to update one over WiFi.
 Observer builds ship in the same releases as the plain repeater firmware.

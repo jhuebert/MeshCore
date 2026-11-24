@@ -81,6 +81,11 @@ should not need to explore beyond them before making a change.
   bits, never change existing ones; (5) `REQ_TYPE_OTA` is fork-private `0xA0`,
   outside upstream's `0x01..0x09` REQ range (`0x08` is upstream's `subscribe`);
   the app's `reqTypeOta` constant changes with it.
+- `ONLINE_OTA.md`: online OTA over WiFi for repeater observer builds. The user
+  manual for the three commands (`ota fetch ver`, `ota fetch sha`,
+  `ota fetch start`), `ota net` progress, the frozen `ota status` line, digest
+  syntax, errors 10 to 16, fleet recipes and limits. Observer-only: setting
+  ver/sha touches no WiFi, and non-observer builds compile no adapter.
 
 **New top-level features need two docs in the same commit:** a paragraph in
 `README.md` describing the feature, and a dedicated, user-focused guide (like
@@ -144,7 +149,20 @@ same commit**. The guides are user-facing API documentation, not optional docs.
   (`Esp32SlotIo`) and the all-state `OP_INFO` negotiation handshake. Ops ride
   inside admin REQ/RESPONSE datagrams (`REQ_TYPE_OTA`, dispatched by
   `handleRequest`); the boot health probe is the one zero-hop RAW_CUSTOM
-  OP_NOP. The wire contract is frozen in the header; treat it as such.
+  OP_NOP. The wire contract is frozen in the header; treat it as such. It also
+  exposes the local staging API (`beginLocalStage`/`appendLocalStage`/
+  `finishLocalStage`/`cancelLocalStage`) used by the online download and the
+  appended `0x40` feature bit. Frozen replies and report layouts are unchanged.
+- `OnlineOtaPolicy.h`: pure, Arduino-free version normalization, SHA-256 token
+  parsing and release URL construction. The release tag prefix (`v`) is one
+  macro here.
+- `OnlineOtaCore.h/.cpp`: RAM-only async download state machine (wifi, clock,
+  asset, verify, ready, error) driven one bounded step per `loop()`. Three CLI
+  steps (ver, sha, start) store inputs before any network work. No persistence.
+- `OnlineOtaNet.h/.cpp`: narrow network interface and its ESP32 observer
+  adapter: station request, HTTPS GET with the framework CA bundle, bounded
+  redirects, Content-Length via `contentLength()` and one reused 2 KiB chunk.
+  Compiled only under `ESP32 && WITH_MQTT_OBSERVER`.
 - `MyMesh.cpp/.h`: upstream files carrying the fork's hook lines
   (`allowPacketForward`, `onGroupDataRecv`, `logRx` (profile stamp + ack repeat
   detector), `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`,
@@ -222,7 +240,9 @@ timing bounds, scheduler states, deferred apply, persistence and the `radio2`
 CLI) and `test/test_mqtt_observer/` (config codec +
 record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
 connect gates, queue/retry policy, the liveness probe, and the
-status/packet/raw JSON schema). Test-only shims:
+status/packet/raw JSON schema) and `test/test_online_ota/` (version and digest
+parsing, URL construction, every core phase and error with a fake network,
+CLI replies and local staging on the real OTA engine). Test-only shims:
 `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
 `FilterTestHelpers.h`, `CliReplyHelper.h`.
 
@@ -231,15 +251,16 @@ native_battery_gate` / `-e native_ham_mode` / `-e native_fleet` /
 `-e native_fleet_noack` (the fleet
 suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
 other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e
-native_radio2` / `-e native_mqtt_observer`
-(host-native, no hardware), plus `-e
+native_radio2` / `-e native_mqtt_observer` / `-e native_ota` / `-e
+native_online_ota` (host-native, no hardware), plus `-e
 native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_ham_mode_san` /
 `-e native_fleet_san` /
 `-e native_mesh_clock_san` / `-e native_rx_power_saving_san` / `-e
 native_radio2_san` / `-e
-native_mqtt_observer_san` for ASan+UBSan;
+native_mqtt_observer_san` / `-e native_ota_san` / `-e native_online_ota_san`
+for ASan+UBSan;
 firmware via `bash build.sh build-firmware <target>` (`bash build.sh list`;
-`build.sh` uses bash arrays, so `sh` is not a contract), the filter fork's flash
+`build.sh` uses bash arrays, so `sh` is not a contract), the fork's flash
 target being `Xiao_S3_WIO_repeater` (observer builds add
 `Xiao_S3_WIO_repeater_observer`). **Compile-check every filesystem
 family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
@@ -262,6 +283,12 @@ shut down). The build job prints the tail of a failed target's log, prunes a
 failed target's build tree, and retries the failed set once with two workers
 (`--retry-failed`) after the main pass, so runner-resource flakes do not leave
 assets missing; a deterministic failure simply fails again.
+App images are uploaded as `<env>-v<version>.bin` and the firmware version
+string is the same sha-free `v<version>`. Release tags use the `v` prefix;
+branch names and the workflow file name keep `filter` for now.
+`scripts/rename-ota-assets.py` and `scripts/rename-ota-tags.py` renamed existing
+assets and releases in place through the GitHub API, keeping the old tag refs
+as aliases. `OnlineOtaPolicy.h` holds the single tag-prefix macro.
 `RELEASE_NOTES.md` holds the pending release notes and `filter-release.yml` uses
 it verbatim as the body of every dev release. A stable release collects the
 bodies of the dev releases since the previous stable one, so it needs no
@@ -324,16 +351,18 @@ Fork-owned file set (free to edit):
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
 - `examples/simple_repeater/Radio2.h/.cpp`, `Radio2Config.h`
+- `examples/simple_repeater/OnlineOtaPolicy.h`, `OnlineOtaCore.h/.cpp`,
+  `OnlineOtaNet.h/.cpp`
 - `src/helpers/PowerProfile.h/.cpp`,
   `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`,
   `src/helpers/radiolib/SX1262RxPowerSaving.h`, `src/helpers/radiolib/RadioProfileControl.h`
 - `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
   `test/test_mesh_clock/`, `test/test_rx_power_saving/`, `test/test_radio2/`,
-  `test/test_mqtt_observer/`
+  `test/test_mqtt_observer/`, `test/test_online_ota/`
 - `examples/mqtt_observer/`, `observer_targets.ini`
 - `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `POWER.md`,
-  `RADIO2.md`, `MQTT_OBSERVER.md`
-- `scripts/local-release-build.sh`, `scripts/tests/`
+  `RADIO2.md`, `MQTT_OBSERVER.md`, `ONLINE_OTA.md`
+- `scripts/local-release-build.sh`, `scripts/rename-ota-assets.py`, `scripts/tests/`
 - `.github/workflows/filter-release.yml`,
   `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
 - `.github/actions/open-conflict-issue/` (the conflict issue the two sync
@@ -625,13 +654,14 @@ pio test -e native_mesh_clock       # mesh clock sync
 pio test -e native_radio2           # second radio preset (policy/scheduler/persistence/CLI + core profile byte)
 pio test -e native_mqtt_observer    # observer config/format/policy
 pio test -e native_ota              # LoRa OTA engine (branch lora-ota)
+pio test -e native_online_ota       # online fetch policy, core, CLI and local staging
 ```
 
 All green, and every touched line required, together with the full host-env
 run, since the generic envs are where a broken selection shows up:
 
 ```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_ham_mode -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san
+pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_ham_mode -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san -e native_online_ota -e native_online_ota_san
 ```
 
 Touching firmware-hook or persistence code additionally warrants compile checks

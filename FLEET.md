@@ -589,6 +589,35 @@ The obvious footgun (a script that runs `fleet chan clear` on the whole
 fleet) is the same class as deleting the filter rule that delivered it:
 documented here, not special-cased in code. Don't.
 
+### Online firmware download (observer builds)
+
+An observer target uses three CLI lines to start a release download. The
+`start` reply is immediate, so a script never waits for the download; image
+bytes never travel over LoRa. Target only observer nodes, since a plain
+repeater replies `Err - unsupported`.
+
+```text
+!id 2026-11-24-online-fetch
+!tags canary
+!ack err
+ota fetch ver 1.18.0-dev.11
+ota fetch sha sha256:39483a72f358ea976125928a45394115d452ec29b4dbe4bf35c9e2ddf3f2d826
+ota fetch start
+```
+
+Then, once `ota status` shows `ready`, apply with a second job that `!at` can
+schedule:
+
+```text
+!id 2026-11-24-online-apply
+!tags canary
+ota apply
+```
+
+Each node fetches independently over its own WiFi. The fleet PSK remains full
+admin access. See [ONLINE_OTA.md](./ONLINE_OTA.md) for the digest syntax,
+errors and limits.
+
 ## Status, logs and troubleshooting
 
 `fleet` is the feature's dashboard; `fleet seen <key>` over a normal admin
