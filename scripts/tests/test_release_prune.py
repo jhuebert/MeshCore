@@ -36,7 +36,7 @@ class ReleasePruneTest(unittest.TestCase):
                 },
                 check=True, capture_output=True, text=True,
             )
-            base = "out/Board_repeater-v1.0.0-filter-0000000"
+            base = "out/Board_repeater-v1.0.0"
             self.assertEqual(result.stdout.splitlines(), [f"{base}.bin", f"{base}.uf2"])
             return (build.exists(), (work / ".pio" / "libdeps" / "Board_repeater").exists())
 

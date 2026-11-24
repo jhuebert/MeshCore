@@ -57,9 +57,10 @@
 # Environment parity with the releases CI cuts: FIRMWARE_VERSION = <tag minus
 # the "filter-" prefix> + "-filter" (exactly what filter-release.yml's version
 # job derived), PLATFORMIO_BUILD_FLAGS starts with -fstack-usage, and build.sh's
-# "-<short-sha>" suffix comes from the release's pinned commit. Artifacts land
-# in <build-dir>/<tag>/out/ as well as on the release, so a failed upload never
-# loses a build.
+# "-<short-sha>" suffix comes from the release's pinned commit. Uploaded app
+# images are named <env>-v<version>.bin without the sha; the firmware version
+# string still carries it. Artifacts land in <build-dir>/<tag>/out/ as well as
+# on the release, so a failed upload never loses a build.
 #
 # Build environment isolation: PlatformIO runs from a dedicated venv (not your
 # system Python packages), and every compiler/toolchain comes from the
@@ -182,7 +183,11 @@ if [[ ${1:-} == __worker ]]; then
   # (codegen unchanged, consumed by the stack gate below) + version string
   export PLATFORMIO_BUILD_FLAGS="-fstack-usage -DFIRMWARE_BUILD_DATE='\"${firmware_build_date}\"' -DFIRMWARE_VERSION='\"${firmware_version_string}\"'"
 
-  file_base="${target}-${firmware_version_string}"
+  # Release assets are named <env>-v<version>.bin. The firmware's own version
+  # string keeps the short commit sha; the asset name does not, so the node can
+  # build the download URL from its version token and its own environment.
+  asset_version="${FIRMWARE_VERSION%-filter}"
+  file_base="${target}-${asset_version}"
   mkdir -p out
 
   platform=${WORKER_PLATFORM:-}   # passed by the orchestrator's precomputed map
