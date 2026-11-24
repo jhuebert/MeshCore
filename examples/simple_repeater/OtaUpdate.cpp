@@ -132,7 +132,8 @@ static void zFree(ZInflater* z) {
 
 // All fixed CLI replies go through one snprintf call.
 static void cliSay(char* reply, const char* text) {
-  snprintf(reply, CLI_REPLY_MAX, "%s", text);
+  // The online core passes nullptr: it only cares about success or failure.
+  if (reply != nullptr) snprintf(reply, CLI_REPLY_MAX, "%s", text);
 }
 
 static uint16_t le16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
@@ -1099,31 +1100,44 @@ void OtaUpdate::formatStatus(char* reply, size_t reply_size) {
            state_name, (unsigned long)_size, (unsigned long)_written, (unsigned)_err);
 }
 
-// The contract both staging sources must satisfy, kept in one place.
+// The contract both staging sources must satisfy, kept in one place. The
+// online caller passes no reply buffer and needs a real error code instead.
+static void stageErr(uint8_t* out, uint8_t code) {
+  if (out != nullptr) *out = code;
+}
+
 bool OtaUpdate::checkStageRequest(uint32_t size, const uint8_t sha[32],
-                                  const char* ver, char* reply) {
+                                  const char* ver, char* reply, uint8_t* err_out) {
   if (_io == nullptr) {
+    stageErr(err_out, OTA_ERR_SLOT);
     cliSay(reply, "Err - OTA unsupported on this platform");
     return false;
   }
   if (_gate != nullptr && _gate->isSuspended()) {
+    stageErr(err_out, OTA_ERR_BATTERY);
     cliSay(reply, "Err - battery gate active; staging refused");
     return false;
   }
   if (size == 0 || size > 0x7FFFFFFFu) {
+    stageErr(err_out, OTA_ERR_SLOT);
     cliSay(reply, "Err - size must be 1..2147483647");
     return false;
   }
   if (size > _io->slotSize()) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - size exceeds the %lu-byte slot",
-             (unsigned long)_io->slotSize());
+    stageErr(err_out, OTA_ERR_SLOT);
+    if (reply != nullptr) {
+      snprintf(reply, CLI_REPLY_MAX, "Err - size exceeds the %lu-byte slot",
+               (unsigned long)_io->slotSize());
+    }
     return false;
   }
   if (sha == nullptr) {
+    stageErr(err_out, OTA_ERR_SHA);
     cliSay(reply, "Err - sha256 must be 64 hex chars");
     return false;
   }
   if (ver == nullptr || ver[0] == 0 || strlen(ver) > 63) {
+    stageErr(err_out, OTA_ERR_BOUNDS);
     cliSay(reply, "Err - ver must be 1..63 bytes");
     return false;
   }
@@ -1141,7 +1155,7 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
     cliSay(reply, "Err - sha256 must be 64 hex chars");
     return false;
   }
-  if (!checkStageRequest((uint32_t)size, sha, ver_tok, reply)) return false;
+  if (!checkStageRequest((uint32_t)size, sha, ver_tok, reply, nullptr)) return false;
   if (_rng == nullptr) {
     cliSay(reply, "Err - rng unavailable");
     return false;
@@ -1167,15 +1181,20 @@ bool OtaUpdate::stageCommand(const char* size_tok, const char* sha_tok, const ch
 
 bool OtaUpdate::beginLocalStage(uint32_t size, const uint8_t sha[32],
                                 const char* ver, char* reply) {
+  // A LoRa arm from an earlier `ota stage` must not survive into this session.
+  clearPending();
   if (_local_source) {
+    _err = OTA_ERR_BOUNDS;
     cliSay(reply, "Err - online fetch already active");
     return false;
   }
   if (_state == State::Staging || _state == State::Ready) {
+    _err = OTA_ERR_BOUNDS;
     cliSay(reply, "Err - staging busy; abort first");
     return false;
   }
-  if (!checkStageRequest(size, sha, ver, reply)) return false;
+  uint8_t err = OTA_ERR_NONE;
+  if (!checkStageRequest(size, sha, ver, reply, &err)) { _err = err; return false; }
   if (_state == State::Error) resetSession();
   armSession(size, sha);
   if (_state != State::Staging) return false;   // armSession recorded the reason
@@ -1187,7 +1206,10 @@ bool OtaUpdate::beginLocalStage(uint32_t size, const uint8_t sha[32],
 }
 
 bool OtaUpdate::appendLocalStage(const uint8_t* data, size_t len) {
-  if (!_local_source || _state != State::Staging) return false;
+  if (!_local_source || _state != State::Staging) {
+    _err = OTA_ERR_BOUNDS;
+    return false;
+  }
   if (len == 0) return true;
   if ((uint64_t)_written + len > _size) { abortStaging(OTA_ERR_BOUNDS); return false; }
   if (!_io->append(data, len)) { abortStaging(OTA_ERR_IO); return false; }
@@ -1213,11 +1235,13 @@ bool OtaUpdate::finishLocalStage(char* reply) {
 }
 
 void OtaUpdate::cancelLocalStage() {
+  clearPending();
   if (!_local_source) return;
   resetSession();
 }
 
 void OtaUpdate::noteOnlineError(uint8_t err, char* reply) {
+  clearPending();
   resetSession();
   _state = State::Error;
   _err = err;

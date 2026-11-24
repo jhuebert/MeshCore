@@ -65,8 +65,12 @@ private:
   uint8_t _redirects = 0;
   uint16_t _status = 0;
   char _host[128];
-  char _path[256];
-  char _location[320];
+  // A GitHub release redirect carries a ~950 byte signed URL. These are
+  // members, not stack frames, and overlong headers fail closed below.
+  char _path[1024];
+  char _location[1024];
+  char _line[1024];
+  char _request[1200];   // GET path + headers after a GitHub redirect
   uint8_t _buffer[2048];
 };
 

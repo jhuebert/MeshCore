@@ -34,8 +34,16 @@ inline bool validVersionChar(char c) {
          (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
 }
 
-// Strip surrounding spaces, one leading v/V and an optional -filter-<sha>,
-// so a version copied out of `ota status` is accepted.
+inline int nibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+// Strip surrounding spaces, one leading v/V and an optional trailing
+// -filter-<sha>, so a version copied out of `ota status` is accepted. A
+// -filter- in the middle of a legitimate token is left alone.
 inline bool normalizeVersion(const char* input, char* out, size_t cap) {
   if (input == nullptr || out == nullptr || cap == 0) return false;
   while (*input == ' ') input++;
@@ -43,7 +51,14 @@ inline bool normalizeVersion(const char* input, char* out, size_t cap) {
   while (end > 0 && input[end - 1] == ' ') end--;
   const size_t start = (end > 0 && (*input == 'v' || *input == 'V')) ? 1 : 0;
   for (size_t i = start; i + 8 <= end; i++) {
-    if (memcmp(input + i, "-filter-", 8) == 0) { end = i; break; }
+    if (memcmp(input + i, "-filter-", 8) != 0) continue;
+    const size_t sha_len = end - (i + 8);
+    bool is_sha = sha_len >= 7;
+    for (size_t j = 0; j < sha_len && is_sha; j++) {
+      is_sha = nibble(input[i + 8 + j]) >= 0;
+    }
+    if (is_sha) end = i;   // only a trailing -filter-<hex> is a build suffix
+    break;
   }
   const size_t len = end - start;
   if (len == 0 || len > ONLINE_OTA_MAX_VERSION || len + 1 > cap) return false;
@@ -54,13 +69,6 @@ inline bool normalizeVersion(const char* input, char* out, size_t cap) {
   }
   out[len] = 0;
   return true;
-}
-
-inline int nibble(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
 }
 
 // Accepts an optional "sha256:" prefix followed by exactly 64 hex digits.

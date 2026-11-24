@@ -1708,6 +1708,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
   } else if (memcmp(command, "ota", 3) == 0 && (command[3] == ' ' || command[3] == 0)) {
     const char* sub = command + 3;
     while (*sub == ' ') sub++;
+#ifdef WITH_MQTT_OBSERVER
+    // The frozen reply comes from otaCLI; the online job must be dropped too.
+    if (strcmp(sub, "abort") == 0) onlineOta.abort();
+#endif
     otaCLI(ota, sub, reply);
   } else if (memcmp(command, "clock mesh", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
     // before the common CLI's bare "clock" prefix match, which would swallow it

@@ -26,7 +26,12 @@ public:
   bool start(char* reply);
   void loop();
   void abort();
-  bool needsAwake() const { return _phase != Phase::Idle && _phase != Phase::Ready; }
+  // Only a live job holds the radio awake. Error and Ready are terminal: a
+  // failed update must not stop a powersaving node from sleeping.
+  bool needsAwake() const {
+    return _phase == Phase::Wifi || _phase == Phase::Clock ||
+           _phase == Phase::Asset || _phase == Phase::Verify;
+  }
   void formatNet(char* reply, size_t cap) const;
 
   Phase phase() const { return _phase; }
@@ -50,6 +55,7 @@ private:
   char _url[ONLINE_OTA_MAX_URL];
   uint32_t _size, _got;
   uint32_t _deadline;
+  uint32_t _last_progress;
 };
 
 // The online verbs, dispatched from MyMesh::handleCommand() before otaCLI().

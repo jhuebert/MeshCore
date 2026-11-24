@@ -100,7 +100,8 @@ MQTTObserver::MQTTObserver()
       _runtime_config{}, _work_config{}, _io_config{}, _save_record{}, _load_record{},
       _config_mux(portMUX_INITIALIZER_UNLOCKED), _queue_mux(portMUX_INITIALIZER_UNLOCKED),
       _queue(), _raw_stager(), _brokers{}, _wifi_started(false),
-      _recover_requested(false), _station_request(false), _queue_disconnected_since(0), _last_ntp_request(0),
+      _recover_requested(false), _station_request(false), _web_ota_hold(false),
+      _queue_disconnected_since(0), _last_ntp_request(0),
       _device_id{}, _json{},
       _state(STATE_OFF), _save_state(), _received(0), _published(0),
       _disconnected_drops(0), _queue_drops(0), _publish_drops(0) {
@@ -626,9 +627,10 @@ void MQTTObserver::worker() {
     // release download) can request it on its own. With neither, Wi-Fi stays
     // down. Both cases share the join and NTP path below, so the clock is set
     // whenever the station is up, broker or not.
+    const bool requested = _station_request.load(std::memory_order_relaxed) ||
+                           _web_ota_hold.load(std::memory_order_relaxed);
     bool station_wanted = MQTTObserverOtaStationPolicy::stationWanted(
-        have_ready_broker, _station_request.load(std::memory_order_relaxed),
-        _work_config.wifi_ssid[0]);
+        have_ready_broker, requested, _work_config.wifi_ssid[0]);
     if (!station_wanted) {
       for (size_t i = 0; i < MQTT_OBSERVER_MAX_BROKERS; i++) {
         disconnectBroker(i);
@@ -1100,8 +1102,11 @@ bool MQTTObserver::handleCommand(char* command, char* reply) {
     portEXIT_CRITICAL(&_config_mux);
     if (MQTTObserverOtaStationPolicy::wantsStation(have_credentials,
                                                   WiFi.status() == WL_CONNECTED)) {
-      _station_request.store(true, std::memory_order_relaxed);
-      if (!MQTTObserverOtaStationPolicy::isOnlineFetchCommand(command)) {
+      if (MQTTObserverOtaStationPolicy::isOnlineFetchCommand(command)) {
+        _station_request.store(true, std::memory_order_relaxed);
+      } else {
+        // The uploader keeps its link until reboot, independent of online OTA.
+        _web_ota_hold.store(true, std::memory_order_relaxed);
         uint32_t started = millis();
         while (WiFi.status() != WL_CONNECTED &&
                millis() - started < MQTTObserverOtaStationPolicy::kAssociateTimeoutMs) {

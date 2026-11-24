@@ -17,6 +17,7 @@
 namespace {
 constexpr uint32_t kStationTimeoutMs = 30000;
 constexpr uint32_t kClockTimeoutMs = 45000;
+constexpr uint32_t kNoProgressMs = 15000;
 
 bool expired(uint32_t deadline) {
   return (uint32_t)(millis() - deadline) < 0x80000000u;
@@ -25,7 +26,8 @@ bool expired(uint32_t deadline) {
 
 OnlineOtaCore::OnlineOtaCore()
     : _net(nullptr), _ota(nullptr), _slot_size(0), _phase(Phase::Idle), _err(0),
-      _ver_set(false), _sha_set(false), _size(0), _got(0), _deadline(0) {
+      _ver_set(false), _sha_set(false), _size(0), _got(0), _deadline(0),
+      _last_progress(0) {
   _env[0] = 0;
   _version[0] = 0;
   _url[0] = 0;
@@ -53,6 +55,10 @@ void OnlineOtaCore::begin(OnlineOtaNet* net, OtaUpdate* ota,
 }
 
 bool OnlineOtaCore::setVersion(const char* version, char* reply) {
+  if (needsAwake()) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - fetch already active; abort first");
+    return false;
+  }
   char canonical[ONLINE_OTA_MAX_VERSION + 1];
   if (!OnlineOtaPolicy::normalizeVersion(version, canonical, sizeof(canonical))) {
     snprintf(reply, CLI_REPLY_MAX, "Err - invalid version token");
@@ -65,6 +71,10 @@ bool OnlineOtaCore::setVersion(const char* version, char* reply) {
 }
 
 bool OnlineOtaCore::setSha(const char* sha, char* reply) {
+  if (needsAwake()) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - fetch already active; abort first");
+    return false;
+  }
   uint8_t digest[32];
   if (!OnlineOtaPolicy::parseSha(sha, digest)) {
     snprintf(reply, CLI_REPLY_MAX, "Err - sha256 must be 64 hex chars");
@@ -82,14 +92,18 @@ bool OnlineOtaCore::start(char* reply) {
     snprintf(reply, CLI_REPLY_MAX, "Err - set ver and sha first");
     return false;
   }
-  if (_env[0] == 0 || _net == nullptr || !_net->available() || _ota == nullptr ||
-      _slot_size == 0) {
-    snprintf(reply, CLI_REPLY_MAX, "Err - unsupported board");
-    return false;
-  }
   if (_ota->state() == OtaUpdate::State::Staging ||
       _ota->state() == OtaUpdate::State::Ready) {
     snprintf(reply, CLI_REPLY_MAX, "Err - staging active; abort first");
+    return false;
+  }
+  if (_phase != Phase::Idle && _phase != Phase::Error) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - fetch already active; abort first");
+    return false;
+  }
+  if (_env[0] == 0 || _net == nullptr || !_net->available() || _ota == nullptr ||
+      _slot_size == 0) {
+    snprintf(reply, CLI_REPLY_MAX, "Err - unsupported board");
     return false;
   }
   if (_ota->batterySuspended()) {
@@ -112,6 +126,8 @@ bool OnlineOtaCore::start(char* reply) {
 }
 
 void OnlineOtaCore::fail(uint8_t err) {
+  // A failure path must never report err=0, which the frozen surface calls OK.
+  if (err == 0) err = ONLINE_ERR_HTTP;
   if (_net != nullptr) {
     _net->cancel();
     _net->requestStation(false);
@@ -127,7 +143,9 @@ void OnlineOtaCore::fail(uint8_t err) {
 }
 
 void OnlineOtaCore::loop() {
-  if (_phase == Phase::Idle || _phase == Phase::Ready) return;
+  // Error is terminal: a later battery reading must not overwrite the reason
+  // the operator is shown.
+  if (_phase == Phase::Idle || _phase == Phase::Ready || _phase == Phase::Error) return;
   if (_net == nullptr || !_net->available()) { fail(ONLINE_ERR_CFG); return; }
   if (_ota != nullptr && _ota->batterySuspended()) { fail(OTA_ERR_BATTERY); return; }
 
@@ -145,12 +163,19 @@ void OnlineOtaCore::loop() {
         fail(ONLINE_ERR_HEAP);
       } else if (_net->clockValid()) {
         if (!_net->beginGet(_url, _slot_size)) fail(ONLINE_ERR_TLS);
-        else _phase = Phase::Asset;
+        else {
+          _phase = Phase::Asset;
+          _last_progress = millis();
+        }
       } else if (expired(_deadline)) {
         fail(ONLINE_ERR_CLOCK);
       }
       break;
     case Phase::Asset: {
+      if (expired(_last_progress + kNoProgressMs)) {
+        fail(ONLINE_ERR_HTTP);
+        return;
+      }
       const uint8_t* chunk = nullptr;
       size_t len = 0;
       uint8_t err = 0;
@@ -165,6 +190,7 @@ void OnlineOtaCore::loop() {
           return;
         }
         _size = size;
+        _last_progress = millis();
       }
       if (step == OnlineOtaNet::Step::Busy) return;
       if (chunk != nullptr && len > 0) {
@@ -173,6 +199,7 @@ void OnlineOtaCore::loop() {
           return;
         }
         _got += (uint32_t)len;
+        _last_progress = millis();
       }
       if (step == OnlineOtaNet::Step::Done) {
         if (_size == 0 || _got != _size) { fail(ONLINE_ERR_DOWNLOAD); return; }

@@ -183,6 +183,10 @@ TEST(OnlineOtaPolicyTest, NormalizesVersionTokens) {
   EXPECT_FALSE(normalizeVersion("", out, sizeof(out)));
   EXPECT_FALSE(normalizeVersion("1.0/../evil", out, sizeof(out)));
   EXPECT_FALSE(normalizeVersion(std::string(65, 'a').c_str(), out, sizeof(out)));
+  // Only a trailing -filter-<hex> is a build suffix; a token containing it in
+  // the middle must be preserved.
+  ASSERT_TRUE(normalizeVersion("2.0-filter-hotfix", out, sizeof(out)));
+  EXPECT_STREQ(out, "2.0-filter-hotfix");
 }
 
 TEST(OnlineOtaPolicyTest, ParsesShaWithOptionalPrefix) {
@@ -244,6 +248,33 @@ TEST_F(OnlineTest, FullDownloadReachesReadyAndReleasesTheStation) {
   char reply[160];
   ASSERT_TRUE(ota.applyCommand(reply));
   EXPECT_STREQ(reply, "OK - applied; rebooting");
+}
+
+TEST_F(OnlineTest, SecondStartIsRefusedWhileAJobIsActive) {
+  auto image = imageBytes();
+  ASSERT_TRUE(arm(image));
+  char reply[160];
+  EXPECT_FALSE(core.start(reply));
+  EXPECT_NE(std::string(reply).find("already active"), std::string::npos);
+  EXPECT_EQ(core.phase(), OnlineOtaCore::Phase::Wifi);
+  EXPECT_FALSE(core.setVersion("9.9.9", reply));   // inputs are frozen once armed
+  EXPECT_FALSE(core.setSha(kSha, reply));
+  core.abort();
+  EXPECT_FALSE(core.start(reply));   // abort cleared ver and sha
+  EXPECT_NE(std::string(reply).find("set ver and sha first"), std::string::npos);
+}
+
+TEST_F(OnlineTest, ErrorIsTerminalAndDoesNotSleepOrChangeReason) {
+  net.step_err = ONLINE_ERR_HTTP;
+  ASSERT_TRUE(arm(imageBytes()));
+  pump();
+  ASSERT_EQ(core.phase(), OnlineOtaCore::Phase::Error);
+  EXPECT_FALSE(core.needsAwake());
+  board.mV = 3000; gate.setThresholds(3400, 3600);
+  gate.loop(&fs, board); g_mock_millis += 60000; gate.loop(&fs, board);
+  core.loop(); core.loop();
+  EXPECT_EQ(core.error(), ONLINE_ERR_HTTP);   // battery did not overwrite 14
+  EXPECT_NE(status().find("err=14"), std::string::npos);
 }
 
 TEST_F(OnlineTest, AbortClearsInputsAndEveryPhase) {

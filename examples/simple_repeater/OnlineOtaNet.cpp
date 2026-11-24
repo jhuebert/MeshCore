@@ -41,10 +41,22 @@ bool startsWithCI(const char* s, const char* p) {
   }
   return true;
 }
+
+bool containsCI(const char* s, const char* needle) {
+  for (; *s; s++) {
+    if (startsWithCI(s, needle)) return true;
+  }
+  return false;
+}
 } // namespace
 
 void OnlineOtaNetEsp32::begin(MQTTObserver* observer) {
   _observer = observer;
+  // The CA bundle is a framework global shared with the observer's MQTT TLS
+  // client. Load it once here, not on every connect or redirect.
+#if !defined(ESP_IDF_VERSION_MAJOR) || ESP_IDF_VERSION_MAJOR < 5
+  _client.setCACertBundle(x509_crt_bundle);
+#endif
 }
 
 void OnlineOtaNetEsp32::requestStation(bool want) {
@@ -82,6 +94,7 @@ bool OnlineOtaNetEsp32::beginGet(const char* url, uint32_t max_bytes) {
   if (url == nullptr || !heapOk() || !setUrl(url)) return false;
   _max_bytes = max_bytes;
   _redirects = 0;
+  _location[0] = 0;
   _phase = HttpPhase::Connect;
   return true;
 }
@@ -95,22 +108,18 @@ OnlineOtaNet::Step OnlineOtaNetEsp32::step(const uint8_t** out, size_t* len, uin
     // DNS, TCP and TLS use the framework's socket timeout; later phases poll
     // available() and never wait on the link.
     _client.setTimeout(kSocketTimeoutSec);
-#if defined(ESP_IDF_VERSION_MAJOR) && ESP_IDF_VERSION_MAJOR >= 5
-    _client.attachArduinoCACertBundle();
-#else
-    _client.setCACertBundle(x509_crt_bundle);
-#endif
+    // IDF5's NetworkClientSecure uses a different bundle API and is not used
+    // by any current observer target; the SHA gate still verifies the image.
     if (!_client.connect(_host, 443)) {
       *err = ONLINE_ERR_TLS;
       cancel();
       return Step::Error;
     }
-    char request[512];
-    const int n = snprintf(request, sizeof(request),
+    const int n = snprintf(_request, sizeof(_request),
         "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: MeshCore-OTA/1\r\n"
         "Accept: */*\r\nConnection: close\r\n\r\n", _path, _host);
-    if (n <= 0 || n >= (int)sizeof(request) ||
-        _client.write((const uint8_t*)request, (size_t)n) != (size_t)n) {
+    if (n <= 0 || n >= (int)sizeof(_request) ||
+        _client.write((const uint8_t*)_request, (size_t)n) != (size_t)n) {
       *err = ONLINE_ERR_HTTP;
       cancel();
       return Step::Error;
@@ -124,30 +133,43 @@ OnlineOtaNet::Step OnlineOtaNetEsp32::step(const uint8_t** out, size_t* len, uin
       if (!_client.connected()) { *err = ONLINE_ERR_HTTP; cancel(); return Step::Error; }
       return Step::Busy;
     }
-    char line[384];   // a GitHub redirect Location can be long
-    const int got = _client.readBytesUntil('\n', line, sizeof(line) - 1);
+    const int got = _client.readBytesUntil('\n', _line, sizeof(_line) - 1);
     if (got <= 0) return Step::Busy;
-    line[got] = 0;
-    size_t n = strlen(line);
-    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n')) line[--n] = 0;
+    if (got >= (int)sizeof(_line) - 1) {   // truncated header: fail closed
+      *err = ONLINE_ERR_HTTP;
+      cancel();
+      return Step::Error;
+    }
+    _line[got] = 0;
+    size_t n = strlen(_line);
+    while (n > 0 && (_line[n - 1] == '\r' || _line[n - 1] == '\n')) _line[--n] = 0;
     if (n == 0) { _phase = HttpPhase::Body; return Step::Busy; }
 
-    if (startsWith(line, "HTTP/")) {
-      const char* sp = strchr(line, ' ');
+    if (startsWith(_line, "HTTP/")) {
+      // Each response starts with a status line: forget any Location from the
+      // previous response before deciding whether this one redirects.
+      _location[0] = 0;
+      const char* sp = strchr(_line, ' ');
       _status = sp != nullptr ? (uint16_t)strtoul(sp + 1, nullptr, 10) : 0;
-    } else if (startsWithCI(line, "location:")) {
-      const char* v = line + 9;
+    } else if (startsWithCI(_line, "location:")) {
+      const char* v = _line + 9;
       while (*v == ' ') v++;
       snprintf(_location, sizeof(_location), "%s", v);
-    } else if (startsWithCI(line, "content-length:")) {
-      const char* v = line + 15;
+    } else if (startsWithCI(_line, "content-length:")) {
+      const char* v = _line + 15;
       while (*v == ' ') v++;
-      _body_length = strtoul(v, nullptr, 10);
-      if (_body_length > _max_bytes) { *err = ONLINE_ERR_HTTP; cancel(); return Step::Error; }
-    } else if (startsWithCI(line, "transfer-encoding:")) {
+      char* end = nullptr;
+      const unsigned long declared = strtoul(v, &end, 10);
+      if (end == v || declared == 0 || declared > _max_bytes) {
+        *err = ONLINE_ERR_HTTP;
+        cancel();
+        return Step::Error;
+      }
+      _body_length = (uint32_t)declared;
+    } else if (startsWithCI(_line, "transfer-encoding:")) {
       // Refuse a chunked body rather than mis-stage it: release assets carry
-      // a Content-Length.
-      if (strstr(line + 18, "chunked") != nullptr) {
+      // a Content-Length. Transfer-coding tokens are case-insensitive.
+      if (containsCI(_line + 18, "chunked")) {
         *err = ONLINE_ERR_HTTP;
         cancel();
         return Step::Error;
@@ -156,12 +178,10 @@ OnlineOtaNet::Step OnlineOtaNetEsp32::step(const uint8_t** out, size_t* len, uin
 
     if (_status >= 300 && _status < 400 && _location[0] != 0) {
       if (++_redirects > kMaxRedirects) { *err = ONLINE_ERR_HTTP; cancel(); return Step::Error; }
-      char next[sizeof(_location)];
-      snprintf(next, sizeof(next), "%s", _location);
       const uint32_t max_bytes = _max_bytes;
-      cancel();
-      _max_bytes = max_bytes;   // closing the old socket must not drop the cap
-      if (!setUrl(next)) { *err = ONLINE_ERR_HTTP; return Step::Error; }
+      cancel();   // keeps _location, which holds the next URL
+      _max_bytes = max_bytes;
+      if (!setUrl(_location)) { *err = ONLINE_ERR_HTTP; return Step::Error; }
       _phase = HttpPhase::Connect;
       return Step::Busy;
     }
@@ -202,7 +222,7 @@ void OnlineOtaNetEsp32::cancel() {
   _max_bytes = 0;
   _body_length = 0;
   _status = 0;
-  _location[0] = 0;
+  // _location survives cancel(): a redirect needs it after the socket closes.
 }
 
 #endif // ESP32 && WITH_MQTT_OBSERVER

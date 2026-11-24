@@ -228,8 +228,13 @@
 #define OTA_HAS_ONLINE_FETCH 1
 #endif
 
-// One reply string for the whole CLI, shared by the LoRa and online verbs.
+// One reply string for the whole CLI, shared by the verbs that exist in this
+// build. Non-observer builds must not advertise the online verbs.
+#ifdef OTA_HAS_ONLINE_FETCH
 #define OTA_USAGE "Usage: ota [status|net|fetch <ver|sha|start>|stage <size> <sha256> <ver>|apply|abort|rollback]"
+#else
+#define OTA_USAGE "Usage: ota [status|stage <size> <sha256> <ver>|apply|abort|rollback]"
+#endif
 
 // OP_STATUS_REPORT.state values (same order as OtaUpdate::State).
 #define OTA_STATE_IDLE        0
@@ -491,7 +496,8 @@ private:
   void clearPending() { _pending.valid = false; }
   void abortStaging(uint8_t err);           // scrap the staged slot on failure
   void armSession(uint32_t size, const uint8_t sha[32]);
-  bool checkStageRequest(uint32_t size, const uint8_t sha[32], const char* ver, char* reply);
+  bool checkStageRequest(uint32_t size, const uint8_t sha[32], const char* ver,
+                         char* reply, uint8_t* err_out = nullptr);
   void handleStart(const uint8_t* body, uint16_t body_len);
   void applyOp(const uint8_t* body, uint16_t body_len, uint8_t op);
   void applyCopy(uint32_t base_off, uint16_t len);

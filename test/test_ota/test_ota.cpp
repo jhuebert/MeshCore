@@ -1724,16 +1724,32 @@ TEST_F(OtaTest, LocalStageAbortCancelsTheFetchAndLoraOpsAreExcluded) {
   EXPECT_EQ(ota.state(), OtaUpdate::State::Idle);
   EXPECT_FALSE(ota.localStageActive());
 
-  EXPECT_NE(stage(image).find("token="), std::string::npos);
+  // Arm a real LoRa transfer first, then start a local one. The valid token
+  // must still be unable to take over the session.
+  std::string arm_reply = stage(image);
+  ASSERT_NE(arm_reply.find("token="), std::string::npos);
+  auto token = armTokenOf(arm_reply);
   ASSERT_TRUE(beginLocal(ota, image));
   feed(infoFrame());   // read-only handshake stays available
   uint8_t sha[32];
   mockSha256(image, sha);
-  auto token = armTokenOf(stage(image));
   auto body = makeStartBody(image.size(), sha, testTargetId(), token.data());
   feed(frame(OTA_OP_START, 0, body));
   EXPECT_EQ(ota.state(), OtaUpdate::State::Staging);
   EXPECT_TRUE(ota.localStageActive());
+}
+
+TEST_F(OtaTest, OnlineGuardsTolerateANullReplyAndRecordAnError) {
+  auto image = testImage(16);
+  ASSERT_TRUE(beginLocal(ota, image));
+  // The online core passes nullptr; guarded refusals must not crash and must
+  // leave a real error code for ota status.
+  EXPECT_FALSE(ota.beginLocalStage(image.size(), image.data(), "1.2.3", nullptr));
+  EXPECT_NE(statusLine().find("err=6"), std::string::npos);
+  EXPECT_TRUE(ota.appendLocalStage(image.data(), 0));   // zero-length append is inert
+  ota.cancelLocalStage();
+  EXPECT_FALSE(ota.appendLocalStage(image.data(), image.size()));
+  EXPECT_NE(statusLine().find("err=6"), std::string::npos);
 }
 
 TEST_F(OtaTest, OnlineErrorSetsTheFrozenStatusLineAndIsReArmable) {
