@@ -1,216 +1,79 @@
 # MeshCore: Remote-Configurable Repeater Firmware
 
 This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds repeater management, power,
-radio, fleet and update capabilities on top of stock firmware. The packet
-filter is one of them, not the fork's identity. Everything else (supported
-boards, clients, protocols, build system) is identical to upstream;
-see the
+It tracks upstream `main` releases and adds repeater management, power, radio,
+fleet and update capabilities on top of stock firmware. Everything else,
+including supported boards, clients, protocols and the build system, is
+identical to upstream; see the
 [upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
-general project, hardware support, and getting-started guide.
+general project and getting-started guide.
 
-## What this fork adds
+Every feature is opt-in. With all features off, a fresh install behaves like
+stock firmware.
 
-### 📡 Packet filter
+## Get started
 
-A remote-configurable drop-rule engine for the `simple_repeater` firmware.
-Rules match on packet type, route type, region, hop count, channel, and
-(on decrypted payloads) channel identity and sender/text patterns. Rules are
-managed over the repeater CLI, locally via serial or **remotely over the mesh**
-by an authenticated admin. No rebuild, no physical access.
+1. Download a prebuilt image for your board from the
+   [Releases page](https://github.com/jhuebert/MeshCore/releases).
+2. Flash it as you would stock firmware.
+3. Pick the one guide below that matches what you want to do. Most features
+   need no rebuild and are configured from the repeater CLI.
 
-Independently of the rules, flood-route adverts can be rate-limited per
-originating node: each node's advert is forwarded at most once per window
-(up to 30 days), taming advert storms on busy channels while every node
-stays discoverable.
+> **Action required:** the first OTA release needs a full erase and a merged
+> reflash for 28 ESP32 repeater targets: 20 move to `min_spiffs.csv` and 8 16 MB
+> boards to `default_16MB.csv`. Back up the private key and settings first.
+> See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change).
 
-→ Full guide, including the complete predicate reference and CLI commands:
-**[FILTER.md](./FILTER.md)**
+## Features
 
-### 🔋 Battery gate
+| Feature | What it does | Guide |
+|---|---|---|
+| Packet filter | Remote-configurable drop rules by packet type, route, hops, channel, region, sender and text, plus per-node advert rate limiting. | [FILTER.md](./FILTER.md) |
+| Battery gate | Stops forwarding below a set voltage while the node stays reachable, then resumes automatically. | [BATTERY.md](./BATTERY.md) |
+| Power profile | Three persisted CLI knobs take an idle repeater from about 54 mA to 4 mA. | [POWER.md](./POWER.md) |
+| Second radio preset | One transceiver visits a second LoRa preset in short windows to bridge or listen on two networks. | [RADIO2.md](./RADIO2.md) |
+| Ham mode | Sends publicly readable traffic at amateur power and encrypted traffic at normal power, with callsign IDs. | [HAM.md](./HAM.md) |
+| Mesh clock sync | Estimates UTC from signed adverts on a repeater with no GPS, NTP or battery-backed clock. | [MESHCLOCK.md](./MESHCLOCK.md) |
+| Fleet management | Broadcasts CLI scripts to tagged repeaters over one keyed channel, with acknowledgements and scheduled jobs. | [FLEET.md](./FLEET.md) |
+| MQTT observer | Optional firmware that publishes heard traffic to one or two MQTT brokers for maps and analysis. | [MQTT_OBSERVER.md](./MQTT_OBSERVER.md) |
+| LoRa OTA | Updates ESP32 repeaters over the mesh through the MeshCoreRepeaterManager app, with verification and rollback. | [OTA.md](./OTA.md) |
+| Online OTA | Observer repeaters download a release over WiFi and apply it after a SHA-256 check. | [ONLINE_OTA.md](./ONLINE_OTA.md) |
+| Chat bot | Opt-in responder for `test`, `ping` and `help` on one keyed channel. | [BOT.md](./BOT.md) |
 
-A configurable low-battery cut-off: below a set voltage the repeater stops
-forwarding (but stays reachable and keeps advertising); when the battery
-recovers it resumes automatically. Debounce + hysteresis keep it from
-flapping, and the admin can check voltage and tune thresholds over the mesh.
+> **Most meshes do not need the bot.** Every reply costs airtime for everyone.
+> Enable it only with a reason, and give it its own channel with no other bots.
 
-→ Full guide: **[BATTERY.md](./BATTERY.md)**
+## Who this is for
 
-### ⚡ Power profile
+- **Shared and community nodes.** Mute noisy senders or channels that eat your
+  airtime without asking anyone to change their setup. The packet filter
+  follows the policy model of [OpenHop](https://github.com/openhop-dev) and runs
+  entirely in the repeater, with no computer or companion app to keep running.
+- **Solar and off-grid sites.** The node goes quiet while it can still answer
+  you, and wakes itself when there is sun again.
+- **Fleet operators.** Push settings to many repeaters with one broadcast
+  instead of one admin session each: preset cutovers, advert hygiene, filter
+  policy, rollouts and rollbacks.
+- **Licensed amateur operators.** Send publicly readable traffic at amateur
+  power while encrypted traffic stays at unlicensed power.
 
-Three runtime knobs take an idle repeater from ~54 mA to ~4 mA: ESP32 light
-sleep (`powersaving`), the radio's receive duty cycle (`radio.rxps`) and the CPU
-clock (`cpu.freq`). All are persisted and revertible from the CLI. The
-duty-cycle levels are chosen so the datasheet's preamble-capture guarantee still
-holds, so the savings do not quietly turn into lost packets.
+## Credits
 
-Credit where it is due: `powersaving` is upstream MeshCore, and the RXPS
-duty-cycle subsystem is ported from **EasySkyMesh**
-([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore),
-`PowerSaving-v18` + the SX1262 post-preamble-timer fix from `Dev-PS18`,
-PR #27 by Dom4n); this fork added the `cpu.freq` setting, the port and the
-guide.
+`powersaving` is upstream MeshCore. The RXPS duty-cycle subsystem is ported from
+EasySkyMesh ([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore),
+`PowerSaving-v18` plus the SX1262 post-preamble-timer fix from `Dev-PS18`, PR #27
+by Dom4n); this fork added the `cpu.freq` setting, the port and the guide. Ham
+mode is adapted from
+[NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham) by
+KF0WXX for the Nebraska Mesh community.
 
-→ Full guide: **[POWER.md](./POWER.md)**
-
-### 📻 Second radio preset
-
-One transceiver, two LoRa presets. The repeater keeps its normal preset as the
-protected home channel and visits a second preset for short windows, so it can
-repeat adverts and group flood traffic between two nearby networks, or simply
-listen to a second preset. Direct messages, ACKs, path returns and traces never
-cross, replies go back on the preset the request arrived on, and the existing
-packet filter applies to both. Off by default: with radio2 off the node behaves
-like stock firmware.
-
-→ Full guide, including the policy recipes, CLI reference and tradeoffs:
-**[RADIO2.md](./RADIO2.md)**
-
-### 📢 Ham mode (licensed amateur operators)
-
-For licensed operators who want more range on traffic anyone can read. With
-ham mode on, publicly readable traffic (the Public channel, the #hashtag
-channels you list, adverts, ACKs and traces) goes out at the power you set
-with `ham tx`, while encrypted traffic keeps using the normal `set tx` power.
-The node schedules a zero-hop callsign advert if it has not scheduled a local
-advert in the last 10 minutes. Actual air time depends on the radio and queue.
-Packets themselves are unchanged, so stock nodes and apps are unaffected.
-Off by default: with ham mode off the node behaves like stock firmware.
-
-Adapted from [NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham)
-by KF0WXX for the Nebraska Mesh community; see the Acknowledgements in HAM.md.
-
-→ Full guide, including the classification table, setup and the legal notes:
-**[HAM.md](./HAM.md)**
-
-### 🕒 Mesh clock sync
-
-A repeater with no GPS, NTP, or battery-backed RTC can estimate UTC from signed
-adverts it hears. When enabled (`clock mesh on`), it waits for a batch of distinct
-sources to agree on the median before stepping the RTC; it is off by default.
-Advert timestamps earlier than the firmware build timestamp are rejected and
-never enter the batch. Public adverts are not a root of trust, so this is for
-plausible time on clockless nodes, not authoritative timekeeping.
-
-→ Full guide: **[MESHCLOCK.md](./MESHCLOCK.md)**
-
-### 🛰️ Fleet management (remote CLI scripts)
-
-Broadcast CLI jobs to a whole fleet of repeaters through one private keyed
-channel. Set once per repeater (`fleet chan set` + tags + `fleet on`), a group
-text message on that channel executes as a small script (deferred, and at
-most once per job key per boot) on every repeater whose tags the job targets.
-Every admin command works remotely: radio settings, filter rules, node names,
-reboots. Re-send jobs freely to catch nodes that were offline; duplicates are
-ignored automatically; tags address sub-fleets (by location, board type, or
-rollout stage) and `!ack` makes nodes answer in-channel.
-
-The channel key is the credential: holding the PSK is equivalent to
-serial-console access on every member, so PSK hygiene is the whole security
-model. The feature supersedes the battery gate: fleet jobs run, and
-fleet-channel traffic relays, even while a low battery has suspended
-forwarding.
-
-→ Full guide, including recipes, the two-phase and scheduled-cutover
-patterns, and the security model: **[FLEET.md](./FLEET.md)**
-
-### 📶 MQTT observer
-
-An optional firmware build that publishes the traffic a repeater hears to one
-or two MQTT brokers, turning the node into a live feed for map, coverage, and
-packet-analysis tools, no computer or companion app attached to it. It
-captures **before** the packet filter and battery gate, so it observes packets
-the node will not forward, and it uplinks its own adverts by default so the
-node appears in the feed. ESP32 boards only; two broker slots with
-Ed25519-signed JWT or username/password auth, TLS with a valid clock, and a
-bounded best-effort queue that rides out broker outages.
-
-→ Full guide, including the build targets, broker setup, CLI reference, and the
-message schema: **[MQTT_OBSERVER.md](./MQTT_OBSERVER.md)**
-
-### 📲 LoRa OTA
-
-ESP32 repeaters are updated over the mesh with the
-**[MeshCoreRepeaterManager](https://github.com/jhuebert/MeshCoreRepeaterManager)** app, the supported
-way to run an update. It talks to a stock companion over Bluetooth or TCP,
-stages the image in the inactive A/B slot, verifies it before applying, and
-boots it only when you confirm. If the new image cannot start its radio, the
-repeater flips back on its own.
-
-Boards without a dual app partition and non-ESP32 builds report the feature
-unsupported. The `ota status`, `ota abort` and `ota rollback` CLI commands are
-for diagnostics.
-
-→ Full guide: **[OTA.md](./OTA.md)**
-
-> **Partition change:** the 28 ESP32 repeaters still using `default.csv`, and
-> the other roles on those boards, need a full erase and merged reflash for OTA
-> headroom: 20 move to `min_spiffs.csv`, 8 16 MB boards to `default_16MB.csv`.
-> See [OTA.md](./OTA.md#action-required-esp32-repeater-partition-change) for the
-> affected targets and the backup procedure.
-
-### 🌐 Online OTA (observer builds)
-
-Observer repeaters can update straight from a GitHub release over WiFi. Set
-the version and the expected SHA-256 with `ota fetch ver` and `ota fetch sha`,
-then `ota fetch start` downloads the board's image in the background; `ota
-status` shows progress and `ota apply` reboots into the verified image. No
-manifest, GitHub API call or phone is needed, and the usual SHA-256 gate and
-rollback still apply.
-
-→ Full guide: **[ONLINE_OTA.md](./ONLINE_OTA.md)**
-
-### 🤖 Chat bot
-
-An opt-in responder that answers `test`/`ping`/`help` chatter on one keyed
-channel with the sender tagged and the path it arrived on, no companion, no
-internet, no contact table. **Most meshes do not need a bot:** every reply costs
-airtime for everyone, so enable it only with a reason, and then give it its own
-channel with no other bots on it. Off by default; no rebuild needed.
-
-→ Full guide: **[BOT.md](./BOT.md)**
-
-## Why run this instead of stock repeater firmware?
-
-Stock repeaters forward everything they hear, until the battery dies. This
-fork is for operators who want policy and resilience at the node:
-
-- **Shared / community nodes**: mute noisy senders or channels that eat your
-  airtime, without asking anyone to change their setup.
-- **OpenHop-style policy, nothing extra to run**: the rule engine is modelled
-  after the policy filters in [OpenHop](https://github.com/openhop-dev) and
-  lives entirely in the repeater firmware, so you get about the same
-  functionality with just the node itself, no computer, companion app, or
-  other hardware needed.
-- **Solar / off-grid sites**: the node goes quiet *while it can still answer
-  you*, instead of disappearing dark, and wakes itself when there's sun again.
-- **Fleet operators**: run several repeaters (a region, a club's network, a
-  set of towers) and push settings to all of them with one broadcast message
-  instead of one admin session each: radio preset cutovers, advert hygiene,
-  filter policy, rollouts and rollbacks.
-- **Licensed amateur operators**: send publicly readable traffic at amateur
-  power while encrypted traffic stays at unlicensed power, with the callsign
-  included in adverts on a 10-minute ID timer.
-
-## Getting the firmware
-
-Prebuilt binaries for all supported boards are on the
-[Releases page](https://github.com/jhuebert/MeshCore/releases), except the
-STM32WLE5 boards (wio-e5, wio-e5-mini, the wio-e5 bridge, RAK3172 and Tiny
-Relay), which no longer fit the fork's repeater firmware and ship no build.
-Two channels:
+## Release channels
 
 | Channel | Branch | Based on | Tags |
 |---|---|---|---|
-| dev | `repeater-filter` | `repeater-filter-stable` (fork work, lands on stable) | `v*-dev.N` |
+| dev | `repeater-filter` | `repeater-filter-stable` | `v*-dev.N` |
 | stable | `repeater-filter-stable` | upstream `main` releases | `v*` |
 
-Flash as you would stock firmware, then follow
-[FILTER.md](./FILTER.md) to set your first rules over the CLI,
-[FLEET.md](./FLEET.md) if you are running a fleet,
-[POWER.md](./POWER.md) if the node runs on solar or battery,
-[RADIO2.md](./RADIO2.md) if it should listen on a second preset,
-[HAM.md](./HAM.md) if you are a licensed operator using dual TX power,
-[MQTT_OBSERVER.md](./MQTT_OBSERVER.md) if you flashed an observer build, or
-[ONLINE_OTA.md](./ONLINE_OTA.md) to update one over WiFi.
-Observer builds ship in the same releases as the plain repeater firmware.
+The STM32WLE5 boards (wio-e5, wio-e5-mini, the wio-e5 bridge, RAK3172 and Tiny
+Relay) no longer fit the fork's repeater firmware and ship no build. Observer
+builds ship in the same releases as the plain repeater firmware.

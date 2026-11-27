@@ -71,12 +71,12 @@ should not need to explore beyond them before making a change.
 
 **User guides (authoritative for behavior; keep in sync with code):**
 
-- `FILTER.md`: the packet filter's user manual: rule model, every predicate
-  (`type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`, `chan`, `chanhash`,
-  `region`, `sender`, `text`, `prob`, `throttle`, `action`), full command
-  reference, TinyRegex syntax and limits, real-world setups, quoting and
-  sending notes, troubleshooting; ends with a brief pointer to fleet
-  management. First stop for any CLI-semantics or least-surprise question.
+- `FILTER.md`: the packet filter's user manual: rule model, the predicate table,
+  full command reference, common setups and limits; ends with a brief pointer to
+  fleet management. First stop for any CLI-semantics or least-surprise question.
+  Deep detail lives in two linked appendices: `FILTER_PATTERNS.md` (pattern
+  syntax, quoting, quirks, troubleshooting) and `FILTER_CONFIG_FORMAT.md`
+  (binary record layout and migration, for tooling authors).
 - `FLEET.md`: fleet management user manual: the `fleet chan set` and
   `fleet tag add` setup, script format (the `!tags`/`!ack`/`!at` directive
   block, inline `!delay`), tag targeting (exact equality), acknowledgements and
@@ -92,9 +92,9 @@ should not need to explore beyond them before making a change.
   the measured profile, attribution and what the profile deliberately does not
   do. First stop for any power question.
 - `MQTT_OBSERVER.md`: optional MQTT observer firmware user manual: build
-  targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS), topic
-  templates and the status/packet/raw schemas, the capture and delivery model,
-  recipes, troubleshooting and limits.
+  targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS), the
+  capture and delivery model, recipes, troubleshooting and limits. The
+  status/packet/raw JSON reference lives in `MQTT_SCHEMA.md`.
 - `RADIO2.md`: second radio preset user manual: shared transceiver model,
   preset validation (overlap and scannability), the policy matrix
   (`same`/`other`/`both`/`drop`, broadcast-flood-only crossing), reply-origin
@@ -107,16 +107,29 @@ should not need to explore beyond them before making a change.
   decoupling from the filter, credit to NebraskaMesh/MeshCore-Ham, and the
   operator's responsibility for power levels and identification. First stop for
   any ham-mode question.
-- LoRa OTA: over-the-air firmware update for repeaters, branch `lora-ota`, not
-  merged into `repeater-filter` yet. The user manual, Android/Linux app and
-  hardware bench live in `MeshCoreRepeaterManager`; `OtaUpdate.h` is the
-  authoritative wire spec. The frozen contract is in *Compatibility & frozen
-  contracts*.
+- `OTA.md`: short operator overview of LoRa OTA for repeaters (branch `lora-ota`).
+  The full user manual, Android/Linux app and hardware bench live in
+  `MeshCoreRepeaterManager`; `OtaUpdate.h` is the authoritative wire spec. The
+  partition-change notice and target lists live here. The frozen contract is in
+  *Compatibility & frozen contracts*.
 - `ONLINE_OTA.md`: online OTA over WiFi for repeater observer builds: the
   `ota fetch ver`/`ota fetch sha`/`ota fetch start` commands, `ota net`
   progress, the frozen `ota status` line, digest syntax, errors and limits,
   fleet recipes. Observer-only: setting ver/sha touches no WiFi, and
   non-observer builds compile no adapter.
+- `BOT.md`: opt-in chat bot on one keyed channel: reply triggers, CLI, rate
+  limit, persistence and interactions.
+
+**User guide style.** Guides are task-focused reference, not prose. Each starts
+with `# <Feature>: User Guide`, then `## What it does` (one short paragraph),
+`## Quick start`, `## Command reference`, `## Common setups` or `## Recipes`,
+`## Interactions`, `## Limits`. Use "you" and active voice; no first person,
+jokes, design justification, or "honest limit" asides. One term per concept:
+"repeater", "stock firmware", "radio2", "behaviour". Exact CLI replies, error
+strings, safety/legal notes, attribution and frozen contracts are not
+paraphrased or condensed. Deep tooling detail goes in a linked appendix page,
+not the main guide. No em dashes. Fork-wide parity is stated once in
+`README.md`: every feature is opt-in, and off means stock behaviour.
 
 **New top-level features need two docs in the same commit:** a paragraph in
 `README.md` describing the feature, and a dedicated user-focused guide covering
