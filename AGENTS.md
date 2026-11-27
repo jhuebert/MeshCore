@@ -1,352 +1,513 @@
 # Agent Guide: jhuebert/MeshCore (personal fork)
 
+## Project & ownership
+
 This is my personal fork of `meshcore-dev/MeshCore`. The fork-specific features
-are the **repeater packet filter** (`filter ...` CLI, drop/forward rules, advert
-rate limiter), the battery gate, mesh clock sync, fleet management, and an
-optional **MQTT observer** firmware, all carried on the `repeater-filter*`
-branches, plus firmware release channels released by
-`.github/workflows/filter-release.yml` (tag + release object; firmware assets are
-built locally).
+are the repeater packet filter (the `filter` CLI, drop/forward rules, advert rate
+limiter), the battery gate, mesh clock sync, fleet management, and an optional
+MQTT observer firmware. They are carried on the `repeater-filter*` branches.
+Firmware release channels are cut by `.github/workflows/filter-release.yml` (tag
+and release object; firmware assets are built locally).
 
-Remotes: `origin` = upstream `meshcore-dev/MeshCore` (never push there),
-`fork` = `jhuebert/MeshCore` (push here). Upstream has **no** AGENTS.md, so this
-file is fork-owned and does not conflict with upstream syncs.
+Remotes: `origin` is upstream `meshcore-dev/MeshCore`, never push there; `fork`
+is `jhuebert/MeshCore`, push here only when explicitly asked. Upstream has no
+AGENTS.md, so this file is fork-owned and does not conflict with upstream syncs.
 
-## Patterns become rules: ask first
+## Agent conduct
 
-When a way of working turns out to persist (a convention the user applies
-repeatedly, a preference stated more than once, a pattern that emerged from a
-finished change and will likely recur), **ask the user** whether to codify it
-in this file before relying on it again. Never silently start following an
-unwritten rule, and never edit this file on your own initiative. Proposed
-wording plus a one-line rationale; the user decides.
+These rules apply to every change, including documentation-only changes.
 
-## Repo docs & code map: read this, then start
+- **Ask before codifying a pattern.** When a way of working recurs (a convention
+  applied more than once, a preference stated twice, a pattern from a finished
+  change), propose wording plus a one-line rationale and ask before adding it
+  here. Never follow an unwritten rule silently, and never edit this file on
+  your own initiative.
+- **Commit only when asked.** Commit when Jason asks or clearly wants one. Never
+  bundle unrelated cleanup with an implementation commit.
+- **Ask before publishing.** Do not create a GitHub issue, PR, release, tag, or
+  published artifact, push to a remote, or trigger `Filter Release`,
+  `promote-stable`, or `sync-upstream` without Jason's explicit request.
+- **No em dashes anywhere.** In this guide, fork docs, code comments, commit
+  messages, CLI help and replies, and any other user-facing text. Use a short
+  sentence, a colon or a comma instead. Replace one on any line you touch.
+- **Minimum viable change.** The smallest diff that fully fixes the problem: no
+  drive-by refactors, no renames, no reformatting of untouched lines, no
+  dependency upgrades folded into unrelated work. Re-read the final diff and
+  confirm every touched line is required and nothing else changed.
+- **Keep the upstream diff small.** Prefer fork-owned files. Where a hook in an
+  upstream file is unavoidable, keep it to a handful of lines so syncs stay
+  cheap and the fork remains easy to rebase. See *Fork-owned vs upstream code*.
+- **DRY.** Shared logic gets one authoritative home, and nothing re-implements
+  it. Precedents: the CLI tokenizer and reply writer in `CliUtil.h`, and the
+  match gates plus hit/airtime commit in `FilterRules::decideMatch()`. If you
+  find yourself copying a block from a sibling function, factor it instead.
+- **Deslop as you go.** Code you touch ends up cleaner than you found it where
+  slop is in reach: duplicated logic factored, unbounded writes bounded, dead
+  state removed, twin branches merged. Remove unimplemented stubs and dead code
+  before calling the change done. Do not deslop code you are not otherwise
+  touching; that is churn, not cleanliness.
+- **Simplicity and maintainability.** The simplest correct code; obvious beats
+  clever; write what the project's maintainers would have written. Comments
+  explain why (invariants, protocol quirks, on-air format constraints), not
+  what. Choose solutions that stay workable so later features are easy to add.
+- **Minimize flash and RAM.** Targets have tight flash budgets and limited RAM.
+  Share code instead of duplicating it, reuse existing helpers, avoid heavy
+  dependencies for small gains, bound buffers and queues, keep per-feature state
+  small, and avoid large stack frames and heap churn. Stack size is a
+  boot-breaking constraint the host suites cannot see; see *Verification*.
+- **Guide durability.** This guide holds durable rules and pointers, not
+  volatile state: no test counts, current coverage figures, version or date
+  stamps, churn statistics, growing suite or target inventories, or planned
+  work. Point to the file that owns the current value. Keep a numeric constant
+  only when it encodes a frozen contract, and name its authoritative source.
+- **Honesty about validation.** Do not claim hardware or on-air validation
+  unless it was actually run. State what was bench-verified and what remains
+  empirical.
 
-Everything needed to begin work is here or in the two files below; an agent
+## Start here: docs & code map
+
+Everything needed to begin work is here or in the files named below; an agent
 should not need to explore beyond them before making a change.
 
 **User guides (authoritative for behavior; keep in sync with code):**
+
 - `FILTER.md`: the packet filter's user manual: rule model, every predicate
   (`type`, `route`, `hops`, `len`, `snr`, `path`, `hsize`, `chan`, `chanhash`,
   `region`, `sender`, `text`, `prob`, `throttle`, `action`), full command
-  reference, TinyRegex syntax + limits, real-world setups, quoting/sending
-  notes, troubleshooting; ends with a brief pointer to the fleet feature.
-  First stop for any CLI-semantics or least-surprise question.
-- `FLEET.md`: the fleet management user manual: the `fleet chan set` +
+  reference, TinyRegex syntax and limits, real-world setups, quoting and
+  sending notes, troubleshooting; ends with a brief pointer to fleet
+  management. First stop for any CLI-semantics or least-surprise question.
+- `FLEET.md`: fleet management user manual: the `fleet chan set` and
   `fleet tag add` setup, script format (the `!tags`/`!ack`/`!at` directive
-  block, inline `!delay`), tag targeting (exact equality), acknowledgements
-  and the reply-jitter window, the sync → verify → schedule recipe for `!at`,
+  block, inline `!delay`), tag targeting (exact equality), acknowledgements and
+  the reply-jitter window, the sync to verify to schedule recipe for `!at`,
   idempotency, two-phase cutovers, recipes, troubleshooting and limits. First
   stop for anything about the fleet feature.
-- `BATTERY.md`: battery gate user manual: behavior, what suspension does
-  not touch, persistence, CLI reference.
+- `BATTERY.md`: battery gate user manual: behavior, what suspension does not
+  touch, persistence, CLI reference.
 - `MESHCLOCK.md`: mesh clock sync behavior, CLI, defaults and caveats.
-- `POWER.md`: power profile user manual: `powersaving` (upstream light
-  sleep), `radio.rxps` (the receive duty cycle ported from EasySkyMesh, the
-  level scale and its preamble guard, presets/raw/level forms), `cpu.freq`,
-  persistence, the measured profile, attribution and what the profile
-  deliberately does not do. First stop for any power question.
-- `MQTT_OBSERVER.md`: the optional MQTT observer firmware's user manual:
-  build targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS),
-  topic templates and the status/packet/raw schemas, the capture and delivery
-  model, recipes, troubleshooting and limits.
-- `RADIO2.md`: the second radio preset user manual: the shared transceiver
-  model, preset validation (overlap + scannability), the policy matrix
+- `POWER.md`: power profile user manual: `powersaving` (upstream light sleep),
+  `radio.rxps` (the receive duty cycle ported from EasySkyMesh, the level scale
+  and its preamble guard, presets/raw/level forms), `cpu.freq`, persistence,
+  the measured profile, attribution and what the profile deliberately does not
+  do. First stop for any power question.
+- `MQTT_OBSERVER.md`: optional MQTT observer firmware user manual: build
+  targets, the `mqtt*`/`wifi*` CLI, broker setup (JWT vs password, TLS), topic
+  templates and the status/packet/raw schemas, the capture and delivery model,
+  recipes, troubleshooting and limits.
+- `RADIO2.md`: second radio preset user manual: shared transceiver model,
+  preset validation (overlap and scannability), the policy matrix
   (`same`/`other`/`both`/`drop`, broadcast-flood-only crossing), reply-origin
   rules, the active/idle visit scheduler, the full CLI reference, feature
-  interactions (RXPS, `extra.sf`, tempradio, filter, battery/fleet, powersaving)
-  and tradeoffs.
+  interactions (RXPS, `extra.sf`, tempradio, filter, battery/fleet,
+  powersaving) and tradeoffs.
 - `HAM.md`: ham mode user manual: the Part 97 / Part 15 power split, the
   public/private classification table, the callsign gate and the 10-minute
   station-ID timer, the `ham` CLI, persistence in `/ham_cfg`, the deliberate
-  decoupling from the filter, the credit to NebraskaMesh/MeshCore-Ham, and
-  the operator's responsibility for power levels and identification. First
-  stop for any ham-mode question.
-- LoRa OTA: the over-the-air firmware update for repeaters (branch
-  `lora-ota`; not merged to `repeater-filter` yet). The user manual, the
-  Android/Linux app and the hardware bench live in the `MeshCoreRepeaterManager` repo
-  (`jhuebert/MeshCoreRepeaterManager`); `OtaUpdate.h` is the authoritative spec of the
-  wire contract. Five rules the fork must not forget: (1) ops ride inside
-  ordinary encrypted REQ/RESPONSE datagrams (`REQ_TYPE_OTA`), never a new
-  payload type; (2) the op stream is inert unless armed by an operator
-  (`ota stage` + token), and the staged image boots only after a SHA-256
-  gate; (3) `OP_INFO` is the capability handshake, answered in every state,
-  and its report carries target id, slot size, max literal, feature bits, the
-  running firmware version and the running image's SHA-256 (taken over exactly
-  the bytes an update wrote, with the image length from the ESP image header
-  and the appended digest included, so it equals the hash of the app's own .bin
-  and is the delta-base identity; all zeros means "cannot tell"); (4) the wire
-  contract is append-only frozen: new features add new op codes/report
-  bits, never change existing ones; (5) `REQ_TYPE_OTA` is fork-private `0xA0`,
-  outside upstream's `0x01..0x09` REQ range (`0x08` is upstream's `subscribe`);
-  the app's `reqTypeOta` constant changes with it.
-- `ONLINE_OTA.md`: online OTA over WiFi for repeater observer builds. The user
-  manual for the three commands (`ota fetch ver`, `ota fetch sha`,
-  `ota fetch start`), `ota net` progress, the frozen `ota status` line, digest
-  syntax, errors 10 to 16, fleet recipes and limits. Observer-only: setting
-  ver/sha touches no WiFi, and non-observer builds compile no adapter.
+  decoupling from the filter, credit to NebraskaMesh/MeshCore-Ham, and the
+  operator's responsibility for power levels and identification. First stop for
+  any ham-mode question.
+- LoRa OTA: over-the-air firmware update for repeaters, branch `lora-ota`, not
+  merged into `repeater-filter` yet. The user manual, Android/Linux app and
+  hardware bench live in `MeshCoreRepeaterManager`; `OtaUpdate.h` is the
+  authoritative wire spec. The frozen contract is in *Compatibility & frozen
+  contracts*.
+- `ONLINE_OTA.md`: online OTA over WiFi for repeater observer builds: the
+  `ota fetch ver`/`ota fetch sha`/`ota fetch start` commands, `ota net`
+  progress, the frozen `ota status` line, digest syntax, errors and limits,
+  fleet recipes. Observer-only: setting ver/sha touches no WiFi, and
+  non-observer builds compile no adapter.
 
 **New top-level features need two docs in the same commit:** a paragraph in
-`README.md` describing the feature, and a dedicated, user-focused guide (like
-`FILTER.md`, `FLEET.md`, `RADIO2.md`) covering setup, behavior, the CLI and
-limits. **When behavior changes, the matching guide section is updated in the
-same commit**. The guides are user-facing API documentation, not optional docs.
+`README.md` describing the feature, and a dedicated user-focused guide covering
+setup, behavior, the CLI and limits. When behavior changes, the matching guide
+section is updated in the same commit. The guides are user-facing API
+documentation, not optional docs.
 
 **Code (`examples/simple_repeater/`):**
-- `PacketFilter.h/.cpp`: rule model, evaluation (`checkPacket` packet-level,
-  `checkContent` decrypted-content single pass, verdict stash), binary
-  persistence (`load`/`save`, v3..v7 stepwise migration), `filterCLI`.
-- `FleetManager.h/.cpp`: the fleet feature: one PSK-backed channel, the
-  repeater's tag set, `fleetCLI`, the receive-side hook (`onGroupData`), the
-  relay-side battery exemption (`checkForward`), acknowledgements (jittered,
-  one byte-identical retry until a repeat is heard, sent on the captured
-  channel), unsolicited alerts (`sendAlert`, on the
-  configured channel), scheduled `!at` jobs (RAM-only store), and the
-  `/fleet_cfg` persistence (v1 with a whole-payload CRC-16). Owns a
-  `CliScriptRunner`.
-- `CliScript.h/.cpp`: the fleet script runner: `!id` parse, the
-  `!tags`/`!ack`/`!at` directive block, inline `!delay` with resumable run,
-  the 2-slot pending queue, the seen-key hash ring, and the run callback
-  MyMesh drives (see the behavioral-invariants note).
-- `AdvertRateLimiter.h/.cpp`: the per-origin advert repeat window: cache,
-  counters, and the check/commit split (see the fork's rule-model note).
-- `PersistUtil.h`: the lazy dirty-save pattern, the per-platform file opens, and
-  the shared staged-save transaction; also the config-integrity note.
-- `PacketFilterConfig.h`: the filter's capacity tunables (`FILTER_MAX_RULES`,
-  ...), override via build flags; persistence-layout caveats noted inline.
-  `FleetConfig.h` holds the fleet's (`FLEET_*`, including the renamed
-  `FLEET_CLI_*` runner capacities and the `!tags`/`!delay`/`!at` grammar
-  limits).
-- `TinyRegex.h/.cpp`: vendored kokke/tiny-regex-c + step budget (see Hard
-  invariants; treat as upstream).
+
+- `PacketFilter.h/.cpp`: rule model, evaluation (`checkPacket` for packet-level
+  rules, `checkContent` for decrypted-content in one pass, verdict stash),
+  binary persistence (load/save, stepwise version migration),
+  `filterCLI`.
+- `FleetManager.h/.cpp`: one PSK-backed channel, the repeater's tag set,
+  `fleetCLI`, the receive-side hook (`onGroupData`), the relay-side battery
+  exemption (`checkForward`), jittered acknowledgements with one byte-identical
+  retry until a repeat is heard, sent on the captured channel, unsolicited
+  alerts on the configured channel, scheduled `!at` jobs (RAM-only), and
+  `/fleet_cfg` persistence with a whole-payload CRC-16. Owns a `CliScriptRunner`.
+- `CliScript.h/.cpp`: `!id` parse, the `!tags`/`!ack`/`!at` directive block,
+  inline `!delay` with resumable run, the two-slot pending queue, the seen-key
+  hash ring, and the run callback MyMesh drives.
+- `AdvertRateLimiter.h/.cpp`: per-origin advert repeat window: cache, counters,
+  check/commit split.
+- `PersistUtil.h`: lazy dirty-save pattern, per-platform file opens, shared
+  staged-save transaction, CRC-16 and config-integrity helpers.
+- `PacketFilterConfig.h` and `FleetConfig.h`: capacity tunables (`FILTER_*`,
+  `FLEET_*`, including the renamed `FLEET_CLI_*` runner capacities and the
+  `!tags`/`!delay`/`!at` grammar limits). Override via build flags; layout
+  caveats noted inline.
+- `TinyRegex.h/.cpp`: vendored kokke/tiny-regex-c plus a step budget. Treat as
+  upstream; see *Compatibility & frozen contracts*.
 - `PatternMatch.h/.cpp`: the user-facing pattern language: top-level `|`
-  alternation, structural validation (empty alternative, alternative cap); thin
-  wrapper over the vendored engine.
+  alternation, structural validation (empty alternative, alternative cap), a
+  thin wrapper over the vendored engine.
 - `CliUtil.h`: shared CLI helpers (`nextToken`, `CliBuf`, `cliPrepare`,
   `cliCutReply`, `cliIsErrorReply`, `CLI_REPLY_MAX`) used by the filter,
-  battery, fleet and clock CLIs alike: the bounded reply writer, the command
-  entry point, the marked cut, and the one place that knows what a failing
-  reply looks like (the fork's `Err - ...` and the core's own vocabulary).
-- `BatteryGate.h/.cpp`: low-battery forward suspension, `battery` CLI, and a
-  RAM-only one-shot suspend/resume transition readout (`takeStateChange`).
-- `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, and `BuildEpoch.h`: advert
-  sample collection, median/quorum decision, enabled-flag persistence and CLI.
-- `Radio2.h/.cpp`, `Radio2Config.h`: the second radio preset: config record
-  and staged persistence (`/radio2_cfg`), preset/timing validation against the
-  primary, the policy matrix, the active/idle visit scheduler, the deferred
-  apply, and `radio2CLI`. `Radio2Device` is its only radio surface, so the
-  native suite drives a fake; MyMesh supplies the adapter over `radio_driver`.
-- `HamMode.h/.cpp`, `HamModeConfig.h`: ham mode: per-packet public/private TX
-  power selection, the 10-minute station-ID advert timer, the `ham` CLI and
-  the `/ham_cfg` record (v1, magic "HAMC", CRC-16). Uses `CliUtil.h` and
-  `PersistUtil.h`. The one upstream hook is `Dispatcher::onBeforeTransmit()`.
-  Kept fully decoupled from the filter.
-- `OtaUpdate.h/.cpp`: the LoRa OTA engine: the `ota` CLI (`stage`, `status`,
-  `apply`, `abort`, `rollback`), the `/ota_pend` boot-health marker with its
-  attempt counter, the boot-time verdict (`earlyBootCheck`) that rolls back a
-  freshly-applied image after 3 bad boots, the ESP32 partition glue
-  (`Esp32SlotIo`) and the all-state `OP_INFO` negotiation handshake. Ops ride
-  inside admin REQ/RESPONSE datagrams (`REQ_TYPE_OTA`, dispatched by
-  `handleRequest`); the boot health probe is the one zero-hop RAW_CUSTOM
-  OP_NOP. The wire contract is frozen in the header; treat it as such. It also
-  exposes the local staging API (`beginLocalStage`/`appendLocalStage`/
-  `finishLocalStage`/`cancelLocalStage`) used by the online download and the
-  appended `0x40` feature bit. Frozen replies and report layouts are unchanged.
+  battery, fleet and clock CLIs: bounded reply writer, command entry point,
+  marked cut, and the one place that knows what a failing reply looks like.
+- `BatteryGate.h/.cpp`: low-battery forward suspension, `battery` CLI, RAM-only
+  one-shot suspend/resume readout (`takeStateChange`).
+- `MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`, `BuildEpoch.h`: advert sample
+  collection, median/quorum decision, enabled-flag persistence and CLI.
+- `Radio2.h/.cpp`, `Radio2Config.h`: second radio preset: config record and
+  staged persistence (`/radio2_cfg`), preset/timing validation against the
+  primary, policy matrix, active/idle visit scheduler, deferred apply,
+  `radio2CLI`. `Radio2Device` is its only radio surface, so the native suite
+  drives a fake; MyMesh supplies the adapter over `radio_driver`.
+- `HamMode.h/.cpp`, `HamModeConfig.h`: per-packet public/private TX power
+  selection, the 10-minute station-ID advert timer, the `ham` CLI and the
+  `/ham_cfg` record (magic `HAMC`, CRC-16). Uses `CliUtil.h` and
+  `PersistUtil.h`; the one upstream hook is `Dispatcher::onBeforeTransmit()`.
+  Fully decoupled from the filter.
+- `OtaUpdate.h/.cpp`: LoRa OTA engine: the `ota` CLI (`stage`, `status`, `apply`,
+  `abort`, `rollback`), the `/ota_pend` boot-health marker and attempt counter,
+  the boot-time verdict (`earlyBootCheck`) that rolls back a freshly applied
+  image after bad boots, ESP32 partition glue (`Esp32SlotIo`), and the
+  all-state `OP_INFO` handshake. Ops ride inside admin REQ/RESPONSE datagrams
+  (`REQ_TYPE_OTA`, dispatched by `handleRequest`); the boot-health probe is the
+  one zero-hop RAW_CUSTOM `OP_NOP`. Also exposes the local staging API
+  (`beginLocalStage`/`appendLocalStage`/`finishLocalStage`/`cancelLocalStage`)
+  used by the online download and the appended `0x40` feature bit. Frozen
+  replies and report layouts are unchanged.
 - `OnlineOtaPolicy.h`: pure, Arduino-free version normalization, SHA-256 token
-  parsing and release URL construction. The release tag prefix (`v`) is one
-  macro here.
+  parsing and release URL construction. The release tag prefix macro is here.
 - `OnlineOtaCore.h/.cpp`: RAM-only async download state machine (wifi, clock,
   asset, verify, ready, error) driven one bounded step per `loop()`. Three CLI
   steps (ver, sha, start) store inputs before any network work. No persistence.
-- `OnlineOtaNet.h/.cpp`: narrow network interface and its ESP32 observer
-  adapter: station request, HTTPS GET with the framework CA bundle, bounded
-  redirects, Content-Length via `contentLength()` and one reused 2 KiB chunk.
-  Compiled only under `ESP32 && WITH_MQTT_OBSERVER`.
+- `OnlineOtaNet.h/.cpp`: narrow network interface and ESP32 observer adapter:
+  station request, HTTPS GET with the framework CA bundle, bounded redirects,
+  Content-Length via `contentLength()` and one reused small chunk. Compiled
+  only under `ESP32 && WITH_MQTT_OBSERVER`.
 - `MyMesh.cpp/.h`: upstream files carrying the fork's hook lines
-  (`allowPacketForward`, `onGroupDataRecv`, `logRx` (profile stamp + ack repeat
-  detector), `logRxRaw`/`logRx`/`logTx` observer capture, `searchChannelsByHash`,
-  CLI dispatch, lazy-save loop, the `execCliLine` script-execution trampoline,
-  the fleet device-service injections, the `batteryAlerts` transition drain, the
-  radio2 scheduler/profile-control hooks and `getSleepMs`).
-- `main.cpp`: upstream's serial CLI entry, plus the fork's radio2 sleep deadline
+  (`allowPacketForward`, `onGroupDataRecv`, `logRx` (profile stamp and ack
+  repeat detector), `logRxRaw`/`logRx`/`logTx` observer capture,
+  `searchChannelsByHash`, CLI dispatch, lazy-save loop, `execCliLine`
+  script-execution trampoline, fleet device-service injections, the
+  `batteryAlerts` transition drain, radio2 scheduler/profile-control hooks and
+  `getSleepMs`).
+- `main.cpp`: upstream's serial CLI entry plus the fork's radio2 sleep deadline
   (`getSleepMs()`/`sleepMs()`) on the powersaving path.
 
-**Power (`src/helpers/` + the upstream radio layer):**
-- `PowerProfile.h/.cpp`: the fork's power glue kept out of upstream files: the
-  persisted CPU cap (`cpu.freq` parsing/apply, `0`/default restore), the
-  repeater's power defaults (RXPS off, balanced level carried), and the hook
-  that pushes the stored RXPS config into the radio. `loadPrefs()`/`handleSetCmd`
-  /`handleGetCmd`/`MyMesh` carry only the call lines.
-- `radiolib/RXPowerSaving.h/.cpp`: the duty-cycle policy: the level ladders per
-  preamble profile, the datasheet timer guard, period calculation, config
-  normalisation and the arm-retry state. Ported from EasySkyMesh
-  (`IoTThinks/MeshCore`): the `PowerSaving-v18` branch, plus the SX1262
-  post-preamble-timer fix from `Dev-PS18` (PR #27, Dom4n) ported unchanged;
-  see the `SX1262RxPowerSaving.h` entry. The LR1110 arm path additionally
-  carries this fork's LF-clock fix (BUSY release must not wait on a 32 kHz
-  Xtal that never starts on the T1000-E).
-- `radiolib/SX1262RxPowerSaving.h`: the SX1262-only effective RX-period
-  computation applied at arm time (Dom4n's measured post-preamble timer
-  model; `R` chosen so the timer covers a P32 sender's header).
+**Power (`src/helpers/` and the upstream radio layer):**
+
+- `PowerProfile.h/.cpp`: fork power glue kept out of upstream files: persisted
+  CPU cap (`cpu.freq` parsing/apply, `0`/default restore), repeater power
+  defaults (RXPS off, balanced level carried), and the hook pushing stored RXPS
+  config into the radio. `loadPrefs()`, `handleSetCmd`, `handleGetCmd` and
+  `MyMesh` carry only the call lines.
+- `radiolib/RXPowerSaving.h/.cpp`: duty-cycle policy: level ladders per preamble
+  profile, datasheet timer guard, period calculation, config normalization and
+  arm-retry state. Ported from EasySkyMesh (`IoTThinks/MeshCore`), the
+  `PowerSaving-v18` branch, plus the SX1262 post-preamble-timer fix from
+  `Dev-PS18` (PR by Dom4n) ported unchanged; see `SX1262RxPowerSaving.h`. The
+  LR1110 arm path carries this fork's LF-clock fix (BUSY release must not wait
+  on a 32 kHz Xtal that never starts on the T1000-E).
+- `radiolib/SX1262RxPowerSaving.h`: SX1262-only effective RX-period computation
+  at arm time (Dom4n's measured post-preamble timer model; `R` chosen so the
+  timer covers a P32 sender's header).
 - `radiolib/RXPowerSavingCLI.h/.cpp`: `get radio.rxps` / `set radio.rxps`
-  (presets, `level N`, `preamble 16|32`, raw periods) and the status report.
-  `preamble=0` in the reply means the profile follows the SF (SF<=8 -> P32).
-- The integration into the radio lives in upstream files and is the fork's
-  largest upstream diff: `radiolib/RadioLibWrappers.*` (duty-cycle arming,
-  re-arm around TX/receive, noise-floor calibration), `CustomSX1262*` and
-  `CustomLR1110*`/`CustomLR2021` (per-family arming + TCXO delay), and
-  `CommonRadioPrefs.*` (CLI hook + apply). See the merge playbook below before
+  (presets, `level N`, `preamble 16|32`, raw periods) and status report.
+  `preamble=0` means the profile follows the SF (SF<=8 maps to P32).
+- The radio integration lives in upstream files and is the fork's largest
+  upstream diff: `radiolib/RadioLibWrappers.*` (duty-cycle arming, re-arm around
+  TX/receive, noise-floor calibration), `CustomSX1262*` and
+  `CustomLR1110*`/`CustomLR2021` (per-family arming and TCXO delay), and
+  `CommonRadioPrefs.*` (CLI hook and apply). Read the merge playbook before
   resolving a conflict in them.
 
 **Code (`examples/mqtt_observer/`, compiled only under `WITH_MQTT_OBSERVER`):**
-- `MQTTObserver.h/.cpp`: the ESP32-only observer: Wi-Fi/NTP, up to two broker
-  slots, Ed25519 JWT or user/pass auth, the receive/TX capture hooks, a bounded
-  RAM event queue, the heap-headroom connect gate, and the `mqtt*`/`wifi*` CLI.
-- `MQTTObserverConfig.h`: the config model + `MQTTObserverConfigCodec`
-  (`/mqtt_prefs` payload v5; `MQTT_OBSERVER_MAX_BROKERS`, queue capacity).
-- `MQTTObserverRecord.h`: the `/mqtt_prefs` record framing (magic `MQO1`,
-  CRC-16 over the payload) and its header/version/checksum checks.
-- `MQTTObserverPolicy.h`: pure host-tested policies: command/slot parsing, JWT
-  renewal, the queue/retry rules, the connect gates (heap admission, attempt
-  outcome), the liveness probe, and the raw frame stager.
-- `MQTTObserverCli.h/.cpp`: the `mqtt*`/`wifi*` command handling, separated
-  from the radio, the Wi-Fi stack and the MQTT client: the observer fills in
-  the device facts (Wi-Fi, clock, heap, queue, slot states) and the unit owns
-  the config and the replies. Host-tested, like the filter's and the fleet's
-  CLIs.
-- `MQTTObserverFormat.h/.cpp`: pure host-tested JSON builders for the status,
-  packet and raw messages (the reference observer schema).
-`observer_targets.ini` (repo root) defines the optional `*_repeater_observer`
-PlatformIO environments. It is pulled in through `platformio.ini`'s
-`extra_configs`, so the environments it adds are part of the resolved config
-(`build.sh list` enumerates them); what marks an environment as an observer is
-the `_repeater_observer` name suffix, not membership in that file.
 
-**Tests:** the behavior-level (native googletest) suites, one per feature, each
+- `MQTTObserver.h/.cpp`: ESP32-only observer: Wi-Fi/NTP, up to two broker slots,
+  Ed25519 JWT or user/pass auth, receive/TX capture hooks, bounded RAM event
+  queue, heap-headroom connect gate, `mqtt*`/`wifi*` CLI.
+- `MQTTObserverConfig.h`: config model and codec (`/mqtt_prefs` payload v5;
+  `MQTT_OBSERVER_MAX_BROKERS`, queue capacity).
+- `MQTTObserverRecord.h`: record framing (magic `MQO1`, CRC-16 over the
+  payload) and header, version and checksum checks.
+- `MQTTObserverPolicy.h`: pure host-tested policies: command/slot parsing, JWT
+  renewal, queue/retry rules, connect gates (heap admission, attempt outcome),
+  liveness probe, raw frame stager.
+- `MQTTObserverCli.h/.cpp`: command handling separated from the radio, Wi-Fi
+  stack and MQTT client: the observer supplies device facts (Wi-Fi, clock,
+  heap, queue, slot states) and the unit owns config and replies. Host-tested.
+- `MQTTObserverFormat.h/.cpp`: pure host-tested JSON builders for status,
+  packet and raw messages (the reference observer schema).
+
+`observer_targets.ini` (repo root) defines the optional
+`*_repeater_observer` PlatformIO environments. It is pulled in through
+`platformio.ini`'s `extra_configs`, so those environments are part of the
+resolved config. What marks an environment as an observer is the
+`_repeater_observer` name suffix, not membership in that file.
+
+**Tests:** behavior-level native googletest suites, one per feature, each
 reached through the same entry points a user or the firmware would:
 `test/test_packet_filter/` (matching, content rules, limiter, persistence
 upgrades, CLI surface, TinyRegex, PatternMatch), `test/test_fleet/` (runner
-grammar, tag targeting, acknowledgements, scheduling, persistence, CLI surface,
-the battery exemption contract), `test/test_battery_gate/` (suspension
-behavior, persistence, CLI), `test/test_ham_mode/` (classification, callsign
-gate, station-ID timing, CLI and persistence), `test/test_mesh_clock/` (sample
-collection, quorum
-decision, persistence, CLI), `test/test_rx_power_saving/` (the duty-cycle
-level ladders and preamble guard, timer-condition validation, config
-normalisation, presets/raw parsing and the `get radio.rxps` report),
-`test/test_radio2/` (core profile metadata and outbound peek, policy matrix,
-timing bounds, scheduler states, deferred apply, persistence and the `radio2`
-CLI) and `test/test_mqtt_observer/` (config codec +
-record framing, URI/topic builders, CLI and slot parsing, JWT renewal, the
-connect gates, queue/retry policy, the liveness probe, and the
-status/packet/raw JSON schema) and `test/test_online_ota/` (version and digest
-parsing, URL construction, every core phase and error with a fake network,
-CLI replies and local staging on the real OTA engine). Test-only shims:
-`NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
+grammar, tag targeting, acknowledgements, scheduling, persistence, CLI, battery
+exemption contract), `test/test_battery_gate/` (suspension, persistence, CLI),
+`test/test_ham_mode/` (classification, callsign gate, station-ID timing, CLI,
+persistence), `test/test_mesh_clock/` (sample collection, quorum decision,
+persistence, CLI), `test/test_rx_power_saving/` (duty-cycle ladders and preamble
+guard, timer-condition validation, config normalization, presets/raw parsing,
+CLI report), `test/test_radio2/` (profile metadata, outbound peek, policy
+matrix, timing bounds, scheduler states, deferred apply, persistence, CLI) and
+`test/test_mqtt_observer/` (config/record framing, URI/topic builders, CLI and
+slot parsing, JWT renewal, connect gates, queue/retry, liveness probe, JSON
+schema), `test/test_online_ota/` (version and digest parsing, URL construction,
+every core phase and error with a fake network, CLI replies and local staging).
+Test-only shims: `NativeShim.h`, `NativeTestStubs.cpp`, `RegionMapStub.cpp`,
 `FilterTestHelpers.h`, `CliReplyHelper.h`.
 
-**Build & CI:** `pio test -e native_packet_filter` / `-e
-native_battery_gate` / `-e native_ham_mode` / `-e native_fleet` /
-`-e native_fleet_noack` (the fleet
-suite with `FLEET_ACK_RETRY=0`, whose test bodies live in `#else` branches no
-other env compiles) / `-e native_mesh_clock` / `-e native_rx_power_saving` / `-e
-native_radio2` / `-e native_mqtt_observer` / `-e native_ota` / `-e
-native_online_ota` (host-native, no hardware), plus `-e
-native_packet_filter_san` / `-e native_battery_gate_san` / `-e native_ham_mode_san` /
-`-e native_fleet_san` /
-`-e native_mesh_clock_san` / `-e native_rx_power_saving_san` / `-e
-native_radio2_san` / `-e
-native_mqtt_observer_san` / `-e native_ota_san` / `-e native_online_ota_san`
-for ASan+UBSan;
-firmware via `bash build.sh build-firmware <target>` (`bash build.sh list`;
-`build.sh` uses bash arrays, so `sh` is not a contract), the fork's flash
-target being `Xiao_S3_WIO_repeater` (observer builds add
-`Xiao_S3_WIO_repeater_observer`). **Compile-check every filesystem
-family** before calling persistence work done: `Xiao_S3_WIO_repeater`,
-`RAK_4631_repeater` (nRF52), `PicoW_repeater`, `wio-e5_kiss_modem`: host-native
-tests cannot catch a platform-specific API difference, and one did (the nRF52
-file type has no default constructor). The STM32WLE5 repeaters no longer fit
-their flash budget, so the smallest STM32 env that still links stands in for
-them (same `InternalFS` path).
-`.github/workflows/filter-release.yml` cuts release channels (dev →
-`repeater-filter`, stable → `repeater-filter-stable`); tag + release object
-only; the firmware assets are built locally with
-`scripts/local-release-build.sh` (the default target set includes the observer
-targets, so they ship in the same release, with no separate observer channel; the
-STM32WLE5 repeaters (wio-e5, wio-e5-mini, wio-e5-repeater_bridge_rs232,
-RAK_3x72_repeater, Tiny_Relay_repeater) exceed the flash budget and are
-excluded from the target set) and
-uploaded to the release with `gh`
-(CI no longer builds firmware; the wide runner fan-out got Actions
-shut down). The build job prints the tail of a failed target's log, prunes a
-failed target's build tree, and retries the failed set once with two workers
-(`--retry-failed`) after the main pass, so runner-resource flakes do not leave
-assets missing; a deterministic failure simply fails again.
-App images are uploaded as `<env>-v<version>.bin` and the firmware version
-string is the same sha-free `v<version>`. Release tags use the `v` prefix;
-branch names and the workflow file name keep `filter` for now.
-`scripts/rename-ota-assets.py` and `scripts/rename-ota-tags.py` renamed existing
-assets and releases in place through the GitHub API, keeping the old tag refs
-as aliases. `OnlineOtaPolicy.h` holds the single tag-prefix macro.
-`RELEASE_NOTES.md` holds the pending release notes and `filter-release.yml` uses
-it verbatim as the body of every dev release. A stable release collects the
-bodies of the dev releases since the previous stable one, so it needs no
-separate notes file; a `RELEASE_NOTES_STABLE.md` on the stable branch overrides
-that collection when curated stable notes are wanted. Update the pending file
-as changes land, since the gate cuts a release only when code (not docs)
-changed.
-`sync-upstream.yml` merges upstream `main` into `repeater-filter-stable`
-(channel=stable) or `repeater-filter-stable` into `repeater-filter` (dev);
-`promote-stable.yml` fast-forwards `repeater-filter-stable` to
-`repeater-filter` after running the native suites plus the build-tooling
-tests in `scripts/tests/`. It never merges; if stable is not an ancestor of
-dev it fails and tells you to merge stable into dev first (run
-`sync-upstream.yml` with channel=dev). Both are manual-dispatch only (never
-on a schedule) and neither cuts a release; use Filter Release for that. A
-conflict in a sync opens (or updates) an issue through
-`.github/actions/open-conflict-issue/` and fails the run. Upstream's own
-docs live in `docs/` (MeshCore protocol/CLI generally), not fork-filter
-documentation.
+## Current state & next milestone
 
-Some repeater targets fail on the upstream tree too, and are deliberately left
-failing: `Heltec_ct62_repeater_bridge_espnow`,
-`Tenstar_C3_sx1262_repeater_bridge_espnow` and
-`Tenstar_C3_sx1268_repeater_bridge_espnow` (all absent from
-`filter-v1.18.0-r1`; `ESPNowBridge::recv_cb`'s `int32_t` parameter does not
-match `esp_now_recv_cb_t` on RISC-V). They are upstream's to fix; do not patch
-them as part of a fork fix; the release simply ships without those assets.
+The integration branch is `repeater-filter` (dev); `repeater-filter-stable` is
+the stable channel. LoRa OTA is carried on `lora-ota` and is not merged into
+`repeater-filter` yet; `OtaUpdate.h` is the authoritative spec and the app side
+lives in `MeshCoreRepeaterManager`. Current build and release state lives in
+`RELEASE_NOTES.md` and the workflows; do not duplicate it here.
 
-## Branch model
+Some repeater targets fail on the upstream tree too and are deliberately left
+failing. They are upstream's to fix; do not patch them as part of a fork fix and
+do not add them to the fork's release targets. The current target set lives in
+the build script, not in this guide.
+
+## Parity & intentional differences
+
+### Default-off parity with upstream
+
+Every fork feature is opt-in, and **off must mean off**. With every feature
+disabled (the fresh-install default), the node must behave like the official
+(upstream `meshcore-dev/MeshCore`) firmware for that role, within reason: same
+on-air behaviour, same forwarding decisions, same RF activity, same sleep/wake
+behaviour and the same default power state. Flashing this fork over an official
+node must be undetectable until the operator enables a feature.
+
+- **Do not override the board's compiled configuration.** "No cap" or "off"
+  means the board's own value (for example `ESP32_CPU_FREQ`), not a convenient
+  default such as 240 MHz.
+- **Official persisted config loads unchanged.** New keys ride with defaults;
+  an upgrade must never switch a feature on or change a clock behind the
+  operator's back.
+- **When off, take the upstream path.** Hot-path hooks are skipped or branch to
+  the original code, not computed and discarded; no feature may install a
+  radio/profile/timer/sleep hook while off.
+- **"Within reason"** allows additive CLI/status output, new config keys and
+  boot-time setup that does not change a running node's RF, forwarding or
+  sleep/wake behaviour.
+- **Verify the off path explicitly**: default value, RF command trace,
+  sleep/wake path, forwarding decision and CLI surface. "It compiles" is not
+  evidence.
+
+The exception is an overlap between fork features that must work in tandem
+(for example the fleet channel's battery-gate exemption, the filter's channel
+store and the fleet PSK, radio2's RXPS mutual exclusion). Those interactions may
+change behaviour for the participating features, are documented where they are
+defined, and must not affect an otherwise-off node.
+
+The fork-wide convention is a gate at the top of the feature's receive/loop-path
+hook (or at the call site): a disabled feature may not compute a value nothing
+downstream reads. RXPS and radio2 take the upstream path when off
+(`needsService()`, no profile controller installed), `filter off` branches
+every gate to upstream behaviour and `checkContent` skips an empty rule store,
+the battery gate samples the ADC only while enabled, and the fleet and mesh
+clock sync early-return before any crypto or RTC read (the advert hook is gated
+at the call site). The boot path makes no clock-changing call when the requested
+CPU frequency equals the running one.
+
+### Known intentional differences
+
+These are accepted residuals, recorded so nobody re-flags them:
+
+- Fresh nodes pre-provision the built-in Public channel. The core MAC-verifies
+  Public group traffic, and the documented `filter chan list` contract pins it
+  in the CLI tests.
+- The fleet's relay-side auth (the just-decrypted fleet packet's content hash)
+  is not cleared after the receive bracket, so a later same-tag group packet
+  pays one SHA-256 in the battery-gate exemption.
+- Observer builds always create the worker task (1 Hz idle, Wi-Fi off with no
+  broker configured).
+- The fresh first boot writes `/filter_cfg` once (the Public provision).
+- The OTA engine is compiled into every repeater build, where its loop-path hook
+  is a flag test and its per-TX hook compares one payload length. A node with no
+  pending apply and no traffic on the wire does no OTA work.
+
+## Compatibility & frozen contracts
+
+### Backwards compatibility
+
+- **Persistence is paramount.** A config written by any firmware version still
+  in the field must load with settings intact. A change is either directly
+  backwards compatible (new fields ride tail padding; the old record is a
+  byte-identical prefix of the new one, enforced by the `static_assert`s in
+  `PacketFilter.h`) or it ships migration code in `load()` plus a version bump.
+  Within reason: layouts older than the versions whose record code is kept in
+  `load()` were already discarded by design and need no migration; the current
+  floor lives in `PacketFilter.cpp`. Every version bump must keep older configs
+  loading, with roundtrip and old-version fixtures in the persistence suite.
+- **CLI surface is compatibility too.** Never break existing command syntax,
+  reply formats or index semantics (0-based, shifting on delete).
+- **Behavioral invariants are compatibility.** First-match-wins ordering,
+  prob-before-throttle and stats semantics (hits travel with the rule on
+  move/delete; a stats reset never grants a throttle free pass) are observable
+  behaviour. So is the fleet model: a `!id` job key runs at most once per boot
+  (marked at admission, RAM-only seen ring), targeting is by exact tag equality
+  via `!tags` (absent means broadcast), the fleet channel is a single unnamed
+  PSK that supersedes the battery gate (scripts run, fleet traffic relays, acks
+  send while suspended), armed `!at` jobs and pending acks are RAM-only, battery
+  alerts are emitted on the fleet channel only when it is enabled and
+  configured, and script execution is deferred out of the receive path.
+  Changing them is a breaking decision, not a refactor side effect.
+- The observer's observable surface is compatibility too: capture happens
+  before forwarding policy (a packet the node drops is still observed), the
+  feed is best-effort (no flash replay, no delivery guarantee), TX uplinks this
+  node's own adverts by default, the topic template and the status/packet/raw
+  schemas follow the reference observer, and `/mqtt_prefs` (magic `MQO1`) is the
+  fork's own format, deliberately not migrated from the other observers.
+- **New pattern syntax must not silently change the meaning of an
+  already-storable pattern.** If it would, either ship an escape (`\|`) or
+  reject the ambiguous form with an error. Deliberate historical exception:
+  `|` became OR through alternation; a stored pattern containing an unescaped
+  `|` previously matched a literal pipe.
+- **Config integrity is checked per record where the format allows it.** A
+  truncated save is detected on load; a torn write of exactly the right length
+  is caught only by a record checksum. Since the CRC bump, each rule record
+  carries a CRC-16 over its payload (`crc16_ccitt` in `PersistUtil.h`); older
+  records cannot, so they stay length-checked. A checksum rides a version bump,
+  never a patch. Channel records and the battery config keep the length-only
+  story until their own layout change adds one. No sidecar file: a second file
+  is a second thing to go missing. This stops a later "improvement" from
+  quietly weakening compatibility.
+- **Old-version migration is temporary.** Older record loading is kept for now
+  and is expected to be dropped once the field has migrated. The migration
+  chain is one named step function per version pair in `PacketFilter.cpp`,
+  kept contiguous; never skip a middle step in code. Removing a version later
+  is one excision: delete its step function, raise the floor in
+  `rule_bytes_for()`, delete its fixtures.
+
+### Hard invariants
+
+1. **Config persistence layout.** See *Backwards compatibility* above; the
+   `static_assert`s in `PacketFilter.h` are the enforced form of that rule.
+2. **Vendored TinyRegex.** Only the documented modifications (step budget,
+   `re_budget_exhausted()`, unsigned-char literal compare and the `matchone()`
+   operand fix). A bug fix is the only reason to touch vendored source, and
+   only after asking first: not every bug is worth a vendored edit. Weigh a
+   one-line engine fix against reimplementing the check in the wrapper, and
+   propose the trade-off (diff size, hot-path cost, what else it would pin
+   down) rather than deciding unilaterally. Features, syntax and tuning are
+   never a reason.
+3. **CLI reply bound: 157 bytes in a 160-byte buffer.** All writes bounded:
+   one-liners via `snprintf(reply, CLI_REPLY_MAX, ...)`, staged output via
+   `CliBuf`; never unbounded `sprintf` into `reply`. `CLI_REPLY_MAX` is 3 bytes
+   under the upstream buffers (`main.cpp`'s serial/ethernet `char reply[160]`
+   and the mesh remote-CLI's `&temp[5]` of `temp[166]`) because the core's
+   companion-radio `xx|command` form puts that prefix in front of the reply the
+   handler writes into the same buffer. Those buffers are upstream's; the fork
+   keeps its replies short enough not to overrun them (`static_assert` in
+   `CliUtil.h`). A fork-owned buffer the prefix is written into is
+   `CLI_REPLY_BUFFER_MAX` (the fleet's script runner). Shared CLI helpers live
+   in `CliUtil.h`; do not duplicate them.
+4. **First match wins.** Rule evaluation order (listed order, packet-level in
+   `checkPacket()`, whole-list single pass in `checkContent()`, stash
+   consumption) is load-bearing; the prob roll runs before the throttle gate.
+5. **Pattern syntax lives in the wrapper, not in the vendored engine.**
+   `PatternMatch.*` owns every user-visible syntax decision (alternation
+   splitting, structural validation, alternative cap). `TinyRegex.cpp` keeps
+   only the documented modifications and `TinyRegex.h`'s only role is the
+   engine API. A change that adds syntax by editing the engine violates this.
+   Fixing an engine bug does not, but it must not grow into a second dialect in
+   two places.
+
+### LoRa OTA wire contract
+
+`OtaUpdate.h` is the authoritative spec. The app side lives in
+`MeshCoreRepeaterManager`; the two halves must stay in sync.
+
+1. Ops ride inside ordinary encrypted REQ/RESPONSE datagrams (`REQ_TYPE_OTA`),
+   never a new payload type.
+2. The op stream is inert unless armed by an operator (`ota stage` plus token),
+   and a staged image boots only after a SHA-256 gate.
+3. `OP_INFO` is the capability handshake, answered in every state. Its report
+   carries target id, slot size, max literal, feature bits, running firmware
+   version and the running image's SHA-256, taken over exactly the bytes an
+   update wrote (image length from the ESP image header, appended digest
+   included), so it equals the hash of the app's own `.bin` and is the
+   delta-base identity. All zeros means "cannot tell".
+4. The wire contract is append-only and frozen: new features add new op codes
+   or report bits, never change existing ones.
+5. `REQ_TYPE_OTA` is fork-private `0xA0`, outside upstream's `0x01..0x09` REQ
+   range (`0x08` is upstream's `subscribe`); the app's `reqTypeOta` constant
+   changes with it.
+
+### Frozen terminology
+
+The OTA transport is the format, not a draft awaiting a successor. Do not
+introduce "wire v2" or similar naming in docs or comments, and do not rename
+the existing op stream. Nodes in the field predate any such release.
+
+## Principle of least surprise
+
+CLI and filter semantics must work the way a user would guess without reading
+`FILTER.md`:
+
+- `filter get <idx>` is an **inspection** command: its reply shows the rule's
+  predicates plus counters, is truncated to the CLI reply bound (see hard
+  invariant 3), and is *not* re-addable input (`add` rejects the `hits=`,
+  `air=`, `pass=` metadata it prints).
+- `filter chan list [<start-idx>]` exists because a full store does not fit one
+  reply and `chan del` takes a name; a truncated listing ends with `next=N`.
+- Errors say what is wrong and what is accepted, for example `Err - chanhash
+  must be 2 hex chars`; usage lines enumerate the command surface.
+- Syntax reads like the concept: `[a,b]`-style intervals, comma lists, `*` as
+  wildcard, first match wins like firewall rules, `prob=` and `throttle=` gates
+  behave exactly as `FILTER.md` describes them.
+- Replies stay short and stable. Treat existing reply strings as user-facing
+  API: humans parse them, and companion tools may too.
+
+## Domain rules
+
+### Branch model
 
 - `repeater-filter-stable`: stable release channel; tracks upstream `main`,
-  synced by the manually-dispatched `sync-upstream.yml` (channel=stable).
-- `repeater-filter`: dev release channel; based on `repeater-filter-stable`,
+  synced by the manually dispatched `sync-upstream.yml` (channel=stable).
+- `repeater-filter`: dev release channel, based on `repeater-filter-stable`,
   the integration branch for all fork work. Default branch of the fork.
 - Changes reach stable by fast-forward via `promote-stable.yml` (gate included),
   never by a merge commit on stable; dev absorbs stable via `sync-upstream.yml`
-  (channel=dev) after every sync or promotion that moves `repeater-filter-stable`.
-  Keep the invariant that stable is an ancestor of dev: every commit on stable
-  is reachable from dev. Never commit directly to `repeater-filter-stable`;
-  never merge dev into stable with a merge commit.
+  (channel=dev) after every sync or promotion that moves
+  `repeater-filter-stable`. Keep the invariant that stable is an ancestor of
+  dev: every commit on stable is reachable from dev. Never commit directly to
+  `repeater-filter-stable`; never merge dev into stable with a merge commit.
 - Work branches: `repeater-filter-<topic>` cut from `repeater-filter`, merged
-  back with `--no-ff` (keep feature commits traceable). Topic branches cut
-  before 2026-11-12 from the old dev lineage must be rebased onto the new
-  dev: never merged raw (merging drags upstream `dev` back in).
-- The 2026-11 branch swap: the old dev lineage (tracking upstream `dev`) is
-  archived at tag `archive/repeater-filter-2026-11-12`; `repeater-filter` was
-  restarted from `repeater-filter-stable` after verifying the fork content was
-  identical across the two (the remaining tree diff is upstream dev/main drift).
-- Do not hand-merge upstream `main` locally; use `sync-upstream.yml` and
-  resolve conflicts in the branch if the run fails.
+  back with `--no-ff` to keep feature commits traceable.
+- Do not hand-merge upstream `main` locally; use `sync-upstream.yml` and resolve
+  conflicts in the branch if the run fails.
+- A conflict in a sync opens or updates an issue through
+  `.github/actions/open-conflict-issue/` and fails the run. `sync-upstream.yml`
+  and `promote-stable.yml` are manual-dispatch only, never on a schedule, and
+  neither cuts a release; use Filter Release for that. If stable is not an
+  ancestor of dev, promotion fails and tells you to sync channel=dev first.
+- Upstream's own docs live in `docs/` (MeshCore protocol and CLI generally),
+  not fork-filter documentation.
 
-## Fork-owned vs upstream code
+### Fork-owned vs upstream code
 
-Fork-owned file set (free to edit):
+Fork-owned files (free to edit):
+
 - `examples/simple_repeater/PacketFilter.h/.cpp`, `PacketFilterConfig.h`
 - `examples/simple_repeater/TinyRegex.h/.cpp`, `CliUtil.h`, `BatteryGate.h/.cpp`
-- `examples/simple_repeater/PatternMatch.h/.cpp`
-- `examples/simple_repeater/CliScript.h/.cpp`
+- `examples/simple_repeater/PatternMatch.h/.cpp`, `CliScript.h/.cpp`
 - `examples/simple_repeater/AdvertRateLimiter.h/.cpp`, `PersistUtil.h`
 - `examples/simple_repeater/MeshClockSync.h/.cpp`, `MeshClockSyncConfig.h`,
   `BuildEpoch.h`
@@ -355,30 +516,31 @@ Fork-owned file set (free to edit):
   `OnlineOtaNet.h/.cpp`
 - `src/helpers/PowerProfile.h/.cpp`,
   `src/helpers/radiolib/RXPowerSaving.h/.cpp`, `RXPowerSavingCLI.h/.cpp`,
-  `src/helpers/radiolib/SX1262RxPowerSaving.h`, `src/helpers/radiolib/RadioProfileControl.h`
+  `src/helpers/radiolib/SX1262RxPowerSaving.h`,
+  `src/helpers/radiolib/RadioProfileControl.h`
 - `test/test_packet_filter/`, `test/test_fleet/`, `test/test_battery_gate/`,
   `test/test_mesh_clock/`, `test/test_rx_power_saving/`, `test/test_radio2/`,
   `test/test_mqtt_observer/`, `test/test_online_ota/`
 - `examples/mqtt_observer/`, `observer_targets.ini`
 - `FILTER.md`, `FLEET.md`, `BATTERY.md`, `MESHCLOCK.md`, `POWER.md`,
   `RADIO2.md`, `MQTT_OBSERVER.md`, `ONLINE_OTA.md`
-- `scripts/local-release-build.sh`, `scripts/rename-ota-assets.py`, `scripts/tests/`
-- `.github/workflows/filter-release.yml`,
-  `sync-upstream.yml`, `.github/workflows/promote-stable.yml`
-- `.github/actions/open-conflict-issue/` (the conflict issue the two sync
-  workflows open; `setup-build-environment/` next to it is upstream's)
+- `scripts/local-release-build.sh`, `scripts/rename-ota-assets.py`,
+  `scripts/tests/`
+- `.github/workflows/filter-release.yml`, `sync-upstream.yml`,
+  `.github/workflows/promote-stable.yml`
+- `.github/actions/open-conflict-issue/` (`setup-build-environment/` next to
+  it is upstream's)
 
 Fork lines inside upstream files stay **minimal**: a reviewer should see a
 handful of lines, not a fork interleaved into upstream code. Those files are
 `examples/simple_repeater/MyMesh.h/.cpp` (the hooks the features call),
-`build.sh` (the observer commands and `build_observer_firmwares`),
-`platformio.ini` (the fork's native and sanitizer environments, and the
-`observer_targets.ini` include), plus small patches in
-`examples/companion_radio/` and `test/mocks/SHA256.h`; `README.md` is the
-fork's own. Everything else is upstream: apply the change discipline below
-*even more strictly* there, and match the existing style (`.clang-format`:
-2-space indent, `camelCase` functions, `UpperCamelCase` classes, lines < ~100
-chars).
+`build.sh` (observer commands and `build_observer_firmwares`), `platformio.ini`
+(the fork's native and sanitizer environments and the `observer_targets.ini`
+include), small patches in `examples/companion_radio/` and
+`test/mocks/SHA256.h`, plus `README.md`, which is the fork's own. Everything
+else is upstream; apply the change discipline even more strictly there and
+match the existing style (`.clang-format`: 2-space indent, `camelCase`
+functions, `UpperCamelCase` classes, lines under about 100 chars).
 
 ### Merge playbook: the RXPS layer
 
@@ -387,12 +549,12 @@ where an upstream sync is most likely to conflict. Resolutions are mechanical:
 
 | File | Fork surface | On conflict |
 |---|---|---|
-| `RadioLibWrappers.h` | `RxPowerSavingControl` base, `_rx_ps_*`/`_nf_*` members, ~12 declarations, ctor init | keep upstream's shape, re-add the fork block |
-| `RadioLibWrappers.cpp` | `loop()` and `startRecv()` replaced; hooks in `begin`/`idle`/`powerOff`/`resetAGC`/`recvRaw`/`startSendRaw`/`onSendFinished`; the additive functions live in one fork section at the end of the file | take upstream's function, re-apply the fork's 1-6 lines; the end section is additive |
-| `CustomSX1262.h`, `CustomSX1262Wrapper.h`, `CustomLR1110*`, `CustomLR2021.h` | `begin()` + TCXO helper, per-family arm/stop, wrapper overrides | keep both; upstream has not touched these in 3+ months |
-| `CommonRadioPrefs.h/.cpp` | include, `_active_sf/_active_bw`, virtual + apply, two CLI branches | keep both sides |
-| `CommonCLI.h` | `cpu_freq_mhz`, `rxps`, 6 `def(...)` keys | add the keys to upstream's structure |
-| `MyMesh.cpp` | 4 call lines (`powerApplyDefaults`, `powerApplyRadioProfile`) | one line each |
+| `RadioLibWrappers.h` | `RxPowerSavingControl` base, `_rx_ps_*`/`_nf_*` members, declarations, ctor init | keep upstream's shape, re-add the fork block |
+| `RadioLibWrappers.cpp` | `loop()` and `startRecv()` replaced; hooks in `begin`/`idle`/`powerOff`/`resetAGC`/`recvRaw`/`startSendRaw`/`onSendFinished`; additive functions in one fork section at the end | take upstream's function, re-apply the fork's 1 to 6 lines; the end section is additive |
+| `CustomSX1262.h`, `CustomSX1262Wrapper.h`, `CustomLR1110*`, `CustomLR2021.h` | `begin()` and TCXO helper, per-family arm/stop, wrapper overrides | keep both; upstream has not touched these in months |
+| `CommonRadioPrefs.h/.cpp` | include, `_active_sf`/`_active_bw`, virtual + apply, two CLI branches | keep both sides |
+| `CommonCLI.h` | `cpu_freq_mhz`, `rxps`, `def(...)` keys | add the keys to upstream's structure |
+| `MyMesh.cpp` | `powerApplyDefaults`, `powerApplyRadioProfile` call lines | one line each |
 
 1. Take upstream's version of a conflicting *function* first, then re-apply the
    fork's lines. Never hand-merge the two bodies.
@@ -403,281 +565,72 @@ where an upstream sync is most likely to conflict. Resolutions are mechanical:
    build: flash, confirm `get radio.rxps` reports `effective=armed`, then send a
    direct CLI command and see it ACKed. A wrong delegation makes the node deaf
    while it still transmits.
-4. `test/test_rx_power_saving` covers the policy, not the integration: only
-   the on-air check catches a broken delegation.
+4. `test/test_rx_power_saving` covers the policy, not the integration: only the
+   on-air check catches a broken delegation.
 
-Upstream churn (12 months to 2026-10): `RadioLibWrappers.cpp` 23 commits (5 in
-the last 3), `CommonRadioPrefs.cpp` 7 (all in 3), `CustomSX1262.h` 13 (0 in 3),
-`CommonCLI.h` 40 (15 in 3), `MyMesh.cpp` 103 (14 in 3). The frequently edited
-files carry the small hunks; the large functions live in the rare ones, so the
-expected cost is a few 5-minute resolutions a year plus an occasional 30-minute
-one in the wrapper.
+## Verification
 
-The planned simplification is `RxPowerSavingRuntime`: move the duty-cycle state
-machine and its state (including the file-static `state`/ISR in
-`RadioLibWrappers.cpp`) into a fork-owned class the wrapper friends, leaving
-~30 lines of delegates. Do that when the wrapper diff starts actually
-conflicting, not before.
-
-## Change discipline: every change (fork or upstream)
-
-- **Minimum viable change.** The smallest diff that fully fixes the problem:
-  no drive-by refactors, no renames, no reformatting of untouched lines, no
-  dependency upgrades folded into an unrelated change. Re-read the final diff
-  and confirm every touched line is required and nothing else changed.
-- **Keep the upstream diff small.** Prefer fork-owned files. When a hook in an
-  upstream file is unavoidable, keep it to a handful of lines (see *Fork-owned
-  vs upstream code* above), so upstream syncs stay cheap and the fork remains
-  easy to rebase.
-- **DRY.** Shared logic gets one authoritative home, and nothing re-implements
-  it. Precedents: the CLI tokenizer and reply writer in `CliUtil.h`; the match
-  gates + hit/airtime commit in `FilterRules::decideMatch()`. If you find
-  yourself copying a block from a sibling function, factor it instead.
-- **Deslop as you go.** Code you touch must end up cleaner than you found it
-  where slop is in reach: duplicated logic factored, unbounded writes bounded,
-  dead state removed, twin branches merged. Remove unimplemented stubs, dead
-  code and anything unnecessary before calling the change done. But don't
-  deslop code you aren't otherwise touching: that's churn, not cleanliness.
-- **Simplicity.** The simplest code that is correct; obvious beats clever;
-  write what the project's maintainers would have written, not what an agent
-  would. Prefer the less clever option when it is easier to reason about and
-  verify. Comments explain *why* (invariants, protocol quirks, on-air format
-  constraints), not what.
-- **Maintainability.** This fork is maintained long term. Choose solutions
-  that stay workable and flexible so later features are easy to add and we do
-  not design ourselves into a corner.
-- **Minimize flash usage.** Targets have tight flash budgets (the STM32WLE5
-  repeaters no longer fit). Share code instead of duplicating it, reuse
-  existing helpers, and avoid heavy dependencies for small gains.
-- **Minimize RAM usage.** Targets have limited RAM and small stacks. Bound
-  buffers and queues, keep per-feature state small, and avoid large stack
-  frames and heap churn (see the stack constraint under *Tests &
-  verification*).
-- **No em dashes anywhere.** In this file, fork docs, code comments, commit
-  messages, CLI help and replies, and any other user-facing text, use a short
-  sentence, a colon or a comma instead. Do not introduce an em dash; replace
-  one on any line you touch.
-
-## Default-off parity with upstream
-
-Every fork feature is opt-in, and **off must mean off**. With every feature
-disabled (the fresh-install default), the node must behave like the official
-(upstream `meshcore-dev/MeshCore`) firmware for that role, within reason: same
-on-air behaviour, same forwarding decisions, same RF activity, same sleep/wake
-behaviour and the same default power state. Flashing this fork over an official
-node must be undetectable until the operator enables a feature.
-
-- **Do not override the board's compiled configuration.** "No cap"/"off" means
-  the board's own value (e.g. `ESP32_CPU_FREQ`), not a convenient default such
-  as 240 MHz.
-- **Official persisted config loads unchanged.** New keys ride with defaults;
-  an upgrade must never switch a feature on or change a clock behind the
-  operator's back.
-- **When off, take the upstream path.** Hot-path hooks are skipped or branch to
-  the original code, not computed and discarded, and no feature may install a
-  radio/profile/timer/sleep hook while off.
-- **"Within reason"** allows additive CLI/status output, new config keys, and
-  boot-time setup that does not change a running node's RF, forwarding or
-  sleep/wake behaviour.
-- **Verify the off path explicitly**: default value, RF command trace,
-  sleep/wake path, forwarding decision and CLI surface. "It compiles" is not
-  evidence.
-
-The exception is an overlap between fork features that must work in tandem
-(e.g. the fleet channel's battery-gate exemption, the filter's channel store
-and the fleet PSK, radio2's RXPS mutual exclusion). Those interactions may
-change behaviour for the participating features, are documented where they are
-defined, and must not affect an otherwise-off node.
-
-The fork-wide convention is a gate at the top of the feature's receive/
-loop-path hook (or at the call site): a disabled feature may not compute a
-value nothing downstream reads. All features follow it: RXPS and radio2 take
-the upstream path when off (`needsService()`, no profile controller installed),
-`filter off` branches every gate to upstream behaviour and `checkContent`
-skips an empty rule store entirely, the battery gate samples the ADC only
-while enabled, the fleet and mesh clock sync early-return before any crypto
-or RTC read (the advert hook is gated at the call site), and the boot path
-makes no clock-changing call when the requested CPU frequency equals the
-running one. Accepted residuals, so nobody re-flags them: fresh nodes
-pre-provision the built-in Public channel (core MAC-verifies Public group
-traffic: the documented `filter chan list` contract, pinned by the CLI
-tests); the fleet's relay-side auth (the just-decrypted fleet packet's content
-hash) is not cleared after the receive bracket, so a later same-tag group
-packet pays one SHA-256 in the battery-gate exemption; in observer builds the
-worker task is always created (1 Hz idle, Wi-Fi off with no broker configured);
-the fresh first boot writes `/filter_cfg` once (the Public provision); and the
-OTA engine is compiled into every repeater build, where its loop-path hook is a
-flag test and its per-TX hook compares one payload length (a node with no
-pending apply and no traffic on the wire does no OTA work).
-
-## Behavior: principle of least surprise
-
-CLI and filter semantics must work the way a user would guess without reading
-FILTER.md:
-
-- `filter get <idx>` is an **inspection** command: its reply shows the rule's
-  predicates plus counters, is truncated to the CLI reply bound (see hard
-  invariant 3), and is *not* re-addable input (`add` rejects the
-  `hits=`/`air=`/`pass=` metadata it prints).
-- `filter chan list [<start-idx>]` exists because a full store does not fit one
-  reply and `chan del` takes a name; a truncated listing ends with `next=N`.
-- Errors say what's wrong and what's accepted (e.g. `Err - chanhash must be 2
-  hex chars`); usage lines enumerate the command surface.
-- Syntax reads like the concept: `[a,b]`-style intervals, comma lists, `*` =
-  wildcard, first match wins like firewall rules, `prob=`/`throttle=` gates
-  behave exactly as FILTER.md describes them.
-- Replies stay short and stable: treat existing reply strings as user-facing
-  API. Humans parse them, and companion tools may too.
-
-## Backwards compatibility
-
-- **Persistence is paramount.** A config written by any firmware version still
-  in the field must load with settings intact. A change is either directly
-  backwards compatible (new fields ride tail padding; the old record is a
-  byte-identical prefix of the new one, per the `static_assert` rule below) or it
-  ships migration code in `load()` plus a `FILTER_CFG_VERSION` bump. Within
-  reason: layouts older than the versions whose record code is kept in
-  `load()` (currently v3..v6, migrated stepwise to v7) were already discarded
-  by design and need no migration. Every version bump must keep older configs
-  loading: add tests for the upgrade path (roundtrip + old-version fixtures,
-  as the persistence tests already do).
-- **CLI surface is compatibility too.** Never break existing command syntax,
-  reply formats, or index semantics (0-based, shifting on delete).
-- **Behavioral invariants are compatibility.** First-match-wins ordering,
-  prob-before-throttle, stats semantics (hits travel with the rule on
-  move/del; a stats reset never grants a throttle free pass) are observable
-  behavior. So is the fleet model: a `!id` job key runs at most once per
-  boot (marked at admission, RAM-only seen ring), targeting is by exact tag
-  equality via `!tags` (absent = broadcast), the fleet channel is a single
-  unnamed PSK that supersedes the battery gate (scripts run, fleet traffic
-  relays, acks send while suspended), armed `!at` jobs and pending acks are
-  RAM-only, battery alerts are emitted on the fleet channel only when it is
-  enabled and configured, and script execution is deferred out of the receive
-  path. Changing them is a breaking decision, not a refactor side effect.
-  The observer's observable surface is compatibility too: capture happens before
-  forwarding policy (a packet the node drops is still observed), the feed is
-  best-effort (no flash replay, no delivery guarantee), TX uplinks this node's
-  own adverts by default, the topic template and the status/packet/raw schemas
-  follow the reference observer, and `/mqtt_prefs` (v5, magic `MQO1`) is the
-  fork's own format, deliberately not migrated from the other observers.
-- **New pattern syntax must not silently change the meaning of an
-  already-storable pattern.** If it would, either ship an escape (`\|`) or
-  reject the ambiguous form with an error. Deliberate exception: `|` became OR
-  in 2026-10 (alternation); a stored pattern containing an unescaped `|`
-  previously matched a literal pipe.
-- **Config integrity is checked per record where the format allows it.** A
-  truncated save is detected on load; a torn write of exactly the right length
-  is caught only by a record checksum. Since the 2026-10 v7 bump, each rule
-  record carries a CRC-16 over its payload (crc16_ccitt in PersistUtil.h);
-  older records cannot, so they stay length-checked: a checksum rides a
-  version bump, never a patch. Channel records and the battery config keep
-  the length-only story until their own layout change adds one. No sidecar
-  file (a second file is a second thing to go missing). Rationale: stops a
-  later "improvement" from quietly weakening config compatibility.
-- **Old-version migration is temporary.** v3..v6 loading is kept for now and
-  is expected to be dropped once the field has migrated. The migration chain
-  is one named step function per version pair (`migrateV3ToV4` …
-  `migrateV6ToV7` in PacketFilter.cpp), kept contiguous; never skip a middle
-  step in code. Removing a version later is one excision: delete its step
-  function, raise the floor in `rule_bytes_for()`, delete its fixtures.
-
-## Hard invariants (do not break)
-
-1. **Config persistence layout.** See *Backwards compatibility* above; the
-   `static_assert`s in `PacketFilter.h` are the enforced form of that rule.
-2. **Vendored TinyRegex.** Only the documented modifications (step budget,
-   `re_budget_exhausted()`, unsigned-char literal compare, and the `matchone()`
-   operand fix): no other edits, or the vendoring diff against
-   kokke/tiny-regex-c becomes unmaintainable. **A bug fix is the only reason to
-   touch vendored source, and only after asking first:** not every bug is worth
-   a vendored edit; weigh a one-line engine fix against reimplementing the
-   check in the wrapper, and propose the trade-off (diff size, hot-path cost,
-   what else it would pin down) rather than deciding unilaterally. Features,
-   syntax and tuning are never a reason.
-3. **CLI reply bound: 157 bytes, in a 160-byte buffer.** All writes bounded:
-   one-liners via `snprintf(reply, CLI_REPLY_MAX, ...)`, staged output via
-   `CliBuf`; never unbounded `sprintf` into `reply`. `CLI_REPLY_MAX` is 3 bytes
-   under the upstream buffers (`main.cpp`'s serial/ethernet `char reply[160]`,
-   the mesh remote-CLI's `&temp[5]` of `temp[166]`) because the core's
-   companion-radio `xx|command` form puts that 3-byte prefix in front of the
-   reply the handler writes *into the same buffer*: those buffers are
-   upstream's, the fork only keeps its replies short enough not to overrun them
-   (`static_assert` in `CliUtil.h`). A fork-owned buffer the prefix is written
-   into is `CLI_REPLY_BUFFER_MAX` (the fleet's script runner). Shared CLI
-   helpers (`nextToken`, `CliBuf`, `cliPrepare`) live in `CliUtil.h`: don't
-   duplicate them.
-4. **First match wins.** Rule evaluation order (listed order, packet-level in
-   `checkPacket()`, whole-list single pass in `checkContent()`, stash
-   consumption) is load-bearing; the prob roll runs before the throttle gate.
-5. **Pattern syntax lives in the wrapper, not in the vendored engine.**
-   `examples/simple_repeater/PatternMatch.*` owns every user-visible syntax
-   decision (alternation splitting, structural validation, the alternative
-   cap). `TinyRegex.cpp` keeps only the documented modifications and
-   `TinyRegex.h`'s only role is the engine API. A change that adds syntax by
-   editing the engine violates this. Fixing an engine *bug* does not (see 2),
-   but it must not grow into a second dialect living in two places.
-
-## Tests & verification: all code paths covered
-
-- PlatformIO's project checksum is derived from the global build flags, so
+- PlatformIO's project checksum is derived from global build flags, so
   `build.sh` (release `-D` flags) and plain `pio test` produce different
-  signatures, and each flip wipes `.pio/build` (all environments) before
-  rebuilding. Alternate between the two as little as possible; a firmware
-  build that dies with `…/.sconsign314.dblite: No such file or directory`
-  right after a native test run was almost certainly a checksum flip mid-run;
-  rerun it alone and it will succeed.
-- Every behavior change ships with tests covering its new or changed code
-  paths, added in the same commit. The suites are behavior-level (native
-  googletest); reach them via the same CLI/`checkPacket`/`checkContent`
-  entry points a user or the firmware would.
-- **Stack is a boot-breaking constraint the suites cannot see.** `setup()`/
-  `loop()` run in a hard-capped 4 KB FreeRTOS task on nRF52 and an 8 KB
-  `loopTask` on ESP32, and a big scratch array in boot- or loop-path code
-  crash-loops every repeater flashed with the release (2026-10: ~8.5 KB of
-  scratch in `FilterRules::load()` did exactly that). Measure frames with
+  signatures, and each flip wipes `.pio/build` before rebuilding. Alternate
+  between them as little as possible. A firmware build that dies with a
+  `.sconsign314.dblite` error right after a native run was almost certainly a
+  checksum flip mid-run; rerun it alone.
+- Every behavior change ships with tests covering its new or changed code paths,
+  in the same commit. The suites are behavior-level (native googletest) and
+  reach the same CLI/`checkPacket`/`checkContent` entry points a user or the
+  firmware would. Every bug fix gets a test that reproduces it. Pure refactors
+  keep the suites green **unchanged**: the suites are the safety net that proves
+  no behavior slipped.
+- The fleet's no-ACK variant compiles its test bodies in `#else` branches no
+  other environment sees, so it cannot be inferred from the main fleet suite.
+- **Stack is a boot-breaking constraint the suites cannot see.** `setup()` and
+  `loop()` run in a hard-capped small FreeRTOS task on nRF52 and a small
+  `loopTask` on ESP32; a large scratch array in boot- or loop-path code
+  crash-loops every repeater flashed with the release. Measure frames with
   `PLATFORMIO_BUILD_FLAGS=-fstack-usage pio run -e <env>` before committing
-  large local arrays; the stack gate in `scripts/local-release-build.sh`
-  fails any release target whose `src/`/`examples/` code holds a frame
-  >= 2 KB (formerly a filter-release.yml CI check): keep new frames well
-  under it.
-- Pure refactors keep the suites green **unchanged**: the suites are the safety
-  net that proves no behavior slipped.
-- Run the feature suites, then re-read the diff:
+  large local arrays. The stack gate in `scripts/local-release-build.sh` fails
+  any release target whose `src/`/`examples/` code holds a frame at or above
+  its threshold; keep new frames well under it.
+- Run the feature suites, then the full host-env run, then re-read the diff and
+  confirm every touched line is required. The exact commands and environment
+  names live in `build.sh`; do not duplicate them here.
+- Touching firmware-hook or persistence code additionally warrants compile
+  checks of every filesystem family before calling the work done. The current
+  target set lives in `build.sh`; host-native tests cannot catch a
+  platform-specific API difference, and one did (the nRF52 file type has no
+  default constructor). The smallest STM32 env that still links stands in for
+  the STM32WLE5 repeaters, which no longer fit their flash budget (same
+  `InternalFS` path).
+- PlatformIO does **not** track the force-included `test/test_packet_filter/NativeShim.h`
+  as a dependency: after changing a struct it defines, clean the native envs
+  (`pio run -e native_packet_filter -t clean`) or stale objects will silently
+  disagree with the new layout.
+- Firmware is built locally with `bash build.sh build-firmware <target>`
+  (`bash build.sh list`; `build.sh` uses bash arrays, so `sh` is not a
+  contract). CI cuts tag and release object only; the local release script
+  builds and uploads assets with `gh`. It prints the tail of a failed target's
+  log, prunes a failed target's build tree and retries the failed set once with
+  two workers after the main pass, so runner-resource flakes do not leave
+  assets missing; a deterministic failure simply fails again.
+- `RELEASE_NOTES.md` holds pending release notes and `filter-release.yml` uses
+  it verbatim as the body of every dev release. A stable release collects the
+  bodies of the dev releases since the previous stable one, so it needs no
+  separate notes file; `RELEASE_NOTES_STABLE.md` on the stable branch overrides
+  that collection when curated stable notes are wanted. Update the pending file
+  as changes land, since the gate cuts a release only when code, not docs,
+  changed. Release tags use the `v` prefix; branch names and the workflow file
+  name keep `filter` for now. `OnlineOtaPolicy.h` holds the single tag-prefix
+  macro. `scripts/rename-ota-assets.py` and `scripts/rename-ota-tags.py` renamed
+  existing assets and releases in place through the GitHub API, keeping old tag
+  refs as aliases.
 
-```
-pio test -e native_packet_filter    # filter + PatternMatch + TinyRegex + CLI + persistence
-pio test -e native_battery_gate     # battery gate
-pio test -e native_ham_mode         # ham mode (classification, gate, ID, CLI, persistence)
-pio test -e native_fleet            # fleet manager + runner + CLI + persistence
-pio test -e native_fleet_noack      # the same, with FLEET_ACK_RETRY=0 (the off switch)
-pio test -e native_mesh_clock       # mesh clock sync
-pio test -e native_radio2           # second radio preset (policy/scheduler/persistence/CLI + core profile byte)
-pio test -e native_mqtt_observer    # observer config/format/policy
-pio test -e native_ota              # LoRa OTA engine (branch lora-ota)
-pio test -e native_online_ota       # online fetch policy, core, CLI and local staging
-```
-
-All green, and every touched line required, together with the full host-env
-run, since the generic envs are where a broken selection shows up:
-
-```
-pio test -e native -e native_kiss_modem -e native_packet_filter -e native_battery_gate -e native_ham_mode -e native_fleet -e native_fleet_noack -e native_mesh_clock -e native_rx_power_saving -e native_radio2 -e native_mqtt_observer -e native_ota -e native_ota_san -e native_online_ota -e native_online_ota_san
-```
-
-Touching firmware-hook or persistence code additionally warrants compile checks
-of `Xiao_S3_WIO_repeater`, `RAK_4631_repeater`, `PicoW_repeater` and
-`wio-e5_kiss_modem`. Note that PlatformIO does **not** track the
-force-included `test/test_packet_filter/NativeShim.h` as a dependency: after
-changing a struct it defines, clean the native envs (`pio run -e
-native_packet_filter -t clean`) or the stale objects will silently disagree
-with the new layout.
-
-## Commit / PR discipline
+## Change & git discipline
 
 - Commit style: conventional prefixes as used in the fork history: `feat:`,
   `fix:`, `ci:`, `docs:`, `refactor:` (no behavior change). Descriptive, one
   concern per commit.
 - Work stays on the **fork**. Opening a PR against `meshcore-dev/MeshCore`
   requires explicit human approval of the diff first.
-- Upstream CONTRIBUTING.md: an agent-opened PR with `🤖🤖` in the title opts
+- Upstream `CONTRIBUTING.md`: an agent-opened PR with `🤖🤖` in the title opts
   into fast-tracked merging.
