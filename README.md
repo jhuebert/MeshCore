@@ -1,12 +1,10 @@
 # MeshCore: Remote-Configurable Repeater Firmware
 
-This is a feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore).
-It tracks upstream `main` releases and adds repeater management, power, radio,
-fleet and update capabilities on top of stock firmware. Everything else,
-including supported boards, clients, protocols and the build system, is
-identical to upstream; see the
-[upstream README](https://github.com/meshcore-dev/MeshCore#readme) for the
-general project and getting-started guide.
+A feature fork of [MeshCore](https://github.com/meshcore-dev/MeshCore) that
+tracks upstream `main` and adds repeater management, power, radio, fleet and
+update capabilities. Boards, clients, protocols and the build system are
+unchanged; see the
+[upstream README](https://github.com/meshcore-dev/MeshCore#readme) for those.
 
 Every feature is opt-in. With all features off, a fresh install behaves like
 stock firmware.
@@ -59,13 +57,13 @@ stock firmware.
 
 ## Credits
 
-`powersaving` is upstream MeshCore. The RXPS duty-cycle subsystem is ported from
-EasySkyMesh ([IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore),
-`PowerSaving-v18` plus the SX1262 post-preamble-timer fix from `Dev-PS18`, PR #27
-by Dom4n); this fork added the `cpu.freq` setting, the port and the guide. Ham
-mode is adapted from
-[NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham) by
-KF0WXX for the Nebraska Mesh community.
+- **Power:** `powersaving` is upstream. RXPS comes from EasySkyMesh /
+  [IoTThinks/MeshCore](https://github.com/IoTThinks/MeshCore) `PowerSaving-v18`,
+  with the SX1262 post-preamble-timer fix from `Dev-PS18` (PR #27 by Dom4n). This
+  fork added `cpu.freq`, the port and the guide.
+- **Ham:** adapted from
+  [NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham) by
+  KF0WXX for the Nebraska Mesh community.
 
 ## Release channels
 

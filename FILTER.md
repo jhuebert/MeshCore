@@ -84,36 +84,84 @@ Interval syntax, used by `hops`, `len` and `snr`:
 
 ### Prob and throttle
 
-- `prob=N` decides only about N% of the packets whose conditions all match. On a failed roll the rule steps aside and evaluation continues, exactly as if the conditions had not matched; when every matching rule fails, the packet passes. This is dosing, not a hard cutoff. Omit `prob=` for the default 100%. It works on both actions: `drop` with `prob=75` drops 3 of 4, `forward` with `prob=75` terminates the list on 3 of 4. A later static rule is the fallback, e.g. `prob=80` followed by an unconditional rule means "80% pressure, guaranteed floor".
-- The roll is **deterministic per packet**: the same packet always gets the same verdict from the same rule. It is derived from the payload and packet type, so a copy a neighbour forwards to reach this repeater rolls **identically** to the first copy; a genuinely new message rolls afresh. Determinism is scoped to the rule **as stored**: the roll is salted with a digest of the rule's own fields, so editing a `prob=` rule, or reading the same config under firmware whose rule record differs, re-rolls it. `prob` is dosing, not a stable contract; use a plain drop rule where "exactly these packets" matters. `prob=0` is rejected, use `filter disable <idx>`.
-- `throttle=N` lets **at most one matching packet every N seconds slip past the rule untouched**; every other matching packet inside those N seconds triggers the rule's action (default `drop`). A rule that steps aside behaves exactly as on a failed `prob` roll. Omit `throttle=` for no limit. It works on both actions: `drop` drops the excess, `forward` forwards everything and counts exactly the excess.
-- **One budget per rule.** The rule's whole matched stream shares it, so scope with `sender=`/`chan=`/etc. Careful: `chan=#test throttle=60` with no `sender=` limits the *channel* to one message per minute total, first come, first served, and one busy sender could starve everyone else. Over-rate firings **do not extend** the window: at N seconds it is the next pass. The rate state is RAM-only and resets on reboot, so the first match after a reboot is a free pass.
-- Combined: **prob filters what the rule sees, throttle meters what it sees**; the prob roll runs first and a failed roll never touches the budget. `hits` counts **decisions**, not condition matches: a failed prob roll or a within-budget throttle pass is not counted and is not shown in `filter get`. For a throttle rule `hits` are exactly the over-rate firings (the would-be drops); within-budget passes show as `pass=` in `filter get`.
+**`prob=N`.** About N% of packets whose conditions all match are decided by the
+rule. On a failed roll the rule steps aside exactly as if the conditions had not
+matched; if every matching rule fails, the packet passes. This is dosing, not a
+cutoff. Omit for 100%. It works on both actions: `drop` with `prob=75` drops 3 of
+4; `forward` with `prob=75` ends the list on 3 of 4. A later static rule is the
+fallback: `prob=80` then an unconditional rule means "80% pressure, guaranteed
+floor".
+
+**Deterministic per packet.** The same packet always gets the same verdict from
+the same rule. The roll comes from the payload and packet type, so a neighbour's
+copy rolls identically to the first copy while a new message rolls afresh. The
+roll is salted with a digest of the rule's stored fields: editing a `prob=` rule,
+or reading it under firmware with a different rule record, re-rolls it. `prob` is
+not a stable contract; use a plain drop when exact selection matters. `prob=0`
+is rejected; use `filter disable <idx>`.
+
+**`throttle=N`.** At most one matching packet every N seconds steps aside
+untouched; other matching packets inside the window trigger the rule's action
+(default `drop`). A stepping-aside pass behaves exactly like a failed `prob`
+roll. Omit for no limit. On `drop` the excess is dropped; on `forward` everything
+is forwarded and only the excess is counted.
+
+**One budget per rule.** The whole matched stream shares it, so scope with
+`sender=` or `chan=`. `chan=#test throttle=60` without `sender=` limits the
+channel to one message per minute in total, first come first served, and one busy
+sender can starve the rest. Over-rate firings never extend the window: at N
+seconds it is the next pass. Rate state is RAM-only and resets on reboot, so the
+first match after boot is a free pass.
+
+**Together.** Prob filters what the rule sees; throttle meters it. The prob roll
+runs first and a failed roll never touches the budget. `hits` counts decisions,
+not condition matches: a failed roll or an in-budget pass is neither counted nor
+shown in `filter get`. On a throttle rule `hits` are the over-rate firings;
+in-budget passes appear as `pass=`.
 
 ### Channels, senders and message text
 
-- `Public` is built in with the well-known Public key. `#name` channels need no key: the key is derived from the name, exactly as the companion apps do, and writing `chan=#memes` in a rule adds the channel automatically. Private (non-`#`) channels need a key: add them first with `filter chan add <name> <psk-hex>` (32 or 64 hex digits, 16 or 32 bytes), then reference the name.
-- A channel name cannot contain `,`, `=`, `"` or control characters: those cannot be represented in a rule's comma-separated `chan=` list, so no rule could reference such a channel. Ordinary spaces are fine, quote the value where you use it: `chan="two words"`. Names already in the store from an older config are left alone and stay visible in `filter chan list`.
-- The on-air channel hash is only one byte. The repeater offers core at most **4 distinct keys** per hash, and only keys that differ count; several channel *names* sharing one key are free because they decrypt identically. `filter chan add` says `multiple keys on this hash; core tries 4` when a hash starts carrying keys the repeater may never get to try.
-- Channel names are literal, not patterns: `chan=#test.*` does **not** mean "all test channels". If you delete the last channel a rule named, that rule's `chan=` list becomes empty and the rule stops matching **anything**, deliberately. It is not turned into a catch-all, so deleting a channel can never quietly widen a rule into dropping every packet of that type. Re-point the rule or remove it.
-- `chan=` matches traffic the repeater can actually decrypt with the stored key, a strong identity check. `chanhash=` matches a 1-byte on-air tag which other channels can collide with; use it only when you do not have, or want, the channel's key. `chan` alone also matches group data; adding `sender` or `text` restricts the rule to group text.
-- The store holds at most 32 channels. `filter chan list` shows what is stored and `filter chan del <name>` frees a slot. A `chan=` list can name every channel in the store: its length is bounded by the CLI command length (about 180 characters), not by a limit of its own. A command that does not fit is refused whole (`Err - command too long`), never acted on as a truncated prefix.
-- For `SpamBot: hello`, `sender=` matches the name without the colon (`SpamBot`) and `text=` matches the message only (`hello`). Use both in one rule when you need both. These conditions only apply to group text, never adverts or binary group data. Matching is **case-sensitive** and searches anywhere unless anchored:
+| Topic | Rule |
+|---|---|
+| Built-in channel | `Public` uses the well-known Public key. |
+| Hashtag channel | `#name` needs no key: the name derives it, as in companion apps. Writing `chan=#memes` adds it automatically. |
+| Private channel | Add a key first with `filter chan add <name> <psk-hex>` (32 or 64 hex digits, 16 or 32 bytes), then reference the name. |
+| Channel name | Cannot contain `,`, `=`, `"` or control characters, because a comma-separated `chan=` list cannot represent them. Spaces are fine but must be quoted: `chan="two words"`. Names stored from an older config are left alone and shown by `filter chan list`. |
+| On-air hash | One byte. Core accepts at most **4 distinct keys** per hash, and only differing keys count; several names sharing a key are free. `filter chan add` warns `multiple keys on this hash; core tries 4` when some keys may never be tried. |
+| Names are literal | `chan=#test.*` does not mean "all test channels". Deleting the last channel a rule names empties its `chan=` list and the rule stops matching anything, deliberately; it never becomes a catch-all. Re-point or remove the rule. |
+| `chan=` vs `chanhash=` | `chan=` needs a stored key and is a strong identity check. `chanhash=` matches a 1-byte on-air tag that other channels can collide with; use it only without the key. `chan` alone also matches group data; adding `sender` or `text` restricts it to group text. |
+| Store size | At most 32 channels. `filter chan list` shows them; `filter chan del <name>` frees a slot. A `chan=` list can name them all; its length is bounded by the CLI command length (about 180 characters), not a rule limit. An oversized command is refused whole with `Err - command too long`, never acted on as a truncated prefix. |
 
-  | You want | Pattern | For `SpamBot: hello` |
-  |---|---|---|
-  | Name *contains* `SpamBot` | `sender=SpamBot` | Matches; also matches `MySpamBot2` |
-  | Name *starts with* `SpamBot` | `sender=^SpamBot` | Matches; also matches `SpamBot2` |
-  | Name is *exactly* `SpamBot` | `sender=^SpamBot$` | Matches; not `SpamBot2`, not `spambot` |
+For `SpamBot: hello`, `sender=` matches the name without the colon (`SpamBot`)
+and `text=` matches the message only (`hello`). Use both in one rule when you
+need both. These apply only to group text, never adverts or binary group data.
+Matching is case-sensitive and searches anywhere unless anchored:
 
-Patterns use a small regex-like language, not JavaScript or PCRE regex. For the complete syntax, alternation, quoting, field-splitting edge cases, Unicode notes and troubleshooting, see [FILTER_PATTERNS.md](./FILTER_PATTERNS.md).
+| You want | Pattern | For `SpamBot: hello` |
+|---|---|---|
+| Name *contains* `SpamBot` | `sender=SpamBot` | Matches; also `MySpamBot2` |
+| Name *starts with* `SpamBot` | `sender=^SpamBot` | Matches; also `SpamBot2` |
+| Name is *exactly* `SpamBot` | `sender=^SpamBot$` | Matches; not `SpamBot2` or `spambot` |
+
+Patterns use a small regex-like language, not JavaScript or PCRE. For the full
+syntax, alternation, quoting, field-splitting edge cases, Unicode and
+troubleshooting, see [FILTER_PATTERNS.md](./FILTER_PATTERNS.md).
 
 ## Advert rate limiter
 
 Independent of the rules, you can rate-limit flood adverts per originating node: *each node's advert is forwarded at most once every N hours.*
 
-- The window counts adverts this repeater actually **admitted for relay**, not every advert it heard. An advert refused afterwards (by `set off`, a hop limit, an unknown region, loop detection, or the battery gate) does not use up the node's budget, so turning forwarding back on does not leave that node invisible for the rest of the window. An advert queued for transmission that never makes it onto the air still counts as admitted. Already-queued relays are not cancelled by turning the filter or the battery gate off.
-- The window can be 0 (off) to 720 hours (30 days). The window edge is minute-granular: an advert can be re-admitted up to a minute before the full N hours have elapsed. Use this on a well-connected repeater to stop re-flooding everyone's periodic adverts while still passing each node's advert once per window.
+- **Admitted traffic only.** The window counts adverts this repeater actually
+  admitted for relay, not every advert it heard. An advert refused afterwards
+  (by `set off`, a hop limit, an unknown region, loop detection or the battery
+  gate) does not use up the node's budget, so turning forwarding back on does
+  not leave it invisible for the rest of the window. An advert queued for
+  transmission that never reaches the air still counts as admitted; already
+  queued relays are not cancelled by turning the filter or battery gate off.
+- **Window.** 0 (off) to 720 hours (30 days), with minute-granular edges: an
+  advert can be re-admitted up to a minute before the full N hours elapse. Use
+  it on a well-connected repeater to stop re-flooding periodic adverts while
+  still passing each node once per window.
 
 ```text
 filter ratelimit advert 48     # each origin forwarded at most every 48 h
@@ -146,18 +194,46 @@ All commands begin with `filter`. They work identically over serial and remote a
 | `filter ratelimit clear` | Empty the advert cache |
 | anything else | Usage line listing the commands |
 
-- **Reading `filter list` output.** Each line is one rule, written the way you would type it after `filter add` (minus the verb), numbered by index:
+**Reading `filter list` output.** Each line is one rule, written as you would
+type it after `filter add` (minus the verb), numbered by index:
 
-  ```text
-  0: drop advert
-  1: forward chan=#weather
-  2: disabled drop chan=#test sender=^bob throttle=60
-  ```
+```text
+0: drop advert
+1: forward chan=#weather
+2: disabled drop chan=#test sender=^bob throttle=60
+```
 
-  The number before `: ` is the rule's index, then its action (`drop`/`forward`) plus its conditions, in evaluation order. An enabled rule says nothing about its state; enabled is the default, while a disabled rule prints `disabled`. `filter get <idx>` shows the same line for one rule plus its counters (`hits=`, `pass=` when `throttle=` is set, and `air=`); `filter list` never shows counters, so use `filter` for on/off state and rule count and `filter stats` for per-rule hits. A rule too large for one line is cut at a condition boundary and marked with `..` (two dots); `filter get <idx>` shows more of it. When the listing itself does not fit one reply, it ends with a line containing only `...` (three dots): run `filter list <last-index + 1>`, the index right after the last one shown, to continue. `filter list` with no argument starts at rule 0.
-- Commands that take a rule number want the rule's index, the number before the `:` in `filter list`, not the whole line. Indexes count from **0**: the first rule added is rule 0, the second rule 1, and so on. The repeater prints the index when you add a rule (`OK - rule 0 added`), so `filter get 0` is correct and `filter get 0: drop advert` is not. Deleting a rule shifts later rules down: delete rule 1 of 3 and the old rules 2 and 3 become 1 and 2. Re-check `filter list` after deletions.
-- `filter get <idx>` is inspection output, not `add` input: `add` rejects the `hits=`, `air=` and `pass=` metadata it prints. The repeater replies with short lines; `filter get <idx>` gives the most detail about a rule. Counters and per-rule rate state reset to zero on reboot, so each `throttle=` rule grants one free pass after a reboot; the rules themselves do not.
-- `filter list` and `filter get` changed shape in 2026-10: the packed `<idx><e|d><D|F><digest>` listing and the `r0 en`/`r0 dis` prefix are gone, and a rule's digest is no longer printed anywhere. Rule indexes are unchanged, so anything that only passes an index keeps working.
+The number before `: ` is the index, then the action (`drop`/`forward`) plus its
+conditions, in evaluation order. An enabled rule says nothing about its state;
+enabled is the default, while a disabled rule prints `disabled`.
+
+**Markers and counters.** `filter get <idx>` shows the same line for one rule
+plus its counters (`hits=`, `pass=` when `throttle=` is set, and `air=`).
+`filter list` never shows counters: use `filter` for on/off state and rule
+count, and `filter stats` for per-rule hits. A rule too large for one line is
+cut at a condition boundary and marked `..`; `filter get <idx>` shows more of it.
+When a listing will not fit one reply it ends with a line containing only `...`
+(three dots); run `filter list <last-index + 1>` to continue. With no argument,
+`filter list` starts at rule 0.
+
+**Indexes.** Commands that take a rule number want the index, the number before
+the `:` in `filter list`, not the whole line. Indexes count from **0**: the first
+rule is rule 0, the second rule 1, and so on. The repeater prints the index when
+you add a rule (`OK - rule 0 added`), so `filter get 0` is correct and
+`filter get 0: drop advert` is not. Deleting a rule shifts later rules down:
+delete rule 1 of 3 and old rules 2 and 3 become 1 and 2. Re-check `filter list`
+after deletions.
+
+**Inspection, not input.** `filter get <idx>` is inspection output, not `add`
+input: `add` rejects the `hits=`, `air=` and `pass=` metadata it prints. The
+repeater replies with short lines; `filter get` gives the most detail about a
+rule. Counters and per-rule rate state reset to zero on reboot, so each
+`throttle=` rule grants one free pass after a reboot; the rules do not.
+
+**Listing format change.** `filter list` and `filter get` changed shape in
+2026-10: the packed `<idx><e|d><D|F><digest>` listing and the `r0 en`/`r0 dis`
+prefix are gone, and a rule's digest is no longer printed anywhere. Indexes are
+unchanged, so anything that only passes an index keeps working.
 
 ### Reading `filter stats`
 
@@ -167,11 +243,29 @@ All commands begin with `filter`. They work identically over serial and remote a
 filter stats           # e.g. lim:118 abort:0 air:214s:36%; hits: 0:42
 ```
 
-- `air` is an *estimate* of the time-on-air the packets dropped so far would have consumed had they been relayed (rule drops and rate-limiter drops). The seconds are rounded down from the repeater's millisecond estimate applied to the received packet length, not a measurement of what the channel was doing and not a count of confirmed transmissions. Treat it as a comparative figure between "with the rule" and "without it", not as a channel-utilisation figure.
-- `filter get <idx>` shows the per-rule share as `air=<seconds>s`. A shadow `forward` probe bills nothing (`air=0s`, since its packets are still relayed); flip it to `drop` and those same hits start accumulating the estimate.
-- The percentage is saved airtime divided by total estimated airtime evaluated by the enabled filter, rounded to the nearest whole percent. It includes rule and advert-limiter drops and is airtime-weighted, not packet-weighted. With no evaluated airtime it shows `0%`. It measures the filter's estimated savings, not actual transmitted airtime or channel utilisation: packets allowed by the filter may still be blocked by other forwarding checks.
-- The figure is an **upper bound on the real saving**: a packet the filter drops is billed whether or not this repeater would have relayed it anyway (the flood hop limit, forwarding disabled, loop detection). The filter is asked first, so it cannot know what the repeater's own forwarding checks would have decided. All airtime counters are RAM-only and reset on reboot or a statistics reset.
+**Airtime estimate.** `air` is an estimate of the time-on-air the dropped
+packets would have consumed had they been relayed (rule drops and rate-limiter
+drops). Seconds are rounded down from the repeater's millisecond estimate
+applied to the received packet length. It is neither a measurement of the
+channel nor a count of confirmed transmissions: treat it as a comparison
+between "with the rule" and "without it", not as channel utilisation.
 
+**Per-rule share.** `filter get <idx>` shows it as `air=<seconds>s`. A shadow
+`forward` probe bills nothing (`air=0s`, since its packets are still relayed);
+flip it to `drop` and those hits start accumulating the estimate.
+
+**Percentage.** Saved airtime divided by total estimated airtime evaluated by
+the enabled filter, rounded to the nearest whole percent. It includes rule and
+advert-limiter drops and is airtime-weighted, not packet-weighted; with no
+evaluated airtime it shows `0%`. It measures the filter's estimated savings, not
+actual transmitted airtime or channel utilisation, because allowed packets may
+still be blocked by other forwarding checks.
+
+**Upper bound.** A packet the filter drops is billed whether or not this
+repeater would have relayed it anyway (flood hop limit, forwarding disabled,
+loop detection). The filter is asked first, so it cannot know what the
+repeater's own checks would have done. All airtime counters are RAM-only and
+reset on reboot or a statistics reset.
 ## Examples for every condition
 
 Complete, independent commands. Anything not specified is unrestricted. Rules default to dropping; add `action=forward` to count matches first without enforcing them (see Common setups below). Lines starting with `#` are comments, do not send them to the repeater.
@@ -413,15 +507,58 @@ This is the normal management path for a repeater on a tower: the serial port is
 | Advert rate-limit window | 0-720 hours (0 = off, 30 days at maximum) |
 | CLI reply length | one short line, 157-byte reply bound; use `filter get <idx>` for detail |
 
-- Overly long or complex patterns are **rejected with an error**, not silently shortened. Pattern lengths count the **whole** pattern, every `|` and anchor included: `sender=` fits about four short exact names (`^Alice$|^Bob$|^Carol$|^Dan$` is 28 of 31 characters) and `text=` about eight. Need more? Add a second rule, or use one broader alternative such as `^Bot`.
-- Rules, channels and settings survive reboots. Counters, the advert cache and all airtime counters do not: they start fresh after every reboot. The advert window and `throttle=` are measured on the repeater's own uptime, which keeps counting correctly no matter how long it stays on, including past the ~49.7-day point where a 32-bit millisecond counter wraps. Both state sets are RAM-only.
-- An edit is written to flash about **3 seconds** after you make it (a burst of commands costs one write, not one each). Power the repeater off within that window and that edit is lost, everything before it is safe. Saving is staged, so a crash or power cut mid-write cannot destroy your rules: the repeater writes a scratch copy, reads it back to confirm it, keeps your previous config as a backup, and only then swaps it in. If the main config ever fails to load, the backup is used and a repaired copy is written at the next save. The worst case is that the most recent edit is lost, not the whole rule list. This is recovery in the firmware, not a guarantee about the flash itself: a power cut *inside* the filesystem's own write can still damage the underlying storage.
-- A `len=` larger than the largest packet the radio can carry is accepted as valid syntax but can never match a real packet: the payload is bounded by the packet buffer, so keep length predicates within what a message can actually be.
-- Very complicated patterns can be slow to match. Prefer short, distinctive patterns like `^BEACON` over long wildcard chains. Several alternatives multiply that cost. The `aborted` counter in `filter stats` grows if a pattern gives up mid-match; simplify it if you see that. When a pattern gives up, **that rule simply does not match**: it does not disable the whole filter, and a later rule, including a plain drop, can still decide the packet.
-- Rules are evaluated **top to bottom, first match wins** over the whole list: packet-level and content conditions live in the same ordered list. Older fork firmware ran content rules in a separate second pass; with interleaved configs the observable differences are that a matching `forward` or content rule now shields later drop rules, and a packet-level rule listed before a content rule now decides first for decrypted group text/data. The rule order in `filter list` is now honoured exactly as listed. `forward` rules on decrypted group traffic count their hit at the moment the message is read (one scan instead of two); counters are RAM-only and reset on reboot, so this self-heals.
-- Configs are compatible in both directions: the stored action value did not change with the `logonly` to `forward` rename, so firmware that still says `logonly` reads and forwards a `forward` rule. That is *format* compatibility: the stored byte means the same thing. It is not a claim that old firmware behaves identically, because a two-pass implementation evaluated rules differently and the same config could decide differently on old code. If the exact outcome matters, check it on the firmware you actually run.
-- One stored pattern is read differently by firmware from 2026-10 onwards: an unescaped `|` used to mean a literal pipe and now means OR, so write `\|` if you want a literal pipe. A pattern built on a bare quantifier (`*Bot`) or a misplaced anchor (`A^B`) is accepted as before, but now matches nothing instead of matching or not depending on whichever pattern the engine compiled before it.
-- **What a filter rule is, and is not.** Rules match on *what a packet says*, not on who is allowed to send it. A sender name is chosen freely by whoever writes the message, a channel key is shared by everyone holding it, and the protocol's message tag is two bytes. So a `sender=` or `chan=` rule is a **content policy**, not authentication: it reduces noise, it does not prove an identity. Treat it that way, and do not rely on it as a security boundary.
-- **Keeping remote admin reachable.** A management request addressed *to this repeater* is answered directly, so your own filter, and the battery gate, never block logging in to it. Remote admin still depends on the path working: a drop rule on an *intermediate* repeater between your app and this one can silence the reply before it arrives. So before enabling a broad drop rule, add a higher-priority `forward` rule for the traffic you need relayed, e.g. `filter add chan=<admin channel> action=forward`, and test it from the app while you still have serial access. A rule exception here is about the *relay path*, not about authorising the login: nothing in this filter makes a management packet authenticated.
+**Patterns.** Long or complex patterns are rejected with an error, never
+silently shortened. Length counts the whole pattern, including `|` and anchors:
+`sender=` fits about four short exact names (`^Alice$|^Bob$|^Carol$|^Dan$` is 28
+of 31 characters) and `text=` about eight. Add a rule, or use a broader
+alternative such as `^Bot`.
+
+**Runtime state.** Rules, channels and settings survive reboots. Counters, the
+advert cache and airtime counters are RAM-only and start fresh. Windows use the
+repeater's own uptime, so they stay correct across the ~49.7-day wrap of a 32-bit
+millisecond counter.
+
+**Saving.** An edit is written about 3 seconds later; a burst of commands costs
+one write. Power off inside that window loses only the last edit. The save is
+staged: scratch copy, read-back check, previous config kept as backup, then swap.
+If the main config fails to load, the backup is used and repaired on the next
+save. A power cut inside the filesystem's own write can still damage storage.
+
+**Pattern cost.** Complex patterns match slowly, and alternatives multiply the
+cost. Prefer short distinctive patterns such as `^BEACON`. A pattern that gives
+up (`aborted` in `filter stats`) makes only that rule not match; later rules,
+including a plain drop, still decide the packet.
+
+**Length predicates.** A `len=` above the radio's largest packet is valid
+syntax that can never match, because the payload is bounded by the packet
+buffer.
+
+**Rule order.** First match wins over the whole ordered list; packet-level and
+content conditions share that list. Older fork firmware ran content rules in a
+second pass, so with interleaved configs a `forward` or content rule now shields
+later drops, and a packet-level rule listed first now decides first for
+decrypted group traffic. `filter list` order is now honoured exactly. `forward`
+rules on decrypted group traffic count their hit when the message is read;
+counters are RAM-only and self-heal on reboot.
+
+**Compatibility.** The stored action byte did not change with the `logonly` to
+`forward` rename, so old and new firmware read the same value. That is format
+compatibility, not identical behaviour: two-pass firmware could decide
+differently. Check outcomes on the firmware you run. From 2026-10, an unescaped
+`|` means OR instead of a literal pipe; write `\|` for a literal pipe. A bare
+quantifier (`*Bot`) or misplaced anchor (`A^B`) is still accepted but now
+matches nothing.
+
+**Not authentication.** Rules match what a packet says, not who sent it: sender
+names are chosen freely, channel keys are shared, and the protocol tag is two
+bytes. A `sender=` or `chan=` rule is a content policy, not an identity check.
+Do not treat it as a security boundary.
+
+**Remote admin.** Management requests addressed to this repeater are answered
+directly, so your filter and the battery gate never block logging in.
+Intermediate repeaters can still drop the reply, so before a broad drop rule add
+a higher-priority exception (`filter add chan=<admin channel> action=forward`)
+and test from the app while you have serial access. This is about the relay
+path, not login authorisation.
 
 The binary `/filter_cfg` layout, record sizes, CRC, version migration and staged-save mechanics are a tooling-only reference in [FILTER_CONFIG_FORMAT.md](./FILTER_CONFIG_FORMAT.md).

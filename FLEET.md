@@ -1,14 +1,13 @@
 # Fleet Management: User Guide
 
-Fleet management for the `simple_repeater` firmware. One PSK-backed channel, set
-once per repeater, becomes a remote administration bus: a group text on that
-channel is executed as a small CLI script, deferred and at most once per job, on
-every repeater whose **tags** the script targets. One broadcast message
-configures a whole fleet or any tagged subset, with no serial cable and no
-per-node logins. The feature is a top-level `fleet` command, independent of the
-packet filter: it works with `filter off`, it works while the battery gate has
-suspended forwarding (see [Battery supersession](#battery-supersession)), and
-filter rule changes can never break fleet script delivery.
+Fleet management turns one PSK-backed channel into a remote admin bus for
+`simple_repeater`. A group text on that channel runs as a small CLI script,
+deferred and at most once per job, on every repeater whose **tags** it targets.
+One broadcast configures the whole fleet or a tagged subset, with no serial
+cable and no per-node logins.
+
+- Independent of the packet filter: works with `filter off`, and filter changes cannot break script delivery.
+- Works while the battery gate has suspended forwarding; see [Battery supersession](#battery-supersession).
 
 ## What it does
 
@@ -164,68 +163,63 @@ the core's `Error`, `Error, ...`, `ERROR: ...`, `ERR: ...`, `error` and
 `Unknown command`. A typo'd core command (`set txdelayy 2`) replies
 `Unknown command`, and that is an error: the job did not do what it said.
 
-Reply content is always prefixed with the job key so replies are correlatable
-when several jobs are in flight. On air the body is `<key>`, then a newline,
-then the response, and companions show the id and the response on separate
-lines. A single-command script sends the command's **actual reply** (e.g.
-`2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`), cut to fit one packet. A
-multi-command script sends `<key> ran 5 ok`, or
-`<key> ran 5; err: <first failing line's reply>`: the first error is the only
-useful detail in one packet. Replies are never split across packets.
+Reply content is always prefixed with the job key, so replies stay correlatable
+when several jobs are in flight. On air the body is `<key>`, a newline, then the
+response; companions show both lines separately.
 
-An acknowledgement carries as much reply as the packet has room for: the node
-name and job key take their share, leaving 97 bytes in the worst case (a
-31-character name and a 32-character key), more whenever either is shorter,
-with about 93 bytes of reply text after the 3-byte marker. A reply that does not
-fit is cut where it stops fitting, the text before the cut is **kept** exactly as
-it was (the line the cut landed in stays visible), and a single `...` marks where
-the reply stopped; a reply that fits is copied byte for byte, so the filter's own
-`...` marker survives untouched. A `...` at the end of the reply means *the
-reply was cut here*, while `...` on a line of its own in a `filter list` reply is
-the filter's own page marker (see [FILTER.md](./FILTER.md)) and means the same
-thing: more follows. A `..` at the end of a line means *that line is
-incomplete*: the repeater's own listing abbreviated a rule too large for one
-line (FILTER.md marks those with `..`). The two say different things: `...` is
-the end of what you got, `..` is that rule **not shown whole**. The way on is the
-same in both cases: `filter get <idx>` shows that rule whole (the number before
-the `:` in the listing), and `filter list <idx+1>` shows the rules after it as a
-new job; a listing that stopped at an abbreviated rule shows the same `..`
-again, so page on by index rather than by re-reading the same line.
+| Job | Reply |
+|---|---|
+| One command | The command's actual reply, cut to fit one packet (e.g. `2026-06-12-stats rx:12 fwd:34 arp:1 arp_fwd:0`) |
+| Several commands | `<key> ran 5 ok`, or `<key> ran 5; err: <first failing line's reply>` |
 
-Protocol guarantees, by construction:
+The first error is the only useful detail that fits one packet. Replies are never split across packets.
 
-1. Replies are `txt_type = 0x00` plain group texts, visible in the companion's
-   channel view.
-2. **Replies never parse as scripts**: reply text starts with the job key
-   (charset `[A-Za-z0-9._-]`, never `!`), so it can never match the `!id ` marker.
-   Keep future reply formats key-prefixed for the same reason.
-3. Flood is the only reply route: group texts carry no pubkey, so a repeater
-   cannot direct-reply to "alice" (sender-controlled text, not an identity).
-   Every reply floods and is relayed by the fleet, using the repeater's
-   configured path-hash size and its default region scope when one is set
-   (unscoped otherwise).
+| Marker | Meaning |
+|---|---|
+| `...` at the end of a reply | The reply was cut here. |
+| `...` on its own line in `filter list` | The filter's page marker: more rules follow. |
+| `..` at the end of a line | That rule was not shown whole. |
 
-Storm control: the reply is scheduled at a uniform-random instant in a jitter
-window (default 15 s, node-tunable via `fleet reply <secs>`, 1–600 s) measured
-from when the script *finishes running*. A reply storm is N near-simultaneous
-packets that all flood and are relayed, so the window has to be wide enough to
-spread them out: **rule of thumb ≈ 5 s per repeater**. A 3-node fleet is fine at
-the default; a 10-node fleet wants ~50 s and a 20-node fleet ~100 s. Widening
-costs only latency, while a too-narrow window costs collisions: when in doubt,
-widen. Set it per node, or fleet-wide from a script (`fleet reply 50`). Pending
-replies (2 slots) are RAM-only: a reboot wipes them, so a re-sent `!ack` job
-after a reboot re-runs *and* re-replies. A full reply store drops and counts the
-reply (`refused`); no reply cooldown in v1: per-key dedupe already bounds each
-script to one reply.
+Both markers have the same next step: `filter get <idx>` shows the rule whole,
+then `filter list <idx+1>` pages on. Re-reading the same line only shows the
+same `..` again.
 
-After a reply floods, the repeater listens for a neighbour repeating it; with none heard within ~5 s it re-sends once, byte-identically (same frozen timestamp, node name and cut body, so the same on-air packet), then stops.
-Because the copy is byte-identical, nodes that already relayed have it in their seen table and suppress it at the mesh layer before any app or companion sees it: the retry never appears as a duplicate message and a healthy fleet shows exactly one reply per node;
-the name and room the body is cut to are frozen with the first attempt, so an intervening `set name` cannot turn the copy into a different packet.
-"Heard a repeat" proves a repeater relayed the reply, not that the companion received it: flood group text has no end-to-end ack, and each miss increments `rtx` (climbing means no neighbouring repeater in range or heavy loss).
-A send the packet pool refuses is retried after the configured backoff, with `rtx` incremented only when that retry is queued; a send it keeps refusing is given up on after a few attempts (`FLEET_ACK_SEND_MAX_ATTEMPTS`),
-since an ack that can never be sent must not hold its reply slot forever, or two would block every later acknowledgement until reboot, and is counted as `refused` when dropped.
-The retry is build-time tunable (`FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`, `FLEET_ACK_RETRY_BACKOFF_MS`, `FLEET_ACK_SEND_MAX_ATTEMPTS`), never persisted;
-build with `FLEET_ACK_RETRY=0` to restore the single fire-and-forget send.
+**Reply budget.** The node name and job key take their share of the packet,
+leaving 97 bytes in the worst case (31-character name, 32-character key), about
+93 bytes of text after the 3-byte marker, and more whenever either is shorter.
+A reply that does not fit is cut where it stops fitting: text before the cut is
+kept exactly, a single `...` marks the stop, and a reply that fits is copied
+byte for byte, so the filter's own `...` survives untouched.
+
+**Protocol guarantees:**
+
+1. Replies are `txt_type = 0x00` plain group texts, visible in the companion's channel view.
+2. Replies never parse as scripts: they start with the job key (charset `[A-Za-z0-9._-]`, never `!`), so they cannot match the `!id ` marker. Keep future reply formats key-prefixed for the same reason.
+3. Flood is the only reply route. Group texts carry no pubkey, so a repeater cannot direct-reply to "alice" (sender-controlled text, not an identity). Every reply floods and is relayed by the fleet, using the repeater's path-hash size and its default region scope when one is set.
+
+**Storm control.** A reply is scheduled at a uniform-random instant in a jitter
+window measured from when the script finishes. The default is 15 s, set per node
+with `fleet reply <secs>` (1-600 s). A storm is N near-simultaneous floods, so
+widen the window to spread them: about **5 s per repeater** (3 nodes: default,
+10 nodes: ~50 s, 20 nodes: ~100 s). Widening costs only latency; a narrow window
+costs collisions. Set it fleet-wide from a script with `fleet reply 50`.
+Pending replies (2 slots) are RAM-only: a reboot wipes them, so a re-sent `!ack`
+job after a reboot re-runs and re-replies. A full reply store drops and counts
+the reply (`refused`); there is no reply cooldown in v1, because per-key dedupe
+already bounds each script to one reply.
+
+**Retry.** After a reply floods, the repeater listens for a neighbour repeating
+it. With none heard within ~5 s it re-sends once, byte-identically (same frozen
+timestamp, node name and cut body), then stops. Nodes that already relayed
+suppress the copy at the mesh layer, so it never appears as a duplicate message.
+The name and room are frozen with the first attempt, so a later `set name`
+cannot turn the copy into a different packet.
+
+| Retry fact | Detail |
+|---|---|
+| Heard repeat | Proves a repeater relayed the reply, not that the companion received it. Flood group text has no end-to-end ack; each miss increments `rtx`. |
+| Refused send | Retried after the configured backoff, with `rtx` incremented only when the retry is queued. Given up after a few attempts and counted as `refused`, so an unsendable ack cannot hold the reply slot forever and block later acknowledgements until reboot. |
+| Build flags | `FLEET_ACK_RETRY`, `FLEET_ACK_REPEAT_WINDOW_MS`, `FLEET_ACK_RETRY_BACKOFF_MS`, `FLEET_ACK_SEND_MAX_ATTEMPTS`. Never persisted. `FLEET_ACK_RETRY=0` restores the single fire-and-forget send. |
 
 ## Inline pauses (`!delay <ms>`)
 
@@ -488,45 +482,32 @@ be orphaned from a fleet cutover by its own battery state.
 
 ## Security model
 
-The channel key is the credential; its MAC gate is the only thing between the
-world and your scripts. Holders of the key are equals: there is no per-sender
+The channel key is the credential. Its MAC gate is the only thing between the
+world and your scripts. Key holders are equals: there is no per-sender
 distinction, and tags are not authentication.
 
-Each repeater remembers executed job keys in RAM only: the memory starts empty
-on every boot, like the advert cache. Within one boot a key executes at most
-once, and the key is marked at admission, the moment the script is queued, so a
-duplicate flood delivery or a deliberate re-send no-ops (but the message is
-still relayed) and costs nothing. The seen table is a 32-entry RAM ring: a 33rd
-distinct job this boot evicts the oldest key and re-arms it. `fleet seen <key>`
-answers "did this job run here?" over a normal admin session, one per repeater.
-`fleet forget <key>` re-arms one key for a deliberate re-run, and
-`fleet forget all` re-arms everything, but a job still **queued, sleeping or
-armed** is never doubled: a re-send is refused as a duplicate until it has run
-or been cancelled, even after a `forget`.
+| Topic | How it works |
+|---|---|
+| Per boot | Executed job keys live in RAM only and start empty on every boot. A key runs at most once per boot and is marked at admission, when the script is queued. Duplicates and deliberate re-sends no-op but are still relayed, at no cost. |
+| Seen ring | 32 entries. A 33rd distinct job evicts the oldest key and re-arms it. |
+| Inspect and re-arm | `fleet seen <key>` answers "did this job run here?" over a normal admin session, one per repeater. `fleet forget <key>` re-arms one key and `fleet forget all` re-arms everything. A job still queued, sleeping or armed is never doubled: a re-send stays refused until it has run or been cancelled, even after a `forget`. |
+| Re-send | Re-send freely while the fleet is up to catch nodes that were offline or out of range. Repeats are free: they no-op on the seen table and are still relayed. |
 
-Re-send freely while the fleet is up: that is how you catch nodes that were
-offline or out of range, and repeats are free. A captured message re-sent while
-the repeater is up no-ops on the seen table and is still relayed.
+**Note:** After a reboot, keys are forgotten and a re-sent job runs again. Write
+scripts to be re-runnable:
 
-**Note:** After a reboot, keys are forgotten and a re-sent job runs again.
-Scripts are therefore *re-runnable by convention*: commands that **set** state
-(`set …`, `filter add …`, `filter ratelimit …`, `battery …`) are safe to repeat
-forever; index-based mutations (`filter del 3`, indices shift!) and one-shot
-effects (`reboot`, `start ota`) belong in their own jobs, sent deliberately and
-only once. A captured message replayed after a reboot re-runs. That residual
-exposure is bounded by the re-runnable-scripts convention above; cross-reboot
-replay immunity is not a property of this feature. If cross-reboot replay
-protection matters to you, keep one-shot jobs off the channel and do them over
-direct admin.
+- State-setting commands (`set …`, `filter add …`, `filter ratelimit …`, `battery …`) are safe to repeat forever.
+- Index-based mutations (`filter del 3`, indices shift) and one-shot effects (`reboot`, `start ota`) belong in their own jobs, sent deliberately and once.
+- A captured message replayed after a reboot re-runs. Cross-reboot replay immunity is not a property of this feature; if that matters, keep one-shot jobs off the channel and do them over direct admin.
 
-Leak response: treat every fleet member as compromised, rotate the PSK
-([channel rotation](#recipes)), and use `fleet off` (per node, over normal
-admin) in the meantime.
+**Leak response.** Treat every fleet member as compromised, rotate the PSK
+([channel rotation](#recipes)), and use `fleet off` per node over normal admin
+in the meantime.
 
-Bounded resources: payload-sized scripts, a 2-slot run queue, a 2-entry
-scheduled store, a 2-entry reply store, a 32-entry seen ring, one script per
-packet. No amplification: a fleet member relays the message once and runs its
-own copy locally; `!ack` replies are jittered against storms.
+**Bounded resources.** Payload-sized scripts, a 2-slot run queue, 2 scheduled
+entries, 2 reply slots, a 32-entry seen ring, one script per packet. No
+amplification: a member relays the message once and runs its own copy locally,
+and `!ack` replies are jittered against storms.
 
 ## Limits
 

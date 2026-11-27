@@ -119,14 +119,16 @@ Err - channel list full (max 8); remove one first
 
 ## Interactions with other features
 
-- **Filter:** fully decoupled. Ham mode has its own channel list and never reads `/filter_cfg`; the filter does not know ham mode exists. You may list the same hashtag in both, but each list is edited separately.
-- **radio2:** one power pair covers both presets. radio2 has no per-preset power, and ham mode adds none.
-- **RXPS:** allowed. radio2 and RXPS remain mutually exclusive.
-- **Battery gate:** independent. Ham ID adverts still fire while forwarding is suspended, so disable ham mode on battery-critical nodes if you do not want that RF activity.
-- **Fleet:** fleet traffic and its acknowledgements are group texts encrypted with the fleet channel's private PSK. Ham classification checks group traffic against the Public channel and your listed hashtag channels, so neither fleet datagrams nor fleet ACKs match and both use `set tx`.
-- **Observer:** capture happens before forwarding policy and only TX power changes, so there is no schema change.
-- **OTA:** update operations ride inside requests and responses, so they are encrypted and use `set tx`. A low private power slows updates.
-- **Mesh clock:** ID adverts are ordinary signed adverts and feed clock sync like any other.
+| Feature | Interaction |
+|---|---|
+| Filter | Fully decoupled. Ham mode has its own channel list and never reads `/filter_cfg`; the filter does not know ham mode exists. You may list the same hashtag in both, but edit each list separately. |
+| radio2 | One power pair covers both presets; radio2 has no per-preset power and ham mode adds none. |
+| RXPS | Allowed. radio2 and RXPS remain mutually exclusive. |
+| Battery gate | Independent. Ham ID adverts still fire while forwarding is suspended, so disable ham mode on battery-critical nodes if you do not want that RF activity. |
+| Fleet | Fleet traffic and ACKs are group texts under the fleet PSK. Ham classification checks group traffic against the Public channel and your listed hashtag channels, so neither fleet datagrams nor ACKs match and both use `set tx`. |
+| Observer | Capture happens before forwarding policy and only TX power changes, so there is no schema change. |
+| OTA | Operations ride inside requests and responses, so they are encrypted and use `set tx`. A low private power slows updates. |
+| Mesh clock | ID adverts are ordinary signed adverts and feed clock sync like any other. |
 
 ## Persistence and defaults
 
@@ -147,11 +149,14 @@ This is a new format. Settings from the source fork's `/ham_prefs` are not read 
 This feature adapts the ham capability built and published by **KF0WXX and the
 Nebraska Mesh community** in
 [NebraskaMesh/MeshCore-Ham](https://github.com/NebraskaMesh/MeshCore-Ham)
-(MIT licensed), whose original implementation is
+(MIT licensed), from
 [commit `6e716038`](https://github.com/NebraskaMesh/MeshCore-Ham/commit/6e716038).
-The public/private classification
-model and its fail-safe rule, the hardcoded Public key and hashtag derivation,
-the activation gate, the per-packet TX power hook, the command names and the
-public/private counters all come from that work. This fork rewrites it into the
-repeater-filter architecture with fork-owned files, CRC-protected settings,
-native tests, whole-word callsign validation and a timer-driven station ID.
+
+Borrowed from that work: the public/private classification model and its
+fail-safe rule, the hardcoded Public key and hashtag derivation, the activation
+gate, the per-packet TX power hook, the command names and the public/private
+counters.
+
+This fork rewrites it into the repeater-filter architecture with fork-owned
+files, CRC-protected settings, native tests, whole-word callsign validation and
+a timer-driven station ID.

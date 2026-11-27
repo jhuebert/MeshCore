@@ -16,17 +16,21 @@ The topic convention and the status, packet and raw JSON payloads are defined in
 
 ## What it does
 
-The observer captures from two existing receive-path points: **Receive**, every
-packet the radio parses and decodes with its SNR/RSSI and, for direct routes, the
-path; and **Transmit**, this node's own transmissions, filtered to just its
-adverts by default. Capture happens **before** the packet filter, the battery
-gate, repeat enablement, hop/loop limits, and region policy, so a packet the
-repeater *refuses to forward* is still observed. Observation is not affected by
-your filter rules, and your filter rules cannot be broken by the observer. What
-the observer **cannot** see is a frame that never parsed; see
-[Limits and good-to-knows](#limits-and-good-to-knows). Each enabled broker gets
-three feeds: online status, parsed packets (rx and tx), and the original radio
-frame.
+The observer captures from two points on the receive path:
+
+| Feed | What it captures |
+|---|---|
+| Receive | Every parsed packet, with SNR/RSSI and, for direct routes, the path. |
+| Transmit | This node's own transmissions, adverts only by default. |
+
+Capture happens **before** the packet filter, battery gate, repeat enablement,
+hop/loop limits and region policy, so a packet the repeater refuses to forward
+is still observed. Your filter cannot change observation, and the observer
+cannot change filtering. A frame that never parsed is invisible; see
+[Limits and good-to-knows](#limits-and-good-to-knows).
+
+Each enabled broker gets three feeds: online status, parsed packets (rx and tx),
+and the original radio frame.
 
 ## Firmware
 
@@ -180,18 +184,17 @@ set mqtt1.owner <64-hex-public-key>   # optional claim
 set mqtt1.email you@example.org       # optional claim
 ```
 
-The token is valid for 24 hours and is renewed before it expires and before any
-reconnect, so a long outage never leaves you with a dead token. The token
-carries `publicKey`, `aud`, `iat`, `exp`, and `client` (this fork's version
-string) claims plus any `owner`/`email` you set. Clearing the audience
-(`set mqtt1.audience` with no value) switches the slot back to username/password.
-Renewing the token, or changing the slot's configuration, rebuilds the MQTT
-client before reconnecting: the broker then sees the new credentials and
-session settings instead of a reused client's previous ones.
-The observer also keeps its MQTT session (`clean_session=false`) with a stable
-client ID, so a reconnect resumes/takes over the previous session instead of
-asking the broker to discard it. Brokers that close a clean reconnect while the
-old session is still settling accept this path.
+The token is valid for 24 hours and is renewed before expiry and before every
+reconnect, so an outage cannot leave a dead token.
+
+| Token claim | Value |
+|---|---|
+| `publicKey`, `aud`, `iat`, `exp`, `client` | Standard claims; `client` is this fork's version string. |
+| `owner`, `email` | Optional, from `set mqtt1.owner` and `set mqtt1.email`. |
+
+- `set mqtt1.audience` with no value switches the slot back to username/password.
+- Renewing the token or changing the slot's config rebuilds the MQTT client before reconnecting, so the broker sees fresh credentials and session settings.
+- The session is retained (`clean_session=false`) with a stable client ID, so a reconnect resumes the previous session instead of asking the broker to discard it. This covers brokers that close a clean reconnect while the old session is still settling.
 
 **Username/password.** For a private broker:
 
@@ -281,39 +284,21 @@ valid clock), `connecting`, `connected`, `retry`, and `error`.
 
 ## Delivery behaviour
 
-The observer is a bounded, best-effort feed. It is designed to survive a broker
-outage without stalling the mesh:
+The observer is a bounded, best-effort feed that survives a broker outage
+without stalling the mesh.
 
-- **Bounded queue.** Captured events sit in a small RAM queue (default 8 events,
-  shared by both slots) while connections are down. The oldest pending event is
-  replaced when it is full. Nothing is written to flash or replayed after a
-  reboot.
-- **Bounded retries.** A failed publish is retried up to three times, 300–499 ms
-  apart; if a broker stays disconnected for a full minute, the queue is flushed.
-- **Heap-aware connects.** Before opening a broker connection the observer
-  checks headroom in the pool that will serve the TLS buffers (PSRAM when the
-  board has it, internal RAM otherwise) plus a small internal-RAM floor for the
-  MQTT/lwIP buffers. A secure slot needs much more than a plaintext one. If the
-  pool is too fragmented it waits and retries every 30 seconds: this keeps a
-  TLS slot on a small board from crashing the node, and it is never a dead end.
-- **Liveness probes.** Every status message is QoS 1, so a status-enabled node
-  already proves its broker session each interval. With `mqtt.status off`, at
-  most one packets/raw publish per broker per interval is promoted to QoS 1
-  instead. If a probe is not acknowledged within 60 seconds while the slot
-  still reports connected, the broker is force-stopped and reconnected on the
-  normal backoff ladder. A promoted packet can be delivered twice, and a slot
-  with no traffic sends no probe.
-- **Patient reconnects.** A dropped broker is retried on a 10/30/60/120/300 s
-  ladder, and then every 5 minutes **forever**: a broker that is unreachable
-  during a long internet outage is picked up again when the link returns.
-- **Partial delivery counts as delivered.** Both connected slots are offered
-  each event, but as soon as any one of them publishes it the event is done, so
-  a per-slot outage does not cause duplicate work. QoS 0 also means a rare loss
-  is possible if a connection dies mid-write.
+| Aspect | Behaviour |
+|---|---|
+| Queue | Small RAM queue, default 8 events shared by both slots. When full, the oldest pending event is replaced. Nothing is written to flash or replayed after reboot. |
+| Retries | A failed publish is retried up to three times, 300–499 ms apart. A broker disconnected for a full minute flushes the queue. |
+| Connect gate | Before connecting, the observer checks headroom in the pool that will hold TLS buffers (PSRAM when present, otherwise internal RAM) plus a small internal-RAM floor for MQTT/lwIP. A secure slot needs much more than a plaintext one. If the pool is fragmented it waits and retries every 30 s, which keeps a TLS slot on a small board from crashing the node. |
+| Liveness | Every status message is QoS 1, so a status-enabled node proves its session each interval. With `mqtt.status off`, at most one packets/raw publish per broker per interval is promoted to QoS 1. A probe unacknowledged after 60 s while still connected force-stops the broker and reconnects on the normal ladder. A promoted packet can arrive twice; a slot with no traffic sends no probe. |
+| Reconnect | 10/30/60/120/300 s ladder, then every 5 minutes forever, so a broker returns when the internet does. |
+| Partial delivery | Both connected slots see each event, but the first publish completes it, so one slot's outage causes no duplicate work. QoS 0 means a rare loss if a connection dies mid-write. |
 
 The receive hook runs **before mesh de-duplication**, so a packet heard on more
 than one repeat can be published more than once, useful for per-reception RF
-analysis, but packet counts are receptions, not unique packets.
+analysis; counts are receptions, not unique packets.
 
 ## Recipes
 
@@ -460,14 +445,12 @@ point at the path or the TLS session; `config` never opened a socket at all.
 | Liveness probe | status message (or one packet/raw per interval when status is off); 60 s PUBACK timeout |
 | TLS heap gate | ~64 KB free and ~18 KB largest block in the TLS pool (PSRAM when present, otherwise internal), plus ~24 KB free and ~8 KB largest internal for a secure connect |
 
-- **Stale-session recovery.** Some brokers keep the previous session or
-  authentication state bound to the identity and silently close an in-process
-  reconnect (`err:closed`) even with a fresh token and client. After **5
-  consecutive `closed` failures**, the observer drops and rejoins the Wi-Fi
-  station, which gives both slots new TCP/TLS state (the same thing a reboot
-  provides) without rebooting the repeater. The station IP may change; the
-  status gap is the Wi-Fi rejoin plus one connect attempt. `mqtt recover` forces
-  the same reset immediately.
+- **Stale-session recovery.** Some brokers bind the old session or auth state
+  to the identity and silently close an in-process reconnect (`err:closed`),
+  even with a fresh token and client. After **5 consecutive `closed` failures**
+  the observer drops and rejoins Wi-Fi, giving both slots new TCP/TLS state
+  without rebooting. The IP may change; the status gap is the rejoin plus one
+  connect attempt. `mqtt recover` forces the same reset.
 - **ESP32 only.** nRF52, STM32, and RP2040 boards have no observer build.
 - **Not included:** broker presets, per-slot packet-type allowlists, neighbour
   queries, a WebConfig portal, SNMP, and alerting. Every packet type is captured

@@ -260,29 +260,16 @@ while queued, two airtime charges, and the same duty-cycle budget.
 ### What may cross profiles
 
 Cross-profile actions (`other` and `both`) apply only to **broadcast flood**
-traffic:
+traffic. Everything else stays on the preset it was heard on.
 
-- adverts, including zero-hop adverts;
-- group text with flood routing;
-- group data with flood routing.
+| Cross profiles | Stay on origin |
+|---|---|
+| Adverts (including zero-hop), flood group text, flood group data | Direct and transport-direct, ACKs, path returns, traces, anonymous requests, direct messages/requests/responses and unicast flood DMs, control/discovery, raw custom |
 
-Everything else stays on the preset it was heard on:
-
-- direct and transport-direct packets;
-- ACKs;
-- path returns;
-- traces;
-- anonymous requests;
-- direct messages, requests, responses and unicast flood DMs;
-- control/discovery packets;
-- raw custom packets.
-
-If the configured action is `other` or `both` but the packet is not
-crossable, the effective action is `same`. `drop` still drops it.
-
-A direct message flooded across profiles would need its ACK or path return to
-cross too, and the two sides can disagree about paths, timing and which preset
-is primary. Keeping private traffic on its origin avoids that trap.
+If the action is `other` or `both` but the packet is not crossable, the
+effective action is `same`. `drop` still drops it. Private traffic stays on its
+origin: a flooded DM would need its ACK and path return to cross too, and the
+two sides can disagree about paths, timing and which preset is primary.
 
 ### Replies
 
